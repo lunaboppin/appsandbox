@@ -20,6 +20,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <stdio.h>
+#include <wctype.h>
 #include <stdlib.h>
 #include <shlobj.h>
 
@@ -223,17 +224,23 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"autoOpenDisplay", v->auto_open_display);
     jb_bool(jb, L"managementBusy", asb_vm_management_busy(asb_vm_get(i)));
     jb_int(jb, L"guestGrowTargetGb", (int)v->guest_grow_target_gb);
-    {
+    jb_string(jb, L"sharedResourceExclusions", v->shared_resource_exclusions);
+    jb_string(jb, L"sharedResourceTransport", v->shared_resource_transport);
+    jb_string(jb, L"sharedResourceError", v->shared_resource_error);
+    jb_bool(jb, L"sharedResourcePending", v->shared_resource_pending);
+    if (v->storage_root[0]) {
+        jb_string(jb, L"storageDir", v->storage_root);
+    } else {
         wchar_t storage_dir[MAX_PATH];
         wchar_t *slash;
+        wcscpy_s(storage_dir, MAX_PATH,
+                 st_->base_dir[0] ? st_->base_dir : v->vhdx_path);
+        slash = wcsrchr(storage_dir, L'\\');
+        if (slash) *slash = L'\0';
         if (st_->base_dir[0]) {
-            wcscpy_s(storage_dir, MAX_PATH, st_->base_dir);
-            slash = wcsrchr(storage_dir, L'\\');
-            if (slash) *slash = L'\0';
-        } else {
-            wcscpy_s(storage_dir, MAX_PATH, v->vhdx_path);
-            slash = wcsrchr(storage_dir, L'\\');
-            if (slash) *slash = L'\0';
+            size_t len = wcslen(storage_dir);
+            if (len >= 10 && _wcsicmp(storage_dir + len - 10, L"\\snapshots") == 0)
+                storage_dir[len - 10] = L'\0';
         }
         jb_string(jb, L"storageDir", storage_dir);
     }
@@ -324,11 +331,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
 
 static void send_vm_list(void)
 {
-    wchar_t buf[32768];
+    wchar_t buf[65536];
     JsonBuilder jb;
     int i, count = asb_vm_count();
 
-    jb_init(&jb, buf, 32768);
+    jb_init(&jb, buf, 65536);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"vmListChanged");
 
@@ -453,6 +460,7 @@ static void send_full_state(void)
     jb_init(&jb, buf, 32768);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"fullState");
+    jb_string(&jb, L"lastStorageParent", asb_get_last_storage_parent());
 
     count = asb_vm_count();
     jb_array_begin(&jb, L"vms");
@@ -504,6 +512,28 @@ static void send_full_state(void)
             jb_object_begin(&jb);
             jb_string(&jb, L"name", asb_template_name(i));
             jb_string(&jb, L"osType", asb_template_os_type(i));
+            jb_object_end(&jb);
+        }
+        jb_array_end(&jb);
+    }
+
+    /* Global host-backed shared resources */
+    {
+        int rc = asb_shared_resource_count(), emitted = 0;
+        jb_array_begin(&jb, L"sharedResources");
+        for (i = 0; i < rc; i++) {
+            AsbSharedResourceInfo r;
+            if (!asb_shared_resource_get(i, &r)) continue;
+            if (emitted++) jb_append(&jb, L",");
+            jb_object_begin(&jb);
+            jb_string(&jb, L"id", r.id);
+            jb_string(&jb, L"name", r.name);
+            jb_string(&jb, L"hostPath", r.host_path);
+            { wchar_t letter[2] = { r.drive_letter, L'\0' };
+              jb_string(&jb, L"driveLetter", letter); }
+            jb_bool(&jb, L"enabled", r.enabled);
+            jb_bool(&jb, L"readOnly", r.read_only);
+            jb_bool(&jb, L"aclCreated", r.acl_created);
             jb_object_end(&jb);
         }
         jb_array_end(&jb);
@@ -904,6 +934,7 @@ static void send_manage_result(int operation, HRESULT result)
     } else {
         _snwprintf_s(message, 512, _TRUNCATE, L"Operation failed (0x%08X). Check the application log for details.", result);
     }
+
     jb_init(&jb, buf, 1024);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"manageResult");
@@ -984,7 +1015,7 @@ static void on_webview2_message(const wchar_t *json)
         AsbVmConfig cfg;
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
-        wchar_t adapter_buf[256] = {0};
+        wchar_t adapter_buf[256] = {0}, storage_buf[MAX_PATH] = {0}, exclusions_buf[1024] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -995,6 +1026,8 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"adminUser", user_buf, 128);
         json_get_string(json, L"adminPass", pass_buf, 128);
         json_get_string(json, L"netAdapter", adapter_buf, 256);
+        json_get_string(json, L"storageParent", storage_buf, MAX_PATH);
+        json_get_string(json, L"sharedResourceExclusions", exclusions_buf, _countof(exclusions_buf));
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -1005,6 +1038,8 @@ static void on_webview2_message(const wchar_t *json)
         cfg.username = user_buf;
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
+        cfg.storage_parent = storage_buf;
+        cfg.shared_resource_exclusions = exclusions_buf;
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
@@ -1184,25 +1219,61 @@ static void on_webview2_message(const wchar_t *json)
             jb_string(&jb, L"kind", L"iso"); jb_string(&jb, L"path", file);
             jb_object_end(&jb); webview2_post(json_buf);
         }
-    } else if (wcscmp(action, L"browseManageStorage") == 0) {
+    } else if (wcscmp(action, L"browseManageStorage") == 0 ||
+               wcscmp(action, L"browseCreateStorage") == 0 ||
+               wcscmp(action, L"browseSharedFolder") == 0) {
         BROWSEINFOW bi;
         PIDLIST_ABSOLUTE pidl;
         wchar_t folder[MAX_PATH] = { 0 };
         ZeroMemory(&bi, sizeof(bi));
         bi.hwndOwner = g_hwnd_main;
-        bi.lpszTitle = L"Choose the parent folder for the VM's managed directory";
+        bi.lpszTitle = wcscmp(action,L"browseSharedFolder")==0
+            ? L"Choose the host folder to share with Windows VMs"
+            : L"Choose the parent folder for the VM's managed directory";
         bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
         pidl = SHBrowseForFolderW(&bi);
         if (pidl) {
             if (SHGetPathFromIDListW(pidl, folder)) {
                 wchar_t json_buf[2048]; JsonBuilder jb;
                 jb_init(&jb, json_buf, 2048); jb_object_begin(&jb);
-                jb_string(&jb, L"type", L"manageBrowseResult");
-                jb_string(&jb, L"kind", L"storage"); jb_string(&jb, L"path", folder);
+                jb_string(&jb, L"type", wcscmp(action, L"browseCreateStorage") == 0
+                                      ? L"createStorageBrowseResult"
+                                      : wcscmp(action, L"browseSharedFolder") == 0
+                                      ? L"sharedFolderBrowseResult" : L"manageBrowseResult");
+                if (wcscmp(action, L"browseCreateStorage") != 0 &&
+                    wcscmp(action, L"browseSharedFolder") != 0)
+                    jb_string(&jb, L"kind", L"storage");
+                jb_string(&jb, L"path", folder);
                 jb_object_end(&jb); webview2_post(json_buf);
             }
             CoTaskMemFree(pidl);
         }
+    } else if (wcscmp(action, L"saveSharedResource") == 0) {
+        AsbSharedResourceInfo r; wchar_t id[ASB_SHARED_ID_CHARS]={0};
+        wchar_t dl[8]={0}, created[ASB_SHARED_ID_CHARS]={0};
+        BOOL confirm=FALSE; HRESULT hr;
+        ZeroMemory(&r,sizeof(r));
+        json_get_string(json,L"id",id,_countof(id));
+        json_get_string(json,L"name",r.name,_countof(r.name));
+        json_get_string(json,L"hostPath",r.host_path,_countof(r.host_path));
+        json_get_string(json,L"driveLetter",dl,_countof(dl)); r.drive_letter=towupper(dl[0]);
+        if(!json_get_bool(json,L"enabled",&r.enabled))r.enabled=TRUE;
+        json_get_bool(json,L"readOnly",&r.read_only);
+        json_get_bool(json,L"confirmPermissions",&confirm);
+        hr=id[0]?asb_shared_resource_update(id,&r,confirm)
+                :asb_shared_resource_create(&r,confirm,created,_countof(created));
+        { wchar_t out[1024]; JsonBuilder sj; jb_init(&sj,out,_countof(out));jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);if(created[0])jb_string(&sj,L"id",created);jb_object_end(&sj);webview2_post(out); }
+        send_full_state();
+    } else if (wcscmp(action, L"deleteSharedResource") == 0) {
+        wchar_t id[ASB_SHARED_ID_CHARS]={0}; HRESULT hr;
+        json_get_string(json,L"id",id,_countof(id));hr=asb_shared_resource_remove(id);
+        { wchar_t out[512]; JsonBuilder sj; jb_init(&sj,out,_countof(out));jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);jb_object_end(&sj);webview2_post(out); }
+        send_full_state();
+    } else if (wcscmp(action, L"setVmSharedResource") == 0) {
+        int vi=-1; wchar_t id[ASB_SHARED_ID_CHARS]={0}; BOOL enabled=TRUE; HRESULT hr=E_INVALIDARG;
+        if(json_get_int(json,L"vmIndex",&vi)){json_get_string(json,L"id",id,_countof(id));json_get_bool(json,L"enabled",&enabled);hr=asb_vm_set_shared_resource_enabled(asb_vm_get(vi),id,enabled);}
+        { wchar_t out[512]; JsonBuilder sj; jb_init(&sj,out,_countof(out));jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);jb_object_end(&sj);webview2_post(out); }
+        send_vm_list();
     } else if (wcscmp(action, L"setVmInstallerIso") == 0) {
         int vi; wchar_t path[MAX_PATH] = { 0 }; HRESULT hr = E_INVALIDARG;
         if (json_get_int(json, L"vmIndex", &vi)) {

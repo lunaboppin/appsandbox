@@ -16,6 +16,8 @@ Windows features:
 - SSH via Hyper-V socket proxy (no network required)
 - Checkpoints and branches
 - Per-VM management for installer media, storage relocation, grow-only disk resizing, and display auto-open preferences
+- Creation-time placement of the complete VM tree (disk, resources, checkpoints, branches, and metadata) on a selected fixed NTFS/ReFS volume
+- Global host folders exposed to Windows guests as deterministic Virtual SMB drives, with per-VM opt-outs and read-only/read-write modes
 - Fixed 1080P60 display, with displayless starts by default and an explicit monitor button
 - Host to client hot-key support
 - Provision and boot with / without internet
@@ -83,6 +85,12 @@ runner. Provisioning a VM runs a full unattended install; snapshots, branches, a
 until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
 forks a writable disk from it to run divergent actions. The full API reference and runnable
 examples are in [`tools/headless-api/`](tools/headless-api/).
+
+On Windows, `POST /v1/vms` accepts an optional `storageParent`. Shared-drive
+definitions are managed through `/v1/shared-resources`; a VM can include or
+exclude one through `/v1/vms/{name}/shared-resources/{id}`. The Python client
+exposes the same operations. Removing a definition or deleting a VM never
+deletes the shared host folder or its contents.
 
 **How it works:** this repo also aims to be a working example of creating full desktop VMs
 programmatically with the Windows HCS/HCN APIs and Apple's Virtualization.framework. On

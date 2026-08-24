@@ -14,6 +14,7 @@ let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status
 let rowSigCache = {};       /* vm.name -> last render signature; skip rebuild when unchanged */
 let manageVmIndex = -1;
 let managePending = false;
+let sharedResources = [];
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -145,6 +146,9 @@ window.onHostMessage = function(msg) {
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'manageBrowseResult': onManageBrowseResult(msg); break;
+        case 'createStorageBrowseResult': document.getElementById('storage-parent').value = msg.path || ''; break;
+        case 'sharedFolderBrowseResult': document.getElementById('resource-path').value = msg.path || ''; break;
+        case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'manageResult':  onManageResult(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
@@ -174,6 +178,11 @@ function onFullState(msg) {
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
     if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     if (msg.templates) populateTemplates(msg.templates);
+    lastStorageParent = msg.lastStorageParent || lastStorageParent;
+    sharedResources = msg.sharedResources || [];
+    renderSettingsResources();
+    renderCreateSharedResources();
+    refreshManageVm(true);
     if (!minSizeReported) {
         minSizeReported = true;
         setTimeout(reportMinSize, 50);
@@ -243,6 +252,7 @@ function populateAdapters(adapters, defaultIdx) {
 /* ---- Templates ---- */
 
 var currentTemplates = [];
+var lastStorageParent = '';
 
 function templateDefaultLabel() {
     var n = currentTemplates.length;
@@ -440,10 +450,16 @@ function gatherConfig() {
     /* Same ISO-picker path for Windows and Linux. The cloud-image
        Linux-version dropdown is dormant (see applyOsTypeUI). */
     var imagePath = document.getElementById('image-path').value.trim();
+    var excluded = [];
+    document.querySelectorAll('#create-shared-resource-list input[data-resource-id]').forEach(function(cb) {
+        if (!cb.checked) excluded.push(cb.dataset.resourceId);
+    });
     return {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
         imagePath:   imagePath,
+        storageParent: document.getElementById('storage-parent').value.trim(),
+        sharedResourceExclusions: excluded.join(','),
         templateName: document.getElementById('template-select').value,
         hddGb:       parseInt(document.getElementById('hdd-size').value) || 64,
         ramMb:       alignRamMb(parseInt(document.getElementById('ram-size').value) || 16384),
@@ -587,6 +603,8 @@ function openCreateModal() {
     /* Reset to defaults every time the modal opens */
     document.getElementById('vm-name').value = 'MyAppSandbox';
     document.getElementById('image-path').value = '';
+    document.getElementById('storage-parent').value = lastStorageParent;
+    renderCreateSharedResources();
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
@@ -849,6 +867,8 @@ function renderVmTable() {
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuName, vm.networkMode,
             vm.imagePath, vm.storageDir, vm.autoOpenDisplay, vm.managementBusy,
+            vm.sharedResourceExclusions, vm.sharedResourceTransport,
+            vm.sharedResourceError, vm.sharedResourcePending,
             selectedSnap[i] || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -1189,6 +1209,7 @@ function refreshManageVm(forceFields) {
     sizeInput.min = vm.hddGb + 1;
     if (forceFields || document.activeElement !== sizeInput) sizeInput.value = vm.hddGb + 1;
     document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
+    renderManageSharedResources(vm);
     populateManageCheckpointSelect(vm);
 
     ['manage-iso-attach','manage-iso-eject','manage-storage-move','manage-disk-grow',
@@ -1198,6 +1219,46 @@ function refreshManageVm(forceFields) {
     setManageDisabled('manage-auto-display', managePending);
     onManageCheckpointSelection();
 }
+
+function resourceIsExcluded(vm, id) {
+    return (vm.sharedResourceExclusions || '').split(',').indexOf(id) >= 0;
+}
+
+function renderCreateSharedResources() {
+    var box = document.getElementById('create-shared-resource-list');
+    if (!box) return;
+    box.innerHTML = '';
+    sharedResources.filter(function(r) { return r.enabled; }).forEach(function(r) {
+        var label=document.createElement('label'), cb=document.createElement('input');
+        cb.type='checkbox';cb.checked=true;cb.dataset.resourceId=r.id;
+        label.appendChild(cb);label.appendChild(document.createTextNode(' '+r.driveLetter+': '+r.name+(r.readOnly?' (read-only)':'')));
+        box.appendChild(label);
+    });
+    if (!box.children.length) box.textContent='No global shared resources configured.';
+}
+
+function renderManageSharedResources(vm) {
+    var box=document.getElementById('manage-shared-resource-list');
+    if(!box)return;box.innerHTML='';
+    sharedResources.filter(function(r){return r.enabled;}).forEach(function(r){
+        var label=document.createElement('label'),cb=document.createElement('input');
+        cb.type='checkbox';cb.checked=!resourceIsExcluded(vm,r.id);cb.disabled=!!vm.managementBusy||managePending;
+        cb.onchange=function(){sendCmd('setVmSharedResource',{vmIndex:manageVmIndex,id:r.id,enabled:cb.checked});};
+        label.appendChild(cb);label.appendChild(document.createTextNode(' '+r.driveLetter+': '+r.name+(r.readOnly?' (read-only)':'')));
+        box.appendChild(label);
+    });
+    if(!box.children.length)box.textContent='No global shared resources configured.';
+    if(vm.sharedResourceError){var err=document.createElement('span');err.className='field-warn';err.textContent=vm.sharedResourceError;box.appendChild(err);}
+}
+
+function openSettingsModal(){if(hostBridge.isMac)return;populateResourceLetters();clearResourceEditor();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
+function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
+function populateResourceLetters(){var s=document.getElementById('resource-letter');if(s.options.length)return;for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';s.appendChild(o);}}
+function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-path').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-editor-title').textContent='Add shared resource';}
+function editResource(id){var r=sharedResources.find(function(x){return x.id===id;});if(!r)return;populateResourceLetters();document.getElementById('resource-id').value=r.id;document.getElementById('resource-name').value=r.name;document.getElementById('resource-path').value=r.hostPath;document.getElementById('resource-letter').value=r.driveLetter;document.getElementById('resource-enabled').checked=!!r.enabled;document.getElementById('resource-readonly').checked=!!r.readOnly;document.getElementById('resource-editor-title').textContent='Edit shared resource';}
+function renderSettingsResources(){var box=document.getElementById('settings-resource-list');if(!box)return;box.innerHTML='';sharedResources.forEach(function(r){var row=document.createElement('div');row.className='settings-resource-row';var text=document.createElement('span');text.textContent=r.driveLetter+': '+r.name+' — '+r.hostPath+(r.readOnly?' (read-only)':' (read/write)')+(r.enabled?'':' [disabled]');var edit=document.createElement('button');edit.textContent='Edit';edit.onclick=function(){editResource(r.id);};var del=document.createElement('button');del.className='danger';del.textContent='Remove';del.onclick=function(){showModal('Remove shared resource','Remove '+r.name+'? The host folder and its contents will not be deleted.','Remove').then(function(ok){if(ok)sendCmd('deleteSharedResource',{id:r.id});});};row.appendChild(text);row.appendChild(edit);row.appendChild(del);box.appendChild(row);});if(!box.children.length)box.textContent='No shared resources configured.';}
+function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),hostPath:document.getElementById('resource-path').value.trim(),driveLetter:document.getElementById('resource-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked,confirmPermissions:true};if(!payload.name||!payload.hostPath){showModal('Shared resource','Name and host folder are required.','OK',{confirmClass:'primary'});return;}showModal('Folder permissions','App Sandbox may add the exact Virtual Machines group permission required for this '+(payload.readOnly?'read-only':'read/write')+' resource. Only an entry created by App Sandbox is removed later. Continue?','Allow',{confirmClass:'primary'}).then(function(ok){if(ok)sendCmd('saveSharedResource',payload);});}
+function onSharedResourceResult(msg){if(!msg.success)showModal('Shared resource error','The resource could not be saved. Check that it is a unique, non-nested local fixed NTFS/ReFS folder outside VM storage, and that its name and drive letter are unique.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 
 function onManageBrowseResult(msg) {
     if (manageVmIndex < 0) return;

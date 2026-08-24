@@ -421,6 +421,40 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             notify_agent_status(vm);
         }
 
+        /* Recreate deterministic VSMB drive mappings in the current
+           interactive session after every agent connection/logon. A single
+           unavailable resource is reported but never blocks startup. */
+        if (vm->shared_resource_count > 0) {
+            int ri;
+            vm->shared_resource_error[0] = L'\0';
+            for (ri = 0; ri < vm->shared_resource_count; ri++) {
+                char map_cmd[128], share[64];
+                HcsSharedResource *r = &vm->shared_resources[ri];
+                WideCharToMultiByte(CP_UTF8, 0, r->share_name, -1,
+                                    share, sizeof(share), NULL, NULL);
+                sprintf_s(map_cmd, sizeof(map_cmd), "shared_map:%c:%s",
+                          (char)r->drive_letter, share);
+                n = send_tagged_cmd(s, vm, &conn->cmd_seq,
+                                    map_cmd, buf, sizeof(buf));
+                if (n <= 0) goto disconnected;
+                if (strcmp(buf, "ok") != 0) {
+                    wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"failed");
+                    swprintf_s(r->failure, _countof(r->failure), L"%S", buf);
+                    swprintf_s(vm->shared_resource_error,
+                        _countof(vm->shared_resource_error),
+                        L"%c: %S", r->drive_letter, buf);
+                    ui_log(L"Shared resource mapping failed for \"%s\" %c: (%S).",
+                           vm->name, r->drive_letter, buf);
+                } else {
+                    wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"mapped");
+                    r->failure[0] = L'\0';
+                    ui_log(L"Mapped shared resource for \"%s\" at %c:.",
+                           vm->name, r->drive_letter);
+                }
+            }
+            notify_agent_status(vm);
+        }
+
         /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
            subnet's .1; prefix length is always /24 for our NAT. */
         if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {

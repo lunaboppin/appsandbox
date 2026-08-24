@@ -901,6 +901,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t video_section[2048];
     wchar_t comports_section[512];
     wchar_t plan9_section[5120];
+    wchar_t vsmb_section[16384];
     wchar_t service_table[2048];
     wchar_t vmgs_path[MAX_PATH];
     wchar_t vmrs_path[MAX_PATH];
@@ -1102,6 +1103,43 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         }
     }
 
+    /* Host-backed shared resources.  The guest-visible prefix is the stable
+       Windows VSMB device path used by hcsshim; the interactive-session agent
+       maps the requested drive letter without relying on the VM network. */
+    vsmb_section[0] = L'\0';
+    if (is_windows && !config->is_template && config->shared_resource_count > 0) {
+        wchar_t shares[15360];
+        int i, count = 0;
+        shares[0] = L'\0';
+        for (i = 0; i < config->shared_resource_count; i++) {
+            const HcsSharedResource *r = &config->shared_resources[i];
+            wchar_t path_esc[MAX_PATH * 2], name_esc[128], item[1024];
+            DWORD attrs = GetFileAttributesW(r->host_path);
+            if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                ui_log(L"Shared resource %s is unavailable; skipping it for this boot.", r->host_path);
+                continue;
+            }
+            if (pfnGrantAccess) pfnGrantAccess(config->name, r->host_path);
+            escape_json_path(r->host_path, path_esc, _countof(path_esc));
+            escape_json_path(r->share_name, name_esc, _countof(name_esc));
+            swprintf_s(item, _countof(item),
+                L"%s{\"Name\":\"%s\",\"Path\":\"%s\",\"Options\":{%s}}",
+                count ? L"," : L"", name_esc, path_esc,
+                r->read_only
+                    ? L"\"ReadOnly\":true,\"ShareRead\":true,\"CacheIo\":true,\"PseudoOplocks\":true"
+                    : L"\"NoDirectmap\":true");
+            if (wcslen(shares) + wcslen(item) + 1 >= _countof(shares)) break;
+            wcscat_s(shares, _countof(shares), item);
+            count++;
+            ui_log(L"Virtual SMB share: %c: %s -> %s%s",
+                   r->drive_letter, r->share_name, r->host_path,
+                   r->read_only ? L" (read-only)" : L"");
+        }
+        if (count)
+            swprintf_s(vsmb_section, _countof(vsmb_section),
+                       L",\"VirtualSmb\":{\"Shares\":[%s]}", shares);
+    }
+
     /* ServiceTable: list the AppSandbox service GUIDs the guest is
        permitted to bind on. Windows guests get the a5b0cafe-XXXX-...
        form (reached via AF_HYPERV from the in-VM agent and helpers).
@@ -1179,6 +1217,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                 L"\"Mouse\":{}"
                 L"%s"
                 L"%s"
+                L"%s"
             L"}"
             L"%s"
             L"%s"
@@ -1197,6 +1236,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         service_table,
         net_section,
         plan9_section,
+        vsmb_section,
         security_section,
         guest_state_section);
 
@@ -1205,7 +1245,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
 HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
 {
-    wchar_t json[16384];
+    wchar_t json[32768];
     HCS_OPERATION op;
     HRESULT hr;
 
@@ -1240,7 +1280,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
     }
 
     /* Build JSON — endpoint_guid is set later by caller if networking is used */
-    if (!hcs_build_vm_json(config, NULL, json, 16384))
+    if (!hcs_build_vm_json(config, NULL, json, _countof(json)))
         return E_FAIL;
 
     /* Dump JSON to file for debugging */
@@ -1271,10 +1311,28 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         }
     }
 
+    /* A share transport failure must not strand the VM. Retry the compute
+       system without shared resources and surface the per-boot failure. This
+       is also the hand-off point for the isolated ordinary-SMB compatibility
+       transport on hosts where that helper is available. */
+    if (FAILED(hr) && config->shared_resource_count > 0) {
+        VmConfig retry = *config;
+        retry.shared_resource_count = 0;
+        ui_log(L"Virtual SMB was rejected (0x%08X); retrying VM without shared resources.", hr);
+        hr = hcs_create_vm(&retry, instance);
+        if (SUCCEEDED(hr)) {
+            wcscpy_s(instance->shared_resource_transport, 16, L"unavailable");
+            wcscpy_s(instance->shared_resource_error, 256,
+                     L"Virtual SMB rejected; shared drives unavailable for this boot.");
+        }
+        return hr;
+    }
+
     if (SUCCEEDED(hr)) {
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
+        wcscpy_s(instance->storage_root, MAX_PATH, config->storage_root);
         wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
         instance->hdd_gb = config->hdd_gb;
@@ -1286,6 +1344,12 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
+        memcpy(instance->shared_resources, config->shared_resources,
+               sizeof(instance->shared_resources));
+        instance->shared_resource_count = config->shared_resource_count;
+        wcscpy_s(instance->shared_resource_transport, 16,
+                 config->shared_resource_count ? L"vsmb" : L"");
+        instance->shared_resource_error[0] = L'\0';
         instance->running = FALSE;
 
         /* Register callback after create, before start */
@@ -1298,7 +1362,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
 HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpoint_guid,
                                      VmInstance *instance)
 {
-    wchar_t json[16384];
+    wchar_t json[32768];
     HCS_OPERATION op;
     HRESULT hr;
 
@@ -1332,7 +1396,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
             pfnGrantAccess(config->name, config->resources_iso_path);
     }
 
-    if (!hcs_build_vm_json(config, endpoint_guid, json, 16384))
+    if (!hcs_build_vm_json(config, endpoint_guid, json, _countof(json)))
         return E_FAIL;
 
     /* Dump JSON to file for debugging */
@@ -1363,10 +1427,24 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         }
     }
 
+    if (FAILED(hr) && config->shared_resource_count > 0) {
+        VmConfig retry = *config;
+        retry.shared_resource_count = 0;
+        ui_log(L"Virtual SMB was rejected (0x%08X); retrying VM without shared resources.", hr);
+        hr = hcs_create_vm_with_endpoint(&retry, endpoint_guid, instance);
+        if (SUCCEEDED(hr)) {
+            wcscpy_s(instance->shared_resource_transport, 16, L"unavailable");
+            wcscpy_s(instance->shared_resource_error, 256,
+                     L"Virtual SMB rejected; shared drives unavailable for this boot.");
+        }
+        return hr;
+    }
+
     if (SUCCEEDED(hr)) {
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
+        wcscpy_s(instance->storage_root, MAX_PATH, config->storage_root);
         wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
         instance->hdd_gb = config->hdd_gb;
@@ -1378,6 +1456,12 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
+        memcpy(instance->shared_resources, config->shared_resources,
+               sizeof(instance->shared_resources));
+        instance->shared_resource_count = config->shared_resource_count;
+        wcscpy_s(instance->shared_resource_transport, 16,
+                 config->shared_resource_count ? L"vsmb" : L"");
+        instance->shared_resource_error[0] = L'\0';
         instance->running = FALSE;
 
         /* Register callback after create, before start */

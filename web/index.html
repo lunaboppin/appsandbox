@@ -15,7 +15,10 @@
 <section id="vm-section">
     <div class="section-header">
         <h2>Sandboxes</h2>
-        <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        <div class="header-actions">
+            <button class="win-host-only" onclick="openSettingsModal()">Shared Resources</button>
+            <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        </div>
     </div>
     <div class="vm-table-wrap">
         <table id="vm-table">
@@ -108,6 +111,15 @@
                 <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB
                 <span class="host-info" id="host-hdd"></span>
             </div>
+
+            <label for="storage-parent" class="win-only">Storage Parent:</label>
+            <div class="image-row win-only">
+                <input type="text" id="storage-parent" placeholder="Default: %ProgramData%\\AppSandbox" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button type="button" onclick="sendCmd('browseCreateStorage')">Browse...</button>
+            </div>
+
+            <label class="win-only">Shared Drives:</label>
+            <div id="create-shared-resource-list" class="resource-check-list win-only"></div>
 
             <label for="ram-size">RAM Size:</label>
             <div class="form-row">
@@ -218,6 +230,12 @@
         </fieldset>
 
         <fieldset>
+            <legend>Shared resources</legend>
+            <div id="manage-shared-resource-list" class="resource-check-list"></div>
+            <small>Changes apply on the next start. Drive letters are never substituted.</small>
+        </fieldset>
+
+        <fieldset>
             <legend>Checkpoints and branches</legend>
             <div class="manage-row">
                 <select id="manage-checkpoint-select" onchange="onManageCheckpointSelection()"></select>
@@ -231,6 +249,28 @@
         <div class="modal-buttons">
             <button onclick="closeManageVm()">Close</button>
         </div>
+    </div>
+</div>
+
+<!-- Application settings: global host-backed shared resources -->
+<div class="modal-overlay win-host-only" id="settings-overlay">
+    <div class="modal manage-modal">
+        <h3>Shared Resources</h3>
+        <p>Enabled folders appear as drives in every Windows VM unless that VM opts out. Shared data stays outside VM storage and checkpoints.</p>
+        <div id="settings-resource-list" class="settings-resource-list"></div>
+        <fieldset>
+            <legend id="resource-editor-title">Add shared resource</legend>
+            <input type="hidden" id="resource-id">
+            <div class="form-grid resource-editor">
+                <label for="resource-name">Name:</label><input id="resource-name" maxlength="63">
+                <label for="resource-path">Host folder:</label>
+                <div class="manage-row"><input id="resource-path"><button type="button" onclick="sendCmd('browseSharedFolder')">Browse...</button></div>
+                <label for="resource-letter">Drive letter:</label><select id="resource-letter"></select>
+                <label>Options:</label><div><label class="manage-check"><input type="checkbox" id="resource-enabled" checked> Enabled</label> <label class="manage-check"><input type="checkbox" id="resource-readonly"> Read-only</label></div>
+            </div>
+            <div class="modal-buttons"><button onclick="clearResourceEditor()">Clear</button><button class="primary" onclick="saveResourceEditor()">Save</button></div>
+        </fieldset>
+        <div class="modal-buttons"><button onclick="closeSettingsModal()">Close</button></div>
     </div>
 </div>
 

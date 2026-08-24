@@ -11,6 +11,7 @@
 #define ASB_CORE_H
 
 #include <windows.h>
+#include "shared_resources.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -50,6 +51,8 @@ typedef struct {
     const wchar_t *os_type;        /* L"Windows" or L"Linux" */
     const wchar_t *image_path;     /* ISO path, or NULL for template */
     const wchar_t *template_name;  /* template name, or NULL for image */
+    const wchar_t *storage_parent; /* optional parent for <parent>\<VM-name> */
+    const wchar_t *shared_resource_exclusions; /* optional comma-separated stable GUIDs */
     DWORD  ram_mb;
     DWORD  hdd_gb;
     DWORD  cpu_cores;
@@ -242,8 +245,24 @@ ASB_API void asb_save(void);
 
 ASB_API void asb_set_last_iso_path(const wchar_t *path);
 ASB_API const wchar_t *asb_get_last_iso_path(void);
+ASB_API void asb_set_last_storage_parent(const wchar_t *path);
+ASB_API const wchar_t *asb_get_last_storage_parent(void);
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress);
 ASB_API BOOL asb_get_suppress_tray_warn(void);
+
+/* ---- Global shared resources (Windows guests) ---- */
+ASB_API int asb_shared_resource_count(void);
+ASB_API BOOL asb_shared_resource_get(int index, AsbSharedResourceInfo *out);
+ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,
+                                           BOOL confirm_permissions,
+                                           wchar_t *created_id, size_t created_id_chars);
+ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
+                                           const AsbSharedResourceInfo *info,
+                                           BOOL confirm_permissions);
+ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id);
+ASB_API BOOL asb_vm_shared_resource_enabled(AsbVm vm, const wchar_t *id);
+ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
+                                                   const wchar_t *id, BOOL enabled);
 
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);

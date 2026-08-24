@@ -19,6 +19,7 @@
 #include "vm_ssh_proxy.h"
 #include "prereq.h"
 #include "ui.h"
+#include "shared_resources.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,6 +117,12 @@ static TemplateInfo g_templates[ASB_MAX_TEMPLATES];
 static int g_template_count = 0;
 
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
+static wchar_t g_last_storage_parent[MAX_PATH] = { 0 };
+static HRESULT sha256_file(const wchar_t *path, BYTE digest[32]);
+static const GUID ASB_VHDX_VENDOR_MS = {
+    0xec984aec, 0xa0f9, 0x47e9,
+    { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b }
+};
 static BOOL g_suppress_tray_warn = FALSE;
 
 static CRITICAL_SECTION g_cs;
@@ -497,11 +504,14 @@ static BOOL save_vm_list(void)
         return FALSE;
     }
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn ||
+    if (g_last_iso_path[0] != L'\0' || g_last_storage_parent[0] != L'\0' ||
+        g_suppress_tray_warn ||
         g_settings_passthrough[0] != L'\0') {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
+        if (g_last_storage_parent[0] != L'\0')
+            fwprintf(f, L"LastStorageParent=%s\n", g_last_storage_parent);
         if (g_suppress_tray_warn)
             fwprintf(f, L"SuppressTrayWarn=1\n");
         if (g_settings_passthrough[0] != L'\0')
@@ -516,6 +526,8 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"OsType=%s\n", g_vms[i].os_type);
         fwprintf(f, L"ImagePath=%s\n", g_vms[i].image_path);
         fwprintf(f, L"VhdxPath=%s\n", g_vms[i].vhdx_path);
+        if (g_vms[i].storage_root[0] != L'\0')
+            fwprintf(f, L"StorageRoot=%s\n", g_vms[i].storage_root);
         fwprintf(f, L"RamMB=%lu\n", g_vms[i].ram_mb);
         fwprintf(f, L"HddGB=%lu\n", g_vms[i].hdd_gb);
         fwprintf(f, L"CpuCores=%lu\n", g_vms[i].cpu_cores);
@@ -548,6 +560,10 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"AutoOpenDisplay=1\n");
         if (g_vms[i].guest_grow_target_gb)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
+        if (g_vms[i].shared_resource_exclusions[0])
+            fwprintf(f, L"SharedResourceExclusions=%s\n", g_vms[i].shared_resource_exclusions);
+        if (g_vms[i].shared_resource_pending)
+            fwprintf(f, L"SharedResourcesPending=1\n");
         if (g_vms[i].config_passthrough[0] != L'\0')
             fwprintf(f, L"%s", g_vms[i].config_passthrough);
         fwprintf(f, L"\n");
@@ -611,6 +627,8 @@ static void load_vm_list(void)
         if (in_settings) {
             if (wcsncmp(line, L"LastIsoPath=", 12) == 0)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
+            else if (wcsncmp(line, L"LastStorageParent=", 18) == 0)
+                wcscpy_s(g_last_storage_parent, MAX_PATH, line + 18);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
             else
@@ -629,6 +647,8 @@ static void load_vm_list(void)
             wcscpy_s(vm->image_path, MAX_PATH, line + 10);
         else if (wcsncmp(line, L"VhdxPath=", 9) == 0)
             wcscpy_s(vm->vhdx_path, MAX_PATH, line + 9);
+        else if (wcsncmp(line, L"StorageRoot=", 12) == 0)
+            wcscpy_s(vm->storage_root, MAX_PATH, line + 12);
         else if (wcsncmp(line, L"RamMB=", 6) == 0)
             vm->ram_mb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"HddGB=", 6) == 0)
@@ -673,6 +693,10 @@ static void load_vm_list(void)
             vm->auto_open_display = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
+        else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
+            wcsncpy_s(vm->shared_resource_exclusions, 1024, line + 25, _TRUNCATE);
+        else if (wcsncmp(line, L"SharedResourcesPending=", 23) == 0)
+            vm->shared_resource_pending = (_wtoi(line + 23) != 0);
         else
             preserve_config_line(vm->config_passthrough,
                                  _countof(vm->config_passthrough), line);
@@ -684,22 +708,21 @@ static void load_vm_list(void)
     {
         int i;
         for (i = 0; i < g_vm_count; i++) {
-            wchar_t snap_dir[MAX_PATH];
-            wchar_t *last_slash;
+            wchar_t snap_dir[MAX_PATH], root[MAX_PATH];
+            wchar_t *last_slash, *marker = NULL, *scan;
             g_vms[i].handle = NULL;
             g_vms[i].running = FALSE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
-            wcscpy_s(snap_dir, MAX_PATH, g_vms[i].vhdx_path);
-            last_slash = wcsrchr(snap_dir, L'\\');
-            if (last_slash) *last_slash = L'\0';
-            {
-                size_t dlen = wcslen(snap_dir);
-                if (dlen >= 10 && _wcsicmp(snap_dir + dlen - 10, L"\\snapshots") == 0) {
-                    /* Already points to snapshots dir */
-                } else {
-                    wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
-                }
+            wcscpy_s(root, MAX_PATH, g_vms[i].vhdx_path);
+            for(scan=root;*scan;scan++)
+                if(_wcsnicmp(scan,L"\\snapshots",10)==0&&
+                   (scan[10]==L'\0'||scan[10]==L'\\')){marker=scan;break;}
+            if(marker)*marker=L'\0';
+            else {last_slash=wcsrchr(root,L'\\');if(last_slash)*last_slash=L'\0';}
+            swprintf_s(snap_dir,MAX_PATH,L"%s\\snapshots",root);
+            if (!g_vms[i].storage_root[0]) {
+                wcscpy_s(g_vms[i].storage_root, MAX_PATH, root);
             }
             snapshot_init(&g_snap_trees[i], snap_dir);
         }
@@ -805,6 +828,101 @@ static BOOL path_join(wchar_t *out, size_t out_chars,
                       const wchar_t *left, const wchar_t *right)
 {
     return _snwprintf_s(out, out_chars, _TRUNCATE, L"%s\\%s", left, right) >= 0;
+}
+
+static HRESULT validate_storage_parent(const wchar_t *parent, DWORD hdd_gb,
+                                       wchar_t *normalized, size_t normalized_chars)
+{
+    wchar_t volume_root[MAX_PATH], fs_name[32], probe[MAX_PATH];
+    ULARGE_INTEGER free_bytes;
+    DWORD attrs;
+    HANDLE file;
+    if (!parent || !parent[0] || !normalized || normalized_chars < MAX_PATH)
+        return E_INVALIDARG;
+    if ((parent[0] == L'\\' && parent[1] == L'\\') ||
+        !GetFullPathNameW(parent, (DWORD)normalized_chars, normalized, NULL))
+        return HRESULT_FROM_WIN32(ERROR_BAD_NETPATH);
+    attrs = GetFileAttributesW(normalized);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+        return HRESULT_FROM_WIN32(ERROR_REPARSE_TAG_INVALID);
+    if (!GetVolumePathNameW(normalized, volume_root, MAX_PATH) ||
+        GetDriveTypeW(volume_root) != DRIVE_FIXED)
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    if (!GetVolumeInformationW(volume_root, NULL, 0, NULL, NULL, NULL,
+                               fs_name, _countof(fs_name)) ||
+        (_wcsicmp(fs_name, L"NTFS") != 0 && _wcsicmp(fs_name, L"ReFS") != 0))
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    if (!GetDiskFreeSpaceExW(normalized, &free_bytes, NULL, NULL))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (free_bytes.QuadPart < (ULONGLONG)hdd_gb * 1024ULL * 1024ULL * 1024ULL)
+        return HRESULT_FROM_WIN32(ERROR_DISK_FULL);
+    if (_snwprintf_s(probe, MAX_PATH, _TRUNCATE, L"%s\\.asb-write-%lu-%llu.tmp",
+                     normalized, GetCurrentProcessId(), GetTickCount64()) < 0)
+        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    file = CreateFileW(probe, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                       FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return HRESULT_FROM_WIN32(GetLastError());
+    CloseHandle(file);
+    return S_OK;
+}
+
+static void remember_storage_parent(const wchar_t *root)
+{
+    wchar_t parent[MAX_PATH], *slash;
+    if (!root || !root[0]) return;
+    wcscpy_s(parent, MAX_PATH, root);
+    slash = wcsrchr(parent, L'\\');
+    if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
+}
+
+/* Update the guest agent on the active writable VHDX before attaching VSMB.
+   Only the active disk is mounted; checkpoint parents remain frozen. */
+static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
+{
+    VIRTUAL_STORAGE_TYPE st;
+    OPEN_VIRTUAL_DISK_PARAMETERS op;
+    ATTACH_VIRTUAL_DISK_PARAMETERS ap;
+    HANDLE disk = INVALID_HANDLE_VALUE;
+    DWORD before, after, result, bit, wait;
+    wchar_t module[MAX_PATH], dir[MAX_PATH], source[MAX_PATH];
+    wchar_t dest[MAX_PATH], temp[MAX_PATH];
+    BYTE a[32], b[32];
+    HRESULT hr = E_FAIL;
+    GetModuleFileNameW(g_dll_module,module,MAX_PATH);
+    { wchar_t *s=wcsrchr(module,L'\\');if(s)*s=L'\0'; }
+    swprintf_s(dir,MAX_PATH,L"%s\\resources",module);
+    if(GetFileAttributesW(dir)==INVALID_FILE_ATTRIBUTES)wcscpy_s(dir,MAX_PATH,module);
+    swprintf_s(source,MAX_PATH,L"%s\\appsandbox-agent.exe",dir);
+    if(GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES)return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    before=GetLogicalDrives();
+    st.DeviceId=VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;st.VendorId=ASB_VHDX_VENDOR_MS;
+    ZeroMemory(&op,sizeof(op));op.Version=OPEN_VIRTUAL_DISK_VERSION_2;
+    result=OpenVirtualDisk(&st,vhdx_path,VIRTUAL_DISK_ACCESS_ATTACH_RW,
+        OPEN_VIRTUAL_DISK_FLAG_NONE,&op,&disk);
+    if(result!=ERROR_SUCCESS)return HRESULT_FROM_WIN32(result);
+    ZeroMemory(&ap,sizeof(ap));ap.Version=ATTACH_VIRTUAL_DISK_VERSION_1;
+    result=AttachVirtualDisk(disk,NULL,ATTACH_VIRTUAL_DISK_FLAG_NONE,0,&ap,NULL);
+    if(result!=ERROR_SUCCESS){CloseHandle(disk);return HRESULT_FROM_WIN32(result);}
+    for(wait=0;wait<100;wait++){after=GetLogicalDrives()&~before;if(after)break;Sleep(100);}
+    after=GetLogicalDrives()&~before;
+    for(bit=0;bit<26;bit++)if(after&(1u<<bit)){
+        wchar_t windows[MAX_PATH];swprintf_s(windows,MAX_PATH,L"%c:\\Windows",L'A'+bit);
+        if(GetFileAttributesW(windows)==INVALID_FILE_ATTRIBUTES)continue;
+        swprintf_s(dest,MAX_PATH,L"%c:\\Windows\\AppSandbox\\appsandbox-agent.exe",L'A'+bit);
+        swprintf_s(temp,MAX_PATH,L"%s.new",dest);
+        if(SUCCEEDED(sha256_file(source,a))&&SUCCEEDED(sha256_file(dest,b))&&memcmp(a,b,32)==0){hr=S_OK;break;}
+        if(!CopyFileW(source,temp,FALSE)){hr=HRESULT_FROM_WIN32(GetLastError());break;}
+        if(!MoveFileExW(temp,dest,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){hr=HRESULT_FROM_WIN32(GetLastError());DeleteFileW(temp);break;}
+        hr=sha256_file(dest,b);if(SUCCEEDED(hr)){hr=sha256_file(source,a);if(SUCCEEDED(hr)&&memcmp(a,b,32)!=0)hr=HRESULT_FROM_WIN32(ERROR_CRC);}
+        break;
+    }
+    if(!after)hr=HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    DetachVirtualDisk(disk,DETACH_VIRTUAL_DISK_FLAG_NONE,0);
+    CloseHandle(disk);
+    return hr;
 }
 
 static BOOL path_is_within(const wchar_t *path, const wchar_t *root)
@@ -1154,6 +1272,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     VmInstance *vm = args->vm;
     HRESULT hr;
     wchar_t endpoint_guid_str[64] = { 0 };
+    BOOL shared_upgrade_failed = FALSE;
 
     /* Allocate NAT IP before endpoint creation (only for NAT mode) */
     if (args->network_mode == NET_NAT) {
@@ -1207,6 +1326,18 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             prepare_gl_layers_share(&args->config.gpu_shares);
     }
 
+    if (args->config.shared_resource_count > 0 && vm->install_complete &&
+        _wcsicmp(vm->os_type, L"Windows") == 0) {
+        hr = upgrade_windows_agent_offline(vm->vhdx_path);
+        if (FAILED(hr)) {
+            shared_upgrade_failed = TRUE;
+            args->config.shared_resource_count = 0;
+            asb_log(L"Shared-resource agent upgrade failed for \"%s\" (0x%08X); mappings disabled for this boot.", vm->name, hr);
+        } else {
+            asb_log(L"Verified the shared-resource guest agent on \"%s\".", vm->name);
+        }
+    }
+
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
     hr = (endpoint_guid_str[0] != L'\0')
         ? hcs_create_vm_with_endpoint(&args->config, endpoint_guid_str, vm)
@@ -1224,6 +1355,14 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         InterlockedExchange(&vm->management_busy, 0);
         if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
         free(args); return 1;
+    }
+
+    vm->shared_resource_pending = FALSE;
+    save_vm_list();
+    if (shared_upgrade_failed) {
+        wcscpy_s(vm->shared_resource_transport, 16, L"unavailable");
+        wcscpy_s(vm->shared_resource_error, 256,
+                 L"Guest agent upgrade failed; shared drives disabled for this boot.");
     }
 
     asb_log(L"Starting VM \"%s\"...", vm->name);
@@ -1581,12 +1720,20 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    memcpy(inst->shared_resources, heap_inst->shared_resources,
+                           sizeof(inst->shared_resources));
+                    inst->shared_resource_count = heap_inst->shared_resource_count;
+                    wcscpy_s(inst->shared_resource_transport, 16,
+                             heap_inst->shared_resource_transport);
+                    wcscpy_s(inst->shared_resource_error, 256,
+                             heap_inst->shared_resource_error);
                     HeapFree(GetProcessHeap(), 0, heap_inst);
                     args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
                 }
                 LeaveCriticalSection(&g_cs);
 
+                if (!inst->is_template) remember_storage_parent(inst->storage_root);
                 hcs_start_monitor(inst);
                 if (inst->is_template) {
                     asb_log(L"Template \"%s\" building (sysprep will shut down when ready).", inst->name);
@@ -1598,6 +1745,7 @@ done:
                 save_vm_list();
             } else if (args->vhdx_created) {
                 LeaveCriticalSection(&g_cs);
+                if (!inst->is_template) remember_storage_parent(inst->storage_root);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
                 if (args->result == (HRESULT)0x800705AF)
@@ -2651,12 +2799,20 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    memcpy(inst->shared_resources, heap_inst->shared_resources,
+                           sizeof(inst->shared_resources));
+                    inst->shared_resource_count = heap_inst->shared_resource_count;
+                    wcscpy_s(inst->shared_resource_transport, 16,
+                             heap_inst->shared_resource_transport);
+                    wcscpy_s(inst->shared_resource_error, 256,
+                             heap_inst->shared_resource_error);
                     HeapFree(GetProcessHeap(), 0, heap_inst);
                     args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
                 }
                 LeaveCriticalSection(&g_cs);
 
+                remember_storage_parent(inst->storage_root);
                 hcs_start_monitor(inst);
                 vm_agent_start(inst);
                 idd_probe_start(inst);
@@ -2664,6 +2820,7 @@ done:
                 save_vm_list();
             } else if (args->vhdx_created) {
                 LeaveCriticalSection(&g_cs);
+                remember_storage_parent(inst->storage_root);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
                 if (args->result == (HRESULT)0x800705AF)
@@ -2775,10 +2932,29 @@ ASB_API HRESULT asb_init(void)
     hcs_set_state_callback(asb_hcs_state_changed);
 
     load_vm_list();
+    if (!g_last_storage_parent[0]) {
+        wchar_t pd[MAX_PATH];
+        if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH))
+            wcscpy_s(pd, MAX_PATH, L"C:\\ProgramData");
+        swprintf_s(g_last_storage_parent, MAX_PATH, L"%s\\AppSandbox", pd);
+    }
+    shared_resources_init();
+    {
+        int ri;
+        for(ri=0;ri<g_vm_count;ri++){
+            g_vms[ri].shared_resource_count=shared_resources_build_attachments(
+                g_vms[ri].os_type,g_vms[ri].shared_resource_exclusions,
+                g_vms[ri].shared_resources,ASB_MAX_SHARED_RESOURCES);
+            if(g_vms[ri].shared_resource_count)
+                wcscpy_s(g_vms[ri].shared_resource_transport,16,L"vsmb");
+        }
+    }
     scan_templates();
 
     if (g_vm_count > 0) asb_log(L"Loaded %d VM(s) from config.", g_vm_count);
     if (g_template_count > 0) asb_log(L"Found %d template(s).", g_template_count);
+    if (shared_resources_count() > 0)
+        asb_log(L"Loaded %d shared resource(s).", shared_resources_count());
 
     g_initialized = TRUE;
     return S_OK;
@@ -2957,6 +3133,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
     inst->unique_id = g_next_vm_id++;
+    if (config->shared_resource_exclusions)
+        wcsncpy_s(inst->shared_resource_exclusions,
+                  _countof(inst->shared_resource_exclusions),
+                  config->shared_resource_exclusions, _TRUNCATE);
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
@@ -2972,24 +3152,49 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (cfg.admin_user[0] == L'\0')
         wcscpy_s(cfg.admin_user, 128, L"User");
 
-    /* Create VHDX directory */
+    /* Resolve and create the complete managed VM tree. Templates stay in the
+       central template store; normal VMs and template clones may select a
+       fixed local NTFS/ReFS parent. */
     {
-        wchar_t base_dir[MAX_PATH];
+        wchar_t base_dir[MAX_PATH], storage_parent[MAX_PATH];
         if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
             wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-        swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
-        CreateDirectoryW(vhdx_dir, NULL);
+        swprintf_s(storage_parent, MAX_PATH, L"%s\\AppSandbox", base_dir);
+        CreateDirectoryW(storage_parent, NULL);
 
         if (is_template_create) {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
-            CreateDirectoryW(vhdx_dir, NULL);
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+            swprintf_s(storage_parent, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
+            CreateDirectoryW(storage_parent, NULL);
         } else {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            const wchar_t *requested = config->storage_parent && config->storage_parent[0]
+                ? config->storage_parent : storage_parent;
+            hr = validate_storage_parent(requested, cfg.hdd_gb,
+                                         storage_parent, _countof(storage_parent));
+            if (FAILED(hr)) {
+                asb_log(L"Error: Storage parent is not a writable fixed NTFS/ReFS folder (0x%08X).", hr);
+                return hr;
+            }
         }
+        if (!path_join(vhdx_dir, MAX_PATH, storage_parent, cfg.name))
+            return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+        /* Reserve room for checkpoint/branch metadata beneath the managed
+           root; accepting a root that only fits disk.vhdx would fail later. */
+        if (wcslen(vhdx_dir) > MAX_PATH - 96)
+            return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+        if (GetFileAttributesW(vhdx_dir) != INVALID_FILE_ATTRIBUTES)
+            return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+        if (!CreateDirectoryW(vhdx_dir, NULL))
+            return HRESULT_FROM_WIN32(GetLastError());
+        wcscpy_s(cfg.storage_root, MAX_PATH, vhdx_dir);
     }
-    CreateDirectoryW(vhdx_dir, NULL);
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
+    cfg.shared_resource_count = shared_resources_build_attachments(
+        cfg.os_type, inst->shared_resource_exclusions,
+        cfg.shared_resources, ASB_MAX_SHARED_RESOURCES);
+    memcpy(inst->shared_resources, cfg.shared_resources, sizeof(inst->shared_resources));
+    inst->shared_resource_count = cfg.shared_resource_count;
+    if (cfg.shared_resource_count)
+        wcscpy_s(inst->shared_resource_transport, 16, L"vsmb");
 
     /* GPU driver shares */
     if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create) {
@@ -3016,6 +3221,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->name, 256, cfg.name);
             wcscpy_s(inst->os_type, 32, cfg.os_type);
             wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
+            wcscpy_s(inst->storage_root, MAX_PATH, cfg.storage_root);
             wcscpy_s(inst->image_path, MAX_PATH, cfg.image_path);
             inst->ram_mb = cfg.ram_mb;
             inst->hdd_gb = cfg.hdd_gb;
@@ -3047,6 +3253,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             if (!args) {
                 asb_log(L"Error: Out of memory for VHDX create args.");
                 g_vm_count--;
+                remove_dir_recursive(vhdx_dir);
                 return E_OUTOFMEMORY;
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
@@ -3056,7 +3263,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
             asb_log(L"Building VHDX for \"%s\" (this may take several minutes)...", cfg.name);
-            CloseHandle(CreateThread(NULL, 0, vhdx_create_thread, args, 0, NULL));
+            {
+                HANDLE worker=CreateThread(NULL,0,vhdx_create_thread,args,0,NULL);
+                if(!worker){HRESULT thr=HRESULT_FROM_WIN32(GetLastError());HeapFree(GetProcessHeap(),0,args);g_vm_count--;remove_dir_recursive(vhdx_dir);return thr;}
+                CloseHandle(worker);
+            }
 
             if (g_state_cb) g_state_cb(vm_handle(inst), FALSE, g_state_ud);
             return S_OK;
@@ -3083,6 +3294,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->name, 256, cfg.name);
             wcscpy_s(inst->os_type, 32, cfg.os_type);
             wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
+            wcscpy_s(inst->storage_root, MAX_PATH, cfg.storage_root);
             /* image_path isn't used by Linux but copy it through anyway so
                vms.cfg round-trips cleanly (UI sends it as the version tag). */
             wcscpy_s(inst->image_path, MAX_PATH, cfg.image_path);
@@ -3114,6 +3326,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             if (!args) {
                 asb_log(L"Error: Out of memory for Linux create args.");
                 g_vm_count--;
+                remove_dir_recursive(vhdx_dir);
                 return E_OUTOFMEMORY;
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
@@ -3123,7 +3336,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
             asb_log(L"Building Linux VM \"%s\" (direct ISO->VHDX, ~3 minutes)...", cfg.name);
-            CloseHandle(CreateThread(NULL, 0, linux_create_thread, args, 0, NULL));
+            {
+                HANDLE worker=CreateThread(NULL,0,linux_create_thread,args,0,NULL);
+                if(!worker){HRESULT thr=HRESULT_FROM_WIN32(GetLastError());HeapFree(GetProcessHeap(),0,args);g_vm_count--;remove_dir_recursive(vhdx_dir);SecureZeroMemory(cfg.admin_pass,sizeof(cfg.admin_pass));return thr;}
+                CloseHandle(worker);
+            }
 
             /* Wipe the plaintext password from the local cfg; the worker
                thread has its own heap copy in args->config and wipes that
@@ -3150,12 +3367,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
         DeleteFileW(cfg.vhdx_path);
         hr = vhdx_create_differencing(cfg.vhdx_path, g_templates[template_idx].vhdx_path);
-        if (FAILED(hr)) { asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr); return hr; }
+        if (FAILED(hr)) { asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr); remove_dir_recursive(vhdx_dir); return hr; }
         asb_log(L"Differencing VHDX created.");
     } else {
         asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
         hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
-        if (FAILED(hr)) { asb_log(L"Error: Failed to create VHDX (0x%08X)", hr); return hr; }
+        if (FAILED(hr)) { asb_log(L"Error: Failed to create VHDX (0x%08X)", hr); remove_dir_recursive(vhdx_dir); return hr; }
         asb_log(L"VHDX created successfully.");
     }
 
@@ -3255,6 +3472,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             hcn_delete_endpoint(&inst->endpoint_id);
             endpoint_guid_str[0] = L'\0';
         }
+        remove_dir_recursive(vhdx_dir);
         return hr;
     }
 
@@ -3270,6 +3488,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
       snapshot_init(&g_snap_trees[g_vm_count], sd); }
     g_vm_count++;
+
+    if (!is_template_create)
+        remember_storage_parent(inst->storage_root);
 
     if (!is_template_create)
         vm_save_state_json(cfg.vhdx_path, FALSE);
@@ -3355,6 +3576,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.os_type, 32, inst->os_type);
         wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
         wcscpy_s(args->config.vhdx_path, MAX_PATH, inst->vhdx_path);
+        wcscpy_s(args->config.storage_root, MAX_PATH, inst->storage_root);
         args->config.ram_mb = inst->ram_mb;
         args->config.hdd_gb = inst->hdd_gb;
         args->config.cpu_cores = inst->cpu_cores;
@@ -3364,6 +3586,12 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
+        args->config.shared_resource_count = shared_resources_build_attachments(
+            inst->os_type, inst->shared_resource_exclusions,
+            args->config.shared_resources, ASB_MAX_SHARED_RESOURCES);
+        memcpy(inst->shared_resources, args->config.shared_resources,
+               sizeof(inst->shared_resources));
+        inst->shared_resource_count = args->config.shared_resource_count;
         args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
@@ -3391,6 +3619,8 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             return hr;
         }
         asb_log(L"VM \"%s\" started.", inst->name);
+        inst->shared_resource_pending = FALSE;
+        save_vm_list();
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
@@ -3501,14 +3731,19 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     hcs_close_vm(inst);
     hcs_destroy_stale(inst->name);
 
-    /* Determine VM root directory */
-    wcscpy_s(dir, MAX_PATH, inst->vhdx_path);
-    last_slash = wcsrchr(dir, L'\\');
-    if (last_slash) *last_slash = L'\0';
-    {
-        size_t dlen = wcslen(dir);
-        if (dlen >= 10 && _wcsicmp(dir + dlen - 10, L"\\snapshots") == 0)
-            dir[dlen - 10] = L'\0';
+    /* StorageRoot is authoritative for new configurations.  Legacy entries
+       derive the same root from the active VHDX/checkpoint path. */
+    if (inst->storage_root[0]) {
+        wcscpy_s(dir, MAX_PATH, inst->storage_root);
+    } else {
+        wcscpy_s(dir, MAX_PATH, inst->vhdx_path);
+        last_slash = wcsrchr(dir, L'\\');
+        if (last_slash) *last_slash = L'\0';
+        {
+            size_t dlen = wcslen(dir);
+            if (dlen >= 10 && _wcsicmp(dir + dlen - 10, L"\\snapshots") == 0)
+                dir[dlen - 10] = L'\0';
+        }
     }
 
     /* Recursively remove the whole VM folder, including subdirectories
@@ -3846,7 +4081,7 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
     SnapshotTree tree_backup, relocated_tree;
     VmInstance relocated_inst;
     wchar_t old_root[MAX_PATH], new_root[MAX_PATH];
-    wchar_t old_vhdx[MAX_PATH], old_image[MAX_PATH], old_resources[MAX_PATH];
+    wchar_t old_vhdx[MAX_PATH], old_image[MAX_PATH], old_resources[MAX_PATH], old_storage[MAX_PATH];
     wchar_t *slash;
     ULONGLONG total = 0, free_bytes = 0;
     ULARGE_INTEGER free_space;
@@ -3910,14 +4145,17 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
     wcscpy_s(old_vhdx, MAX_PATH, inst->vhdx_path);
     wcscpy_s(old_image, MAX_PATH, inst->image_path);
     wcscpy_s(old_resources, MAX_PATH, inst->resources_iso_path);
+    wcscpy_s(old_storage, MAX_PATH, inst->storage_root);
     hr = snapshot_relocate(&relocated_tree, &relocated_inst, old_root, new_root);
     if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst.image_path, MAX_PATH, old_root, new_root);
     if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst.resources_iso_path, MAX_PATH, old_root, new_root);
+    if (SUCCEEDED(hr)) wcscpy_s(relocated_inst.storage_root, MAX_PATH, new_root);
     if (SUCCEEDED(hr)) {
         *tree = relocated_tree;
         wcscpy_s(inst->vhdx_path, MAX_PATH, relocated_inst.vhdx_path);
         wcscpy_s(inst->image_path, MAX_PATH, relocated_inst.image_path);
         wcscpy_s(inst->resources_iso_path, MAX_PATH, relocated_inst.resources_iso_path);
+        wcscpy_s(inst->storage_root, MAX_PATH, relocated_inst.storage_root);
     }
     if (FAILED(hr) || !save_vm_list()) {
         if (SUCCEEDED(hr)) hr = HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
@@ -3925,6 +4163,7 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
         wcscpy_s(inst->vhdx_path, MAX_PATH, old_vhdx);
         wcscpy_s(inst->image_path, MAX_PATH, old_image);
         wcscpy_s(inst->resources_iso_path, MAX_PATH, old_resources);
+        wcscpy_s(inst->storage_root, MAX_PATH, old_storage);
         remove_dir_recursive(new_root);
         asb_log(L"Storage move commit failed for \"%s\" (0x%08X); source was kept.", inst->name, hr);
         goto done;
@@ -4251,6 +4490,90 @@ ASB_API void asb_set_last_iso_path(const wchar_t *path)
 ASB_API const wchar_t *asb_get_last_iso_path(void)
 {
     return g_last_iso_path;
+}
+
+ASB_API void asb_set_last_storage_parent(const wchar_t *path)
+{
+    if (path) wcscpy_s(g_last_storage_parent, MAX_PATH, path);
+}
+
+ASB_API const wchar_t *asb_get_last_storage_parent(void)
+{
+    return g_last_storage_parent;
+}
+
+ASB_API int asb_shared_resource_count(void)
+{
+    return shared_resources_count();
+}
+
+ASB_API BOOL asb_shared_resource_get(int index, AsbSharedResourceInfo *out)
+{
+    const AsbSharedResourceInfo *r = shared_resources_get(index);
+    if (!r || !out) return FALSE;
+    *out = *r;
+    return TRUE;
+}
+
+ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,
+                                           BOOL confirm_permissions,
+                                           wchar_t *created_id, size_t created_id_chars)
+{
+    HRESULT hr=shared_resources_create(info,confirm_permissions,created_id,created_id_chars);
+    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();}
+    return hr;
+}
+
+ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
+                                           const AsbSharedResourceInfo *info,
+                                           BOOL confirm_permissions)
+{
+    HRESULT hr = shared_resources_update(id, info, confirm_permissions);
+    if (SUCCEEDED(hr)) {
+        int i;
+        for (i = 0; i < g_vm_count; i++) g_vms[i].shared_resource_pending = TRUE;
+        save_vm_list();
+    }
+    return hr;
+}
+
+ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id)
+{
+    HRESULT hr = shared_resources_remove(id);
+    if (SUCCEEDED(hr)) {
+        int i;
+        for (i = 0; i < g_vm_count; i++) {
+            shared_resources_set_excluded(g_vms[i].shared_resource_exclusions,
+                _countof(g_vms[i].shared_resource_exclusions), id, FALSE);
+            g_vms[i].shared_resource_pending = TRUE;
+        }
+        save_vm_list();
+    }
+    return hr;
+}
+
+ASB_API BOOL asb_vm_shared_resource_enabled(AsbVm vm, const wchar_t *id)
+{
+    VmInstance *inst = asb_vm_instance(vm);
+    return inst && id && !shared_resources_is_excluded(inst->shared_resource_exclusions, id);
+}
+
+ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
+                                                   const wchar_t *id, BOOL enabled)
+{
+    VmInstance *inst = asb_vm_instance(vm);
+    HRESULT hr;
+    int i;
+    if (!inst || !id || !id[0]) return E_INVALIDARG;
+    for (i = 0; i < shared_resources_count(); i++) {
+        const AsbSharedResourceInfo *r = shared_resources_get(i);
+        if (r && _wcsicmp(r->id, id) == 0) break;
+    }
+    if (i == shared_resources_count()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    hr = shared_resources_set_excluded(inst->shared_resource_exclusions,
+            _countof(inst->shared_resource_exclusions), id, !enabled);
+    if (SUCCEEDED(hr)) { inst->shared_resource_pending = TRUE; save_vm_list(); }
+    return hr;
 }
 
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress)

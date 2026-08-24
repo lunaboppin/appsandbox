@@ -633,7 +633,8 @@ static int handle_request(int fd, HttpReq *r) {
         send_json(fd, 200, "OK", json_str(@{
             @"product": @"AppSandbox", @"version": product_version(),
             @"apiVersion": @ASB_API_VERSION, @"hostOs": @"macOS",
-            @"capabilities": @{ @"snapshots": @NO, @"templates": @NO } }));
+            @"capabilities": @{ @"snapshots": @NO, @"templates": @NO,
+                                  @"customStorage": @NO, @"sharedResources": @NO } }));
         return 0;
     }
     if (!auth_ok(r)) {
@@ -675,6 +676,11 @@ static int handle_request(int fd, HttpReq *r) {
     /* ---- Templates: not a macOS feature (capabilities.templates=false) ---- */
     if ([path hasPrefix:@"/v1/templates"]) {
         send_501(fd, @"templates");
+        return 0;
+    }
+    if ([path hasPrefix:@"/v1/shared-resources"] ||
+        [path containsString:@"/shared-resources"]) {
+        send_501(fd, @"shared resources");
         return 0;
     }
 

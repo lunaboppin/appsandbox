@@ -25,6 +25,7 @@
 #include <userenv.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include "p9copy.h"
 #include "../transport/asb_transport.h"
 
@@ -768,6 +769,11 @@ static HANDLE g_input_process = NULL;
 static DWORD  g_input_session = 0xFFFFFFFF;  /* session the helper was spawned into */
 static volatile BOOL g_input_monitor_running = FALSE;
 static HANDLE g_input_monitor_thread = NULL;
+typedef struct { char letter; char share[64]; } SharedMapRequest;
+static SharedMapRequest g_shared_maps[16];
+static int g_shared_map_count;
+static DWORD g_shared_map_session = 0xFFFFFFFF;
+static BOOL spawn_vsmb_mapper(char letter, const char *share, DWORD *exit_code);
 
 static void kill_input_helper(void)
 {
@@ -872,6 +878,15 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
                 }
                 agent_log("Input monitor: helper died, respawning in session %lu.", cur_session);
                 spawn_input_in_session(cur_session);
+            }
+            if (cur_session != g_shared_map_session) {
+                int mi;
+                for (mi = 0; mi < g_shared_map_count; mi++) {
+                    DWORD ec = 0;
+                    spawn_vsmb_mapper(g_shared_maps[mi].letter,
+                                      g_shared_maps[mi].share, &ec);
+                }
+                g_shared_map_session = cur_session;
             }
         }
 
@@ -1742,6 +1757,62 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
     send_reply(client, tag, "ok");
 }
 
+/* Define a drive in the interactive user's DOS-device namespace. VSMB is a
+   synthetic filesystem device, so this requires neither networking nor
+   credentials. */
+static int map_vsmb_drive_child(const char *letter_a, const char *share_a)
+{
+    wchar_t drive[3], share[64], target[256], existing[1024];
+    if (!letter_a || !share_a || strlen(letter_a) != 1) return 2;
+    drive[0] = (wchar_t)toupper((unsigned char)letter_a[0]);
+    drive[1] = L':'; drive[2] = L'\0';
+    MultiByteToWideChar(CP_UTF8, 0, share_a, -1, share, _countof(share));
+    swprintf_s(target, _countof(target),
+        L"\\??\\VMSMB\\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\\%s", share);
+    if (QueryDosDeviceW(drive, existing, _countof(existing))) {
+        if (_wcsicmp(existing, target) == 0) {
+            wchar_t root[4]={drive[0],L':',L'\\',L'\0'};
+            return GetFileAttributesW(root)!=INVALID_FILE_ATTRIBUTES?0:4;
+        }
+        return 3; /* requested letter is occupied; never substitute */
+    }
+    if (!DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_NO_BROADCAST_SYSTEM,
+                          drive, target)) return (int)GetLastError();
+    {
+        wchar_t root[4]={drive[0],L':',L'\\',L'\0'};
+        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES){
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION|DDD_EXACT_MATCH_ON_REMOVE|
+                             DDD_RAW_TARGET_PATH|DDD_NO_BROADCAST_SYSTEM,drive,target);
+            return 4;
+        }
+    }
+    return 0;
+}
+
+static BOOL spawn_vsmb_mapper(char letter, const char *share, DWORD *exit_code)
+{
+    DWORD session = WTSGetActiveConsoleSessionId();
+    HANDLE token = NULL;
+    LPVOID env = NULL;
+    wchar_t exe[MAX_PATH], share_w[64], cmd[MAX_PATH + 160];
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    if (session == 0xFFFFFFFF || !WTSQueryUserToken(session, &token)) return FALSE;
+    CreateEnvironmentBlock(&env, token, FALSE);
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    MultiByteToWideChar(CP_UTF8, 0, share, -1, share_w, _countof(share_w));
+    swprintf_s(cmd, _countof(cmd), L"\"%s\" --map-drive %c %s", exe, letter, share_w);
+    ZeroMemory(&si,sizeof(si));si.cb=sizeof(si);si.lpDesktop=L"WinSta0\\Default";
+    ZeroMemory(&pi,sizeof(pi));
+    if (!CreateProcessAsUserW(token, NULL, cmd, NULL, NULL, FALSE,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, NULL, &si, &pi)) {
+        if (env) DestroyEnvironmentBlock(env); CloseHandle(token); return FALSE;
+    }
+    WaitForSingleObject(pi.hProcess, 10000);
+    GetExitCodeProcess(pi.hProcess, exit_code);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    if (env) DestroyEnvironmentBlock(env); CloseHandle(token); return TRUE;
+}
+
 /* ---- Persistent client handler ---- */
 
 /* Disable the Hyper-V synthetic video adapter (if present).
@@ -1932,6 +2003,29 @@ static void handle_client(AsbConn *client)
 
         if (strcmp(cmd, "ping") == 0) {
             REPLY("ok");
+        }
+        else if (strncmp(cmd, "shared_map:", 11) == 0) {
+            char *arg = cmd + 11, *sep = strchr(arg, ':');
+            DWORD ec = ERROR_INVALID_PARAMETER;
+            if (sep && sep == arg + 1) {
+                *sep = '\0';
+                {
+                    int mi, slot = -1;
+                    char letter = (char)toupper((unsigned char)arg[0]);
+                    for (mi = 0; mi < g_shared_map_count; mi++)
+                        if (g_shared_maps[mi].letter == letter) { slot = mi; break; }
+                    if (slot < 0 && g_shared_map_count < 16) slot = g_shared_map_count++;
+                    if (slot >= 0) {
+                        g_shared_maps[slot].letter = letter;
+                        strncpy_s(g_shared_maps[slot].share,
+                                  sizeof(g_shared_maps[slot].share), sep + 1, _TRUNCATE);
+                    }
+                }
+                if (spawn_vsmb_mapper((char)toupper((unsigned char)arg[0]), sep + 1, &ec) && ec == 0)
+                    REPLY("ok");
+                else if (ec == 3) REPLY("drive_collision");
+                else REPLY("map_failed");
+            } else REPLY("invalid");
         }
         else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
             REPLY(deploy_ssh_key(cmd + 15) ? "ssh_key_deployed" : "ssh_key_failed");
@@ -2664,7 +2758,9 @@ int main(int argc, char *argv[])
             return install_service();
         if (strcmp(argv[1], "--remove") == 0)
             return remove_service();
-        printf("Usage: appsandbox-agent.exe [--install | --remove]\n");
+        if (strcmp(argv[1], "--map-drive") == 0 && argc == 4)
+            return map_vsmb_drive_child(argv[2], argv[3]);
+        printf("Usage: appsandbox-agent.exe [--install | --remove | --map-drive LETTER SHARE]\n");
         return 1;
     }
 

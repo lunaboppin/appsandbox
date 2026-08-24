@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include "gpu_enum.h"
+#include "shared_resources.h"
 
 /* DLL export/import */
 #ifndef ASB_API
@@ -34,6 +35,7 @@ typedef struct {
     wchar_t os_type[32];          /* L"Windows" or L"Linux" */
     wchar_t image_path[MAX_PATH]; /* ISO path */
     wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
+    wchar_t storage_root[MAX_PATH]; /* complete managed VM tree */
     DWORD   ram_mb;
     DWORD   hdd_gb;
     DWORD   cpu_cores;
@@ -47,6 +49,8 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
+    int     shared_resource_count;
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -62,6 +66,7 @@ typedef struct {
     wchar_t     name[256];
     wchar_t     os_type[32];
     wchar_t     vhdx_path[MAX_PATH];
+    wchar_t     storage_root[MAX_PATH];
     wchar_t     image_path[MAX_PATH];
     DWORD       ram_mb;
     DWORD       hdd_gb;
@@ -112,6 +117,12 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
+    HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
+    int         shared_resource_count;
+    wchar_t     shared_resource_transport[16]; /* vsmb, smb, unavailable */
+    wchar_t     shared_resource_error[256];
+    BOOL        shared_resource_pending;
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

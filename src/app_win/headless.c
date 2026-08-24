@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <wctype.h>
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
@@ -250,7 +251,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
         "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
-        "\"displayOpen\":%s}",
+        "\"displayOpen\":%s,\"sharedResourcePending\":%s,\"sharedResourceTransport\":",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
         v->install_complete ? "true" : "false", v->building_vhdx ? "true" : "false",
@@ -259,7 +260,30 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
         v->gpu_mode, v->network_mode,
-        display_is_open(v->unique_id) ? "true" : "false");
+        display_is_open(v->unique_id) ? "true" : "false",
+        v->shared_resource_pending ? "true" : "false");
+    pos = append_wstr(out, cap, pos, v->shared_resource_transport);
+    pos += sprintf_s(out + pos, cap - pos, ",\"sharedResourceError\":");
+    pos = append_wstr(out, cap, pos, v->shared_resource_error);
+    pos += sprintf_s(out + pos, cap - pos, ",\"storageRoot\":");
+    pos = append_wstr(out, cap, pos, v->storage_root);
+    pos += sprintf_s(out + pos, cap - pos, "}");
+    return pos;
+}
+
+static int append_shared_resource_json(char *out, int cap, int pos,
+                                       const AsbSharedResourceInfo *r)
+{
+    pos += sprintf_s(out + pos, cap - pos, "{\"id\":");
+    pos = append_wstr(out, cap, pos, r->id);
+    pos += sprintf_s(out + pos, cap - pos, ",\"name\":");
+    pos = append_wstr(out, cap, pos, r->name);
+    pos += sprintf_s(out + pos, cap - pos, ",\"hostPath\":");
+    pos = append_wstr(out, cap, pos, r->host_path);
+    pos += sprintf_s(out + pos, cap - pos,
+        ",\"driveLetter\":\"%c\",\"enabled\":%s,\"readOnly\":%s,\"aclCreated\":%s}",
+        r->drive_letter, r->enabled ? "true":"false",
+        r->read_only ? "true":"false", r->acl_created ? "true":"false");
     return pos;
 }
 
@@ -570,7 +594,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -596,6 +620,44 @@ static int handle_request(PHTTP_REQUEST req)
         build_host_info(buf, sizeof(buf));
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
+    }
+
+    /* ---- Global host-backed shared resources ---- */
+    if (wcscmp(path, L"/v1/shared-resources") == 0) {
+        if (verb == HttpVerbGET) {
+            int count = asb_shared_resource_count();
+            pos = sprintf_s(buf, sizeof(buf), "{\"resources\":[");
+            for (i=0;i<count;i++) { AsbSharedResourceInfo r;
+                if (!asb_shared_resource_get(i,&r)) continue;
+                if (i) pos += sprintf_s(buf+pos,sizeof(buf)-pos,",");
+                pos = append_shared_resource_json(buf,sizeof(buf),pos,&r);
+            }
+            sprintf_s(buf+pos,sizeof(buf)-pos,"]}");
+            send_json(req->RequestId,200,"OK",buf); return 0;
+        }
+        if (verb == HttpVerbPOST) {
+            wchar_t body[4096], id[ASB_SHARED_ID_CHARS]={0};
+            AsbSharedResourceInfo r; BOOL confirm=FALSE; HRESULT hr;
+            ZeroMemory(&r,sizeof(r)); body_to_wide(req,body,_countof(body));
+            json_get_string(body,L"name",r.name,_countof(r.name));
+            json_get_string(body,L"hostPath",r.host_path,_countof(r.host_path));
+            { wchar_t dl[8]={0}; json_get_string(body,L"driveLetter",dl,8); r.drive_letter=towupper(dl[0]); }
+            if(!json_get_bool(body,L"enabled",&r.enabled))r.enabled=TRUE;
+            json_get_bool(body,L"readOnly",&r.read_only);
+            json_get_bool(body,L"confirmPermissions",&confirm);
+            hr=asb_shared_resource_create(&r,confirm,id,_countof(id));
+            if(SUCCEEDED(hr)){pos=sprintf_s(buf,sizeof(buf),"{\"ok\":true,\"id\":");pos=append_wstr(buf,sizeof(buf),pos,id);sprintf_s(buf+pos,sizeof(buf)-pos,"}");send_json(req->RequestId,201,"Created",buf);}
+            else if(hr==HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED))send_err(req->RequestId,409,"Conflict","permissions_confirmation_required","folder ACL confirmation required");
+            else send_err(req->RequestId,400,"Bad Request","invalid_resource","invalid, duplicate, nested, or unsupported resource");
+            return 0;
+        }
+        send_err(req->RequestId,405,"Method Not Allowed","method","unsupported method");return 0;
+    }
+    if (wcsncmp(path,L"/v1/shared-resources/",21)==0) {
+        const wchar_t *id=path+21; wchar_t body[4096]; AsbSharedResourceInfo r; BOOL confirm=FALSE; HRESULT hr;
+        if(verb==HttpVerbDELETE){hr=asb_shared_resource_remove(id);if(SUCCEEDED(hr))send_json(req->RequestId,200,"OK","{\"ok\":true}");else send_err(req->RequestId,404,"Not Found","not_found","no such resource");return 0;}
+        if(verb==HttpVerbPUT){ZeroMemory(&r,sizeof(r));body_to_wide(req,body,_countof(body));json_get_string(body,L"name",r.name,_countof(r.name));json_get_string(body,L"hostPath",r.host_path,_countof(r.host_path));{wchar_t dl[8]={0};json_get_string(body,L"driveLetter",dl,8);r.drive_letter=towupper(dl[0]);}if(!json_get_bool(body,L"enabled",&r.enabled))r.enabled=TRUE;json_get_bool(body,L"readOnly",&r.read_only);json_get_bool(body,L"confirmPermissions",&confirm);hr=asb_shared_resource_update(id,&r,confirm);if(SUCCEEDED(hr))send_json(req->RequestId,200,"OK","{\"ok\":true,\"pendingNextStart\":true}");else if(hr==HRESULT_FROM_WIN32(ERROR_NOT_FOUND))send_err(req->RequestId,404,"Not Found","not_found","no such resource");else if(hr==HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED))send_err(req->RequestId,409,"Conflict","permissions_confirmation_required","folder ACL confirmation required");else send_err(req->RequestId,400,"Bad Request","invalid_resource","invalid, duplicate, nested, or unsupported resource");return 0;}
+        send_err(req->RequestId,405,"Method Not Allowed","method","unsupported method");return 0;
     }
 
     /* ---- Templates ---- */
@@ -642,7 +704,7 @@ static int handle_request(PHTTP_REQUEST req)
             wchar_t body[8192];
             AsbVmConfig cfg; int iv; BOOL bv;
             wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
-            wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0};
+            wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0}, storage[MAX_PATH]={0}, exclusions[1024]={0};
             char nu[256]={0};
             body_to_wide(req, body, 8192);
             ZeroMemory(&cfg, sizeof(cfg));
@@ -653,10 +715,14 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_string(body, L"adminUser", user, 128);
             json_get_string(body, L"adminPass", pass, 128);
             json_get_string(body, L"netAdapter", adapter, 256);
+            json_get_string(body, L"storageParent", storage, MAX_PATH);
+            json_get_string(body, L"sharedResourceExclusions", exclusions, _countof(exclusions));
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
+            cfg.storage_parent = storage;
+            cfg.shared_resource_exclusions = exclusions;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
             if (json_get_int(body, L"hddGb", &iv)) cfg.hdd_gb = (DWORD)iv;
             if (json_get_int(body, L"cpuCores", &iv)) cfg.cpu_cores = (DWORD)iv;
@@ -765,6 +831,39 @@ static int handle_request(PHTTP_REQUEST req)
         }
 
         /* sub-routes */
+        if (wcscmp(sub, L"shared-resources") == 0 && verb == HttpVerbGET) {
+            VmInstance *inst=asb_vm_instance(vm);
+            int count=asb_shared_resource_count(), emitted=0;
+            pos=sprintf_s(buf,sizeof(buf),"{\"resources\":[");
+            for(i=0;i<count;i++){
+                AsbSharedResourceInfo r;BOOL included;const char *mapping;HcsSharedResource *attached=NULL;int ai;
+                if(!asb_shared_resource_get(i,&r))continue;
+                if(emitted++)pos+=sprintf_s(buf+pos,sizeof(buf)-pos,",");
+                included=asb_vm_shared_resource_enabled(vm,r.id);
+                for(ai=0;ai<inst->shared_resource_count;ai++)if(_wcsicmp(inst->shared_resources[ai].id,r.id)==0){attached=&inst->shared_resources[ai];break;}
+                if(!included)mapping="excluded";
+                else if(!r.enabled)mapping="disabled";
+                else if(attached&&attached->mapping_result[0]){static char mr[32];WideCharToMultiByte(CP_UTF8,0,attached->mapping_result,-1,mr,sizeof(mr),NULL,NULL);mapping=mr;}
+                else if(!inst->running||!inst->agent_online)mapping="pending";
+                else mapping="mapped";
+                pos=append_shared_resource_json(buf,sizeof(buf),pos,&r);pos--;
+                pos+=sprintf_s(buf+pos,sizeof(buf)-pos,",\"included\":%s,\"pendingNextStart\":%s,\"transport\":",
+                    included?"true":"false",inst->shared_resource_pending?"true":"false");
+                pos=append_wstr(buf,sizeof(buf),pos,inst->shared_resource_transport);
+                pos+=sprintf_s(buf+pos,sizeof(buf)-pos,",\"mappingResult\":\"%s\",\"failure\":",mapping);
+                pos=append_wstr(buf,sizeof(buf),pos,attached?attached->failure:inst->shared_resource_error);
+                pos+=sprintf_s(buf+pos,sizeof(buf)-pos,"}");
+            }
+            sprintf_s(buf+pos,sizeof(buf)-pos,"]}");send_json(req->RequestId,200,"OK",buf);return 0;
+        }
+        if (wcsncmp(sub, L"shared-resources/", 17) == 0 && verb == HttpVerbPUT) {
+            wchar_t body[512]; BOOL enabled=TRUE; HRESULT hr;
+            body_to_wide(req,body,_countof(body));json_get_bool(body,L"enabled",&enabled);
+            hr=asb_vm_set_shared_resource_enabled(vm,sub+17,enabled);
+            if(SUCCEEDED(hr))send_json(req->RequestId,200,"OK","{\"ok\":true,\"pendingNextStart\":true}");
+            else send_err(req->RequestId,404,"Not Found","not_found","no such resource");
+            return 0;
+        }
         if (verb == HttpVerbPOST && wcscmp(sub, L"start") == 0) {
             /* Optional: boot from a chosen snapshot/branch -- mirrors the GUI's
                startVm (snapIndex/branchIndex/branchName). Starting from a

@@ -44,6 +44,9 @@
     <ClInclude Include="src\backend_win\asb_core.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
+    <ClInclude Include="src\backend_win\shared_resources.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
     <ClInclude Include="src\backend_win\asb_display.h">
       <Filter>Backend Win</Filter>
     </ClInclude>

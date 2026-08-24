@@ -110,7 +110,8 @@ class Client:
 
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
-        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
+        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, storageParent,
+        adminUser,
         adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
@@ -132,6 +133,26 @@ class Client:
     # ---- host / templates / ssh / snapshots ----
     def host(self):              return self._req("GET", "/host")[1]
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
+    def shared_resources(self):  return self._req("GET", "/shared-resources")[1].get("resources", [])
+    def create_shared_resource(self, name, host_path, drive_letter, read_only=False,
+                               enabled=True, confirm_permissions=False):
+        """Create a global Windows shared drive. Set confirm_permissions=True to
+        allow AppSandbox to add its tracked Virtual Machines folder ACE."""
+        return self._req("POST", "/shared-resources", {
+            "name": name, "hostPath": host_path, "driveLetter": drive_letter,
+            "readOnly": read_only, "enabled": enabled,
+            "confirmPermissions": confirm_permissions})
+    def update_shared_resource(self, resource_id, **fields):
+        return self._req("PUT", "/shared-resources/%s" % resource_id, fields)
+    def remove_shared_resource(self, resource_id):
+        """Remove only the definition and AppSandbox-created ACE; host data remains."""
+        return self._req("DELETE", "/shared-resources/%s" % resource_id)
+    def vm_shared_resources(self, name):
+        return self._req("GET", "/vms/%s/shared-resources" % name)[1].get("resources", [])
+    def set_vm_shared_resource(self, name, resource_id, enabled=True):
+        """Include or exclude a resource for this VM. Applies on next start."""
+        return self._req("PUT", "/vms/%s/shared-resources/%s" % (name, resource_id),
+                         {"enabled": bool(enabled)})
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
     def open_display(self, name):
