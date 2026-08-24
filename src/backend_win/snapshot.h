@@ -79,8 +79,13 @@ HRESULT snapshot_new_branch(SnapshotTree *tree, VmInstance *instance, int index)
    Sets instance->vhdx_path accordingly. */
 HRESULT snapshot_select_branch(SnapshotTree *tree, VmInstance *instance, int index, int branch_idx);
 
-/* Delete a snapshot and all its branches. */
+/* Delete a snapshot. The caller must ensure it has no branches. */
 HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index);
+
+/* Rewrite all absolute paths after moving the complete managed VM directory.
+   Also updates each differencing VHDX's internal parent locator. */
+HRESULT snapshot_relocate(SnapshotTree *tree, VmInstance *instance,
+                          const wchar_t *old_root, const wchar_t *new_root);
 
 /* Delete a single branch.
    index >= 0: snapshot branch.  index == -2: base branch. */

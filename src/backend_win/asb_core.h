@@ -168,6 +168,11 @@ ASB_API int     asb_vm_gpu_mode(AsbVm vm);
 ASB_API int     asb_vm_network_mode(AsbVm vm);
 ASB_API BOOL    asb_vm_ssh_enabled(AsbVm vm);
 ASB_API DWORD   asb_vm_ssh_port(AsbVm vm);
+ASB_API const wchar_t *asb_vm_image_path(AsbVm vm);
+ASB_API const wchar_t *asb_vm_vhdx_path(AsbVm vm);
+ASB_API BOOL    asb_vm_auto_open_display(AsbVm vm);
+ASB_API BOOL    asb_vm_management_busy(AsbVm vm);
+ASB_API DWORD   asb_vm_guest_grow_target_gb(AsbVm vm);
 
 /* ---- VM config editing (VM must be stopped) ---- */
 
@@ -176,6 +181,10 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb);
 ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+ASB_API HRESULT asb_vm_set_installer_iso(AsbVm vm, const wchar_t *path);
+ASB_API HRESULT asb_vm_set_auto_open_display(AsbVm vm, BOOL enabled);
+ASB_API HRESULT asb_vm_resize_disk(AsbVm vm, DWORD new_size_gb);
+ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent);
 
 /* ---- Snapshots ---- */
 

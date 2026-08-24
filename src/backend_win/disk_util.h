@@ -24,6 +24,13 @@ HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *paren
    After merge, child_path can be deleted. */
 HRESULT vhdx_merge(const wchar_t *child_path);
 
+/* Grow an existing VHDX to new_size_gb. Shrinking is rejected. */
+HRESULT vhdx_resize_grow(const wchar_t *path, ULONGLONG new_size_gb,
+                         ULONGLONG *old_size_bytes, ULONGLONG *new_size_bytes);
+
+/* Rewrite the internal parent locator of a moved differencing VHDX. */
+HRESULT vhdx_set_parent_path(const wchar_t *child_path, const wchar_t *parent_path);
+
 /* Create a resources ISO containing autounattend.xml, agent, and helper
    executables for unattended Windows install with GPU-PV. GPU driver
    file copy is handled by the agent service's embedded 9P client (p9copy).

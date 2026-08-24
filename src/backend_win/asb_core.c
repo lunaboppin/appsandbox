@@ -24,8 +24,12 @@
 #include <stdlib.h>
 #include <shlobj.h>
 #include <stdarg.h>
+#include <string.h>
+#include <io.h>
+#include <bcrypt.h>
 #include <virtdisk.h>
 #pragma comment(lib, "virtdisk.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
 
@@ -115,7 +119,26 @@ static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
 static BOOL g_suppress_tray_warn = FALSE;
 
 static CRITICAL_SECTION g_cs;
+static SRWLOCK g_save_lock = SRWLOCK_INIT;
+static wchar_t g_settings_passthrough[4096];
 static BOOL g_initialized = FALSE;
+static volatile LONG g_management_active = 0;
+static void asb_log(const wchar_t *fmt, ...);
+
+static void preserve_config_line(wchar_t *buffer, size_t buffer_chars,
+                                 const wchar_t *line)
+{
+    size_t used, needed;
+    if (!buffer || !buffer_chars || !line || !line[0]) return;
+    used = wcslen(buffer);
+    needed = wcslen(line) + 1;
+    if (used + needed >= buffer_chars) {
+        asb_log(L"Warning: unrecognized vms.cfg keys exceed the preservation buffer.");
+        return;
+    }
+    wcscat_s(buffer, buffer_chars, line);
+    wcscat_s(buffer, buffer_chars, L"\n");
+}
 
 /* ---- Callbacks ---- */
 
@@ -277,7 +300,7 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
         closesocket(s);
 
         vm = asb_find_vm_by_id(vm_id);
-        if (vm && !vm->idd_probe_stop && vm->running && !vm->install_complete) {
+        if (vm && !vm->idd_probe_stop && vm->running && vm->auto_open_display) {
             asb_log(L"IDD probe: VDD ready for \"%s\", opening display", vm->name);
             /* Pass the stable ID, not a VmInstance*: the UI thread looks
                it up freshly with asb_find_vm_by_id before acting. */
@@ -302,7 +325,7 @@ static void idd_probe_start(VmInstance *vm)
        opens the display only on an explicit request, gated by asb_vm_idd_ready. */
     if (!g_idd_probe_hwnd) return;
     if (vm->idd_probe_thread) return;
-    if (vm->install_complete) return;
+    if (!vm->auto_open_display) return;
     if (vm->is_template) return;
 
     vm->idd_probe_stop = FALSE;
@@ -457,22 +480,32 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 
 /* ---- Persistence: save VM list ---- */
 
-static void save_vm_list(void)
+static BOOL save_vm_list(void)
 {
-    wchar_t path[MAX_PATH];
+    wchar_t path[MAX_PATH], temp_path[MAX_PATH];
     FILE *f;
     int i;
 
     get_config_path(path, MAX_PATH);
+    if (_snwprintf_s(temp_path, MAX_PATH, _TRUNCATE, L"%s.tmp", path) < 0)
+        return FALSE;
+    AcquireSRWLockExclusive(&g_save_lock);
+    DeleteFileW(temp_path);
 
-    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    if (_wfopen_s(&f, temp_path, L"w") != 0 || !f) {
+        ReleaseSRWLockExclusive(&g_save_lock);
+        return FALSE;
+    }
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
+    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn ||
+        g_settings_passthrough[0] != L'\0') {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
         if (g_suppress_tray_warn)
             fwprintf(f, L"SuppressTrayWarn=1\n");
+        if (g_settings_passthrough[0] != L'\0')
+            fwprintf(f, L"%s", g_settings_passthrough);
         fwprintf(f, L"\n");
     }
 
@@ -511,10 +544,34 @@ static void save_vm_list(void)
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
+        if (g_vms[i].auto_open_display)
+            fwprintf(f, L"AutoOpenDisplay=1\n");
+        if (g_vms[i].guest_grow_target_gb)
+            fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
+        if (g_vms[i].config_passthrough[0] != L'\0')
+            fwprintf(f, L"%s", g_vms[i].config_passthrough);
         fwprintf(f, L"\n");
     }
 
-    fclose(f);
+    if (fflush(f) != 0 || !FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)))) {
+        fclose(f);
+        DeleteFileW(temp_path);
+        ReleaseSRWLockExclusive(&g_save_lock);
+        return FALSE;
+    }
+    if (fclose(f) != 0) {
+        DeleteFileW(temp_path);
+        ReleaseSRWLockExclusive(&g_save_lock);
+        return FALSE;
+    }
+    if (!MoveFileExW(temp_path, path,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp_path);
+        ReleaseSRWLockExclusive(&g_save_lock);
+        return FALSE;
+    }
+    ReleaseSRWLockExclusive(&g_save_lock);
+    return TRUE;
 }
 
 /* ---- Persistence: load VM list ---- */
@@ -556,6 +613,9 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else
+                preserve_config_line(g_settings_passthrough,
+                                     _countof(g_settings_passthrough), line);
             continue;
         }
 
@@ -580,7 +640,8 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"GpuName=", 8) == 0)
             wcscpy_s(vm->gpu_name, 256, line + 8);
         else if (wcsncmp(line, L"GpuDevicePath=", 14) == 0)
-            { /* ignored - backwards compat */ }
+            preserve_config_line(vm->config_passthrough,
+                                 _countof(vm->config_passthrough), line);
         else if (wcsncmp(line, L"NetworkMode=", 12) == 0)
             vm->network_mode = _wtoi(line + 12);
         else if (wcsncmp(line, L"NetAdapter=", 11) == 0)
@@ -608,6 +669,13 @@ static void load_vm_list(void)
             wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
+        else if (wcsncmp(line, L"AutoOpenDisplay=", 16) == 0)
+            vm->auto_open_display = (_wtoi(line + 16) != 0);
+        else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
+            vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
+        else
+            preserve_config_line(vm->config_passthrough,
+                                 _countof(vm->config_passthrough), line);
     }
 
     fclose(f);
@@ -731,6 +799,165 @@ static void remove_dir_recursive(const wchar_t *dir)
         FindClose(h);
     }
     RemoveDirectoryW(dir);
+}
+
+static BOOL path_join(wchar_t *out, size_t out_chars,
+                      const wchar_t *left, const wchar_t *right)
+{
+    return _snwprintf_s(out, out_chars, _TRUNCATE, L"%s\\%s", left, right) >= 0;
+}
+
+static BOOL path_is_within(const wchar_t *path, const wchar_t *root)
+{
+    size_t n;
+    if (!path || !root) return FALSE;
+    n = wcslen(root);
+    return _wcsnicmp(path, root, n) == 0 &&
+           (path[n] == L'\0' || path[n] == L'\\');
+}
+
+static HRESULT directory_size_bytes(const wchar_t *dir, ULONGLONG *total)
+{
+    wchar_t pattern[MAX_PATH], full[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    if (!dir || !total || !path_join(pattern, MAX_PATH, dir, L"*"))
+        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    do {
+        ULARGE_INTEGER size;
+        HRESULT hr;
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+            continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            FindClose(h);
+            return HRESULT_FROM_WIN32(ERROR_REPARSE_TAG_INVALID);
+        }
+        if (!path_join(full, MAX_PATH, dir, fd.cFileName)) {
+            FindClose(h);
+            return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+        }
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            hr = directory_size_bytes(full, total);
+            if (FAILED(hr)) { FindClose(h); return hr; }
+        } else {
+            size.LowPart = fd.nFileSizeLow;
+            size.HighPart = fd.nFileSizeHigh;
+            if (~0ULL - *total < size.QuadPart) {
+                FindClose(h);
+                return HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW);
+            }
+            *total += size.QuadPart;
+        }
+    } while (FindNextFileW(h, &fd));
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        DWORD err = GetLastError();
+        FindClose(h);
+        return HRESULT_FROM_WIN32(err);
+    }
+    FindClose(h);
+    return S_OK;
+}
+
+static HRESULT sha256_file(const wchar_t *path, BYTE digest[32])
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    BYTE *object = NULL, buffer[1024 * 1024];
+    DWORD object_size = 0, value_size = 0, read = 0;
+    NTSTATUS status;
+    HRESULT hr = E_FAIL;
+
+    status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (status < 0) goto done;
+    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&object_size,
+                               sizeof(object_size), &value_size, 0);
+    if (status < 0) goto done;
+    object = (BYTE *)HeapAlloc(GetProcessHeap(), 0, object_size);
+    if (!object) { hr = E_OUTOFMEMORY; goto done; }
+    status = BCryptCreateHash(alg, &hash, object, object_size, NULL, 0, 0);
+    if (status < 0) goto done;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                       FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (file == INVALID_HANDLE_VALUE) { hr = HRESULT_FROM_WIN32(GetLastError()); goto done; }
+    for (;;) {
+        if (!ReadFile(file, buffer, sizeof(buffer), &read, NULL)) {
+            hr = HRESULT_FROM_WIN32(GetLastError()); goto done;
+        }
+        if (read == 0) break;
+        status = BCryptHashData(hash, buffer, read, 0);
+        if (status < 0) goto done;
+    }
+    status = BCryptFinishHash(hash, digest, 32, 0);
+    if (status >= 0) hr = S_OK;
+done:
+    SecureZeroMemory(buffer, sizeof(buffer));
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (hash) BCryptDestroyHash(hash);
+    if (object) HeapFree(GetProcessHeap(), 0, object);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return hr;
+}
+
+static HRESULT copy_tree_verified(const wchar_t *source, const wchar_t *target)
+{
+    wchar_t pattern[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    HRESULT hr = S_OK;
+    if (!CreateDirectoryW(target, NULL))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!path_join(pattern, MAX_PATH, source, L"*"))
+        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    do {
+        BYTE src_hash[32], dst_hash[32];
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+            continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            hr = HRESULT_FROM_WIN32(ERROR_REPARSE_TAG_INVALID); break;
+        }
+        if (!path_join(src, MAX_PATH, source, fd.cFileName) ||
+            !path_join(dst, MAX_PATH, target, fd.cFileName)) {
+            hr = HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE); break;
+        }
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            hr = copy_tree_verified(src, dst);
+        } else {
+            if (!CopyFileW(src, dst, TRUE))
+                hr = HRESULT_FROM_WIN32(GetLastError());
+            if (SUCCEEDED(hr)) hr = sha256_file(src, src_hash);
+            if (SUCCEEDED(hr)) hr = sha256_file(dst, dst_hash);
+            if (SUCCEEDED(hr) && memcmp(src_hash, dst_hash, 32) != 0)
+                hr = HRESULT_FROM_WIN32(ERROR_CRC);
+            if (SUCCEEDED(hr))
+                SetFileAttributesW(dst, fd.dwFileAttributes & ~FILE_ATTRIBUTE_REPARSE_POINT);
+        }
+        if (FAILED(hr)) break;
+    } while (FindNextFileW(h, &fd));
+    if (SUCCEEDED(hr) && GetLastError() != ERROR_NO_MORE_FILES)
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    FindClose(h);
+    return hr;
+}
+
+static HRESULT rewrite_moved_path(wchar_t *path, size_t path_chars,
+                                  const wchar_t *old_root, const wchar_t *new_root)
+{
+    wchar_t updated[MAX_PATH];
+    size_t old_len;
+    if (!path || !path[0] || !path_is_within(path, old_root)) return S_OK;
+    old_len = wcslen(old_root);
+    if (_snwprintf_s(updated, MAX_PATH, _TRUNCATE, L"%s%s", new_root,
+                     path + old_len) < 0)
+        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    wcscpy_s(path, path_chars, updated);
+    return S_OK;
 }
 
 /* ---- HCS state callback (called from HCS worker thread) ---- */
@@ -955,6 +1182,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
+                InterlockedExchange(&vm->management_busy, 0);
                 if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
                 free(args); return 1;
             }
@@ -962,6 +1190,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             vm->endpoint_id = args->endpoint_id;
         } else {
             asb_log(L"Error: Network unavailable (0x%08X).", hr);
+            InterlockedExchange(&vm->management_busy, 0);
             if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
             free(args); return 1;
         }
@@ -992,6 +1221,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             hcn_delete_endpoint(&args->endpoint_id);
             endpoint_guid_str[0] = L'\0';
         }
+        InterlockedExchange(&vm->management_busy, 0);
         if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
         free(args); return 1;
     }
@@ -1012,6 +1242,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         hcs_start_monitor(vm);
     }
 
+    InterlockedExchange(&vm->management_busy, 0);
     if (g_state_cb) g_state_cb(vm_handle(vm), vm->running, g_state_ud);
     free(args);
     return 0;
@@ -3078,6 +3309,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     inst = &g_vms[idx];
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
+    if (InterlockedCompareExchange(&inst->management_busy, 1, 0) != 0) {
+        asb_log(L"VM \"%s\" is busy with another lifecycle operation.", inst->name);
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
 
     /* Switch to snapshot/base branch before booting */
     if (snap_idx >= 0 || snap_idx == -2) {
@@ -3098,6 +3333,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         }
         if (FAILED(hr)) {
             asb_log(L"Error: Failed to select branch (0x%08X)", hr);
+            InterlockedExchange(&inst->management_busy, 0);
             if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
             return hr;
         }
@@ -3109,7 +3345,11 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     if (!inst->handle) {
         /* Need to re-create HCS system - do it in a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
-        if (!args) return E_OUTOFMEMORY;
+        HANDLE thread;
+        if (!args) {
+            InterlockedExchange(&inst->management_busy, 0);
+            return E_OUTOFMEMORY;
+        }
         args->vm = inst;
         wcscpy_s(args->config.name, 256, inst->name);
         wcscpy_s(args->config.os_type, 32, inst->os_type);
@@ -3127,24 +3367,34 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
-        CloseHandle(CreateThread(NULL, 0, start_vm_thread, args, 0, NULL));
+        thread = CreateThread(NULL, 0, start_vm_thread, args, 0, NULL);
+        if (!thread) {
+            HRESULT create_hr = HRESULT_FROM_WIN32(GetLastError());
+            free(args);
+            InterlockedExchange(&inst->management_busy, 0);
+            return create_hr;
+        }
+        CloseHandle(thread);
     } else {
         HRESULT hr = hcs_start_vm(inst);
         if (hr == (HRESULT)0x80370110L && inst->handle) {
             hcs_terminate_vm(inst);
             hcs_close_vm(inst);
+            InterlockedExchange(&inst->management_busy, 0);
             return asb_vm_start(vm, -1, -1, NULL);
         }
         if (FAILED(hr)) {
             asb_log(L"Error: Failed to start VM (0x%08X)", hr);
             if (hr == (HRESULT)0x800705AF)
                 asb_alert(L"The host doesn't have enough resources to start this VM.");
+            InterlockedExchange(&inst->management_busy, 0);
             return hr;
         }
         asb_log(L"VM \"%s\" started.", inst->name);
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
+        InterlockedExchange(&inst->management_busy, 0);
         if (g_state_cb) g_state_cb(vm, TRUE, g_state_ud);
     }
 
@@ -3232,6 +3482,11 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     inst = &g_vms[idx];
+    if (InterlockedCompareExchange(&g_management_active, 0, 0) != 0 ||
+        InterlockedCompareExchange(&inst->management_busy, 0, 0) != 0) {
+        asb_log(L"Cannot delete a VM while a storage or disk operation is active.");
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
 
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
@@ -3380,6 +3635,36 @@ ASB_API DWORD asb_vm_ssh_port(AsbVm vm)
     return inst ? inst->ssh_port : 0;
 }
 
+ASB_API const wchar_t *asb_vm_image_path(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->image_path : L"";
+}
+
+ASB_API const wchar_t *asb_vm_vhdx_path(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->vhdx_path : L"";
+}
+
+ASB_API BOOL asb_vm_auto_open_display(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->auto_open_display : FALSE;
+}
+
+ASB_API BOOL asb_vm_management_busy(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? (InterlockedCompareExchange(&inst->management_busy, 0, 0) != 0) : FALSE;
+}
+
+ASB_API DWORD asb_vm_guest_grow_target_gb(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->guest_grow_target_gb : 0;
+}
+
 /* ---- VM Config Editing ---- */
 
 ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name)
@@ -3389,7 +3674,7 @@ ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name)
     int i;
     if (idx < 0) return E_INVALIDARG;
     inst = &g_vms[idx];
-    if (inst->running) return E_ACCESSDENIED;
+    if (inst->running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
     if (!name || name[0] == L'\0') return E_INVALIDARG;
 
     for (i = 0; i < g_vm_count; i++) {
@@ -3408,7 +3693,7 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (g_vms[idx].running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
     if (ram_mb < 4000) ram_mb = 4000;
     g_vms[idx].ram_mb = ram_mb;
     save_vm_list();
@@ -3420,7 +3705,7 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (g_vms[idx].running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
     if (cores < 1) cores = 1;
     g_vms[idx].cpu_cores = cores;
     save_vm_list();
@@ -3432,7 +3717,7 @@ ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (g_vms[idx].running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
     g_vms[idx].gpu_mode = gpu_mode;
     wcscpy_s(g_vms[idx].gpu_name, 256, gpu_mode == GPU_MIRROR ? L"Try all" :
                                         gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
@@ -3445,12 +3730,216 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (g_vms[idx].running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
     if (mode < 0 || mode > 3) return E_INVALIDARG;
     g_vms[idx].network_mode = mode;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
+}
+
+ASB_API HRESULT asb_vm_set_installer_iso(AsbVm vm, const wchar_t *path)
+{
+    VmInstance *inst;
+    DWORD attrs;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    if (inst->running || inst->building_vhdx || asb_vm_management_busy(vm))
+        return E_ACCESSDENIED;
+    if (path && path[0]) {
+        const wchar_t *ext = wcsrchr(path, L'.');
+        attrs = GetFileAttributesW(path);
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+            !ext || _wcsicmp(ext, L".iso") != 0)
+            return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        wcscpy_s(inst->image_path, MAX_PATH, path);
+        wcscpy_s(g_last_iso_path, MAX_PATH, path);
+        asb_log(L"Installer ISO attached to \"%s\": %s", inst->name, path);
+    } else {
+        inst->image_path[0] = L'\0';
+        asb_log(L"Installer ISO ejected from \"%s\". The host file was not deleted.", inst->name);
+    }
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_set_auto_open_display(AsbVm vm, BOOL enabled)
+{
+    VmInstance *inst;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    inst->auto_open_display = enabled ? TRUE : FALSE;
+    if (!enabled) idd_probe_stop(inst);
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+static HRESULT management_begin(VmInstance *inst, BOOL require_closed_handle)
+{
+    if (!inst) return E_INVALIDARG;
+    if (inst->running || inst->building_vhdx ||
+        (require_closed_handle && inst->handle))
+        return E_ACCESSDENIED;
+    if (InterlockedCompareExchange(&g_management_active, 1, 0) != 0)
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    if (InterlockedCompareExchange(&inst->management_busy, 1, 0) != 0) {
+        InterlockedExchange(&g_management_active, 0);
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+    return S_OK;
+}
+
+static void management_end(VmInstance *inst)
+{
+    if (inst) InterlockedExchange(&inst->management_busy, 0);
+    InterlockedExchange(&g_management_active, 0);
+}
+
+ASB_API HRESULT asb_vm_resize_disk(AsbVm vm, DWORD new_size_gb)
+{
+    VmInstance *inst;
+    SnapshotTree *tree;
+    ULONGLONG old_bytes = 0, new_bytes = 0;
+    HRESULT hr;
+    int idx = vm_index_of(vm);
+    if (idx < 0 || new_size_gb == 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    tree = &g_snap_trees[idx];
+    hr = management_begin(inst, TRUE);
+    if (FAILED(hr)) return hr;
+    if (tree->count > 0 || tree->base_branch_count > 0) {
+        asb_log(L"Disk resize blocked: delete every checkpoint and branch first.");
+        hr = HRESULT_FROM_WIN32(ERROR_DEPENDENT_RESOURCE_EXISTS);
+        goto done;
+    }
+    if (new_size_gb <= inst->hdd_gb) {
+        hr = E_INVALIDARG;
+        goto done;
+    }
+    asb_log(L"Growing disk for \"%s\" from %lu GB to %lu GB...",
+            inst->name, inst->hdd_gb, new_size_gb);
+    hr = vhdx_resize_grow(inst->vhdx_path, new_size_gb, &old_bytes, &new_bytes);
+    if (FAILED(hr)) {
+        asb_log(L"Disk resize failed for \"%s\" (0x%08X).", inst->name, hr);
+        goto done;
+    }
+    inst->hdd_gb = (DWORD)(new_bytes / (1024ULL * 1024ULL * 1024ULL));
+    inst->guest_grow_target_gb = inst->hdd_gb;
+    if (!save_vm_list())
+        asb_log(L"Warning: disk grew, but the new size could not be persisted.");
+    asb_log(L"Disk for \"%s\" is now %lu GB. Guest expansion will be attempted on next boot.",
+            inst->name, inst->hdd_gb);
+done:
+    management_end(inst);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return hr;
+}
+
+ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
+{
+    VmInstance *inst;
+    SnapshotTree *tree;
+    SnapshotTree tree_backup, relocated_tree;
+    VmInstance relocated_inst;
+    wchar_t old_root[MAX_PATH], new_root[MAX_PATH];
+    wchar_t old_vhdx[MAX_PATH], old_image[MAX_PATH], old_resources[MAX_PATH];
+    wchar_t *slash;
+    ULONGLONG total = 0, free_bytes = 0;
+    ULARGE_INTEGER free_space;
+    DWORD attrs;
+    HRESULT hr;
+    int idx = vm_index_of(vm);
+    if (idx < 0 || !destination_parent || !destination_parent[0]) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    tree = &g_snap_trees[idx];
+    if (inst->is_template) return E_NOTIMPL;
+    hr = management_begin(inst, TRUE);
+    if (FAILED(hr)) return hr;
+
+    attrs = GetFileAttributesW(destination_parent);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        hr = HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND); goto done;
+    }
+    if (tree->base_dir[0]) {
+        wcscpy_s(old_root, MAX_PATH, tree->base_dir);
+        slash = wcsrchr(old_root, L'\\');
+        if (!slash) { hr = E_INVALIDARG; goto done; }
+        *slash = L'\0';
+    } else {
+        wcscpy_s(old_root, MAX_PATH, inst->vhdx_path);
+        slash = wcsrchr(old_root, L'\\');
+        if (!slash) { hr = E_INVALIDARG; goto done; }
+        *slash = L'\0';
+    }
+    if (!path_join(new_root, MAX_PATH, destination_parent, inst->name)) {
+        hr = HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE); goto done;
+    }
+    if (_wcsicmp(old_root, new_root) == 0) { hr = S_FALSE; goto done; }
+    if (path_is_within(new_root, old_root)) {
+        hr = HRESULT_FROM_WIN32(ERROR_INVALID_NAME); goto done;
+    }
+    if (GetFileAttributesW(new_root) != INVALID_FILE_ATTRIBUTES) {
+        hr = HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS); goto done;
+    }
+    hr = directory_size_bytes(old_root, &total);
+    if (FAILED(hr)) goto done;
+    if (!GetDiskFreeSpaceExW(destination_parent, &free_space, NULL, NULL)) {
+        hr = HRESULT_FROM_WIN32(GetLastError()); goto done;
+    }
+    free_bytes = free_space.QuadPart;
+    if (free_bytes < total) {
+        hr = HRESULT_FROM_WIN32(ERROR_DISK_FULL); goto done;
+    }
+
+    asb_log(L"Moving storage for \"%s\" to %s (copy and SHA-256 verify)...",
+            inst->name, new_root);
+    hr = copy_tree_verified(old_root, new_root);
+    if (FAILED(hr)) {
+        remove_dir_recursive(new_root);
+        asb_log(L"Storage copy failed for \"%s\" (0x%08X); source was kept.", inst->name, hr);
+        goto done;
+    }
+
+    tree_backup = *tree;
+    relocated_tree = *tree;
+    relocated_inst = *inst;
+    wcscpy_s(old_vhdx, MAX_PATH, inst->vhdx_path);
+    wcscpy_s(old_image, MAX_PATH, inst->image_path);
+    wcscpy_s(old_resources, MAX_PATH, inst->resources_iso_path);
+    hr = snapshot_relocate(&relocated_tree, &relocated_inst, old_root, new_root);
+    if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst.image_path, MAX_PATH, old_root, new_root);
+    if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst.resources_iso_path, MAX_PATH, old_root, new_root);
+    if (SUCCEEDED(hr)) {
+        *tree = relocated_tree;
+        wcscpy_s(inst->vhdx_path, MAX_PATH, relocated_inst.vhdx_path);
+        wcscpy_s(inst->image_path, MAX_PATH, relocated_inst.image_path);
+        wcscpy_s(inst->resources_iso_path, MAX_PATH, relocated_inst.resources_iso_path);
+    }
+    if (FAILED(hr) || !save_vm_list()) {
+        if (SUCCEEDED(hr)) hr = HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+        *tree = tree_backup;
+        wcscpy_s(inst->vhdx_path, MAX_PATH, old_vhdx);
+        wcscpy_s(inst->image_path, MAX_PATH, old_image);
+        wcscpy_s(inst->resources_iso_path, MAX_PATH, old_resources);
+        remove_dir_recursive(new_root);
+        asb_log(L"Storage move commit failed for \"%s\" (0x%08X); source was kept.", inst->name, hr);
+        goto done;
+    }
+
+    remove_dir_recursive(old_root);
+    if (GetFileAttributesW(old_root) != INVALID_FILE_ATTRIBUTES)
+        asb_log(L"Warning: VM now uses %s, but the old tree could not be fully removed: %s",
+                new_root, old_root);
+    else
+        asb_log(L"Storage move complete for \"%s\": %s", inst->name, new_root);
+done:
+    management_end(inst);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return hr;
 }
 
 /* ---- Snapshots ---- */
@@ -3461,19 +3950,21 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     int idx = vm_index_of(vm);
     wchar_t snap_name[128];
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
+    if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm)) {
+        asb_log(L"VM must be stopped and idle to create a checkpoint."); return E_ACCESSDENIED;
+    }
 
     if (name && name[0] != L'\0')
         wcscpy_s(snap_name, 128, name);
     else
-        swprintf_s(snap_name, 128, L"Snapshot %d", g_snap_trees[idx].count + 1);
+        swprintf_s(snap_name, 128, L"Checkpoint %d", g_snap_trees[idx].count + 1);
 
-    asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, g_vms[idx].name);
+    asb_log(L"Creating checkpoint \"%s\" for VM \"%s\"...", snap_name, g_vms[idx].name);
     hr = snapshot_take(&g_snap_trees[idx], &g_vms[idx], snap_name);
     if (FAILED(hr))
-        asb_log(L"Error: Snapshot failed (0x%08X)", hr);
+        asb_log(L"Error: Checkpoint failed (0x%08X)", hr);
     else
-        asb_log(L"Snapshot \"%s\" created.", snap_name);
+        asb_log(L"Checkpoint \"%s\" created.", snap_name);
 
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
@@ -3485,12 +3976,19 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (snap_idx < 0) { asb_log(L"Select a snapshot to delete."); return E_INVALIDARG; }
+    if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
+        return E_ACCESSDENIED;
+    if (snap_idx < 0) { asb_log(L"Select a checkpoint to delete."); return E_INVALIDARG; }
+    if (snap_idx >= g_snap_trees[idx].count) return E_INVALIDARG;
+    if (g_snap_trees[idx].nodes[snap_idx].branch_count > 0) {
+        asb_log(L"Delete every child branch before deleting this checkpoint.");
+        return HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY);
+    }
 
-    asb_log(L"Deleting snapshot %d...", snap_idx);
+    asb_log(L"Deleting checkpoint %d...", snap_idx);
     hr = snapshot_delete(&g_snap_trees[idx], &g_vms[idx], snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
-    else asb_log(L"Snapshot deleted.");
+    else asb_log(L"Checkpoint deleted.");
 
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
@@ -3502,6 +4000,8 @@ ASB_API HRESULT asb_snap_new_branch(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
+        return E_ACCESSDENIED;
 
     hr = snapshot_new_branch(&g_snap_trees[idx], &g_vms[idx], snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to create branch (0x%08X)", hr);
@@ -3516,6 +4016,8 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
+        return E_ACCESSDENIED;
 
     asb_log(L"Deleting branch %d of %s...", branch_idx,
             snap_idx == -2 ? L"base"
@@ -3536,6 +4038,8 @@ ASB_API HRESULT asb_snap_rename(AsbVm vm, int snap_idx, int branch_idx,
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
+        return E_ACCESSDENIED;
 
     hr = snapshot_rename(&g_snap_trees[idx], snap_idx, branch_idx, new_name);
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);

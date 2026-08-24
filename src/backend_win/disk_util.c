@@ -160,6 +160,95 @@ HRESULT vhdx_merge(const wchar_t *child_path)
     return S_OK;
 }
 
+HRESULT vhdx_resize_grow(const wchar_t *path, ULONGLONG new_size_gb,
+                         ULONGLONG *old_size_bytes, ULONGLONG *new_size_bytes)
+{
+    VIRTUAL_STORAGE_TYPE storage_type;
+    OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+    GET_VIRTUAL_DISK_INFO info;
+    RESIZE_VIRTUAL_DISK_PARAMETERS resize_params;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    ULONGLONG requested;
+    DWORD result, info_size;
+
+    if (!path || !path[0] || new_size_gb == 0 ||
+        new_size_gb > (~0ULL / (1024ULL * 1024ULL * 1024ULL)))
+        return E_INVALIDARG;
+
+    requested = new_size_gb * 1024ULL * 1024ULL * 1024ULL;
+    storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storage_type.VendorId = VHDX_VENDOR_MS;
+    ZeroMemory(&open_params, sizeof(open_params));
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+
+    result = OpenVirtualDisk(&storage_type, path,
+        VIRTUAL_DISK_ACCESS_GET_INFO | VIRTUAL_DISK_ACCESS_METAOPS,
+        OPEN_VIRTUAL_DISK_FLAG_NONE, &open_params, &handle);
+    if (result != ERROR_SUCCESS)
+        return HRESULT_FROM_WIN32(result);
+
+    ZeroMemory(&info, sizeof(info));
+    info.Version = GET_VIRTUAL_DISK_INFO_SIZE;
+    info_size = sizeof(info);
+    result = GetVirtualDiskInformation(handle, &info_size, &info, NULL);
+    if (result != ERROR_SUCCESS) {
+        CloseHandle(handle);
+        return HRESULT_FROM_WIN32(result);
+    }
+    if (old_size_bytes) *old_size_bytes = info.Size.VirtualSize;
+    if (requested <= info.Size.VirtualSize) {
+        CloseHandle(handle);
+        return E_INVALIDARG;
+    }
+
+    ZeroMemory(&resize_params, sizeof(resize_params));
+    resize_params.Version = RESIZE_VIRTUAL_DISK_VERSION_1;
+    resize_params.Version1.NewSize = requested;
+    result = ResizeVirtualDisk(handle, RESIZE_VIRTUAL_DISK_FLAG_NONE,
+                               &resize_params, NULL);
+    if (result == ERROR_SUCCESS) {
+        ZeroMemory(&info, sizeof(info));
+        info.Version = GET_VIRTUAL_DISK_INFO_SIZE;
+        info_size = sizeof(info);
+        result = GetVirtualDiskInformation(handle, &info_size, &info, NULL);
+        if (result == ERROR_SUCCESS && info.Size.VirtualSize < requested)
+            result = ERROR_INVALID_DATA;
+    }
+    if (result == ERROR_SUCCESS && new_size_bytes)
+        *new_size_bytes = info.Size.VirtualSize;
+    CloseHandle(handle);
+    return result == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(result);
+}
+
+HRESULT vhdx_set_parent_path(const wchar_t *child_path, const wchar_t *parent_path)
+{
+    VIRTUAL_STORAGE_TYPE storage_type;
+    OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+    SET_VIRTUAL_DISK_INFO info;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    DWORD result;
+
+    if (!child_path || !child_path[0] || !parent_path || !parent_path[0])
+        return E_INVALIDARG;
+
+    storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storage_type.VendorId = VHDX_VENDOR_MS;
+    ZeroMemory(&open_params, sizeof(open_params));
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+    result = OpenVirtualDisk(&storage_type, child_path,
+        VIRTUAL_DISK_ACCESS_METAOPS,
+        OPEN_VIRTUAL_DISK_FLAG_NO_PARENTS, &open_params, &handle);
+    if (result != ERROR_SUCCESS)
+        return HRESULT_FROM_WIN32(result);
+
+    ZeroMemory(&info, sizeof(info));
+    info.Version = SET_VIRTUAL_DISK_INFO_PARENT_PATH;
+    info.ParentFilePath = parent_path;
+    result = SetVirtualDiskInformation(handle, &info);
+    CloseHandle(handle);
+    return result == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(result);
+}
+
 /* ---- Resources ISO for unattended install ---- */
 
 /* Windows unattend base64 password encoding:

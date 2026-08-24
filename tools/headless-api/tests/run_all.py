@@ -110,6 +110,8 @@ results = {}   # label -> list of failures ([] == pass)
 
 if RUN_STATIC:
     print("\n" + "=" * 70 + "\nSTATIC (no-VM) CHECKS\n" + "=" * 70, flush=True)
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_manage_contract.py")], cwd=HERE)
+    results["manage-contract"] = [] if p.returncode == 0 else ["test_manage_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_and_validation.py")], cwd=HERE)
     results["static"] = [] if p.returncode == 0 else ["test_host_and_validation.py exit %d" % p.returncode]
 

@@ -8,7 +8,7 @@
 </head>
 <!-- spellcheck="false" inherits to all descendants; the per-field
      autocorrect/autocapitalize attrs (WebKit/Safari extensions) stop macOS from
-     rewriting VM names, usernames, paths, and snapshot names as you type. -->
+     rewriting VM names, usernames, paths, and checkpoint names as you type. -->
 <body spellcheck="false" autocorrect="off" autocapitalize="off">
 
 <!-- Virtual Machines -->
@@ -29,13 +29,14 @@
                 <th>HDD (GB)</th>
                 <th>GPU</th>
                 <th>Network</th>
-                <th class="win-only">Snapshot</th>
+                <th class="win-host-only">Checkpoint</th>
                 <th class="icon-col">&#x25B6;&#xFE0F;</th>
                 <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
                 <th class="icon-col" title="SSH">&gt;_</th>
                 <th class="icon-col">&#x23FB;</th>
                 <th class="icon-col">&#x2715;&#xFE0F;</th>
                 <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
+                <th class="icon-col win-host-only" title="Manage">&#x2699;&#xFE0F;</th>
                 <th class="icon-col">&#x270F;&#xFE0F;</th>
             </tr></thead>
             <tbody id="vm-tbody"></tbody>
@@ -167,6 +168,68 @@
             <button onclick="closeCreateModal()">Cancel</button>
             <button id="btn-create-template" class="win-only" disabled onclick="onCreateTemplate()">Build Template</button>
             <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
+        </div>
+    </div>
+</div>
+
+<!-- Per-VM management modal (Windows host only) -->
+<div class="modal-overlay win-host-only" id="manage-vm-overlay">
+    <div class="modal manage-modal">
+        <h3>Manage <span id="manage-vm-name"></span></h3>
+        <p class="manage-state" id="manage-state"></p>
+
+        <fieldset>
+            <legend>Installer ISO</legend>
+            <div class="manage-row">
+                <input type="text" id="manage-iso-path" placeholder="No installer ISO attached" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button onclick="sendCmd('browseManageIso')">Browse...</button>
+                <button id="manage-iso-attach" class="primary" onclick="attachManageIso()">Attach</button>
+                <button id="manage-iso-eject" onclick="ejectManageIso()">Eject</button>
+            </div>
+            <small>Eject detaches the installer media only. It never deletes the host file or resources.iso.</small>
+        </fieldset>
+
+        <fieldset>
+            <legend>Managed storage</legend>
+            <label>Current folder</label>
+            <input type="text" id="manage-storage-current" readonly>
+            <label>Destination parent</label>
+            <div class="manage-row">
+                <input type="text" id="manage-storage-parent" placeholder="Choose a parent folder" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button onclick="sendCmd('browseManageStorage')">Browse...</button>
+                <button id="manage-storage-move" class="primary" onclick="moveManageStorage()">Move</button>
+            </div>
+            <small>The complete VM folder is copied, SHA-256 verified, committed, then removed from its old location.</small>
+        </fieldset>
+
+        <fieldset>
+            <legend>Virtual disk</legend>
+            <div class="manage-row compact">
+                <label for="manage-disk-size">Grow from <span id="manage-disk-current"></span> GB to</label>
+                <input type="number" id="manage-disk-size" min="1" step="1"> <span>GB</span>
+                <button id="manage-disk-grow" class="primary" onclick="growManageDisk()">Grow</button>
+            </div>
+            <small id="manage-disk-note">Checkpoints and branches must be deleted first. Guest expansion is best-effort on next boot.</small>
+        </fieldset>
+
+        <fieldset>
+            <legend>Display</legend>
+            <label class="manage-check"><input type="checkbox" id="manage-auto-display" onchange="saveManageDisplay()"> Auto-open the IDD virtual monitor when this VM boots</label>
+        </fieldset>
+
+        <fieldset>
+            <legend>Checkpoints and branches</legend>
+            <div class="manage-row">
+                <select id="manage-checkpoint-select" onchange="onManageCheckpointSelection()"></select>
+                <button id="manage-checkpoint-create" onclick="createManageCheckpoint()">Create checkpoint</button>
+                <button id="manage-checkpoint-rename" onclick="renameManageCheckpoint()">Rename</button>
+                <button id="manage-checkpoint-delete" class="danger" onclick="deleteManageCheckpoint()">Delete</button>
+            </div>
+            <small>The selected checkpoint or branch is used by the row's next Start action. Delete child branches before their checkpoint.</small>
+        </fieldset>
+
+        <div class="modal-buttons">
+            <button onclick="closeManageVm()">Close</button>
         </div>
     </div>
 </div>

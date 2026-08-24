@@ -14,8 +14,9 @@ Windows features:
 - GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
-- Snapshots
-- Fixed 1080P60 display
+- Checkpoints and branches
+- Per-VM management for installer media, storage relocation, grow-only disk resizing, and display auto-open preferences
+- Fixed 1080P60 display, with displayless starts by default and an explicit monitor button
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support

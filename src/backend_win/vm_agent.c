@@ -399,6 +399,28 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
 
+        /* A host VHDX grow is irreversible, while guest partition/filesystem
+           expansion is explicitly best-effort. Attempt this request once on
+           the first agent connection after resize, then clear it regardless of
+           the reply so later boots do not retry silently. */
+        if (vm->guest_grow_target_gb) {
+            char grow_cmd[64];
+            DWORD target_gb = vm->guest_grow_target_gb;
+            sprintf_s(grow_cmd, sizeof(grow_cmd), "grow_root:%lu", target_gb);
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, grow_cmd, buf, sizeof(buf));
+            vm->guest_grow_target_gb = 0;
+            asb_save();
+            if (n <= 0) {
+                ui_log(L"Guest disk expansion for \"%s\" could not be delivered; expand it manually.", vm->name);
+                goto disconnected;
+            }
+            if (strcmp(buf, "ok") == 0)
+                ui_log(L"Guest root partition/filesystem expanded for \"%s\".", vm->name);
+            else
+                ui_log(L"Guest disk expansion failed for \"%s\" (%S); expand it manually.", vm->name, buf);
+            notify_agent_status(vm);
+        }
+
         /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
            subnet's .1; prefix length is always /24 for our NAT. */
         if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {

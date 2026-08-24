@@ -46,6 +46,23 @@ static BOOL get_branch_list(SnapshotTree *tree, int index,
     return FALSE;
 }
 
+static HRESULT relocate_path(wchar_t *path, size_t path_chars,
+                             const wchar_t *old_root, const wchar_t *new_root)
+{
+    wchar_t rewritten[MAX_PATH];
+    size_t old_len;
+    if (!path || !path[0]) return S_OK;
+    old_len = wcslen(old_root);
+    if (_wcsnicmp(path, old_root, old_len) != 0 ||
+        (path[old_len] != L'\0' && path[old_len] != L'\\'))
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    if (_snwprintf_s(rewritten, MAX_PATH, _TRUNCATE, L"%s%s", new_root,
+                     path + old_len) < 0)
+        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    wcscpy_s(path, path_chars, rewritten);
+    return S_OK;
+}
+
 /* ---- Persistence (tree.dat) ---- */
 
 /*  Format:
@@ -341,8 +358,11 @@ HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)
     BOOL need_fallback = FALSE;
 
     if (!tree || !instance) return E_INVALIDARG;
+    if (instance->running) return E_NOT_VALID_STATE;
     if (index < 0 || index >= tree->count) return E_INVALIDARG;
     if (!tree->nodes[index].valid) return E_NOT_VALID_STATE;
+    if (tree->nodes[index].branch_count > 0)
+        return HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY);
 
     /* Check if currently on any of this snapshot's branches */
     for (b = 0; b < tree->nodes[index].branch_count; b++) {
@@ -404,6 +424,7 @@ HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int ind
     int i;
 
     if (!tree || !instance) return E_INVALIDARG;
+    if (instance->running) return E_NOT_VALID_STATE;
     if (!get_branch_list(tree, index, &branches, &branch_count, &parent_vhdx))
         return E_INVALIDARG;
     if (branch_idx < 0 || branch_idx >= *branch_count || !branches[branch_idx].valid)
@@ -431,6 +452,59 @@ HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int ind
     ZeroMemory(&branches[*branch_count - 1], sizeof(BranchEntry));
     (*branch_count)--;
 
+    snapshot_save(tree);
+    return S_OK;
+}
+
+HRESULT snapshot_relocate(SnapshotTree *tree, VmInstance *instance,
+                          const wchar_t *old_root, const wchar_t *new_root)
+{
+    HRESULT hr;
+    int i, b;
+    if (!tree || !instance || !old_root || !old_root[0] || !new_root || !new_root[0])
+        return E_INVALIDARG;
+
+#define RELOCATE_FIELD(field) do { \
+    hr = relocate_path((field), MAX_PATH, old_root, new_root); \
+    if (FAILED(hr)) return hr; \
+} while (0)
+
+    RELOCATE_FIELD(instance->vhdx_path);
+    RELOCATE_FIELD(tree->base_dir);
+    if (tree->base_vhdx[0]) RELOCATE_FIELD(tree->base_vhdx);
+    for (b = 0; b < tree->base_branch_count; b++)
+        if (tree->base_branches[b].valid)
+            RELOCATE_FIELD(tree->base_branches[b].vhdx_path);
+    for (i = 0; i < tree->count; i++) {
+        if (!tree->nodes[i].valid) continue;
+        RELOCATE_FIELD(tree->nodes[i].snap_vhdx);
+        for (b = 0; b < tree->nodes[i].branch_count; b++)
+            if (tree->nodes[i].branches[b].valid)
+                RELOCATE_FIELD(tree->nodes[i].branches[b].vhdx_path);
+    }
+#undef RELOCATE_FIELD
+
+    /* Moving files does not update the absolute parent locator stored inside
+       each differencing VHDX. Repair every edge before the source tree is removed. */
+    if (tree->base_vhdx[0]) {
+        for (b = 0; b < tree->base_branch_count; b++) {
+            if (!tree->base_branches[b].valid) continue;
+            hr = vhdx_set_parent_path(tree->base_branches[b].vhdx_path,
+                                      tree->base_vhdx);
+            if (FAILED(hr)) return hr;
+        }
+        for (i = 0; i < tree->count; i++) {
+            if (!tree->nodes[i].valid) continue;
+            hr = vhdx_set_parent_path(tree->nodes[i].snap_vhdx, tree->base_vhdx);
+            if (FAILED(hr)) return hr;
+            for (b = 0; b < tree->nodes[i].branch_count; b++) {
+                if (!tree->nodes[i].branches[b].valid) continue;
+                hr = vhdx_set_parent_path(tree->nodes[i].branches[b].vhdx_path,
+                                          tree->nodes[i].snap_vhdx);
+                if (FAILED(hr)) return hr;
+            }
+        }
+    }
     snapshot_save(tree);
     return S_OK;
 }

@@ -1807,6 +1807,35 @@ static void disable_hyperv_video(AsbConn *notify_sock)
 /* Forward declaration — defined after SSH proxy section */
 static void handle_ssh_enable(AsbConn *client, const char *tag);
 
+static BOOL grow_root_partition(void)
+{
+    wchar_t cmd[1024] =
+        L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
+        L"\"$d=$env:SystemDrive.TrimEnd(':'); "
+        L"$p=Get-Partition -DriveLetter $d -ErrorAction Stop; "
+        L"$s=Get-PartitionSupportedSize -DriveLetter $d -ErrorAction Stop; "
+        L"if($p.Size -lt $s.SizeMax){Resize-Partition -DriveLetter $d -Size $s.SizeMax -ErrorAction Stop}\"";
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = 1, wait_result;
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        agent_log("grow_root: PowerShell launch failed (%lu)", GetLastError());
+        return FALSE;
+    }
+    wait_result = WaitForSingleObject(pi.hProcess, 60000);
+    if (wait_result == WAIT_OBJECT_0)
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+    else
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    agent_log("grow_root: wait=%lu exit=%lu", wait_result, exit_code);
+    return wait_result == WAIT_OBJECT_0 && exit_code == 0;
+}
+
 static void handle_client(AsbConn *client)
 {
     char buf[256];
@@ -2036,6 +2065,9 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (strncmp(cmd, "grow_root:", 10) == 0) {
+            REPLY(grow_root_partition() ? "ok" : "error:guest_grow_failed");
         }
         else {
             REPLY("error:unknown");

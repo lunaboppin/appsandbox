@@ -279,6 +279,8 @@ def run_vm_lifecycle(spec):
             if sidx is not None:
                 check("rename -> 202", c.snap_rename(name, sidx, "s1b")[0] == 202)
                 bc0 = next(x["branchCount"] for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx)
+                check("checkpoint delete blocked while child branch exists -> 500",
+                      c.snap_delete(name, sidx)[0] == 500)
                 boot_online("from snapshot s1", snap_index=sidx, branch_name="br1")   # boots a branch off s1 to online
                 graceful_down("after snapshot boot")
                 snap = next(x for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx)
@@ -287,6 +289,14 @@ def run_vm_lifecycle(spec):
                 bidx = next((b["index"] for b in branches if b["name"] == "br1"), max((b["index"] for b in branches), default=None))
                 if bidx is not None:
                     check("delete branch -> 202", c.snap_delete_branch(name, sidx, bidx)[0] == 202); time.sleep(2)
+                # Checkpoint deletion is deliberately branch-first. The initial
+                # checkpoint operation created a Default Branch, so remove every
+                # remaining child in descending index order before its parent.
+                remaining = next(x for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx).get("branches", [])
+                for br in sorted(remaining, key=lambda x: x["index"], reverse=True):
+                    check("delete remaining checkpoint branch %s -> 202" % br["index"],
+                          c.snap_delete_branch(name, sidx, br["index"])[0] == 202)
+                    time.sleep(1)
                 check("delete snapshot -> 202", c.snap_delete(name, sidx)[0] == 202); time.sleep(2)
                 check("snapshot count restored", len(c.snapshots(name)) == n0)
                 check("snapshot_*.vhdx removed from disk", len(snap_files("snapshot_")) == snap0,

@@ -80,6 +80,10 @@ typedef struct {
     BOOL        idd_ready;        /* TRUE once the agent reports the display driver is up (idd_status:ok) */
     BOOL        is_template;     /* TRUE = template VM (sysprep after install) */
     BOOL        install_complete; /* TRUE after guest agent first comes online */
+    BOOL        auto_open_display; /* TRUE = open IDD display whenever it becomes ready */
+    DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */
+    volatile LONG management_busy; /* serializes stopped-VM media/storage/disk operations */
+    wchar_t     config_passthrough[4096]; /* unrecognized vms.cfg keys */
     BOOL        test_mode;       /* TRUE = no Secure Boot (for test-signed drivers) */
     BOOL        building_vhdx;   /* TRUE during iso-patch VHDX creation */
     BOOL        vhdx_staging;    /* TRUE during file staging phase */

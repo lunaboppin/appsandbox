@@ -26,6 +26,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -61,6 +62,10 @@ static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 #define WM_SHOW_ALERT          (WM_APP + 15)
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
+#define WM_VM_MANAGE_DONE     (WM_APP + 19)
+
+#define MANAGE_OP_MOVE_STORAGE 1
+#define MANAGE_OP_RESIZE_DISK  2
 
 /* Tray */
 #define TRAY_CMD_SHOW          1
@@ -213,6 +218,25 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+    jb_string(jb, L"imagePath", v->image_path);
+    jb_string(jb, L"vhdxPath", v->vhdx_path);
+    jb_bool(jb, L"autoOpenDisplay", v->auto_open_display);
+    jb_bool(jb, L"managementBusy", asb_vm_management_busy(asb_vm_get(i)));
+    jb_int(jb, L"guestGrowTargetGb", (int)v->guest_grow_target_gb);
+    {
+        wchar_t storage_dir[MAX_PATH];
+        wchar_t *slash;
+        if (st_->base_dir[0]) {
+            wcscpy_s(storage_dir, MAX_PATH, st_->base_dir);
+            slash = wcsrchr(storage_dir, L'\\');
+            if (slash) *slash = L'\0';
+        } else {
+            wcscpy_s(storage_dir, MAX_PATH, v->vhdx_path);
+            slash = wcsrchr(storage_dir, L'\\');
+            if (slash) *slash = L'\0';
+        }
+        jb_string(jb, L"storageDir", storage_dir);
+    }
 
     /* Snapshot tree */
     {
@@ -300,11 +324,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
 
 static void send_vm_list(void)
 {
-    wchar_t buf[16384];
+    wchar_t buf[32768];
     JsonBuilder jb;
     int i, count = asb_vm_count();
 
-    jb_init(&jb, buf, 16384);
+    jb_init(&jb, buf, 32768);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"vmListChanged");
 
@@ -861,6 +885,75 @@ static DWORD WINAPI enable_feature_thread(LPVOID param)
     return 0;
 }
 
+typedef struct {
+    UINT64 vm_id;
+    int operation;
+    DWORD size_gb;
+    wchar_t path[MAX_PATH];
+    HRESULT result;
+} ManageWorkArgs;
+
+static void send_manage_result(int operation, HRESULT result)
+{
+    wchar_t buf[1024], message[512];
+    JsonBuilder jb;
+    const wchar_t *op = operation == MANAGE_OP_MOVE_STORAGE ? L"moveStorage" :
+                        operation == MANAGE_OP_RESIZE_DISK ? L"resizeDisk" : L"settings";
+    if (SUCCEEDED(result)) {
+        wcscpy_s(message, 512, result == S_FALSE ? L"No change was required." : L"Operation completed.");
+    } else {
+        _snwprintf_s(message, 512, _TRUNCATE, L"Operation failed (0x%08X). Check the application log for details.", result);
+    }
+    jb_init(&jb, buf, 1024);
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"manageResult");
+    jb_string(&jb, L"operation", op);
+    jb_bool(&jb, L"success", SUCCEEDED(result));
+    jb_string(&jb, L"message", message);
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
+static DWORD WINAPI manage_work_thread(LPVOID param)
+{
+    ManageWorkArgs *args = (ManageWorkArgs *)param;
+    VmInstance *inst = asb_find_vm_by_id(args->vm_id);
+    if (!inst) {
+        args->result = E_INVALIDARG;
+    } else if (args->operation == MANAGE_OP_MOVE_STORAGE) {
+        args->result = asb_vm_move_storage((AsbVm)inst, args->path);
+    } else if (args->operation == MANAGE_OP_RESIZE_DISK) {
+        args->result = asb_vm_resize_disk((AsbVm)inst, args->size_gb);
+    } else {
+        args->result = E_INVALIDARG;
+    }
+    PostMessageW(g_hwnd_main, WM_VM_MANAGE_DONE, 0, (LPARAM)args);
+    return 0;
+}
+
+static void start_manage_work(int vm_index, int operation,
+                              const wchar_t *path, DWORD size_gb)
+{
+    AsbVm vm = asb_vm_get(vm_index);
+    VmInstance *inst = asb_vm_instance(vm);
+    ManageWorkArgs *args;
+    HANDLE thread;
+    if (!inst) { send_manage_result(operation, E_INVALIDARG); return; }
+    args = (ManageWorkArgs *)calloc(1, sizeof(*args));
+    if (!args) { send_manage_result(operation, E_OUTOFMEMORY); return; }
+    args->vm_id = inst->unique_id;
+    args->operation = operation;
+    args->size_gb = size_gb;
+    if (path) wcscpy_s(args->path, MAX_PATH, path);
+    thread = CreateThread(NULL, 0, manage_work_thread, args, 0, NULL);
+    if (!thread) {
+        free(args);
+        send_manage_result(operation, HRESULT_FROM_WIN32(GetLastError()));
+        return;
+    }
+    CloseHandle(thread);
+}
+
 /* ---- WebView2 message dispatch ---- */
 
 static void on_webview2_message(const wchar_t *json)
@@ -1074,6 +1167,67 @@ static void on_webview2_message(const wchar_t *json)
             jb_object_end(&jb);
             webview2_post(json_buf);
         }
+    } else if (wcscmp(action, L"browseManageIso") == 0) {
+        OPENFILENAMEW ofn;
+        wchar_t file[MAX_PATH] = { 0 };
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_hwnd_main;
+        ofn.lpstrFilter = L"ISO Files (*.iso)\0*.iso\0All Files\0*.*\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (GetOpenFileNameW(&ofn)) {
+            wchar_t json_buf[2048]; JsonBuilder jb;
+            jb_init(&jb, json_buf, 2048); jb_object_begin(&jb);
+            jb_string(&jb, L"type", L"manageBrowseResult");
+            jb_string(&jb, L"kind", L"iso"); jb_string(&jb, L"path", file);
+            jb_object_end(&jb); webview2_post(json_buf);
+        }
+    } else if (wcscmp(action, L"browseManageStorage") == 0) {
+        BROWSEINFOW bi;
+        PIDLIST_ABSOLUTE pidl;
+        wchar_t folder[MAX_PATH] = { 0 };
+        ZeroMemory(&bi, sizeof(bi));
+        bi.hwndOwner = g_hwnd_main;
+        bi.lpszTitle = L"Choose the parent folder for the VM's managed directory";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        pidl = SHBrowseForFolderW(&bi);
+        if (pidl) {
+            if (SHGetPathFromIDListW(pidl, folder)) {
+                wchar_t json_buf[2048]; JsonBuilder jb;
+                jb_init(&jb, json_buf, 2048); jb_object_begin(&jb);
+                jb_string(&jb, L"type", L"manageBrowseResult");
+                jb_string(&jb, L"kind", L"storage"); jb_string(&jb, L"path", folder);
+                jb_object_end(&jb); webview2_post(json_buf);
+            }
+            CoTaskMemFree(pidl);
+        }
+    } else if (wcscmp(action, L"setVmInstallerIso") == 0) {
+        int vi; wchar_t path[MAX_PATH] = { 0 }; HRESULT hr = E_INVALIDARG;
+        if (json_get_int(json, L"vmIndex", &vi)) {
+            json_get_string(json, L"path", path, MAX_PATH);
+            hr = asb_vm_set_installer_iso(asb_vm_get(vi), path);
+        }
+        send_manage_result(0, hr); send_vm_list();
+    } else if (wcscmp(action, L"setVmAutoOpenDisplay") == 0) {
+        int vi; BOOL enabled = FALSE; HRESULT hr = E_INVALIDARG;
+        if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
+            hr = asb_vm_set_auto_open_display(asb_vm_get(vi), enabled);
+        send_manage_result(0, hr); send_vm_list();
+    } else if (wcscmp(action, L"moveVmStorage") == 0) {
+        int vi; wchar_t parent[MAX_PATH] = { 0 };
+        if (json_get_int(json, L"vmIndex", &vi) &&
+            json_get_string(json, L"destinationParent", parent, MAX_PATH))
+            start_manage_work(vi, MANAGE_OP_MOVE_STORAGE, parent, 0);
+        else
+            send_manage_result(MANAGE_OP_MOVE_STORAGE, E_INVALIDARG);
+    } else if (wcscmp(action, L"resizeVmDisk") == 0) {
+        int vi, size;
+        if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"sizeGb", &size) && size > 0)
+            start_manage_work(vi, MANAGE_OP_RESIZE_DISK, NULL, (DWORD)size);
+        else
+            send_manage_result(MANAGE_OP_RESIZE_DISK, E_INVALIDARG);
     } else if (wcscmp(action, L"snapTake") == 0) {
         int vi;
         wchar_t sname[128] = {0};
@@ -1319,11 +1473,11 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (g_displays[i] && vm_display_is_open(g_displays[i])) {
+                if (inst->auto_open_display && g_displays[i] && vm_display_is_open(g_displays[i])) {
                     ui_log(L"Agent online - switching \"%s\" from RDP to IDD.", inst->name);
                     safe_destroy_rdp(i);
                     do_connect_idd(i);
-                } else if (!g_idd_displays[i] && !inst->shutdown_requested) {
+                } else if (inst->auto_open_display && !g_idd_displays[i] && !inst->shutdown_requested) {
                     do_connect_idd(i);
                 }
                 break;
@@ -1339,7 +1493,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
            fresh; returns NULL if the VM was deleted between PostMessage
            and our processing. */
         VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
-        if (inst && inst->running && !inst->install_complete && !inst->shutdown_requested) {
+        if (inst && inst->running && inst->auto_open_display && !inst->shutdown_requested) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
@@ -1350,6 +1504,17 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 break;
             }
         }
+        return 0;
+    }
+
+    case WM_VM_MANAGE_DONE:
+    {
+        ManageWorkArgs *args = (ManageWorkArgs *)lp;
+        if (args) {
+            send_manage_result(args->operation, args->result);
+            free(args);
+        }
+        send_vm_list();
         return 0;
     }
 

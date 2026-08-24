@@ -12,6 +12,8 @@ let minSizeReported = false;
 let lastHostInfo = null;
 let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
 let rowSigCache = {};       /* vm.name -> last render signature; skip rebuild when unchanged */
+let manageVmIndex = -1;
+let managePending = false;
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -72,7 +74,7 @@ function sendCmd(action, data) { hostBridge.send(action, data); }
  * Per-OS field visibility — including the .needs-iso picker — is driven by
  * applyOsTypeUI(), which runs on both hosts. */
 if (hostBridge.isMac) {
-    var hide = document.querySelectorAll('.win-only, .needs-linux-version');
+    var hide = document.querySelectorAll('.win-only, .win-host-only, .needs-linux-version');
     for (var i = 0; i < hide.length; i++) hide[i].style.display = 'none';
 }
 
@@ -136,12 +138,14 @@ window.onHostMessage = function(msg) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
+        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
+        case 'manageBrowseResult': onManageBrowseResult(msg); break;
+        case 'manageResult':  onManageResult(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -635,6 +639,8 @@ document.addEventListener('keydown', function(e) {
     if (e.key !== 'Escape') return;
     if (document.getElementById('create-vm-overlay').classList.contains('active')) {
         closeCreateModal();
+    } else if (document.getElementById('manage-vm-overlay').classList.contains('active')) {
+        closeManageVm();
     }
 });
 
@@ -748,17 +754,17 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
-    if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
+    if (!hostBridge.isMac) cells.push(makeCheckpointSummaryCell(vm, i));
     cells.push(
-        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
+        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld && !vm.managementBusy, (function(vmIdx, sv, vmObj) { return function() {
             var p = parseSnapValue(sv);
             if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
                 /* Creating a new branch — prompt for name */
-                var parentName = p.snapIndex === -2 ? 'Base' : ((vmObj.snapshots && vmObj.snapshots[p.snapIndex]) ? vmObj.snapshots[p.snapIndex].name : 'Snapshot');
+                var parentName = p.snapIndex === -2 ? 'Base' : ((vmObj.snapshots && vmObj.snapshots[p.snapIndex]) ? vmObj.snapshots[p.snapIndex].name : 'Checkpoint');
                 var now = new Date();
                 var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
                 var defaultName = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
-                showModal('New Branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the base snapshot.', 'Boot', {
+                showModal('New Branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the checkpoint.', 'Boot', {
                     confirmClass: 'primary',
                     input: { label: 'Branch name:', value: defaultName }
                 }).then(function(result) {
@@ -769,13 +775,14 @@ function buildRowCells(vm, i, statusTd) {
             } else {
                 sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
             }
-        }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected snapshot/branch)'),
+        }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected checkpoint/branch)'),
         makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
-        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
+        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld && !vm.managementBusy, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
+        makeIconCell('manage', '\u2699\uFE0F', !bld, function() { openManageVm(i); }, '', 'Manage installer media, storage, disk, display, and checkpoints'),
+        makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld && !vm.managementBusy, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped and idle'),
     );
     return cells;
 }
@@ -789,7 +796,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 16 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -836,11 +843,12 @@ function renderVmTable() {
 
         var sig = [
             i === selectedVm, editModeRow === i,
-            vm.running, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
+            vm.running, vm.buildingVhdx, vm.managementBusy, vm.shuttingDown, vm.agentOnline,
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuName, vm.networkMode,
+            vm.imagePath, vm.storageDir, vm.autoOpenDisplay, vm.managementBusy,
             selectedSnap[i] || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -1073,7 +1081,7 @@ function onDeleteVm(idx) {
     if (!vm) return;
     showModal(
         'Confirm Delete',
-        'Are you sure you want to delete VM "' + vm.name + '"?\n\nThis will permanently delete all disk data and snapshots.',
+        'Are you sure you want to delete VM "' + vm.name + '"?\n\nThis will permanently delete all disk data and checkpoints.',
         'Delete'
     ).then(function(confirmed) {
         if (confirmed) {
@@ -1082,7 +1090,254 @@ function onDeleteVm(idx) {
     });
 }
 
-/* ---- Snapshots ---- */
+/* ---- Per-VM management (Windows host) ---- */
+
+function currentCheckpointLabel(vm) {
+    var snaps = vm.snapshots || [];
+    var baseBranches = vm.baseBranches || [];
+    if (vm.snapCurrent >= 0 && snaps[vm.snapCurrent]) {
+        var label = snaps[vm.snapCurrent].name;
+        var branches = snaps[vm.snapCurrent].branches || [];
+        if (vm.snapCurrentBranch >= 0 && branches[vm.snapCurrentBranch])
+            label += ' / ' + (branches[vm.snapCurrentBranch].name || 'branch ' + (vm.snapCurrentBranch + 1));
+        return label;
+    }
+    if (vm.snapCurrent === -2) {
+        var base = 'Base';
+        if (vm.snapCurrentBranch >= 0 && baseBranches[vm.snapCurrentBranch])
+            base += ' / ' + (baseBranches[vm.snapCurrentBranch].name || 'branch ' + (vm.snapCurrentBranch + 1));
+        return base;
+    }
+    return 'Base';
+}
+
+function makeCheckpointSummaryCell(vm, vmIdx) {
+    var td = document.createElement('td');
+    td.className = 'checkpoint-summary-cell';
+    var button = document.createElement('button');
+    button.className = 'checkpoint-summary';
+    var count = (vm.snapshots || []).length;
+    button.textContent = count ? currentCheckpointLabel(vm) + ' (' + count + ')' : 'None';
+    button.title = 'Open Manage to create, select, rename, or delete checkpoints and branches';
+    button.onclick = function(e) { e.stopPropagation(); openManageVm(vmIdx); };
+    td.appendChild(button);
+    return td;
+}
+
+function openManageVm(idx) {
+    if (hostBridge.isMac || !vms[idx]) return;
+    manageVmIndex = idx;
+    managePending = false;
+    document.getElementById('manage-vm-overlay').classList.add('active');
+    refreshManageVm(true);
+}
+
+function closeManageVm() {
+    if (managePending) return;
+    document.getElementById('manage-vm-overlay').classList.remove('active');
+    manageVmIndex = -1;
+}
+
+function setManageDisabled(id, disabled) {
+    var el = document.getElementById(id);
+    if (el) el.disabled = !!disabled;
+}
+
+function populateManageCheckpointSelect(vm) {
+    var select = document.getElementById('manage-checkpoint-select');
+    var wanted = selectedSnap[manageVmIndex] || 'current';
+    var values = [];
+    select.innerHTML = '';
+    function option(value, text) {
+        var o = document.createElement('option');
+        o.value = value; o.textContent = text; select.appendChild(o); values.push(value);
+    }
+    option('current', 'Current: ' + currentCheckpointLabel(vm));
+    if (vm.hasSnapshots) {
+        option('base', 'Base [create a new branch on Start]');
+        (vm.baseBranches || []).forEach(function(br, i) {
+            option('base-' + i, 'Base / ' + (br.name || 'branch ' + (i + 1)));
+        });
+        (vm.snapshots || []).forEach(function(cp, i) {
+            option(String(i), cp.name + ' [create a new branch on Start]');
+            (cp.branches || []).forEach(function(br, b) {
+                option(i + '-' + b, cp.name + ' / ' + (br.name || 'branch ' + (b + 1)));
+            });
+        });
+    }
+    if (values.indexOf(wanted) < 0) wanted = 'current';
+    select.value = wanted;
+    selectedSnap[manageVmIndex] = wanted;
+}
+
+function refreshManageVm(forceFields) {
+    var overlay = document.getElementById('manage-vm-overlay');
+    if (!overlay || !overlay.classList.contains('active') || manageVmIndex < 0) return;
+    var vm = vms[manageVmIndex];
+    if (!vm) { closeManageVm(); return; }
+    var stoppedIdle = !vm.running && !vm.buildingVhdx && !vm.managementBusy && !managePending;
+    var hasChildren = (vm.snapshots || []).length > 0 || (vm.baseBranches || []).length > 0;
+    document.getElementById('manage-vm-name').textContent = vm.name;
+    document.getElementById('manage-state').textContent = managePending || vm.managementBusy
+        ? 'A management operation is running. Do not close the app or move these files manually.'
+        : (vm.running ? 'Stop the VM to change media, storage, disk size, or checkpoints.' : 'VM is stopped and ready to manage.');
+    if (forceFields || document.activeElement !== document.getElementById('manage-iso-path'))
+        document.getElementById('manage-iso-path').value = vm.imagePath || '';
+    document.getElementById('manage-storage-current').value = vm.storageDir || '';
+    document.getElementById('manage-disk-current').textContent = vm.hddGb;
+    var sizeInput = document.getElementById('manage-disk-size');
+    sizeInput.min = vm.hddGb + 1;
+    if (forceFields || document.activeElement !== sizeInput) sizeInput.value = vm.hddGb + 1;
+    document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
+    populateManageCheckpointSelect(vm);
+
+    ['manage-iso-attach','manage-iso-eject','manage-storage-move','manage-disk-grow',
+     'manage-checkpoint-create','manage-checkpoint-rename','manage-checkpoint-delete']
+        .forEach(function(id) { setManageDisabled(id, !stoppedIdle); });
+    setManageDisabled('manage-disk-grow', !stoppedIdle || hasChildren);
+    setManageDisabled('manage-auto-display', managePending);
+    onManageCheckpointSelection();
+}
+
+function onManageBrowseResult(msg) {
+    if (manageVmIndex < 0) return;
+    if (msg.kind === 'iso') document.getElementById('manage-iso-path').value = msg.path || '';
+    if (msg.kind === 'storage') document.getElementById('manage-storage-parent').value = msg.path || '';
+}
+
+function onManageResult(msg) {
+    managePending = false;
+    if (!msg.success) showModal('Management error', msg.message || 'Operation failed.', 'OK');
+    refreshManageVm(true);
+}
+
+function attachManageIso() {
+    var path = document.getElementById('manage-iso-path').value.trim();
+    if (!path || manageVmIndex < 0) return;
+    managePending = true; refreshManageVm(false);
+    sendCmd('setVmInstallerIso', {vmIndex: manageVmIndex, path: path});
+}
+
+function ejectManageIso() {
+    if (manageVmIndex < 0) return;
+    showModal('Eject installer ISO', 'Detach the installer ISO from this VM? The host file and resources.iso will not be deleted.', 'Eject', {confirmClass:'primary'}).then(function(ok) {
+        if (!ok) return;
+        managePending = true; refreshManageVm(false);
+        sendCmd('setVmInstallerIso', {vmIndex: manageVmIndex, path: ''});
+    });
+}
+
+function moveManageStorage() {
+    var parent = document.getElementById('manage-storage-parent').value.trim();
+    var vm = vms[manageVmIndex];
+    if (!parent || !vm) return;
+    showModal('Move managed storage', 'Copy and verify the complete VM folder under "' + parent + '", switch the configuration, then remove the old folder?', 'Move', {confirmClass:'primary'}).then(function(ok) {
+        if (!ok) return;
+        managePending = true; refreshManageVm(false);
+        sendCmd('moveVmStorage', {vmIndex: manageVmIndex, destinationParent: parent});
+    });
+}
+
+function growManageDisk() {
+    var vm = vms[manageVmIndex];
+    var size = parseInt(document.getElementById('manage-disk-size').value, 10);
+    if (!vm || isNaN(size) || size <= vm.hddGb) return;
+    showModal('Grow virtual disk', 'Grow the host VHDX from ' + vm.hddGb + ' GB to ' + size + ' GB? This cannot be undone. Guest expansion will be attempted once on next boot.', 'Grow', {confirmClass:'primary'}).then(function(ok) {
+        if (!ok) return;
+        managePending = true; refreshManageVm(false);
+        sendCmd('resizeVmDisk', {vmIndex: manageVmIndex, sizeGb: size});
+    });
+}
+
+function saveManageDisplay() {
+    if (manageVmIndex < 0) return;
+    var enabled = document.getElementById('manage-auto-display').checked;
+    managePending = true; refreshManageVm(false);
+    sendCmd('setVmAutoOpenDisplay', {
+        vmIndex: manageVmIndex,
+        enabled: enabled
+    });
+}
+
+function onManageCheckpointSelection() {
+    if (manageVmIndex < 0) return;
+    var vm = vms[manageVmIndex];
+    var select = document.getElementById('manage-checkpoint-select');
+    if (!vm || !select) return;
+    selectedSnap[manageVmIndex] = select.value;
+    var p = parseSnapValue(select.value);
+    var stoppedIdle = !vm.running && !vm.buildingVhdx && !vm.managementBusy && !managePending;
+    var canDelete = stoppedIdle && p.snapIndex !== -1 && !(p.snapIndex === -2 && p.branchIndex < 0);
+    if (p.snapIndex >= 0 && p.branchIndex < 0) {
+        var cp = (vm.snapshots || [])[p.snapIndex];
+        if (cp && (cp.branches || []).length) canDelete = false;
+    }
+    setManageDisabled('manage-checkpoint-delete', !canDelete);
+    setManageDisabled('manage-checkpoint-rename', !stoppedIdle || p.snapIndex === -1 || (p.snapIndex === -2 && p.branchIndex < 0));
+    renderVmTable();
+}
+
+function createManageCheckpoint() {
+    var vm = vms[manageVmIndex];
+    if (!vm) return;
+    var name = 'Checkpoint ' + ((vm.snapshots || []).length + 1);
+    showModal('New Checkpoint', 'Create a frozen checkpoint and its first working branch.', 'Create', {
+        confirmClass:'primary', input:{label:'Checkpoint name:', value:name}
+    }).then(function(result) {
+        if (result === false) return;
+        sendCmd('snapTake', {vmIndex:manageVmIndex, name:result});
+    });
+}
+
+function deleteManageCheckpoint() {
+    var vm = vms[manageVmIndex];
+    var p = parseSnapValue(document.getElementById('manage-checkpoint-select').value);
+    if (!vm) return;
+    if (p.branchIndex >= 0) {
+        showModal('Delete Branch', 'Delete this working branch?', 'Delete').then(function(ok) {
+            if (ok) sendCmd('snapDeleteBranch', {vmIndex:manageVmIndex, snapIndex:p.snapIndex, branchIndex:p.branchIndex});
+        });
+    } else if (p.snapIndex >= 0) {
+        var cp = (vm.snapshots || [])[p.snapIndex];
+        if (cp && (cp.branches || []).length) {
+            showModal('Checkpoint has branches', 'Delete every child branch before deleting this checkpoint.', 'OK');
+            return;
+        }
+        showModal('Delete Checkpoint', 'Delete checkpoint "' + (cp ? cp.name : '') + '"?', 'Delete').then(function(ok) {
+            if (ok) sendCmd('snapDelete', {vmIndex:manageVmIndex, snapIndex:p.snapIndex});
+        });
+    }
+}
+
+function renameManageCheckpoint() {
+    var vm = vms[manageVmIndex];
+    var p = parseSnapValue(document.getElementById('manage-checkpoint-select').value);
+    var name = '';
+    if (!vm) return;
+    if (p.snapIndex === -2 && p.branchIndex >= 0)
+        name = (vm.baseBranches[p.branchIndex] || {}).name || '';
+    else if (p.snapIndex >= 0) {
+        var cp = vm.snapshots[p.snapIndex];
+        name = p.branchIndex >= 0 ? ((cp.branches[p.branchIndex] || {}).name || '') : cp.name;
+    }
+    showModal('Rename', 'Enter a new name:', 'Rename', {confirmClass:'primary', input:{label:'Name:', value:name}}).then(function(result) {
+        if (result === false || result === name) return;
+        var data = {vmIndex:manageVmIndex, snapIndex:p.snapIndex, name:result};
+        if (p.branchIndex >= 0) data.branchIndex = p.branchIndex;
+        sendCmd('snapRename', data);
+    });
+}
+
+let manageBackdropPress = false;
+document.getElementById('manage-vm-overlay').addEventListener('mousedown', function(e) {
+    manageBackdropPress = (e.target === this);
+});
+document.getElementById('manage-vm-overlay').addEventListener('click', function(e) {
+    if (e.target === this && manageBackdropPress) closeManageVm();
+    manageBackdropPress = false;
+});
+
+/* ---- Checkpoints ---- */
 
 /* Parse select value string into {snapIndex, branchIndex} */
 function parseSnapValue(val) {
@@ -1217,7 +1472,7 @@ function makeSnapCell(vm, vmIdx) {
     takeBtn.onclick = function(e) {
         e.stopPropagation();
         var defaultName = 'Snapshot ' + (snaps.length + 1);
-        showModal('New Snapshot', 'Create a new snapshot of the base disk. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
+        showModal('New Checkpoint', 'Create a new checkpoint of the base disk. Checkpoints are frozen points in time that you can create independent branches from.', 'Create', {
             confirmClass: 'primary',
             input: { label: 'Snapshot name:', value: defaultName }
         }).then(function(result) {
@@ -1251,12 +1506,12 @@ function makeSnapCell(vm, vmIdx) {
             };
         } else {
             /* Delete entire snapshot + all branches */
-            delBtn.title = 'Delete snapshot';
+            delBtn.title = 'Delete checkpoint';
             delBtn.onclick = function(e) {
                 e.stopPropagation();
                 var snapName = snaps[parsed.snapIndex] ? snaps[parsed.snapIndex].name : '';
                 showModal('Delete Snapshot',
-                    'Delete snapshot "' + snapName + '" and all its branches?',
+                    'Delete checkpoint "' + snapName + '" and all its branches?',
                     'Delete'
                 ).then(function(confirmed) {
                     if (confirmed) {

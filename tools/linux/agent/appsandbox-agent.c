@@ -1047,6 +1047,21 @@ static void handle_gpu_query_response(int fd, int n_shares)
     agent_log("gpu_query: mounted %d/%d shares", n_mounted, n_shares);
 }
 
+static int grow_root_filesystem(void)
+{
+    const char *cmd =
+        "fstype=$(findmnt -n -o FSTYPE /) && [ \"$fstype\" = ext4 ] && "
+        "command -v growpart >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1 && "
+        "root=$(readlink -f \"$(findmnt -n -o SOURCE /)\") && "
+        "part=$(lsblk -no PARTN \"$root\" | tr -d ' ') && "
+        "parent=$(lsblk -no PKNAME \"$root\" | tr -d ' ') && "
+        "[ -n \"$part\" ] && [ -n \"$parent\" ] && "
+        "growpart \"/dev/$parent\" \"$part\" && resize2fs \"$root\"";
+    int rc = run_sync(cmd);
+    agent_log("grow_root: rc=%d", rc);
+    return rc;
+}
+
 /* ---- Per-client command dispatch ---- */
 
 static void handle_client(int fd)
@@ -1125,6 +1140,10 @@ static void handle_client(int fd)
              * it alive after that. */
             respawn_clipboard_helper();
             send_reply(fd, tag, "ok");
+        }
+        else if (strncmp(cmd, "grow_root:", 10) == 0) {
+            send_reply(fd, tag, grow_root_filesystem() == 0
+                ? "ok" : "error:guest_grow_failed");
         }
         else if (strncmp(cmd, "gpu_query_response:", 19) == 0) {
             int n_shares = atoi(cmd + 19);
