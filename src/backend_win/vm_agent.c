@@ -54,8 +54,15 @@ typedef struct AgentConn {
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
     char           cmd[2048];
     char           rsp[256];
+    DWORD          cmd_timeout_ms; /* How long the guest may take on cmd */
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
 } AgentConn;
+
+/* A guest that is executing a command runs it on the same thread that sends
+   heartbeats, so it goes quiet for the duration -- minutes, for the appliance's
+   first-boot storage setup. Silence is only a disconnect once it outlasts this
+   many missed heartbeats' worth of time (the guest beats every 5s). */
+#define AGENT_IDLE_TIMEOUT_MS 30000
 
 #define MAX_AGENTS 16
 static AgentConn g_conns[MAX_AGENTS];
@@ -98,18 +105,40 @@ static void free_conn(AgentConn *conn)
 /* ---- Line I/O ---- */
 
 /* Read a single line (up to \n) from socket. Returns length, 0 on close, -1 on error. */
-static int recv_line(SOCKET s, char *buf, int buf_size)
+/* SO_RCVTIMEO on the agent socket is deliberately short so the connection
+   thread stays responsive to conn->stop. A recv timeout is therefore NOT a
+   disconnect: it fires constantly while the guest is busy running a command
+   (it emits no heartbeats until the command returns). Treating it as one is
+   what dropped the appliance agent five seconds into every long command --
+   configure_shared_nic, the SMB mapping, appliance_ready -- leaving the host
+   with "no reply" and an agent that had never actually gone away.
+   Only silence past the caller's own deadline counts as a dead connection. */
+static int recv_line_wait(SOCKET s, char *buf, int buf_size, DWORD timeout_ms)
 {
     int pos = 0;
+    ULONGLONG deadline = GetTickCount64() +
+        (timeout_ms ? timeout_ms : AGENT_IDLE_TIMEOUT_MS);
     while (pos < buf_size - 1) {
         char c;
         int n = recv(s, &c, 1, 0);
+        if (n < 0) {
+            int err = WSAGetLastError();
+            if (err != WSAETIMEDOUT && err != WSAEWOULDBLOCK) return n;
+            if (GetTickCount64() >= deadline) return -1;
+            if (err == WSAEWOULDBLOCK) Sleep(50);   /* never spin */
+            continue;
+        }
         if (n <= 0) return n;
         if (c == '\n') break;
         if (c != '\r') buf[pos++] = c;
     }
     buf[pos] = '\0';
     return pos;
+}
+
+static int recv_line(SOCKET s, char *buf, int buf_size)
+{
+    return recv_line_wait(s, buf, buf_size, 0);
 }
 
 static int send_line(SOCKET s, const char *msg)
@@ -323,7 +352,8 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
    Processes any interleaved async messages while waiting.
    Returns: response length on success, 0 on close, -1 on error. */
 static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
-                           const char *cmd, char *rsp, int rsp_size)
+                           const char *cmd, char *rsp, int rsp_size,
+                           DWORD timeout_ms)
 {
     char tagged[4096];
     char prefix[32];
@@ -337,7 +367,7 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
     if (send_line(s, tagged) <= 0) return -1;
 
     for (;;) {
-        n = recv_line(s, rsp, rsp_size);
+        n = recv_line_wait(s, rsp, rsp_size, timeout_ms);
         if (n <= 0) return n;
 
         if (strncmp(rsp, prefix, pfx_len) == 0) {
@@ -408,7 +438,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             char grow_cmd[64];
             DWORD target_gb = vm->guest_grow_target_gb;
             sprintf_s(grow_cmd, sizeof(grow_cmd), "grow_root:%lu", target_gb);
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, grow_cmd, buf, sizeof(buf));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, grow_cmd, buf, sizeof(buf), 180000);
             vm->guest_grow_target_gb = 0;
             asb_save();
             if (n <= 0) {
@@ -436,7 +466,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             vm->shared_resource_error[0] = L'\0';
             sprintf_s(net_cmd, sizeof(net_cmd), "shared_net:%s:%s",
                       vm->share_mac, vm->share_ip);
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, net_cmd, buf, sizeof(buf));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, net_cmd, buf, sizeof(buf), 120000);
             if (n <= 0) goto disconnected;
             if (strcmp(buf, "ok") != 0) {
                 swprintf_s(vm->shared_resource_error,
@@ -514,7 +544,7 @@ shared_mapping_done:
             char ip_cmd[64];
             sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
                        vm->nat_ip, hcn_nat_subnet_base());
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf), 60000);
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         }
@@ -551,7 +581,7 @@ shared_mapping_done:
 
         /* Request SSH install/enable if configured */
         if (vm->ssh_enabled) {
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "ssh_enable", buf, sizeof(buf));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "ssh_enable", buf, sizeof(buf), 600000);
             if (n <= 0) goto disconnected;
             if (strcmp(buf, "ssh_ready") == 0) {
                 vm->ssh_state = 2;
@@ -582,9 +612,12 @@ shared_mapping_done:
                 conn->cmd_seq++;
                 sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, conn->cmd);
                 if (send_line(s, tagged) <= 0) break;
-                /* Read lines until we get our tagged response */
+                /* Read lines until we get our tagged response. The caller's
+                   own timeout is the deadline: a guest running a minutes-long
+                   command is silent, not gone. */
                 for (;;) {
-                    n = recv_line(s, conn->rsp, sizeof(conn->rsp));
+                    n = recv_line_wait(s, conn->rsp, sizeof(conn->rsp),
+                                       conn->cmd_timeout_ms);
                     if (n <= 0) {
                         conn->rsp[0] = '\0';
                         conn->cmd_pending = FALSE;
@@ -734,6 +767,8 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
        per VM only one caller exists (shutdown). */
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
+    /* The connection thread must not give up on the reply before we do. */
+    conn->cmd_timeout_ms = timeout_ms;
     conn->cmd_pending = TRUE;
 
     /* timeout_ms == 0  =>  FIRE-AND-FORGET. Used for shutdown/restart, which ride
