@@ -2964,7 +2964,10 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     start_audio_monitor();
 
     set_service_status(SERVICE_RUNNING, 0);
-    agent_log("Service started.");
+    /* Stamp the build into the guest log. Without it there is no way to tell,
+       from the log alone, whether the VM is running the agent you just built
+       or one baked into its disk by an earlier install. */
+    agent_log("Service started (built " __DATE__ " " __TIME__ ").");
 
     /* Ensure VDD device is running (may need restart after logout teardown) */
     ensure_vdd_running();

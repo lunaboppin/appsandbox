@@ -997,7 +997,15 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         LeaveCriticalSection(&g_appliance.cs); return HRESULT_FROM_WIN32(ERROR_NOT_READY);
     }
     if (g_appliance.status.ready) { LeaveCriticalSection(&g_appliance.cs); return S_OK; }
-    if (g_appliance.status.state == ASB_APPLIANCE_STATE_STARTING) {
+    if (g_appliance.status.state == ASB_APPLIANCE_STATE_STARTING ||
+        g_appliance.runtime.running) {
+        /* running-but-not-READY is reachable whenever the readiness handshake
+           failed or timed out, and a client VM starting at that moment used to
+           fall through to the full start path below: hcs_destroy_stale would
+           tear down the live appliance and the ZeroMemory would wipe the
+           VmInstance that the agent and monitor threads are still using --
+           the app hangs, then crashes. Join the wait instead; with
+           wait_ready it also retries the handshake. */
         LeaveCriticalSection(&g_appliance.cs);
         goto wait_existing;
     }
