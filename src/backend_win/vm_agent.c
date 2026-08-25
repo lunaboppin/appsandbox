@@ -506,7 +506,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 sprintf_s(map_cmd, sizeof(map_cmd), "shared_smb_map:%c:%s:%s:%s:%s",
                           (char)r->drive_letter, vm->share_host_ip, share, user, password);
                 n = send_tagged_cmd(s, vm, &conn->cmd_seq,
-                                    map_cmd, buf, sizeof(buf));
+                                    map_cmd, buf, sizeof(buf), 120000);
                 SecureZeroMemory(map_cmd, sizeof(map_cmd));
                 if (n <= 0) {
                     SecureZeroMemory(password_w, sizeof(password_w));
