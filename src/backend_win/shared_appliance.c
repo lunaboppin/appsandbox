@@ -63,6 +63,7 @@ typedef struct {
     BOOL maintenance_endpoint_created;
     BOOL stopping;
     BOOL provisioning_boot;
+    volatile LONG ready_worker_active;
     LONG idle_generation;
     LONG restart_attempts;
 } SharedApplianceGlobal;
@@ -837,6 +838,20 @@ static BOOL file_size_bytes(const wchar_t *path, ULONGLONG *out)
     return TRUE;
 }
 
+static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms);
+
+/* Runs the readiness handshake for a caller that asked not to block. Re-enters
+   start_internal, which sees the appliance already STARTING and drops straight
+   into the wait. */
+static DWORD WINAPI ready_worker(LPVOID parameter)
+{
+    (void)parameter;
+    if (g_appliance.status.state == ASB_APPLIANCE_STATE_STARTING)
+        start_internal(FALSE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+    InterlockedExchange(&g_appliance.ready_worker_active, 0);
+    return 0;
+}
+
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms)
 {
     VmConfig config;
@@ -932,7 +947,20 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     hcs_start_monitor(&g_appliance.runtime);
 
 wait_existing:
-    if (!wait_ready) return S_OK;
+    /* A caller that does not want to block still needs the readiness handshake
+       to happen: appliance_ready is what initializes the data volume, creates
+       the SMB service account and publishes the shares, and nothing else does
+       it. Returning here without it -- as the GUI's Start button did -- leaves
+       the appliance running but permanently un-ready, so every resource waits
+       forever to be published. Hand the wait to a worker instead. */
+    if (!wait_ready) {
+        if (InterlockedCompareExchange(&g_appliance.ready_worker_active, 1, 0) == 0) {
+            HANDLE worker = CreateThread(NULL, 0, ready_worker, NULL, 0, NULL);
+            if (worker) CloseHandle(worker);
+            else InterlockedExchange(&g_appliance.ready_worker_active, 0);
+        }
+        return S_OK;
+    }
     deadline = GetTickCount64() + (timeout_ms ? timeout_ms : 120000);
     wait_started = GetTickCount64();
     last_report = wait_started;
