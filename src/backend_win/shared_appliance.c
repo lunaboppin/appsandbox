@@ -860,6 +860,8 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     HRESULT hr;
     ULONGLONG deadline, wait_started, last_report, last_vhdx_bytes;
     BOOL announced_agent, net_configured;
+    BOOL agent_seen;
+    int agent_connects, commands_sent;
     DWORD elapsed_seconds, saved_progress;
     char response[256] = "";
     const char *base;
@@ -966,6 +968,9 @@ wait_existing:
     last_report = wait_started;
     announced_agent = FALSE;
     net_configured = FALSE;
+    agent_seen = FALSE;
+    agent_connects = 0;
+    commands_sent = 0;
     file_size_bytes(g_appliance.status.os_vhdx_path, &last_vhdx_bytes);
     while (GetTickCount64() < deadline) {
         /* Unattended installs run 10-30+ minutes with no agent to talk to.
@@ -976,6 +981,22 @@ wait_existing:
         if (!announced_agent && g_appliance.runtime.agent_online) {
             announced_agent = TRUE;
             set_progress(90, L"Appliance agent online; verifying readiness...");
+        }
+        /* Report every connect/disconnect. A guest that reboots once during
+           first-boot setup looks identical, in a single snapshot of the log,
+           to an agent that crashes and is restarted on every command -- but
+           the two need completely different fixes, and the count tells them
+           apart. */
+        if (agent_seen != (g_appliance.runtime.agent_online != FALSE)) {
+            agent_seen = g_appliance.runtime.agent_online != FALSE;
+            if (agent_seen)
+                ui_log(L"Shared appliance: guest agent connected (connection %d).",
+                       ++agent_connects);
+            else
+                ui_log(L"Shared appliance: guest agent disconnected after %d command(s) -- "
+                       L"the appliance is rebooting or its agent restarted; waiting for it.",
+                       commands_sent);
+            net_configured = FALSE;   /* the new boot needs its adapter set up again */
         }
         if (GetTickCount64() - last_report >= 30000) {
             elapsed_seconds = (DWORD)((GetTickCount64() - wait_started) / 1000);
@@ -1027,11 +1048,15 @@ wait_existing:
                 char net_command[128];
                 sprintf_s(net_command, sizeof(net_command), "shared_net:%s:%s",
                           g_appliance.runtime.share_mac, g_appliance.runtime.share_ip);
+                commands_sent++;
                 if (appliance_send(net_command, response, sizeof(response), 60000))
                     net_configured = TRUE;
-                else
+                else if (g_appliance.runtime.agent_online)
                     ui_log(L"Shared appliance: private adapter configuration failed (%S); retrying.",
                            response[0] ? response : "no reply");
+                /* Otherwise the agent went away mid-command: the transition
+                   log above already says so, and saying "failed" here would
+                   blame the command for the disconnect. */
             }
             if (appliance_send("appliance_ready",
                               response, sizeof(response), 300000)) {
