@@ -2175,7 +2175,9 @@ static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars
         L"if(Test-Path $root){Write-Output 'storage: clearing unmounted directory on the OS disk'; "
         L"Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop}; "
         L"New-Item -ItemType Directory -Force -Path $root | Out-Null; "
-        L"Add-PartitionAccessPath -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -AccessPath $root -ErrorAction Stop}; "
+        L"Add-PartitionAccessPath -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -AccessPath $root -ErrorAction Stop; "
+        L"Write-Output 'storage: restarting LanmanServer so it sees the new mount point'; "
+        L"Restart-Service LanmanServer -Force -ErrorAction SilentlyContinue}; "
         L"$part=Get-Partition -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber; "
         L"$have=@($part.AccessPaths | ForEach-Object {$_.TrimEnd('\\')}); "
         L"if($have -notcontains $root){Write-Output ('storage: mount verify failed; paths=' + ($have -join ',')); exit 4321}; "
@@ -2313,21 +2315,39 @@ static DWORD appliance_reconcile_share(const char *arguments)
     MultiByteToWideChar(CP_UTF8, 0, copy, -1, share, _countof(share));
     wcscpy_s(directory, _countof(directory), share);
     { wchar_t *dollar = wcschr(directory, L'$'); if (dollar) *dollar = L'\0'; }
-    /* The share ACL alone is not enough: a directory created on the data volume
-       inherits NTFS rights that do not include the service account, so an rw
-       share would still refuse writes. Grant the account explicitly, and do it
-       on every reconcile so a read-only/read-write flip also takes effect. */
     swprintf_s(script, _countof(script),
+        L"try{ "
         L"$p='C:\\AppSandboxData\\%s'; New-Item -ItemType Directory -Force -Path $p | Out-Null; "
         L"$acl=Get-Acl -LiteralPath $p; "
         L"$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
         L"'AppSandboxShare','%s','ContainerInherit,ObjectInherit','None','Allow'); "
         L"$acl.SetAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl; "
         L"if(Get-SmbShare -Name '%s' -ErrorAction SilentlyContinue){Remove-SmbShare -Name '%s' -Force}; "
-        L"New-SmbShare -Name '%s' -Path $p -%sAccess 'AppSandboxShare' -EncryptData:$false | Out-Null",
+        L"New-SmbShare -Name '%s' -Path $p -%sAccess 'AppSandboxShare' -EncryptData:$false | Out-Null; "
+        L"$s=Get-SmbShare -Name '%s' -ErrorAction Stop; "
+        L"Write-Output ('share=' + $s.Name + ' path=' + $s.Path + ' scope=' + $s.ScopeName + ' pathok=' + (Test-Path -LiteralPath $s.Path)); "
+        L"exit 0}catch{Write-Output ('share error: ' + $_.Exception.Message); exit 1}",
         directory, read_only ? L"ReadAndExecute" : L"Modify",
-        share, share, share, read_only ? L"Read" : L"Full");
-    return run_powershell_wait(script, 30000);
+        share, share, share, read_only ? L"Read" : L"Full", share);
+    {
+        char out[1024];
+        DWORD rc = (DWORD)run_powershell_capture(script, 30000, out, sizeof(out));
+        if (out[0]) {
+            char *line = out, *nl;
+            while (line && *line) {
+                nl = strpbrk(line, "\r\n");
+                if (nl) *nl = '\0';
+                if (*line) {
+                    agent_log("appliance_reconcile: %s", line);
+                    agent_log_to_host("appliance_reconcile: %s", line);
+                }
+                if (!nl) break;
+                line = nl + 1;
+                while (*line == '\r' || *line == '\n') line++;
+            }
+        }
+        return rc;
+    }
 }
 
 static DWORD appliance_purge_share(const char *share_arg)
