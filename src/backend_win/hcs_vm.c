@@ -891,6 +891,7 @@ static BOOL hcs_nested_virt_supported(void)
 
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        const wchar_t *share_endpoint_guid,
+                       const char *share_mac,
                        wchar_t *json_out, size_t json_out_chars)
 {
     wchar_t vhdx_esc[MAX_PATH * 2];
@@ -954,20 +955,26 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     if (!config->is_template &&
         ((endpoint_guid && endpoint_guid[0] != L'\0') ||
          (share_endpoint_guid && share_endpoint_guid[0] != L'\0'))) {
+        wchar_t share_mac_field[64] = L"";
+        if (share_endpoint_guid && share_endpoint_guid[0] != L'\0' &&
+            share_mac && share_mac[0])
+            swprintf_s(share_mac_field, _countof(share_mac_field),
+                       L",\"MacAddress\":\"%S\"", share_mac);
         if (endpoint_guid && endpoint_guid[0] != L'\0' &&
             share_endpoint_guid && share_endpoint_guid[0] != L'\0') {
             swprintf_s(net_section, _countof(net_section),
                 L",\"NetworkAdapters\":{"
                 L"\"Default\":{\"EndpointId\":\"%s\"},"
-                L"\"SharedResources\":{\"EndpointId\":\"%s\"}}",
-                endpoint_guid, share_endpoint_guid);
-        } else {
-            const wchar_t *only = endpoint_guid && endpoint_guid[0] != L'\0'
-                                ? endpoint_guid : share_endpoint_guid;
+                L"\"SharedResources\":{\"EndpointId\":\"%s\"%s}}",
+                endpoint_guid, share_endpoint_guid, share_mac_field);
+        } else if (endpoint_guid && endpoint_guid[0] != L'\0') {
             swprintf_s(net_section, _countof(net_section),
-                L",\"NetworkAdapters\":{\"%s\":{\"EndpointId\":\"%s\"}}",
-                endpoint_guid && endpoint_guid[0] != L'\0' ? L"Default" : L"SharedResources",
-                only);
+                L",\"NetworkAdapters\":{\"Default\":{\"EndpointId\":\"%s\"}}",
+                endpoint_guid);
+        } else {
+            swprintf_s(net_section, _countof(net_section),
+                L",\"NetworkAdapters\":{\"SharedResources\":{\"EndpointId\":\"%s\"%s}}",
+                share_endpoint_guid, share_mac_field);
         }
     }
 
@@ -1316,7 +1323,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
     }
 
     /* Build JSON — endpoint_guid is set later by caller if networking is used */
-    if (!hcs_build_vm_json(config, NULL, NULL, json, _countof(json)))
+    if (!hcs_build_vm_json(config, NULL, NULL, NULL, json, _countof(json)))
         return E_FAIL;
 
     /* Dump JSON to file for debugging */
@@ -1422,6 +1429,7 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
     }
 
     if (!hcs_build_vm_json(config, endpoint_guid, share_endpoint_guid,
+                           instance ? instance->share_mac : NULL,
                            json, _countof(json)))
         return E_FAIL;
 
@@ -1450,6 +1458,20 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
         if (op) {
             hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
             hr = hcs_exec_and_wait(hr, op);
+        }
+    }
+
+    if (hr == (HRESULT)0x8037010DL && instance->share_mac[0] &&
+        share_endpoint_guid && share_endpoint_guid[0] != L'\0') {
+        ui_log(L"HCS rejected the pinned share adapter MAC; retrying without it.");
+        if (hcs_build_vm_json(config, endpoint_guid, share_endpoint_guid,
+                              NULL, json, _countof(json))) {
+            hcs_destroy_stale(config->name);
+            op = pfnCreateOp(NULL, NULL);
+            if (op) {
+                hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
+                hr = hcs_exec_and_wait(hr, op);
+            }
         }
     }
 

@@ -221,6 +221,7 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
    endpoint_guid is the HCN endpoint GUID string (NULL if no network). */
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        const wchar_t *share_endpoint_guid,
+                       const char *share_mac,
                        wchar_t *json_out, size_t json_out_chars);
 
 /* Compute the AppSandbox service GUID for a guest OS and port.
