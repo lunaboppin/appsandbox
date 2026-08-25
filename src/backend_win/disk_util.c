@@ -1601,6 +1601,31 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
    so the Windows-host and macOS-host builders stage byte-identical answer files. The
    wide inputs are converted to UTF-8 and the file is opened "wb" (the generator writes
    the UTF-8 BOM itself). */
+/* Sanitize a name into a valid Windows ComputerName: NetBIOS allows at most
+   15 characters from [A-Za-z0-9-]. Dots, spaces and everything else become
+   '-' (collapsed), trailing '-' trimmed, all-invalid input falls back to a
+   fixed name. Operates in place on the UTF-8 buffer. */
+static void sanitize_computer_name(char *name, size_t cap)
+{
+    size_t r, w = 0;
+    if (!name || cap < 5) return;
+    for (r = 0; name[r] != '\0' && w < 15; ++r) {
+        char c = name[r];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-') {
+            name[w++] = c;
+        } else if (w > 0 && name[w - 1] != '-') {
+            name[w++] = '-';
+        }
+    }
+    while (w > 0 && name[w - 1] == '-') --w;
+    if (w == 0) {
+        memcpy(name, "DESKTOP", 7);
+        w = 7;
+    }
+    name[w] = '\0';
+}
+
 BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *vm_name,
                              const wchar_t *admin_user,
@@ -1625,6 +1650,10 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
         SecureZeroMemory(pass_u, sizeof pass_u);
         return FALSE;
     }
+    /* specialize's Shell-Setup rejects invalid ComputerNames with a fatal
+       "could not parse or process the unattend answer file" and boot-loops.
+       The VM display name may be anything; the computer name may not. */
+    sanitize_computer_name(vm_u, sizeof vm_u);
 
     if (_wfopen_s(&f, output_path, L"wb") != 0 || !f) {
         SecureZeroMemory(pass_u, sizeof pass_u);
@@ -1645,6 +1674,27 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
    specialize: ComputerName + BypassNRO + testsigning + BitLocker disable
    oobeSystem: Reseal Audit (no user account, no OOBE)
    auditUser:  sysprep /generalize /oobe /shutdown /mode:vm */
+static void sanitize_computer_name_w(wchar_t *name, size_t cap)
+{
+    size_t r, w = 0;
+    if (!name || cap < 5) return;
+    for (r = 0; name[r] != L'\0' && w < 15; ++r) {
+        wchar_t c = name[r];
+        if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
+            (c >= L'0' && c <= L'9') || c == L'-') {
+            name[w++] = c;
+        } else if (w > 0 && name[w - 1] != L'-') {
+            name[w++] = L'-';
+        }
+    }
+    while (w > 0 && name[w - 1] == L'-') --w;
+    if (w == 0) {
+        memcpy(name, L"DESKTOP", 7 * sizeof(wchar_t));
+        w = 7;
+    }
+    name[w] = L'\0';
+}
+
 BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
                                       const wchar_t *vm_name,
                                       BOOL test_mode)
@@ -1656,6 +1706,7 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
         return FALSE;
 
     wcsncpy_s(comp_name, 16, vm_name, 15);
+    sanitize_computer_name_w(comp_name, 16);
 
     if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
         return FALSE;

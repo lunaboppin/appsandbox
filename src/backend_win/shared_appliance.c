@@ -625,17 +625,150 @@ static HRESULT build_ubuntu_os(const SharedApplianceConfig *config)
 
 static HRESULT build_server_core_os(const SharedApplianceConfig *config)
 {
-    wchar_t exe[MAX_PATH], resource_dir[MAX_PATH];
+    /* Offline-apply pipeline, same as client VMs: iso-patch.exe mounts the
+       Server ISO, applies the image straight onto os.vhdx and stages the
+       agent plus a VHDX-first unattend (specialize + oobeSystem). The old
+       route -- empty VHDX + bootable autounattend DVD -- dead-ended at the
+       Hyper-V UEFI "press any key to boot from CD/DVD" prompt, which no
+       unattended flow can satisfy. Image index 1 on Server composite ISOs
+       is the Standard *Core* edition, exactly what this appliance wants. */
+    wchar_t exe[MAX_PATH], res_dir[MAX_PATH], staging[MAX_PATH], file_path[MAX_PATH];
+    wchar_t manifest[MAX_PATH], cmdline[2048], line_w[512];
     wchar_t *slash;
-    HRESULT hr;
-    set_progress(10, L"Creating Windows Server Core system disk...");
-    hr = vhdx_create(g_appliance.status.os_vhdx_path, 64); if (FAILED(hr)) return hr;
-    GetModuleFileNameW(NULL, exe, _countof(exe)); slash = wcsrchr(exe, L'\\'); if (slash) *slash = L'\0';
-    swprintf_s(resource_dir, _countof(resource_dir), L"%s\\resources", exe);
-    set_progress(25, L"Creating unattended Windows Server Core media...");
-    return iso_create_server_core_resources(g_appliance.seed_iso_path,
-        APPLIANCE_VM_NAME, config->admin_user, (wchar_t *)config->admin_password,
-        resource_dir, config->windows_image_name, config->product_key);
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    SECURITY_ATTRIBUTES sa;
+    HANDLE h_read = INVALID_HANDLE_VALUE, h_write = INVALID_HANDLE_VALUE;
+    BYTE buffer[4096];
+    char line_a[512];
+    DWORD bytes_read, exit_code = ERROR_GEN_FAILURE;
+    int pos = 0, start = 0, end = 0, i;
+    BOOL have_exit = FALSE;
+    HRESULT hr = E_FAIL;
+    GpuDriverShareList no_gpu;
+
+    set_progress(10, L"Applying the Windows Server Core image to the system disk...");
+    GetModuleFileNameW(NULL, exe, _countof(exe));
+    slash = wcsrchr(exe, L'\\'); if (slash) *slash = L'\0';
+    swprintf_s(res_dir, _countof(res_dir), L"%s\\resources", exe);
+    if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
+        wcscpy_s(res_dir, _countof(res_dir), exe);
+
+    swprintf_s(staging, _countof(staging), L"%s\\_appliance_stage",
+               g_appliance.status.storage_root);
+    remove_directory_tree(staging);
+    if (!CreateDirectoryW(staging, NULL))
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    swprintf_s(file_path, _countof(file_path), L"%s\\unattend.xml", staging);
+    if (!generate_unattend_vhdx(file_path, APPLIANCE_VM_NAME, config->admin_user,
+                                config->admin_password, FALSE, L"en-US"))
+        return E_FAIL;
+    swprintf_s(file_path, _countof(file_path), L"%s\\setup.cmd", staging);
+    generate_vhdx_setup_cmd(file_path);
+    swprintf_s(file_path, _countof(file_path), L"%s\\SetupComplete.cmd", staging);
+    generate_vhdx_setupcomplete(file_path, TRUE);
+
+    ZeroMemory(&no_gpu, sizeof(no_gpu));
+    swprintf_s(manifest, _countof(manifest), L"%s\\manifest.txt", staging);
+    if (generate_vhdx_manifest(manifest, staging, res_dir, &no_gpu, TRUE) < 0)
+        return E_FAIL;
+
+    swprintf_s(cmdline, _countof(cmdline),
+               L"\"%s\\iso-patch.exe\" --to-vhdx \"%s\" 1 64 "
+               L"--output \"%s\" --stage \"%s\"",
+               exe, config->windows_iso_path,
+               g_appliance.status.os_vhdx_path, manifest);
+
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&h_read, &h_write, &sa, 0))
+        return HRESULT_FROM_WIN32(GetLastError());
+    SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&startup, sizeof(startup)); startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = h_write;
+    startup.hStdError = h_write;
+    ZeroMemory(&process, sizeof(process));
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &startup, &process)) {
+        DWORD error = GetLastError();
+        CloseHandle(h_read); CloseHandle(h_write);
+        remove_directory_tree(staging);
+        return HRESULT_FROM_WIN32(error);
+    }
+    CloseHandle(h_write); h_write = INVALID_HANDLE_VALUE;
+
+    ui_log(L"Shared appliance: applying image from \"%s\" (index 1, Core edition)...",
+           config->windows_iso_path);
+    /* Keep iso-patch's partial output when a step fails so the failure can
+       be inspected instead of silently vanishing with only an exit code. */
+    SetEnvironmentVariableW(L"ASB_KEEP_PARTIAL_VHDX", L"1");
+
+    while (ReadFile(h_read, buffer + pos, (DWORD)(_countof(buffer) - pos - 1),
+                    &bytes_read, NULL) && bytes_read > 0) {
+        end = pos + (int)bytes_read;
+        buffer[end] = '\0';
+        for (i = start; i < end; ++i) {
+            if (buffer[i] != '\n' && buffer[i] != '\r') continue;
+            buffer[i] = '\0';
+            if (i > start) {
+                int len = i - start;
+                if (len >= (int)_countof(line_a)) len = (int)_countof(line_a) - 1;
+                memcpy(line_a, buffer + start, (size_t)len);
+                line_a[len] = '\0';
+                if (strncmp(line_a, "PROGRESS:", 9) == 0) {
+                    int pct = atoi(line_a + 9);
+                    if (pct < 0) pct = 0;
+                    if (pct > 100) pct = 100;
+                    swprintf_s(line_w, _countof(line_w),
+                               L"Applying the Server Core image (%d%%)...", pct);
+                    set_progress(10 + pct / 2, line_w);
+                } else if (strncmp(line_a, "STATUS:", 7) == 0) {
+                    /* Step changes AND captured external-tool output
+                       (bcdboot/BFSVC failure text) ride the STATUS channel. */
+                    MultiByteToWideChar(CP_UTF8, 0, line_a + 7, -1,
+                                        line_w, _countof(line_w));
+                    if (line_w[0]) ui_log(L"Shared appliance: %s", line_w);
+                } else if (strncmp(line_a, "ERROR:", 6) == 0) {
+                    MultiByteToWideChar(CP_UTF8, 0, line_a + 6, -1,
+                                        line_w, _countof(line_w));
+                    ui_log(L"Shared appliance: image apply failed: %s", line_w);
+                    hr = E_FAIL;
+                } else if (strncmp(line_a, "DONE:", 5) == 0) {
+                    hr = S_OK;
+                }
+            }
+            start = i + 1;
+            if (start < end && (buffer[start] == '\n' || buffer[start] == '\r'))
+                start++;
+        }
+        if (start < end) {
+            memmove(buffer, buffer + start, (size_t)(end - start));
+            pos = end - start;
+        } else {
+            pos = 0;
+        }
+        start = 0;
+    }
+
+    WaitForSingleObject(process.hProcess, 45 * 60 * 1000);
+    if (GetExitCodeProcess(process.hProcess, &exit_code)) have_exit = TRUE;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(h_read);
+    SetEnvironmentVariableW(L"ASB_KEEP_PARTIAL_VHDX", NULL);
+    remove_directory_tree(staging);
+
+    if (SUCCEEDED(hr) && (!have_exit || exit_code != 0))
+        hr = E_FAIL;
+    if (SUCCEEDED(hr))
+        set_progress(62, L"Server Core image applied; staging complete.");
+    return hr;
 }
 
 static void fill_vm_config(VmConfig *config, BOOL provisioning)
@@ -673,13 +806,27 @@ static void cleanup_runtime_network(void)
     }
 }
 
+static BOOL file_size_bytes(const wchar_t *path, ULONGLONG *out)
+{
+    HANDLE file;
+    LARGE_INTEGER size;
+    if (!path || !path[0]) return FALSE;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    if (!GetFileSizeEx(file, &size)) { CloseHandle(file); return FALSE; }
+    CloseHandle(file);
+    *out = (ULONGLONG)size.QuadPart;
+    return TRUE;
+}
+
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms)
 {
     VmConfig config;
     wchar_t share_endpoint[64] = L"", maintenance_endpoint[64] = L"";
     char server_ip[32], server_mac[32];
     HRESULT hr;
-    ULONGLONG deadline, wait_started, last_report;
+    ULONGLONG deadline, wait_started, last_report, last_vhdx_bytes;
     BOOL announced_agent;
     DWORD elapsed_seconds, saved_progress;
     char response[256];
@@ -703,6 +850,7 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     base = hcn_share_subnet_base();
     sprintf_s(server_ip, sizeof(server_ip), "%s.2", base);
     strcpy_s(server_mac, sizeof(server_mac), "02-15-5D-A5-B0-02");
+    ui_log(L"Shared appliance: creating share network endpoint (%S)...", server_ip);
     hr = hcn_create_share_network(&g_appliance.share_network_id);
     if (SUCCEEDED(hr)) hr = hcn_create_share_server_endpoint(
         &g_appliance.share_network_id, &g_appliance.share_endpoint_id,
@@ -712,6 +860,7 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
 
     if (provisioning) {
         char nat_ip[32];
+        ui_log(L"Shared appliance: creating maintenance NAT endpoint...");
         hr = hcn_create_nat_network(&g_appliance.maintenance_network_id);
         if (SUCCEEDED(hr)) {
             sprintf_s(nat_ip, sizeof(nat_ip), "%s.254", hcn_nat_subnet_base());
@@ -731,16 +880,24 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     wcscpy_s(g_appliance.runtime.vhdx_path, MAX_PATH, g_appliance.status.os_vhdx_path);
     strcpy_s(g_appliance.runtime.share_ip, sizeof(g_appliance.runtime.share_ip), server_ip);
     strcpy_s(g_appliance.runtime.share_mac, sizeof(g_appliance.runtime.share_mac), server_mac);
+    /* Must stay within shared_resource_transport[16] INCLUDING the NUL, and
+       must equal the token vm_agent.c compares against ("appliance") or the
+       appliance runtime loses its transport identity. A previous 16-char
+       value ("appliance-server") overflowed by the NUL and fast-failed the
+       CRT on every unwrapped boot. */
     wcscpy_s(g_appliance.runtime.shared_resource_transport,
-             _countof(g_appliance.runtime.shared_resource_transport), L"appliance-server");
+             _countof(g_appliance.runtime.shared_resource_transport), L"appliance");
     fill_vm_config(&config, provisioning);
     hcs_destroy_stale(APPLIANCE_VM_NAME);
+    ui_log(L"Shared appliance: creating compute system (%S boot)...",
+           provisioning ? "provisioning" : "normal");
     hr = hcs_create_vm_with_endpoints(&config,
         maintenance_endpoint[0] ? maintenance_endpoint : NULL,
         share_endpoint, &g_appliance.runtime);
     if (FAILED(hr)) goto fail;
     hr = hcs_start_vm(&g_appliance.runtime);
     if (FAILED(hr)) goto fail;
+    ui_log(L"Shared appliance: VM started; polling for the guest agent...");
     vm_agent_start(&g_appliance.runtime);
     hcs_start_monitor(&g_appliance.runtime);
 
@@ -750,27 +907,50 @@ wait_existing:
     wait_started = GetTickCount64();
     last_report = wait_started;
     announced_agent = FALSE;
+    file_size_bytes(g_appliance.status.os_vhdx_path, &last_vhdx_bytes);
     while (GetTickCount64() < deadline) {
         /* Unattended installs run 10-30+ minutes with no agent to talk to.
            Without the heartbeat below the UI sits frozen at 65% and any
-           terminal request fails with ERROR_NOT_READY, looking like a hang. */
+           terminal request fails with ERROR_NOT_READY, looking like a hang.
+           The OS disk size is polled alongside the timer: Windows Setup
+           writing image data is the only host-visible install progress. */
         if (!announced_agent && g_appliance.runtime.agent_online) {
             announced_agent = TRUE;
             set_progress(90, L"Appliance agent online; verifying readiness...");
         }
-        if (GetTickCount64() - last_report >= 60000) {
+        if (GetTickCount64() - last_report >= 30000) {
             elapsed_seconds = (DWORD)((GetTickCount64() - wait_started) / 1000);
             EnterCriticalSection(&g_appliance.cs);
             saved_progress = g_appliance.status.progress;
             LeaveCriticalSection(&g_appliance.cs);
-            if (g_appliance.runtime.agent_online)
-                set_progress(max(saved_progress, 90), L"Verifying the shared appliance agent...");
-            else if (provisioning) {
+            if (g_appliance.runtime.agent_online) {
+                set_progress(max(saved_progress, 90),
+                             L"Verifying the shared appliance agent...");
+            } else if (provisioning) {
                 wchar_t heartbeat[256];
-                swprintf_s(heartbeat, _countof(heartbeat),
-                           L"Unattended OS install running in the appliance (%u:%02u elapsed)...",
-                           elapsed_seconds / 60, elapsed_seconds % 60);
-                set_progress(min(66 + elapsed_seconds / 60, 92), heartbeat);
+                ULONGLONG now_bytes = 0, grown_mb = 0;
+                BOOL have_size = file_size_bytes(g_appliance.status.os_vhdx_path,
+                                                 &now_bytes);
+                if (have_size && now_bytes > last_vhdx_bytes)
+                    grown_mb = (now_bytes - last_vhdx_bytes) / (1024ULL * 1024ULL);
+                if (have_size && grown_mb)
+                    swprintf_s(heartbeat, _countof(heartbeat),
+                               L"Unattended install running (%u:%02u elapsed): "
+                               L"setup wrote %I64u MB so far (%I64u MB on disk)...",
+                               elapsed_seconds / 60, elapsed_seconds % 60,
+                               grown_mb, now_bytes / (1024ULL * 1024ULL));
+                else if (have_size)
+                    swprintf_s(heartbeat, _countof(heartbeat),
+                               L"Unattended install running (%u:%02u elapsed, "
+                               L"install disk at %I64u MB)...",
+                               elapsed_seconds / 60, elapsed_seconds % 60,
+                               now_bytes / (1024ULL * 1024ULL));
+                else
+                    swprintf_s(heartbeat, _countof(heartbeat),
+                               L"Unattended install running (%u:%02u elapsed)...",
+                               elapsed_seconds / 60, elapsed_seconds % 60);
+                set_progress(min(66 + elapsed_seconds / 30, 92), heartbeat);
+                last_vhdx_bytes = now_bytes;
             }
             last_report = GetTickCount64();
         }
@@ -846,30 +1026,42 @@ static DWORD WINAPI setup_worker(LPVOID parameter)
     }
     DeleteFileW(g_appliance.status.os_vhdx_path);
     DeleteFileW(g_appliance.seed_iso_path);
-    if (args->config.backend == ASB_APPLIANCE_BACKEND_UBUNTU)
+    if (args->config.backend == ASB_APPLIANCE_BACKEND_UBUNTU) {
         hr = build_ubuntu_os(&args->config);
-    else
-        hr = build_server_core_os(&args->config);
-    if (FAILED(hr)) goto failed;
+        if (FAILED(hr)) goto failed;
 
-    set_progress(65, L"Booting appliance for unattended provisioning...");
-    {
-        _invalid_parameter_handler previous_handler;
-        begin_invalid_parameter_capture(&previous_handler);
-        hr = start_internal(TRUE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
-        hr = end_invalid_parameter_capture(previous_handler, hr);
+        set_progress(65, L"Booting appliance for unattended provisioning...");
+        {
+            _invalid_parameter_handler previous_handler;
+            begin_invalid_parameter_capture(&previous_handler);
+            hr = start_internal(TRUE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+            hr = end_invalid_parameter_capture(previous_handler, hr);
+        }
+        if (FAILED(hr)) goto failed;
+        EnterCriticalSection(&g_appliance.cs);
+        g_appliance.status.configured = TRUE;
+        save_config_locked();
+        LeaveCriticalSection(&g_appliance.cs);
+        /* Provisioning media contains one-use secrets. Remove it before the normal
+           appliance boot and drop the temporary maintenance/NAT adapter. */
+        shared_appliance_stop(FALSE);
+        DeleteFileW(g_appliance.seed_iso_path);
+        hr = start_internal(FALSE, TRUE, 120000);
+        if (FAILED(hr)) goto failed;
+    } else {
+        /* Windows Server Core is applied offline; no provisioning media and
+           no firmware boot needed. First boot runs specialize/oobeSystem and
+           brings the agent up, which can take several minutes. */
+        hr = build_server_core_os(&args->config);
+        if (FAILED(hr)) goto failed;
+        set_progress(65, L"Starting the appliance for first boot...");
+        EnterCriticalSection(&g_appliance.cs);
+        g_appliance.status.configured = TRUE;
+        save_config_locked();
+        LeaveCriticalSection(&g_appliance.cs);
+        hr = start_internal(FALSE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+        if (FAILED(hr)) goto failed;
     }
-    if (FAILED(hr)) goto failed;
-    EnterCriticalSection(&g_appliance.cs);
-    g_appliance.status.configured = TRUE;
-    save_config_locked();
-    LeaveCriticalSection(&g_appliance.cs);
-    /* Provisioning media contains one-use secrets. Remove it before the normal
-       appliance boot and drop the temporary maintenance/NAT adapter. */
-    shared_appliance_stop(FALSE);
-    DeleteFileW(g_appliance.seed_iso_path);
-    hr = start_internal(FALSE, TRUE, 120000);
-    if (FAILED(hr)) goto failed;
     EnterCriticalSection(&g_appliance.cs);
     g_appliance.status.busy = FALSE;
     save_config_locked();

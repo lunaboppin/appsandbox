@@ -172,6 +172,93 @@ static int run_command(const wchar_t *cmdline, BOOL quiet)
     return (int)exit_code;
 }
 
+/* Run a command, stream its combined stdout/stderr into the log line by
+   line, and return the process exit code (-1 if it could not be started).
+   Used for steps whose failure text matters (e.g. bcdboot prints the
+   BFSVC reason that a bare exit code hides). */
+static int run_command_logged(const wchar_t *cmdline)
+{
+    SECURITY_ATTRIBUTES sa;
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = (DWORD)-1, bytes_read;
+    wchar_t *cmd_buf;
+    wchar_t wline[1024];
+    char buf[1024];
+    size_t len;
+    int pos = 0;
+
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0))
+        return -1;
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    ZeroMemory(&pi, sizeof(pi));
+
+    len = wcslen(cmdline) + 1;
+    cmd_buf = (wchar_t *)malloc(len * sizeof(wchar_t));
+    if (!cmd_buf) {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return -1;
+    }
+    wcscpy_s(cmd_buf, len, cmdline);
+
+    if (!CreateProcessW(NULL, cmd_buf, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        log_err(L"Failed to run: %s (error %lu)", cmdline, GetLastError());
+        free(cmd_buf);
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return -1;
+    }
+    free(cmd_buf);
+    CloseHandle(hWritePipe);
+
+    while (ReadFile(hReadPipe, buf + pos, (DWORD)(sizeof(buf) - pos - 1),
+                    &bytes_read, NULL) && bytes_read > 0) {
+        int end = pos + (int)bytes_read;
+        int start = 0;
+        int ci;
+        buf[end] = '\0';
+        for (ci = start; ci < end; ci++) {
+            if (buf[ci] != '\n' && buf[ci] != '\r') continue;
+            buf[ci] = '\0';
+            if (ci > start && buf[start]) {
+                MultiByteToWideChar(CP_ACP, 0, buf + start, -1,
+                                    wline, _countof(wline));
+                log_msg(L"%s", wline);
+            }
+            start = ci + 1;
+            if (start < end && (buf[start] == '\n' || buf[start] == '\r'))
+                start++;
+        }
+        if (start < end) {
+            memmove(buf, buf + start, (size_t)(end - start));
+            pos = end - start;
+        } else {
+            pos = 0;
+        }
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hReadPipe);
+    return (int)exit_code;
+}
+
 /* Run a command, capture stdout, and report percentage progress.
    Scans output for patterns like "45.0%" and calls log_msg with updates.
    prefix: status message shown before the percentage (e.g. "Applying Windows image").
@@ -1172,9 +1259,27 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
                     L"%s\\bcdboot.exe \"%s\" /s \"%s\" /f UEFI",
                     sys_dir, windows_dir, efi_clean);
 
-        ret = run_command(cmd, TRUE);
+        ret = run_command_logged(cmd);
+        if (ret != 0) {
+            /* The host bcdboot can reject older images' boot files with an
+               opaque BAD_EXE_FORMAT (193). Retry with the image's OWN
+               bcdboot, which always matches the boot files it ships. */
+            log_msg(L"Host bcdboot failed (exit %d); retrying with the image's own bcdboot...", ret);
+            swprintf_s(cmd, 1024,
+                        L"%sWindows\\System32\\bcdboot.exe \"%s\" /s \"%s\" /f UEFI",
+                        win_mount, windows_dir, efi_clean);
+            ret = run_command_logged(cmd);
+        }
         if (ret != 0) {
             log_err(L"Failed to install boot files (bcdboot exit code %d)", ret);
+            /* Post-mortem aid: how much room is left on the ESP, so copy
+               failures are diagnosable from the log alone. */
+            {
+                ULARGE_INTEGER free_bytes;
+                if (GetDiskFreeSpaceExW(efi_clean, &free_bytes, NULL, NULL))
+                    log_msg(L"ESP free space: %I64u MB",
+                            free_bytes.QuadPart / (1024ULL * 1024ULL));
+            }
             goto cleanup;
         }
     }
@@ -1208,10 +1313,10 @@ cleanup:
         CloseHandle(iso_handle);
     }
 
-    /* If we failed, delete the partial VHDX */
-    if (exit_code != 0 && vhdx_path[0]) {
-        DeleteFileW(vhdx_path);
-    }
+    /* If we failed, keep the partial VHDX: the caller stages gigabytes of
+       image data before boot-file setup, and post-mortem access to the ESP
+       and applied tree is worth more than the disk space. */
+    (void)vhdx_path;
 
     return exit_code;
 }

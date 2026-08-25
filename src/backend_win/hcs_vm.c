@@ -970,10 +970,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        Skip when test_mode is enabled (required for test-signed drivers like VDD).
        Linux: never applies a template — the direct-ISO->VHDX build produces an
        unsigned GRUB/kernel chain, so Secure Boot would block boot. Only the
-       Windows, non-test-mode path applies the MS UEFI CA template below. */
+       Windows, non-test-mode path applies the MS UEFI CA template below.
+       The appliance skips it too: its Server Core image gains nothing from
+       Secure Boot, and applying the template into a fresh vm.gs under
+       GuestStateOnly was observed to break DVD boot ("SCSI DVD boot loader
+       failed") with older Server ISOs. */
     secureboot_section[0] = L'\0';
-    if (config->test_mode) {
-        /* No Secure Boot — allows test-signed drivers to load */
+    if (config->test_mode || config->is_appliance) {
+        /* No Secure Boot — allows test-signed drivers / older boot chains */
     } else if (is_windows) {
         wcscpy_s(secureboot_section, 512,
             L",\"ApplySecureBootTemplate\":\"Apply\""
@@ -1034,21 +1038,55 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     escape_json_path(vmgs_path, vmgs_esc, MAX_PATH * 2);
     escape_json_path(vmrs_path, vmrs_esc, MAX_PATH * 2);
 
-    /* GuestState — always included */
-    swprintf_s(guest_state_section, 1024,
-        L",\"GuestState\":{"
-        L"\"GuestStateFilePath\":\"%s\","
-        L"\"RuntimeStateFilePath\":\"%s\""
-        L"}", vmgs_esc, vmrs_esc);
+    /* GuestState — always included for client VMs; omitted for the appliance
+       together with SecuritySettings (see above): a fresh encrypted vm.gs
+       broke DVD boot during unattended provisioning. The empty files are
+       still created but simply unreferenced by the appliance document. */
+    if (config->is_appliance) {
+        guest_state_section[0] = L'\0';
+    } else {
+        swprintf_s(guest_state_section, 1024,
+            L",\"GuestState\":{"
+            L"\"GuestStateFilePath\":\"%s\","
+            L"\"RuntimeStateFilePath\":\"%s\""
+            L"}", vmgs_esc, vmrs_esc);
+    }
 
     /* VideoMonitor is REQUIRED for all OSes — vmwp.exe crashes (0xC0000005)
-       without it. No ConnectionOptions/named pipe — IDD via agent is the
-       display path. (Matches master branch hcs_vm.c.) */
-    wcscpy_s(video_section, 1024,
-        L"\"VideoMonitor\":{"
-            L"\"HorizontalResolution\":1024,"
-            L"\"VerticalResolution\":768"
-        L"},");
+       without it. For the shared appliance we also attach ConnectionOptions
+       so vmwp.exe serves the console framebuffer on \\.\pipe\<name>.BasicSession.
+       That pipe is what the UI's basic-session viewer (vm_display.c) attaches
+       to -- the only way to watch unattended provisioning, where no guest
+       agent exists yet. Client VMs stay pipe-less and use the IDD/agent
+       display path. */
+    if (config->is_appliance) {
+        wchar_t user_sid[128];
+        if (get_current_user_sid_string(user_sid, _countof(user_sid))) {
+            swprintf_s(video_section, 1024,
+                L"\"VideoMonitor\":{"
+                    L"\"HorizontalResolution\":1024,"
+                    L"\"VerticalResolution\":768,"
+                    L"\"ConnectionOptions\":{"
+                        L"\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.BasicSession\","
+                        L"\"AccessSids\":[\"%s\"]"
+                    L"}"
+                L"},",
+                config->name, user_sid);
+        } else {
+            ui_log(L"Warning: could not resolve user SID; appliance console pipe disabled");
+            wcscpy_s(video_section, 1024,
+                L"\"VideoMonitor\":{"
+                    L"\"HorizontalResolution\":1024,"
+                    L"\"VerticalResolution\":768"
+                L"},");
+        }
+    } else {
+        wcscpy_s(video_section, 1024,
+            L"\"VideoMonitor\":{"
+                L"\"HorizontalResolution\":1024,"
+                L"\"VerticalResolution\":768"
+            L"},");
+    }
 
     /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
        for Linux VMs. systemd's StandardOutput=journal+console writes
@@ -1069,10 +1107,13 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     /* ARM Windows HCS supports neither a vTPM nor guest-state isolation, so
        SecuritySettings is x64-only; on ARM the Win11 Setup TPM/SecureBoot check
-       is bypassed via the autounattend LabConfig keys (disk_util.c). */
+       is bypassed via the autounattend LabConfig keys (disk_util.c).
+       The appliance omits both as well: booting a Server ISO against a fresh
+       encrypted vm.gs (GuestStateOnly) left the firmware unable to load any
+       DVD boot loader, and a headless appliance has no use for vTPM. */
     security_section[0] = L'\0';
 #if !ASB_IS_ARM64
-    if (is_windows) {
+    if (is_windows && !config->is_appliance) {
         wcscpy_s(security_section, 512,
             L",\"SecuritySettings\":{"
             L"\"EnableTpm\":true,"
