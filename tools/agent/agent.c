@@ -1960,6 +1960,11 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         " Write-Output ('map failed user=' + $h + '\\' + $env:ASB_SMB_USER + ' target=' + $remote + ': ' + $_.Exception.Message)\r\n"
         " $t=Test-NetConnection -ComputerName $h -Port 445 -WarningAction SilentlyContinue\r\n"
         " Write-Output ('tcp445=' + $t.TcpTestSucceeded + ' src=' + $t.SourceAddress.IPAddress)\r\n"
+        " foreach($ln in @('Microsoft-Windows-SMBClient/Connectivity','Microsoft-Windows-SMBClient/Security','Microsoft-Windows-SMBClient/Operational')){\r\n"
+        "  Get-WinEvent -LogName $ln -MaxEvents 3 -ErrorAction SilentlyContinue | ForEach-Object {\r\n"
+        "   Write-Output ('evt ' + $ln.Split('/')[-1] + ' id=' + $_.Id + ' ' + (($_.Message -replace '\\s+',' ')).Substring(0,[Math]::Min(220,($_.Message -replace '\\s+',' ').Length)))\r\n"
+        "  }\r\n"
+        " }\r\n"
         " exit $c\r\n"
         "}\r\n"
         "$ready=$false;for($i=0;$i -lt 20 -and -not $ready;$i++){$ready=Test-Path ($local+'\\');if(-not $ready){Start-Sleep -Milliseconds 250}}\r\n"
@@ -1980,7 +1985,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
     SetEnvironmentVariableW(L"ASB_SMB_USER", user);
     SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
     {
-        char out[2048];
+        char out[8192];
         ec = run_agent_powershell_out(path, 90000, out, sizeof(out));
         if (out[0]) {
             char *line = out, *nl;
