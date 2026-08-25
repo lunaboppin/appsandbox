@@ -1026,6 +1026,20 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         share_endpoint, _countof(share_endpoint), server_ip, server_mac);
     if (FAILED(hr)) goto fail;
     g_appliance.share_endpoint_created = TRUE;
+    {
+        char actual_mac[32] = "";
+        if (SUCCEEDED(hcn_get_endpoint_mac(&g_appliance.share_endpoint_id,
+                                           actual_mac, sizeof(actual_mac))) &&
+            actual_mac[0]) {
+            if (_stricmp(actual_mac, server_mac) != 0)
+                ui_log(L"Shared appliance: HCN assigned MAC %S (requested %S); using the assigned one.",
+                       actual_mac, server_mac);
+            strcpy_s(server_mac, sizeof(server_mac), actual_mac);
+        } else {
+            ui_log(L"Shared appliance: could not read the share endpoint MAC; assuming %S.",
+                   server_mac);
+        }
+    }
 
     if (provisioning) {
         char nat_ip[32];
@@ -1607,6 +1621,17 @@ HRESULT shared_appliance_prepare_client(const VmConfig *config,
         &runtime->share_endpoint_id, endpoint_guid, endpoint_guid_chars,
         runtime->share_ip, runtime->share_mac);
     if (SUCCEEDED(hr)) {
+        char actual_mac[32] = "";
+        /* Same as the appliance's own endpoint: the guest hunts for this MAC,
+           so it must be the one HNS really assigned. */
+        if (SUCCEEDED(hcn_get_endpoint_mac(&runtime->share_endpoint_id,
+                                           actual_mac, sizeof(actual_mac))) &&
+            actual_mac[0]) {
+            if (_stricmp(actual_mac, runtime->share_mac) != 0)
+                ui_log(L"Shared resources: HCN assigned MAC %S to \"%s\" (requested %S).",
+                       actual_mac, runtime->name, runtime->share_mac);
+            strcpy_s(runtime->share_mac, sizeof(runtime->share_mac), actual_mac);
+        }
         runtime->share_network_cleaned = FALSE;
         InterlockedIncrement(&g_appliance.status.active_clients);
         InterlockedIncrement(&g_appliance.idle_generation);

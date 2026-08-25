@@ -54,6 +54,14 @@ typedef HRESULT (WINAPI *PFN_HcnEnumerateNetworks)(
 
 static PFN_HcnEnumerateNetworks pfnEnumNet;
 
+typedef HRESULT (WINAPI *PFN_HcnOpenEndpoint)(
+    const GUID *id, void **endpoint, PWSTR *errorRecord);
+typedef HRESULT (WINAPI *PFN_HcnQueryEndpointProperties)(
+    void *endpoint, PCWSTR query, PWSTR *properties, PWSTR *errorRecord);
+
+static PFN_HcnOpenEndpoint            pfnOpenEp;
+static PFN_HcnQueryEndpointProperties pfnQueryEp;
+
 BOOL hcn_init(void)
 {
     g_hcn_dll = LoadLibraryW(L"computenetwork.dll");
@@ -68,6 +76,8 @@ BOOL hcn_init(void)
     pfnCloseEp    = (PFN_HcnCloseEndpoint)GetProcAddress(g_hcn_dll, "HcnCloseEndpoint");
     pfnOpenNet    = (PFN_HcnOpenNetwork)GetProcAddress(g_hcn_dll, "HcnOpenNetwork");
     pfnEnumNet    = (PFN_HcnEnumerateNetworks)GetProcAddress(g_hcn_dll, "HcnEnumerateNetworks");
+    pfnOpenEp     = (PFN_HcnOpenEndpoint)GetProcAddress(g_hcn_dll, "HcnOpenEndpoint");
+    pfnQueryEp    = (PFN_HcnQueryEndpointProperties)GetProcAddress(g_hcn_dll, "HcnQueryEndpointProperties");
 
     if (!pfnCreateNet || !pfnCreateEp || !pfnCloseNet || !pfnCloseEp) {
         FreeLibrary(g_hcn_dll);
@@ -678,6 +688,48 @@ HRESULT hcn_create_share_server_endpoint(const GUID *network_id, GUID *endpoint_
     }
     if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
     if (network && pfnCloseNet) pfnCloseNet(network);
+    return hr;
+}
+
+/* The MacAddress in an endpoint document is a request, not a guarantee: HNS is
+   free to assign one from its own pool. The guest finds its private adapter by
+   matching the MAC, so ask the endpoint what it actually got rather than
+   assuming the request was honoured. Returns the MAC in "XX-XX-.." form. */
+HRESULT hcn_get_endpoint_mac(const GUID *endpoint_id, char *out, size_t out_size)
+{
+    void *endpoint = NULL;
+    PWSTR properties = NULL, error_record = NULL;
+    HRESULT hr;
+    const wchar_t *found;
+
+    if (!out || out_size < 18) return E_INVALIDARG;
+    out[0] = '\0';
+    if (!g_hcn_dll || !pfnOpenEp || !pfnQueryEp || !pfnCloseEp)
+        return E_NOT_VALID_STATE;
+
+    hr = pfnOpenEp(endpoint_id, &endpoint, &error_record);
+    if (error_record) { CoTaskMemFree(error_record); error_record = NULL; }
+    if (FAILED(hr)) return hr;
+
+    hr = pfnQueryEp(endpoint, L"{}", &properties, &error_record);
+    if (error_record) { CoTaskMemFree(error_record); error_record = NULL; }
+    if (SUCCEEDED(hr) && properties) {
+        found = wcsstr(properties, L"\"MacAddress\":\"");
+        if (found) {
+            const wchar_t *value = found + 14;
+            const wchar_t *end = wcschr(value, L'"');
+            size_t chars = end ? (size_t)(end - value) : 0;
+            if (chars > 0 && chars < out_size)
+                WideCharToMultiByte(CP_UTF8, 0, value, (int)chars,
+                                    out, (int)out_size, NULL, NULL);
+            out[chars < out_size ? chars : out_size - 1] = '\0';
+        }
+        if (!out[0]) hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    } else if (SUCCEEDED(hr)) {
+        hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    if (properties) CoTaskMemFree(properties);
+    pfnCloseEp(endpoint);
     return hr;
 }
 

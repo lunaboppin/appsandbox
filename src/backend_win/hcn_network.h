@@ -65,6 +65,11 @@ HRESULT hcn_create_share_server_endpoint(const GUID *network_id, GUID *endpoint_
                                          const char *server_ip,
                                          const char *mac_address);
 
+/* Read back the MAC an endpoint was actually given, in "XX-XX-.." form. The
+   MacAddress in a create document is only a request; the guest matches its
+   private adapter on the MAC, so it has to be told the real one. */
+HRESULT hcn_get_endpoint_mac(const GUID *endpoint_id, char *out, size_t out_size);
+
 /* Create an endpoint on a network.
    network_id: the network to attach to.
    endpoint_id: output GUID for the created endpoint.
