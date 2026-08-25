@@ -1822,7 +1822,12 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
                  _countof(g_shared_management_ip) - (size_t)(last_dot + 1 - g_shared_management_ip),
                  L"1");
     }
-    ec = run_agent_powershell(path, 30000);
+    /* The script's own adapter poll is 60 x 500ms = 30s, so a 30s cap here
+       killed it at exactly the moment it gave up -- before it could configure
+       anything or say why. Every failure came back as a bare ERROR_TIMEOUT
+       with the diagnostics never reached. Leave room for the poll plus the
+       address configuration that follows it. */
+    ec = run_agent_powershell(path, 120000);
     SetEnvironmentVariableW(L"ASB_NET_MAC", NULL);
     SetEnvironmentVariableW(L"ASB_NET_IP", NULL);
     return ec;

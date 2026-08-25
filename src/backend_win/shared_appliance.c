@@ -66,6 +66,7 @@ typedef struct {
     BOOL stopping;
     BOOL provisioning_boot;
     volatile LONG ready_worker_active;
+    volatile LONG readiness_wait_active;
     LONG idle_generation;
     LONG restart_attempts;
 } SharedApplianceGlobal;
@@ -1098,6 +1099,20 @@ wait_existing:
         return S_OK;
     }
     deadline = GetTickCount64() + (timeout_ms ? timeout_ms : 120000);
+    /* Exactly one thread drives the handshake; anyone else just watches it.
+       Two threads sending the same multi-minute commands serialize on
+       command_cs, so the second one -- usually a VM start that needs the
+       appliance -- sat blocked behind appliance_ready and looked like the app
+       had hung. */
+    if (InterlockedCompareExchange(&g_appliance.readiness_wait_active, 1, 0) != 0) {
+        while (GetTickCount64() < deadline) {
+            if (g_appliance.status.ready) return S_OK;
+            if (g_appliance.status.state == ASB_APPLIANCE_STATE_FAILED)
+                return E_FAIL;
+            Sleep(500);
+        }
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    }
     wait_started = GetTickCount64();
     last_report = wait_started;
     announced_agent = FALSE;
@@ -1215,6 +1230,7 @@ wait_existing:
                 wcscpy_s(g_appliance.status.progress_text, 256, L"Ready");
                 g_appliance.restart_attempts = 0;
                 LeaveCriticalSection(&g_appliance.cs);
+                InterlockedExchange(&g_appliance.readiness_wait_active, 0);
                 return S_OK;
             }
         }
@@ -1228,6 +1244,7 @@ fail:
             ? L"The shared appliance did not become ready within the allotted time"
             : L"Failed to start or verify the shared appliance");
     LeaveCriticalSection(&g_appliance.cs);
+    InterlockedExchange(&g_appliance.readiness_wait_active, 0);
     return hr;
 }
 
