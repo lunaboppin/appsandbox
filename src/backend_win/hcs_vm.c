@@ -477,8 +477,14 @@ static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
             HCS_OPERATION op = pfnCreateOp(NULL, NULL);
             if (op) {
                 PWSTR result_doc = NULL;
-                HRESULT hr = pfnGetProps(inst->handle, op,
-                    L"{\"PropertyTypes\":[\"Basic\"]}");
+                /* An empty query returns the default system properties (Id,
+                   SystemType, Owner, RuntimeId, State) -- which is all this
+                   poll reads. "PropertyTypes":["Basic"] is not a valid
+                   RequestedPropertyTypes value for a virtual machine, so HCS
+                   rejected every query with HCS_E_INVALID_JSON (0x8037010D):
+                   the "VM stopped, callback missed" safety net below never
+                   ran, and the log filled with one failure per poll. */
+                HRESULT hr = pfnGetProps(inst->handle, op, L"{}");
                 if (SUCCEEDED(hr))
                     hr = pfnWaitOp(op, 5000, &result_doc);
                 pfnCloseOp(op);

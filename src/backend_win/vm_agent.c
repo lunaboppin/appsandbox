@@ -119,15 +119,28 @@ static int recv_line_wait(SOCKET s, char *buf, int buf_size, DWORD timeout_ms)
     ULONGLONG deadline = GetTickCount64() +
         (timeout_ms ? timeout_ms : AGENT_IDLE_TIMEOUT_MS);
     while (pos < buf_size - 1) {
+        fd_set rfds;
+        struct timeval tv;
         char c;
-        int n = recv(s, &c, 1, 0);
-        if (n < 0) {
-            int err = WSAGetLastError();
-            if (err != WSAETIMEDOUT && err != WSAEWOULDBLOCK) return n;
+        int n, ready;
+
+        /* select() decides whether data is there, so recv() is only ever
+           called when it will not block. That makes n == 0 mean the peer
+           really closed and n < 0 a real error, instead of depending on how
+           this socket provider chooses to report an SO_RCVTIMEO expiry --
+           which is what silently hung up on the guest mid-command. */
+        FD_ZERO(&rfds);
+        FD_SET(s, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;
+        ready = select(0, &rfds, NULL, NULL, &tv);
+        if (ready == SOCKET_ERROR) return -1;
+        if (ready == 0) {
             if (GetTickCount64() >= deadline) return -1;
-            if (err == WSAEWOULDBLOCK) Sleep(50);   /* never spin */
-            continue;
+            continue;   /* guest is busy running a command; it owes us nothing yet */
         }
+
+        n = recv(s, &c, 1, 0);
         if (n <= 0) return n;
         if (c == '\n') break;
         if (c != '\r') buf[pos++] = c;

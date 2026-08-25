@@ -1785,7 +1785,17 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
         " $a=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {(($_.MacAddress) -replace '[:-]','') -eq $m} | Select-Object -First 1\r\n"
         " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
         "}\r\n"
-        "if(-not $a){exit 1168}\r\n"
+        /* Record what the guest can actually see. A silent 1168 gives the host
+           no way to tell "the adapter has not arrived yet" from "it is here
+           under a MAC we did not expect". */
+        "if(-not $a){\r\n"
+        " $log='C:\\Windows\\AppSandbox\\agent.log'\r\n"
+        " Add-Content -Path $log -ErrorAction SilentlyContinue -Value ('[shared_net] no adapter matching MAC ' + $m + '; adapters present:')\r\n"
+        " Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | ForEach-Object {\r\n"
+        "  Add-Content -Path $log -ErrorAction SilentlyContinue -Value ('[shared_net]   name=' + $_.Name + ' mac=' + $_.MacAddress + ' status=' + $_.Status + ' ifIndex=' + $_.ifIndex)\r\n"
+        " }\r\n"
+        " exit 1168\r\n"
+        "}\r\n"
         "Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 9999 -ErrorAction Stop\r\n"
         "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NET_IP -PrefixLength 24 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
