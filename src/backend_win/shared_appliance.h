@@ -82,6 +82,11 @@ HRESULT shared_appliance_purge_resource(const wchar_t *resource_id);
 HRESULT shared_appliance_unpublish_resource(const wchar_t *resource_id);
 HRESULT shared_appliance_open_terminal(void);
 
+/* Attach the stopped appliance's OS disk and copy the tail of the guest's own
+   agent/setup logs into the host log. The only view of the guest side of a
+   failed readiness handshake. No-op while the appliance is running. */
+void shared_appliance_collect_guest_log(void);
+
 BOOL shared_appliance_handle_hcs_state(VmInstance *instance, DWORD event);
 BOOL shared_appliance_owns_instance(const VmInstance *instance);
 VmInstance *shared_appliance_instance_by_id(UINT64 id);

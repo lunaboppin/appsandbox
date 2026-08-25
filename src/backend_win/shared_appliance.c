@@ -13,6 +13,7 @@
 #include <sddl.h>
 #include <aclapi.h>
 #include <shlwapi.h>
+#include <virtdisk.h>
 #include <stdio.h>
 #include <io.h>
 #include <wchar.h>
@@ -23,6 +24,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "virtdisk.lib")
 
 #define APPLIANCE_VM_NAME L"AppSandbox.SharedAppliance"
 #define APPLIANCE_UNIQUE_ID ((UINT64)0xFFFFFFFFFFFFFF00ull)
@@ -74,6 +76,12 @@ typedef struct {
     BOOL switch_backend;
     BOOL cleanup_on_failure;
 } SetupWorkerArgs;
+
+/* Microsoft's VHDX vendor GUID, as used by disk_util.c and asb_core.c. */
+static const GUID ASB_VHDX_VENDOR = {
+    0xec984aec, 0xa0f9, 0x47e9,
+    { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b }
+};
 
 static SharedApplianceGlobal g_appliance;
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
@@ -838,6 +846,124 @@ static BOOL file_size_bytes(const wchar_t *path, ULONGLONG *out)
     return TRUE;
 }
 
+/* Dump the tail of one of the appliance's own log files into the host log.
+   The guest writes \Windows\AppSandbox\{agent,setup}.log; when readiness fails
+   there is no other way to see what the guest actually did, and on a failed
+   first-time setup the disk is deleted moments later. Needs the appliance
+   stopped: the VHDX cannot be attached while the VM holds it. */
+static void dump_guest_log_file(const wchar_t *drive, const wchar_t *name)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE file;
+    LARGE_INTEGER size;
+    DWORD read_bytes, want;
+    char *raw;
+    wchar_t *text;
+    int chars, printed = 0;
+
+    swprintf_s(path, _countof(path), L"%s\\Windows\\AppSandbox\\%s", drive, name);
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        ui_log(L"Shared appliance: the guest has no %s (%lu).", name, GetLastError());
+        return;
+    }
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+        CloseHandle(file);
+        ui_log(L"Shared appliance: the guest's %s is empty.", name);
+        return;
+    }
+    want = size.QuadPart > 32768 ? 32768 : (DWORD)size.QuadPart;
+    if (size.QuadPart > want) {
+        LARGE_INTEGER from;
+        from.QuadPart = size.QuadPart - want;
+        SetFilePointerEx(file, from, NULL, FILE_BEGIN);
+    }
+    raw = (char *)HeapAlloc(GetProcessHeap(), 0, want + 1);
+    if (!raw) { CloseHandle(file); return; }
+    if (!ReadFile(file, raw, want, &read_bytes, NULL)) read_bytes = 0;
+    raw[read_bytes] = '\0';
+    CloseHandle(file);
+
+    chars = MultiByteToWideChar(CP_UTF8, 0, raw, -1, NULL, 0);
+    text = chars > 0 ? (wchar_t *)HeapAlloc(GetProcessHeap(), 0, chars * sizeof(wchar_t)) : NULL;
+    if (text) MultiByteToWideChar(CP_UTF8, 0, raw, -1, text, chars);
+    HeapFree(GetProcessHeap(), 0, raw);
+    if (!text) return;
+
+    ui_log(L"Shared appliance: ---- guest %s (last %lu bytes) ----", name, read_bytes);
+    {
+        wchar_t *line = text, *nl;
+        while (line && *line && printed < 200) {
+            nl = wcspbrk(line, L"\r\n");
+            if (nl) *nl = L'\0';
+            if (*line) { ui_log(L"  [guest] %s", line); printed++; }
+            if (!nl) break;
+            line = nl + 1;
+            while (*line == L'\r' || *line == L'\n') line++;
+        }
+    }
+    ui_log(L"Shared appliance: ---- end of guest %s ----", name);
+    HeapFree(GetProcessHeap(), 0, text);
+}
+
+/* Attach the (stopped) appliance OS disk and report what the guest logged. */
+void shared_appliance_collect_guest_log(void)
+{
+    VIRTUAL_STORAGE_TYPE storage;
+    OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+    ATTACH_VIRTUAL_DISK_PARAMETERS attach_params;
+    HANDLE disk = INVALID_HANDLE_VALUE;
+    DWORD before, added, result, bit, wait;
+
+    if (!g_appliance.status.os_vhdx_path[0]) return;
+    if (g_appliance.runtime.running) {
+        ui_log(L"Shared appliance: stop the appliance to collect its guest log.");
+        return;
+    }
+    before = GetLogicalDrives();
+    storage.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storage.VendorId = ASB_VHDX_VENDOR;
+    ZeroMemory(&open_params, sizeof(open_params));
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_1;
+    open_params.Version1.RWDepth = OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT;
+    result = OpenVirtualDisk(&storage, g_appliance.status.os_vhdx_path,
+                             VIRTUAL_DISK_ACCESS_ATTACH_RO, OPEN_VIRTUAL_DISK_FLAG_NONE,
+                             &open_params, &disk);
+    if (result != ERROR_SUCCESS) {
+        ui_log(L"Shared appliance: could not open the appliance disk to read its log (%lu).", result);
+        return;
+    }
+    ZeroMemory(&attach_params, sizeof(attach_params));
+    attach_params.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
+    result = AttachVirtualDisk(disk, NULL, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
+                               0, &attach_params, NULL);
+    if (result != ERROR_SUCCESS) {
+        ui_log(L"Shared appliance: could not attach the appliance disk to read its log (%lu).", result);
+        CloseHandle(disk);
+        return;
+    }
+    for (wait = 0; wait < 100; wait++) {
+        added = GetLogicalDrives() & ~before;
+        if (added) break;
+        Sleep(100);
+    }
+    added = GetLogicalDrives() & ~before;
+    for (bit = 0; bit < 26; bit++) if (added & (1u << bit)) {
+        wchar_t drive[8], probe[MAX_PATH];
+        swprintf_s(drive, _countof(drive), L"%c:", (wchar_t)(L'A' + bit));
+        swprintf_s(probe, _countof(probe), L"%s\\Windows\\AppSandbox", drive);
+        if (GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES) continue;
+        dump_guest_log_file(drive, L"agent.log");
+        dump_guest_log_file(drive, L"setup.log");
+        break;
+    }
+    if (!added)
+        ui_log(L"Shared appliance: the appliance disk exposed no volume to read.");
+    DetachVirtualDisk(disk, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    CloseHandle(disk);
+}
+
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms);
 
 /* Runs the readiness handshake for a caller that asked not to block. Re-enters
@@ -1171,6 +1297,9 @@ static DWORD WINAPI setup_worker(LPVOID parameter)
     return 0;
 failed:
     shared_appliance_stop(TRUE);
+    /* Before the disk is reclaimed: the guest's own log is the only record of
+       what happened on the other side of the agent connection. */
+    shared_appliance_collect_guest_log();
     if (args->cleanup_on_failure)
         remove_directory_tree(g_appliance.status.storage_root);
     EnterCriticalSection(&g_appliance.cs);

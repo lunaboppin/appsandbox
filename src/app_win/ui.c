@@ -1408,8 +1408,12 @@ static void on_webview2_message(const wchar_t *json)
         HRESULT hr = E_INVALIDARG;
         if (wcscmp(action, L"startSharedAppliance") == 0)
             hr = asb_shared_appliance_start(FALSE, 0);
-        else if (wcscmp(action, L"stopSharedAppliance") == 0)
+        else if (wcscmp(action, L"stopSharedAppliance") == 0) {
             hr = asb_shared_appliance_stop(FALSE);
+            /* The disk is only readable once the VM has released it, so this
+               is the one moment the guest's own log can be pulled out. */
+            if (SUCCEEDED(hr)) asb_shared_appliance_collect_guest_log();
+        }
         else if (wcscmp(action, L"updateSharedAppliance") == 0)
             hr = asb_shared_appliance_update();
         else if (wcscmp(action, L"growSharedAppliance") == 0) {
