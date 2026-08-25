@@ -1759,6 +1759,55 @@ static int write_agent_script(const wchar_t *path, const char *contents)
     CloseHandle(file); return ERROR_SUCCESS;
 }
 
+static int run_agent_powershell_out(const wchar_t *script_path, DWORD timeout_ms,
+                                    char *output, int output_size)
+{
+    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024]; DWORD ec, bytes;
+    SECURITY_ATTRIBUTES sa;
+    HANDLE read_end = NULL, write_end = NULL;
+    int pos = 0;
+
+    if (output && output_size > 0) output[0] = '\0';
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&read_end, &write_end, &sa, 0)) return (int)GetLastError();
+    SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = write_end;
+    si.hStdError = write_end;
+    si.hStdInput = NULL;
+    swprintf_s(cmd, _countof(cmd),
+        L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
+        script_path);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        ec = GetLastError();
+        CloseHandle(read_end); CloseHandle(write_end);
+        return (int)ec;
+    }
+    CloseHandle(write_end);
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(pi.hProcess, 5000);
+        ec = ERROR_TIMEOUT;
+    } else if (!GetExitCodeProcess(pi.hProcess, &ec)) {
+        ec = GetLastError();
+    }
+    if (output && output_size > 1) {
+        while (pos < output_size - 1 &&
+               ReadFile(read_end, output + pos, (DWORD)(output_size - pos - 1),
+                        &bytes, NULL) && bytes > 0)
+            pos += (int)bytes;
+        output[pos] = '\0';
+    }
+    CloseHandle(read_end);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return (int)ec;
+}
+
 static int run_agent_powershell(const wchar_t *script_path, DWORD timeout_ms)
 {
     STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024]; DWORD ec;
@@ -1785,14 +1834,10 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
         " $a=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {(($_.MacAddress) -replace '[:-]','') -eq $m} | Select-Object -First 1\r\n"
         " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
         "}\r\n"
-        /* Record what the guest can actually see. A silent 1168 gives the host
-           no way to tell "the adapter has not arrived yet" from "it is here
-           under a MAC we did not expect". */
         "if(-not $a){\r\n"
-        " $log='C:\\Windows\\AppSandbox\\agent.log'\r\n"
-        " Add-Content -Path $log -ErrorAction SilentlyContinue -Value ('[shared_net] no adapter matching MAC ' + $m + '; adapters present:')\r\n"
+        " Write-Output ('want=' + $m)\r\n"
         " Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | ForEach-Object {\r\n"
-        "  Add-Content -Path $log -ErrorAction SilentlyContinue -Value ('[shared_net]   name=' + $_.Name + ' mac=' + $_.MacAddress + ' status=' + $_.Status + ' ifIndex=' + $_.ifIndex)\r\n"
+        "  Write-Output ('have name=' + $_.Name + ' mac=' + $_.MacAddress + ' status=' + $_.Status + ' if=' + $_.ifIndex)\r\n"
         " }\r\n"
         " exit 1168\r\n"
         "}\r\n"
@@ -1822,12 +1867,21 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
                  _countof(g_shared_management_ip) - (size_t)(last_dot + 1 - g_shared_management_ip),
                  L"1");
     }
-    /* The script's own adapter poll is 60 x 500ms = 30s, so a 30s cap here
-       killed it at exactly the moment it gave up -- before it could configure
-       anything or say why. Every failure came back as a bare ERROR_TIMEOUT
-       with the diagnostics never reached. Leave room for the poll plus the
-       address configuration that follows it. */
-    ec = run_agent_powershell(path, 120000);
+    {
+        char out[2048];
+        ec = run_agent_powershell_out(path, 120000, out, sizeof(out));
+        if (out[0]) {
+            char *line = out, *nl;
+            while (line && *line) {
+                nl = strpbrk(line, "\r\n");
+                if (nl) *nl = '\0';
+                if (*line) agent_log("shared_net: %s", line);
+                if (!nl) break;
+                line = nl + 1;
+                while (*line == '\r' || *line == '\n') line++;
+            }
+        }
+    }
     SetEnvironmentVariableW(L"ASB_NET_MAC", NULL);
     SetEnvironmentVariableW(L"ASB_NET_IP", NULL);
     return ec;
