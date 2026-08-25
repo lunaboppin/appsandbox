@@ -1767,8 +1767,11 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     if (mount) {
         hr = load_credentials(admin, _countof(admin), password, _countof(password));
         if (FAILED(hr)) return hr;
+        wchar_t qualified[192];
+        swprintf_s(qualified, _countof(qualified), L"%S\\%s",
+                   shared_appliance_server_ip(), APPLIANCE_SERVICE_USER);
         SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
-        SetEnvironmentVariableW(L"ASB_SMB_USER", APPLIANCE_SERVICE_USER);
+        SetEnvironmentVariableW(L"ASB_SMB_USER", qualified);
     }
     shared_resources_share_name(resource->id, share, _countof(share));
     swprintf_s(target, _countof(target), L"\\\\%S\\%s", shared_appliance_server_ip(), share);
