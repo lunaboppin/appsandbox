@@ -348,11 +348,22 @@ static BOOL generate_autounattend(const wchar_t *output_path,
                                    const wchar_t *b64_password,
                                    BOOL is_template,
                                    BOOL test_mode,
-                                   const wchar_t *lang)
+                                   const wchar_t *lang,
+                                   const wchar_t *image_name,
+                                   const wchar_t *product_key)
 {
     FILE *f;
     wchar_t comp_name[16];
+    wchar_t product_key_xml[256];
     wcsncpy_s(comp_name, 16, vm_name, 15);
+    if (!image_name || !image_name[0]) image_name = L"Windows 11 Pro";
+    if (product_key && product_key[0])
+        swprintf_s(product_key_xml, _countof(product_key_xml),
+            L"<ProductKey><Key>%s</Key><WillShowUI>Never</WillShowUI></ProductKey>",
+            product_key);
+    else
+        wcscpy_s(product_key_xml, _countof(product_key_xml),
+            L"<ProductKey><WillShowUI>Never</WillShowUI></ProductKey>");
 
     if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
         return FALSE;
@@ -380,12 +391,12 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <UserData>\n"
         L"                <AcceptEula>true</AcceptEula>\n"
-        L"                <ProductKey><WillShowUI>Never</WillShowUI></ProductKey>\n"
+        L"                %s\n"
         L"            </UserData>\n"
         L"            <ImageInstall><OSImage>\n"
         L"                <InstallFrom><MetaData wcm:action=\"add\">\n"
         L"                    <Key>/IMAGE/NAME</Key>\n"
-        L"                    <Value>Windows 11 Pro</Value>\n"
+        L"                    <Value>%s</Value>\n"
         L"                </MetaData></InstallFrom>\n"
         L"                <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>\n"
         L"            </OSImage></ImageInstall>\n"
@@ -402,7 +413,8 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                    <ModifyPartition wcm:action=\"add\"><Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>\n"
         L"                </ModifyPartitions>\n"
         L"            </Disk></DiskConfiguration>\n",
-        lang, lang_to_input_locale(lang), lang, lang, lang);
+        lang, lang_to_input_locale(lang), lang, lang, lang,
+        product_key_xml, image_name);
 
 #if ASB_IS_ARM64
     /* windowsPE Setup pass — bypass keys must run before the Win11 appraiser. */
@@ -729,15 +741,17 @@ BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars)
     return FALSE;
 }
 
-HRESULT iso_create_resources(const wchar_t *iso_path,
-                              const wchar_t *vm_name,
-                              const wchar_t *admin_user,
-                              wchar_t *admin_pass,
-                              const wchar_t *res_dir,
-                              BOOL is_template,
-                              BOOL test_mode,
-                              BOOL ssh_enabled,
-                              const wchar_t *lang)
+static HRESULT iso_create_resources_ex(const wchar_t *iso_path,
+                                        const wchar_t *vm_name,
+                                        const wchar_t *admin_user,
+                                        wchar_t *admin_pass,
+                                        const wchar_t *res_dir,
+                                        BOOL is_template,
+                                        BOOL test_mode,
+                                        BOOL ssh_enabled,
+                                        const wchar_t *lang,
+                                        const wchar_t *image_name,
+                                        const wchar_t *product_key)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -772,7 +786,9 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 
     /* autounattend.xml */
     swprintf_s(file_path, MAX_PATH, L"%s\\autounattend.xml", staging);
-    if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass, is_template, test_mode, lang))
+    if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass,
+                               is_template, test_mode, lang,
+                               image_name, product_key))
         ui_log(L"Warning: failed to write autounattend.xml");
 
     /* Agent + input helper + VDD driver files + SSH MSI */
@@ -880,6 +896,8 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 
             fputs(
                 ":done\r\n"
+                "del /F /Q \"%SystemRoot%\\Panther\\unattend.xml\" 2>nul\r\n"
+                "del /F /Q \"%SystemRoot%\\Panther\\Unattend\\unattend.xml\" 2>nul\r\n"
                 "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
                 sc);
             fclose(sc);
@@ -1382,6 +1400,130 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
             fclose(sc);
         }
     }
+}
+
+HRESULT iso_create_resources(const wchar_t *iso_path,
+                              const wchar_t *vm_name,
+                              const wchar_t *admin_user,
+                              wchar_t *admin_pass,
+                              const wchar_t *res_dir,
+                              BOOL is_template,
+                              BOOL test_mode,
+                              BOOL ssh_enabled,
+                              const wchar_t *lang)
+{
+    return iso_create_resources_ex(iso_path, vm_name, admin_user, admin_pass,
+        res_dir, is_template, test_mode, ssh_enabled, lang,
+        L"Windows 11 Pro", NULL);
+}
+
+HRESULT iso_create_server_core_resources(const wchar_t *iso_path,
+                                         const wchar_t *vm_name,
+                                         const wchar_t *admin_user,
+                                         wchar_t *admin_password,
+                                         const wchar_t *res_dir,
+                                         const wchar_t *image_name,
+                                         const wchar_t *product_key)
+{
+    return iso_create_resources_ex(iso_path, vm_name, admin_user, admin_password,
+        res_dir, FALSE, FALSE, TRUE, L"en-US", image_name, product_key);
+}
+
+static BOOL copy_appliance_source(const wchar_t *staging, const wchar_t *res_dir,
+                                  const wchar_t *name, const wchar_t *repo_relative)
+{
+    wchar_t source[MAX_PATH], destination[MAX_PATH], exe[MAX_PATH], *slash;
+    swprintf_s(destination, _countof(destination), L"%s\\%s", staging, name);
+    swprintf_s(source, _countof(source), L"%s\\linux\\%s", res_dir, name);
+    if (CopyFileW(source, destination, FALSE)) return TRUE;
+    GetModuleFileNameW(NULL, exe, _countof(exe));
+    slash = wcsrchr(exe, L'\\'); if (slash) *slash = L'\0';
+    swprintf_s(source, _countof(source), L"%s\\..\\..\\%s", exe, repo_relative);
+    return CopyFileW(source, destination, FALSE);
+}
+
+HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
+                                        const wchar_t *admin_user,
+                                        const wchar_t *admin_password,
+                                        const wchar_t *smb_user,
+                                        const wchar_t *smb_password,
+                                        const wchar_t *ssh_public_key,
+                                        const wchar_t *res_dir)
+{
+    wchar_t dir[MAX_PATH], staging[MAX_PATH], path[MAX_PATH], *slash;
+    char password_hash[256];
+    FILE *file = NULL;
+    HRESULT hr;
+    if (!iso_path || !admin_user || !admin_password || !smb_user ||
+        !smb_password || !ssh_public_key || !ssh_public_key[0] || !res_dir) return E_INVALIDARG;
+    if (!unix_password_hash(admin_password, password_hash, sizeof(password_hash)))
+        return E_FAIL;
+    wcscpy_s(dir, _countof(dir), iso_path);
+    slash = wcsrchr(dir, L'\\'); if (slash) *slash = L'\0';
+    swprintf_s(staging, _countof(staging), L"%s\\_appliance_seed", dir);
+    remove_staging_dir(staging);
+    if (!CreateDirectoryW(staging, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    swprintf_s(path, _countof(path), L"%s\\meta-data", staging);
+    if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    fwprintf(file, L"instance-id: appsandbox-shared-appliance\nlocal-hostname: appsandbox-share\n");
+    fclose(file); file = NULL;
+
+    swprintf_s(path, _countof(path), L"%s\\user-data", staging);
+    if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    fwprintf(file,
+        L"#cloud-config\n"
+        L"users:\n  - default\n  - name: %s\n    groups: [adm, sudo]\n"
+        L"    shell: /bin/bash\n    lock_passwd: false\n    passwd: '%S'\n"
+        L"    ssh_authorized_keys: ['%s']\n"
+        L"ssh_pwauth: false\npackage_update: true\n"
+        L"packages: [samba, gcc, libc6-dev, parted, cloud-guest-utils]\n"
+        L"write_files:\n"
+        L"  - path: /usr/local/sbin/appsandbox-appliance-firstboot\n"
+        L"    permissions: '0700'\n    content: |\n"
+        L"      #!/bin/sh\n      set -eu\n"
+        L"      disk=$(lsblk -dpno NAME,TYPE | awk '$2==\"disk\"{print $1}' | tail -1)\n"
+        L"      part=${disk}1\n      if ! blkid $part >/dev/null 2>&1; then parted -s $disk mklabel gpt mkpart primary ext4 1MiB 100%%; mkfs.ext4 -F -L ASBSHARED $part; fi\n"
+        L"      mkdir -p /srv/appsandbox\n      grep -q ASBSHARED /etc/fstab || echo 'LABEL=ASBSHARED /srv/appsandbox ext4 defaults,nofail 0 2' >> /etc/fstab\n"
+        L"      mount /srv/appsandbox || true\n"
+        L"      grep -q '^server signing = mandatory' /etc/samba/smb.conf || sed -i '/^\\[global\\]/a server signing = mandatory' /etc/samba/smb.conf\n"
+        L"      id -u %s >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin %s\n"
+        L"      printf '%%s\\n%%s\\n' '%s' '%s' | smbpasswd -s -a %s\n"
+        L"      mkdir -p /mnt/appsandbox-seed; mount -o ro /dev/sr0 /mnt/appsandbox-seed || true\n"
+        L"      gcc -O2 -pthread -D_GNU_SOURCE -o /usr/local/sbin/appsandbox-agent /mnt/appsandbox-seed/appsandbox-agent.c\n"
+        L"      cp /mnt/appsandbox-seed/appsandbox-agent.service /etc/systemd/system/\n"
+        L"      systemctl daemon-reload; systemctl enable appsandbox-agent\n"
+        L"      systemctl enable --now smbd\n"
+        L"      umount /mnt/appsandbox-seed || true\n"
+        L"      find /var/lib/cloud -type f -name 'user-data*' -delete\n"
+        L"      rm -f /usr/local/sbin/appsandbox-appliance-firstboot\n"
+        L"      systemctl start appsandbox-agent\n"
+        L"runcmd:\n  - [/usr/local/sbin/appsandbox-appliance-firstboot]\n"
+        L"final_message: 'AppSandbox appliance provisioned'\n",
+        admin_user, password_hash, ssh_public_key, smb_user, smb_user,
+        smb_password, smb_password, smb_user);
+    fclose(file); file = NULL;
+    SecureZeroMemory(password_hash, sizeof(password_hash));
+
+    if (!copy_appliance_source(staging, res_dir, L"appsandbox-agent.c",
+            L"tools\\linux\\agent\\appsandbox-agent.c")) {
+        hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); goto cleanup;
+    }
+    swprintf_s(path, _countof(path), L"%s\\appsandbox-agent.service", staging);
+    if (_wfopen_s(&file, path, L"w") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    fputs("[Unit]\nDescription=AppSandbox Appliance Agent\nAfter=network.target\n"
+          "[Service]\nType=simple\nExecStart=/usr/local/sbin/appsandbox-agent\nRestart=always\n"
+          "[Install]\nWantedBy=multi-user.target\n", file);
+    fclose(file); file = NULL;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    hr = create_iso_from_dir(iso_path, staging, L"CIDATA");
+    CoUninitialize();
+cleanup:
+    if (file) fclose(file);
+    SecureZeroMemory(password_hash, sizeof(password_hash));
+    remove_staging_dir(staging);
+    return hr;
 }
 
 

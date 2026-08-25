@@ -888,12 +888,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
     wchar_t vhdx_esc[MAX_PATH * 2];
+    wchar_t data_vhdx_esc[MAX_PATH * 2];
     wchar_t iso_esc[MAX_PATH * 2];
     wchar_t res_esc[MAX_PATH * 2];
     wchar_t vmgs_esc[MAX_PATH * 2];
     wchar_t vmrs_esc[MAX_PATH * 2];
     wchar_t iso_section[512];
     wchar_t res_section[512];
+    wchar_t data_section[512];
     wchar_t net_section[1024];
     wchar_t secureboot_section[512];
     wchar_t nested_section[128];
@@ -916,6 +918,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     is_windows = (_wcsicmp(config->os_type, L"Windows") == 0);
 
     escape_json_path(config->vhdx_path, vhdx_esc, MAX_PATH * 2);
+
+    data_section[0] = L'\0';
+    if (config->data_vhdx_path[0] != L'\0') {
+        escape_json_path(config->data_vhdx_path, data_vhdx_esc, MAX_PATH * 2);
+        swprintf_s(data_section, _countof(data_section),
+            L",\"3\":{\"Type\":\"VirtualDisk\",\"Path\":\"%s\"}",
+            data_vhdx_esc);
+    }
 
     /* Optional ISO attachment at SCSI slot 1 */
     iso_section[0] = L'\0';
@@ -1182,6 +1192,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                             L"\"0\":{\"Type\":\"VirtualDisk\",\"Path\":\"%s\"}"
                             L"%s"
                             L"%s"
+                            L"%s"
                         L"}"
                     L"}"
                 L"},"
@@ -1207,6 +1218,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         vhdx_esc,
         iso_section,
         res_section,
+        data_section,
         video_section,
         comports_section,
         service_table,
@@ -1252,6 +1264,8 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
             pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
             pfnGrantAccess(config->name, config->resources_iso_path);
+        if (config->data_vhdx_path[0] != L'\0')
+            pfnGrantAccess(config->name, config->data_vhdx_path);
     }
 
     /* Build JSON — endpoint_guid is set later by caller if networking is used */
@@ -1290,6 +1304,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
+        wcscpy_s(instance->data_vhdx_path, MAX_PATH, config->data_vhdx_path);
         wcscpy_s(instance->storage_root, MAX_PATH, config->storage_root);
         wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
@@ -1298,6 +1313,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         instance->gpu_mode = config->gpu_mode;
         instance->network_mode = config->network_mode;
         instance->is_template = config->is_template;
+        instance->is_appliance = config->is_appliance;
         instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
@@ -1306,7 +1322,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
                sizeof(instance->shared_resources));
         instance->shared_resource_count = config->shared_resource_count;
         wcscpy_s(instance->shared_resource_transport, 16,
-                 config->shared_resource_count ? L"smb" : L"");
+                 config->shared_resource_count ? L"appliance" : L"");
         instance->shared_resource_error[0] = L'\0';
         instance->running = FALSE;
 
@@ -1354,6 +1370,8 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
             pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
             pfnGrantAccess(config->name, config->resources_iso_path);
+        if (config->data_vhdx_path[0] != L'\0')
+            pfnGrantAccess(config->name, config->data_vhdx_path);
     }
 
     if (!hcs_build_vm_json(config, endpoint_guid, share_endpoint_guid,
@@ -1392,6 +1410,7 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
+        wcscpy_s(instance->data_vhdx_path, MAX_PATH, config->data_vhdx_path);
         wcscpy_s(instance->storage_root, MAX_PATH, config->storage_root);
         wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
@@ -1400,6 +1419,7 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
         instance->gpu_mode = config->gpu_mode;
         instance->network_mode = config->network_mode;
         instance->is_template = config->is_template;
+        instance->is_appliance = config->is_appliance;
         instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
@@ -1408,7 +1428,7 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
                sizeof(instance->shared_resources));
         instance->shared_resource_count = config->shared_resource_count;
         wcscpy_s(instance->shared_resource_transport, 16,
-                 config->shared_resource_count ? L"smb" : L"");
+                 config->shared_resource_count ? L"appliance" : L"");
         instance->shared_resource_error[0] = L'\0';
         instance->running = FALSE;
 

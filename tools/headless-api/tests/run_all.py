@@ -114,6 +114,8 @@ if RUN_STATIC:
     results["manage-contract"] = [] if p.returncode == 0 else ["test_manage_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_resources_contract.py")], cwd=HERE)
     results["shared-contract"] = [] if p.returncode == 0 else ["test_shared_resources_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_appliance_contract.py")], cwd=HERE)
+    results["appliance-contract"] = [] if p.returncode == 0 else ["test_shared_appliance_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_and_validation.py")], cwd=HERE)
     results["static"] = [] if p.returncode == 0 else ["test_host_and_validation.py exit %d" % p.returncode]
 

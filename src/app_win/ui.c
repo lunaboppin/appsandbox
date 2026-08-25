@@ -517,9 +517,11 @@ static void send_full_state(void)
         jb_array_end(&jb);
     }
 
-    /* Global host-backed shared resources */
+    /* Global appliance-backed shared resources */
     {
         int rc = asb_shared_resource_count(), emitted = 0;
+        SharedApplianceStatus appliance;
+        asb_shared_appliance_get_status(&appliance);
         jb_array_begin(&jb, L"sharedResources");
         for (i = 0; i < rc; i++) {
             AsbSharedResourceInfo r;
@@ -528,15 +530,46 @@ static void send_full_state(void)
             jb_object_begin(&jb);
             jb_string(&jb, L"id", r.id);
             jb_string(&jb, L"name", r.name);
-            jb_string(&jb, L"hostPath", r.host_path);
+            jb_string(&jb, L"storageKind", L"appliance");
+            jb_string(&jb, L"legacyHostPath", r.legacy_host_path);
             { wchar_t letter[2] = { r.drive_letter, L'\0' };
               jb_string(&jb, L"driveLetter", letter); }
+            { wchar_t letter[2] = { r.host_drive_letter, L'\0' };
+              jb_string(&jb, L"hostDriveLetter", letter); }
             jb_bool(&jb, L"enabled", r.enabled);
             jb_bool(&jb, L"readOnly", r.read_only);
-            jb_bool(&jb, L"aclCreated", r.acl_created);
+            jb_string(&jb, L"availability", appliance.ready ? L"available" : L"unavailable");
+            jb_int(&jb, L"applianceState", appliance.state);
             jb_object_end(&jb);
         }
         jb_array_end(&jb);
+    }
+
+    {
+        SharedApplianceStatus s;
+        asb_shared_appliance_get_status(&s);
+        if (jb.count > 0) jb_append(&jb, L",");
+        jb_append(&jb, L"\"sharedAppliance\":");
+        jb_object_begin(&jb);
+        jb_bool(&jb, L"configured", s.configured);
+        jb_string(&jb, L"backend", s.backend == ASB_APPLIANCE_BACKEND_UBUNTU
+            ? L"ubuntu" : s.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE
+            ? L"server_core" : L"none");
+        jb_int(&jb, L"state", s.state);
+        jb_int(&jb, L"progress", s.progress);
+        jb_bool(&jb, L"ready", s.ready);
+        jb_bool(&jb, L"busy", s.busy);
+        jb_int(&jb, L"dataSizeGb", (int)s.data_size_gb);
+        jb_int(&jb, L"ramMb", (int)s.ram_mb);
+        jb_int(&jb, L"cpuCores", (int)s.cpu_cores);
+        jb_int(&jb, L"activeClients", (int)s.active_clients);
+        jb_int(&jb, L"hostMounts", (int)s.host_mounts);
+        jb_string(&jb, L"storageRoot", s.storage_root);
+        jb_string(&jb, L"osVhdxPath", s.os_vhdx_path);
+        jb_string(&jb, L"dataVhdxPath", s.data_vhdx_path);
+        jb_string(&jb, L"progressText", s.progress_text);
+        jb_string(&jb, L"lastError", s.last_error);
+        jb_object_end(&jb);
     }
 
     jb_object_end(&jb);
@@ -1202,7 +1235,8 @@ static void on_webview2_message(const wchar_t *json)
             jb_object_end(&jb);
             webview2_post(json_buf);
         }
-    } else if (wcscmp(action, L"browseManageIso") == 0) {
+    } else if (wcscmp(action, L"browseManageIso") == 0 ||
+               wcscmp(action, L"browseApplianceIso") == 0) {
         OPENFILENAMEW ofn;
         wchar_t file[MAX_PATH] = { 0 };
         ZeroMemory(&ofn, sizeof(ofn));
@@ -1215,20 +1249,21 @@ static void on_webview2_message(const wchar_t *json)
         if (GetOpenFileNameW(&ofn)) {
             wchar_t json_buf[2048]; JsonBuilder jb;
             jb_init(&jb, json_buf, 2048); jb_object_begin(&jb);
-            jb_string(&jb, L"type", L"manageBrowseResult");
+            jb_string(&jb, L"type", wcscmp(action, L"browseApplianceIso") == 0
+                ? L"applianceBrowseResult" : L"manageBrowseResult");
             jb_string(&jb, L"kind", L"iso"); jb_string(&jb, L"path", file);
             jb_object_end(&jb); webview2_post(json_buf);
         }
     } else if (wcscmp(action, L"browseManageStorage") == 0 ||
                wcscmp(action, L"browseCreateStorage") == 0 ||
-               wcscmp(action, L"browseSharedFolder") == 0) {
+               wcscmp(action, L"browseApplianceStorage") == 0) {
         BROWSEINFOW bi;
         PIDLIST_ABSOLUTE pidl;
         wchar_t folder[MAX_PATH] = { 0 };
         ZeroMemory(&bi, sizeof(bi));
         bi.hwndOwner = g_hwnd_main;
-        bi.lpszTitle = wcscmp(action,L"browseSharedFolder")==0
-            ? L"Choose the host folder to share with Windows VMs"
+        bi.lpszTitle = wcscmp(action,L"browseApplianceStorage")==0
+            ? L"Choose the parent folder for the shared appliance"
             : L"Choose the parent folder for the VM's managed directory";
         bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
         pidl = SHBrowseForFolderW(&bi);
@@ -1238,10 +1273,12 @@ static void on_webview2_message(const wchar_t *json)
                 jb_init(&jb, json_buf, 2048); jb_object_begin(&jb);
                 jb_string(&jb, L"type", wcscmp(action, L"browseCreateStorage") == 0
                                       ? L"createStorageBrowseResult"
-                                      : wcscmp(action, L"browseSharedFolder") == 0
-                                      ? L"sharedFolderBrowseResult" : L"manageBrowseResult");
+                                      : wcscmp(action, L"browseApplianceStorage") == 0
+                                      ? L"applianceBrowseResult" : L"manageBrowseResult");
                 if (wcscmp(action, L"browseCreateStorage") != 0 &&
-                    wcscmp(action, L"browseSharedFolder") != 0)
+                    wcscmp(action, L"browseApplianceStorage") != 0)
+                    jb_string(&jb, L"kind", L"storage");
+                if (wcscmp(action, L"browseApplianceStorage") == 0)
                     jb_string(&jb, L"kind", L"storage");
                 jb_string(&jb, L"path", folder);
                 jb_object_end(&jb); webview2_post(json_buf);
@@ -1255,8 +1292,8 @@ static void on_webview2_message(const wchar_t *json)
         ZeroMemory(&r,sizeof(r));
         json_get_string(json,L"id",id,_countof(id));
         json_get_string(json,L"name",r.name,_countof(r.name));
-        json_get_string(json,L"hostPath",r.host_path,_countof(r.host_path));
         json_get_string(json,L"driveLetter",dl,_countof(dl)); r.drive_letter=towupper(dl[0]);
+        { wchar_t hdl[8]={0}; json_get_string(json,L"hostDriveLetter",hdl,_countof(hdl)); r.host_drive_letter=towupper(hdl[0]); }
         if(!json_get_bool(json,L"enabled",&r.enabled))r.enabled=TRUE;
         json_get_bool(json,L"readOnly",&r.read_only);
         json_get_bool(json,L"confirmPermissions",&confirm);
@@ -1274,6 +1311,84 @@ static void on_webview2_message(const wchar_t *json)
         if(json_get_int(json,L"vmIndex",&vi)){json_get_string(json,L"id",id,_countof(id));json_get_bool(json,L"enabled",&enabled);hr=asb_vm_set_shared_resource_enabled(asb_vm_get(vi),id,enabled);}
         { wchar_t out[512]; JsonBuilder sj; jb_init(&sj,out,_countof(out));jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);jb_object_end(&sj);webview2_post(out); }
         send_vm_list();
+    } else if (wcscmp(action, L"setupSharedAppliance") == 0 ||
+               wcscmp(action, L"rebuildSharedAppliance") == 0 ||
+               wcscmp(action, L"startSharedAppliance") == 0 ||
+               wcscmp(action, L"stopSharedAppliance") == 0 ||
+               wcscmp(action, L"updateSharedAppliance") == 0 ||
+               wcscmp(action, L"growSharedAppliance") == 0) {
+        HRESULT hr = E_INVALIDARG;
+        if (wcscmp(action, L"startSharedAppliance") == 0)
+            hr = asb_shared_appliance_start(FALSE, 0);
+        else if (wcscmp(action, L"stopSharedAppliance") == 0)
+            hr = asb_shared_appliance_stop(FALSE);
+        else if (wcscmp(action, L"updateSharedAppliance") == 0)
+            hr = asb_shared_appliance_update();
+        else if (wcscmp(action, L"growSharedAppliance") == 0) {
+            int size = 0; json_get_int(json, L"dataSizeGb", &size);
+            hr = asb_shared_appliance_grow((DWORD)size);
+        } else {
+            SharedApplianceConfig config;
+            wchar_t backend[32] = L"";
+            int value;
+            BOOL switch_backend = FALSE;
+            ZeroMemory(&config, sizeof(config));
+            json_get_string(json, L"backend", backend, _countof(backend));
+            config.backend = _wcsicmp(backend, L"ubuntu") == 0
+                ? ASB_APPLIANCE_BACKEND_UBUNTU
+                : _wcsicmp(backend, L"server_core") == 0
+                ? ASB_APPLIANCE_BACKEND_SERVER_CORE : 0;
+            json_get_string(json, L"storageParent", config.storage_parent, _countof(config.storage_parent));
+            json_get_string(json, L"adminUser", config.admin_user, _countof(config.admin_user));
+            json_get_string(json, L"adminPassword", config.admin_password, _countof(config.admin_password));
+            json_get_string(json, L"windowsIsoPath", config.windows_iso_path, _countof(config.windows_iso_path));
+            json_get_string(json, L"windowsImageName", config.windows_image_name, _countof(config.windows_image_name));
+            json_get_string(json, L"productKey", config.product_key, _countof(config.product_key));
+            config.data_size_gb = 256;
+            if (json_get_int(json, L"dataSizeGb", &value)) config.data_size_gb = (DWORD)value;
+            if (json_get_int(json, L"ramMb", &value)) config.ram_mb = (DWORD)value;
+            if (json_get_int(json, L"cpuCores", &value)) config.cpu_cores = (DWORD)value;
+            json_get_bool(json, L"switchBackend", &switch_backend);
+            hr = wcscmp(action, L"setupSharedAppliance") == 0
+                ? asb_shared_appliance_setup(&config)
+                : asb_shared_appliance_rebuild(&config, switch_backend);
+            SecureZeroMemory(config.admin_password, sizeof(config.admin_password));
+            SecureZeroMemory(config.product_key, sizeof(config.product_key));
+        }
+        { wchar_t out[1024]; JsonBuilder sj; jb_init(&sj,out,_countof(out));
+          jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedApplianceResult");
+          jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);
+          jb_object_end(&sj);webview2_post(out); }
+        send_full_state();
+    } else if (wcscmp(action, L"openSharedApplianceTerminal") == 0) {
+        HRESULT hr = asb_shared_appliance_open_terminal();
+        if (FAILED(hr)) send_manage_result(0, hr);
+    } else if (wcscmp(action, L"mountHostResource") == 0 ||
+               wcscmp(action, L"openHostResource") == 0 ||
+               wcscmp(action, L"unmountHostResource") == 0 ||
+               wcscmp(action, L"purgeSharedResource") == 0) {
+        wchar_t id[ASB_SHARED_ID_CHARS] = {0};
+        HRESULT hr = E_INVALIDARG;
+        if (json_get_string(json, L"id", id, _countof(id))) {
+            if (wcscmp(action, L"mountHostResource") == 0 ||
+                wcscmp(action, L"openHostResource") == 0)
+                hr = asb_shared_resource_host_mount(id);
+            else if (wcscmp(action, L"unmountHostResource") == 0)
+                hr = asb_shared_resource_host_unmount(id);
+            else hr = asb_shared_resource_purge(id);
+            if (SUCCEEDED(hr) && wcscmp(action, L"openHostResource") == 0) {
+                const AsbSharedResourceInfo *resource = shared_resources_find(id);
+                if (resource && resource->host_drive_letter) {
+                    wchar_t drive[4] = { resource->host_drive_letter, L':', L'\\', L'\0' };
+                    ShellExecuteW(g_hwnd_main, L"open", drive, NULL, NULL, SW_SHOWNORMAL);
+                }
+            }
+        }
+        { wchar_t out[1024]; JsonBuilder sj; jb_init(&sj,out,_countof(out));
+          jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");
+          jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);
+          jb_object_end(&sj);webview2_post(out); }
+        send_full_state();
     } else if (wcscmp(action, L"setVmInstallerIso") == 0) {
         int vi; wchar_t path[MAX_PATH] = { 0 }; HRESULT hr = E_INVALIDARG;
         if (json_get_int(json, L"vmIndex", &vi)) {

@@ -1062,6 +1062,121 @@ static int grow_root_filesystem(void)
     return rc;
 }
 
+static int appliance_token_valid(const char *value)
+{
+    const unsigned char *p = (const unsigned char *)value;
+    if (!p || !*p) return 0;
+    for (; *p; ++p)
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '$') return 0;
+    return 1;
+}
+
+static int configure_shared_nic(const char *arguments)
+{
+    char copy[128], *separator, command[512];
+    snprintf(copy, sizeof(copy), "%s", arguments);
+    separator = strrchr(copy, ':');
+    if (!separator) return EINVAL;
+    *separator++ = '\0';
+    if (strlen(copy) != 17 || !*separator) return EINVAL;
+    snprintf(command, sizeof(command),
+        "iface=$(ip -o link | awk -v mac='%s' 'tolower($0) ~ tolower(mac){gsub(\":\",\"\",$2);print $2;exit}'); "
+        "[ -n \"$iface\" ] && ip link set $iface up && ip addr replace %s/24 dev $iface",
+        copy, separator);
+    return run_sync(command);
+}
+
+static int appliance_prepare_storage(void)
+{
+    return run_sync(
+        "mkdir -p /srv/appsandbox; "
+        "disk=$(lsblk -dpno NAME,TYPE | awk '$2==\"disk\"{print $1}' | tail -1); "
+        "part=${disk}1; "
+        "if ! blkid $part >/dev/null 2>&1; then parted -s $disk mklabel gpt mkpart primary ext4 1MiB 100% && partprobe $disk && mkfs.ext4 -F -L ASBSHARED $part; fi; "
+        "grep -q 'LABEL=ASBSHARED' /etc/fstab || echo 'LABEL=ASBSHARED /srv/appsandbox ext4 defaults,nofail 0 2' >> /etc/fstab; "
+        "mountpoint -q /srv/appsandbox || mount /srv/appsandbox");
+}
+
+static int appliance_set_account(const char *arguments)
+{
+    char copy[512], *separator, command[512], temp[] = "/run/appsandbox-smb-XXXXXX";
+    FILE *file;
+    int fd, rc;
+    snprintf(copy, sizeof(copy), "%s", arguments);
+    separator = strchr(copy, ':');
+    if (!separator) return EINVAL;
+    *separator++ = '\0';
+    if (!appliance_token_valid(copy) || !*separator) return EINVAL;
+    snprintf(command, sizeof(command),
+        "id -u %s >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin %s",
+        copy, copy);
+    if (run_sync(command) != 0) return EIO;
+    fd = mkstemp(temp);
+    if (fd < 0) return errno;
+    fchmod(fd, 0600);
+    file = fdopen(fd, "w");
+    if (!file) { close(fd); unlink(temp); return errno; }
+    fprintf(file, "%s\n%s\n", separator, separator);
+    fclose(file);
+    snprintf(command, sizeof(command), "smbpasswd -s -a %s < %s", copy, temp);
+    rc = run_sync(command);
+    unlink(temp);
+    memset(copy, 0, sizeof(copy));
+    return rc;
+}
+
+static int appliance_reconcile_share(const char *arguments)
+{
+    char copy[256], *mode, directory[128], path[256], command[512];
+    FILE *file;
+    snprintf(copy, sizeof(copy), "%s", arguments);
+    mode = strchr(copy, ':');
+    if (!mode) return EINVAL;
+    *mode++ = '\0';
+    if (!appliance_token_valid(copy) ||
+        (strcmp(mode, "ro") != 0 && strcmp(mode, "rw") != 0)) return EINVAL;
+    snprintf(directory, sizeof(directory), "%s", copy);
+    { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
+    snprintf(command, sizeof(command),
+        "mkdir -p /srv/appsandbox/%s /etc/samba/appsandbox-shares && chown AppSandboxShare:AppSandboxShare /srv/appsandbox/%s",
+        directory, directory);
+    if (run_sync(command) != 0) return EIO;
+    snprintf(path, sizeof(path), "/etc/samba/appsandbox-shares/%s.conf", directory);
+    file = fopen(path, "w");
+    if (!file) return errno;
+    fprintf(file,
+        "[%s]\npath = /srv/appsandbox/%s\nbrowseable = no\nvalid users = AppSandboxShare\nread only = %s\nforce user = AppSandboxShare\n",
+        copy, directory, strcmp(mode, "ro") == 0 ? "yes" : "no");
+    fclose(file);
+    if (run_sync("grep -q 'include = /etc/samba/appsandbox-shares/*.conf' /etc/samba/smb.conf || echo 'include = /etc/samba/appsandbox-shares/*.conf' >> /etc/samba/smb.conf") != 0)
+        return EIO;
+    return run_sync("testparm -s >/dev/null 2>&1 && systemctl reload smbd");
+}
+
+static int appliance_purge_share(const char *share)
+{
+    char directory[128], command[512];
+    if (!appliance_token_valid(share)) return EINVAL;
+    snprintf(directory, sizeof(directory), "%s", share);
+    { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
+    snprintf(command, sizeof(command),
+        "rm -f /etc/samba/appsandbox-shares/%s.conf && rm -rf -- /srv/appsandbox/%s && systemctl reload smbd",
+        directory, directory);
+    return run_sync(command);
+}
+
+static int appliance_remove_share(const char *share)
+{
+    char directory[128], command[384];
+    if (!appliance_token_valid(share)) return EINVAL;
+    snprintf(directory, sizeof(directory), "%s", share);
+    { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
+    snprintf(command, sizeof(command),
+        "rm -f /etc/samba/appsandbox-shares/%s.conf && systemctl reload smbd",
+        directory);
+    return run_sync(command);
+}
+
 /* ---- Per-client command dispatch ---- */
 
 static void handle_client(int fd)
@@ -1109,10 +1224,41 @@ static void handle_client(int fd)
             }
         }
 
-        agent_log("cmd: %s", line);
+        if (strncmp(cmd, "appliance_account:", 18) == 0)
+            agent_log("cmd: appliance_account:<redacted>");
+        else
+            agent_log("cmd: %s", line);
 
         if (strcmp(cmd, "ping") == 0) {
             send_reply(fd, tag, "ok");
+        }
+        else if (strcmp(cmd, "appliance_ready") == 0) {
+            send_reply(fd, tag, appliance_prepare_storage() == 0 ? "ok" : "error:storage");
+        }
+        else if (strncmp(cmd, "appliance_account:", 18) == 0) {
+            send_reply(fd, tag, appliance_set_account(cmd + 18) == 0 ? "ok" : "error:account");
+        }
+        else if (strncmp(cmd, "appliance_reconcile:", 20) == 0) {
+            send_reply(fd, tag, appliance_reconcile_share(cmd + 20) == 0 ? "ok" : "error:share");
+        }
+        else if (strncmp(cmd, "appliance_purge:", 16) == 0) {
+            send_reply(fd, tag, appliance_purge_share(cmd + 16) == 0 ? "ok" : "error:purge");
+        }
+        else if (strncmp(cmd, "appliance_remove:", 17) == 0) {
+            send_reply(fd, tag, appliance_remove_share(cmd + 17) == 0 ? "ok" : "error:remove");
+        }
+        else if (strncmp(cmd, "appliance_grow:", 15) == 0) {
+            send_reply(fd, tag, run_sync(
+                "part=$(findmnt -n -o SOURCE /srv/appsandbox); disk=/dev/$(lsblk -no PKNAME $part); number=$(lsblk -no PARTN $part); growpart $disk $number && resize2fs $part") == 0
+                ? "ok" : "error:grow");
+        }
+        else if (strcmp(cmd, "appliance_update") == 0) {
+            send_reply(fd, tag, run_sync(
+                "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y upgrade") == 0
+                ? "ok" : "error:update");
+        }
+        else if (strncmp(cmd, "shared_net:", 11) == 0) {
+            send_reply(fd, tag, configure_shared_nic(cmd + 11) == 0 ? "ok" : "net_failed");
         }
         else if (strcmp(cmd, "shutdown") == 0) {
             send_reply(fd, tag, "ok");

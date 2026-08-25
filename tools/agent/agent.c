@@ -1944,9 +1944,123 @@ static BOOL grow_root_partition(void)
     return wait_result == WAIT_OBJECT_0 && exit_code == 0;
 }
 
+static BOOL appliance_token_valid(const char *value)
+{
+    const unsigned char *p = (const unsigned char *)value;
+    if (!p || !*p) return FALSE;
+    for (; *p; ++p)
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '$') return FALSE;
+    return TRUE;
+}
+
+static DWORD run_powershell_wait(const wchar_t *script, DWORD timeout_ms)
+{
+    wchar_t command[4096];
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    DWORD exit_code = ERROR_GEN_FAILURE;
+    swprintf_s(command, _countof(command),
+        L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"%s\"",
+        script);
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) return GetLastError();
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_OBJECT_0)
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+    else { TerminateProcess(pi.hProcess, ERROR_TIMEOUT); exit_code = ERROR_TIMEOUT; }
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return exit_code;
+}
+
+static DWORD appliance_prepare_storage(void)
+{
+    return run_powershell_wait(
+        L"$root='C:\\AppSandboxData'; $d=Get-Disk | Where-Object PartitionStyle -eq 'RAW' | Sort-Object Number | Select-Object -Last 1; "
+        L"if($d){Initialize-Disk -Number $d.Number -PartitionStyle GPT -ErrorAction Stop; "
+        L"$p=New-Partition -DiskNumber $d.Number -UseMaximumSize -ErrorAction Stop; Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel AppSandboxShared -Confirm:$false -ErrorAction Stop}; "
+        L"New-Item -ItemType Directory -Force -Path $root | Out-Null; "
+        L"$v=Get-Volume -FileSystemLabel AppSandboxShared -ErrorAction Stop; "
+        L"if(-not (Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue | Get-PartitionAccessPath | Where-Object AccessPath -eq ($root+'\\'))){ "
+        L"Add-PartitionAccessPath -DiskNumber ($v | Get-Partition).DiskNumber -PartitionNumber ($v | Get-Partition).PartitionNumber -AccessPath ($root+'\\') -ErrorAction SilentlyContinue}; "
+        L"Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Confirm:$false -ErrorAction Stop",
+        120000);
+}
+
+static DWORD appliance_set_account(const char *arguments)
+{
+    char copy[512], *separator;
+    wchar_t user[128], password[256];
+    DWORD rc;
+    strcpy_s(copy, sizeof(copy), arguments);
+    separator = strchr(copy, ':');
+    if (!separator) return ERROR_INVALID_PARAMETER;
+    *separator++ = '\0';
+    if (!appliance_token_valid(copy) || !*separator) return ERROR_INVALID_PARAMETER;
+    MultiByteToWideChar(CP_UTF8, 0, copy, -1, user, _countof(user));
+    MultiByteToWideChar(CP_UTF8, 0, separator, -1, password, _countof(password));
+    SetEnvironmentVariableW(L"ASB_APPLIANCE_USER", user);
+    SetEnvironmentVariableW(L"ASB_APPLIANCE_PASSWORD", password);
+    rc = run_powershell_wait(
+        L"$u=$env:ASB_APPLIANCE_USER; $s=ConvertTo-SecureString $env:ASB_APPLIANCE_PASSWORD -AsPlainText -Force; "
+        L"if(Get-LocalUser -Name $u -ErrorAction SilentlyContinue){Set-LocalUser -Name $u -Password $s -PasswordNeverExpires $true}"
+        L"else{New-LocalUser -Name $u -Password $s -PasswordNeverExpires -UserMayNotChangePassword | Out-Null}", 30000);
+    SetEnvironmentVariableW(L"ASB_APPLIANCE_PASSWORD", NULL);
+    SetEnvironmentVariableW(L"ASB_APPLIANCE_USER", NULL);
+    SecureZeroMemory(password, sizeof(password));
+    SecureZeroMemory(copy, sizeof(copy));
+    return rc;
+}
+
+static DWORD appliance_reconcile_share(const char *arguments)
+{
+    char copy[256], *separator;
+    wchar_t share[128], directory[128], script[2048];
+    BOOL read_only;
+    strcpy_s(copy, sizeof(copy), arguments);
+    separator = strchr(copy, ':');
+    if (!separator) return ERROR_INVALID_PARAMETER;
+    *separator++ = '\0';
+    if (!appliance_token_valid(copy) ||
+        (strcmp(separator, "ro") != 0 && strcmp(separator, "rw") != 0))
+        return ERROR_INVALID_PARAMETER;
+    read_only = strcmp(separator, "ro") == 0;
+    MultiByteToWideChar(CP_UTF8, 0, copy, -1, share, _countof(share));
+    wcscpy_s(directory, _countof(directory), share);
+    { wchar_t *dollar = wcschr(directory, L'$'); if (dollar) *dollar = L'\0'; }
+    swprintf_s(script, _countof(script),
+        L"$p='C:\\AppSandboxData\\%s'; New-Item -ItemType Directory -Force -Path $p | Out-Null; "
+        L"if(Get-SmbShare -Name '%s' -ErrorAction SilentlyContinue){Remove-SmbShare -Name '%s' -Force}; "
+        L"New-SmbShare -Name '%s' -Path $p -%sAccess 'AppSandboxShare' -EncryptData:$false | Out-Null",
+        directory, share, share, share, read_only ? L"Read" : L"Full");
+    return run_powershell_wait(script, 30000);
+}
+
+static DWORD appliance_purge_share(const char *share_arg)
+{
+    wchar_t share[128], directory[128], script[1024];
+    if (!appliance_token_valid(share_arg)) return ERROR_INVALID_PARAMETER;
+    MultiByteToWideChar(CP_UTF8, 0, share_arg, -1, share, _countof(share));
+    wcscpy_s(directory, _countof(directory), share);
+    { wchar_t *dollar = wcschr(directory, L'$'); if (dollar) *dollar = L'\0'; }
+    swprintf_s(script, _countof(script),
+        L"if(Get-SmbShare -Name '%s' -ErrorAction SilentlyContinue){Remove-SmbShare -Name '%s' -Force}; Remove-Item -LiteralPath 'C:\\AppSandboxData\\%s' -Recurse -Force -ErrorAction SilentlyContinue",
+        share, share, directory);
+    return run_powershell_wait(script, 60000);
+}
+
+static DWORD appliance_remove_share(const char *share_arg)
+{
+    wchar_t share[128], script[512];
+    if (!appliance_token_valid(share_arg)) return ERROR_INVALID_PARAMETER;
+    MultiByteToWideChar(CP_UTF8, 0, share_arg, -1, share, _countof(share));
+    swprintf_s(script, _countof(script),
+        L"if(Get-SmbShare -Name '%s' -ErrorAction SilentlyContinue){Remove-SmbShare -Name '%s' -Force}",
+        share, share);
+    return run_powershell_wait(script, 30000);
+}
+
 static void handle_client(AsbConn *client)
 {
-    char buf[256];
+    char buf[2048];
     int n;
     DWORD heartbeat_interval = 5000;     /* ms between heartbeats */
     DWORD device_check_interval = 20000; /* ms between VDD/Hyper-V device checks */
@@ -2033,7 +2147,8 @@ static void handle_client(AsbConn *client)
                 }
             }
 
-        if (strncmp(cmd, "shared_smb_map:", 15) == 0)
+        if (strncmp(cmd, "shared_smb_map:", 15) == 0 ||
+            strncmp(cmd, "appliance_account:", 18) == 0)
             agent_log("Command: shared_smb_map:<redacted>");
         else
             agent_log("Command: %s", buf);
@@ -2044,8 +2159,46 @@ static void handle_client(AsbConn *client)
         if (strcmp(cmd, "ping") == 0) {
             REPLY("ok");
         }
+        else if (strcmp(cmd, "appliance_ready") == 0) {
+            DWORD ec = appliance_prepare_storage();
+            if (ec == 0) REPLY("ok");
+            else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
+        }
+        else if (strncmp(cmd, "appliance_account:", 18) == 0) {
+            DWORD ec = appliance_set_account(cmd + 18);
+            if (ec == 0) REPLY("ok");
+            else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
+        }
+        else if (strncmp(cmd, "appliance_reconcile:", 20) == 0) {
+            DWORD ec = appliance_reconcile_share(cmd + 20);
+            if (ec == 0) REPLY("ok");
+            else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
+        }
+        else if (strncmp(cmd, "appliance_purge:", 16) == 0) {
+            DWORD ec = appliance_purge_share(cmd + 16);
+            if (ec == 0) REPLY("ok");
+            else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
+        }
+        else if (strncmp(cmd, "appliance_remove:", 17) == 0) {
+            DWORD ec = appliance_remove_share(cmd + 17);
+            if (ec == 0) REPLY("ok");
+            else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
+        }
+        else if (strncmp(cmd, "appliance_grow:", 15) == 0) {
+            DWORD ec = run_powershell_wait(
+                L"$v=Get-Volume -FileSystemLabel AppSandboxShared -ErrorAction Stop; $p=$v|Get-Partition; $s=$p|Get-PartitionSupportedSize; Resize-Partition -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber -Size $s.SizeMax -ErrorAction Stop", 120000);
+            REPLY(ec == 0 ? "ok" : "error:grow_failed");
+        }
+        else if (strcmp(cmd, "appliance_update") == 0) {
+            DWORD ec = run_powershell_wait(
+                L"$s=New-Object -ComObject Microsoft.Update.Session; $q=$s.CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0'); "
+                L"$c=New-Object -ComObject Microsoft.Update.UpdateColl; foreach($u in $q.Updates){if(-not $u.EulaAccepted){$u.AcceptEula()};[void]$c.Add($u)}; "
+                L"if($c.Count){$d=$s.CreateUpdateDownloader();$d.Updates=$c;[void]$d.Download();$i=$s.CreateUpdateInstaller();$i.Updates=$c;$r=$i.Install();if($r.ResultCode -gt 3){exit 1}}",
+                30 * 60 * 1000);
+            REPLY(ec == 0 ? "ok" : "error:update_failed");
+        }
         else if (strncmp(cmd, "shared_net:", 11) == 0) {
-            char *arg = cmd + 11, *sep = strchr(arg, ':');
+            char *arg = cmd + 11, *sep = strrchr(arg, ':');
             int ec = ERROR_INVALID_PARAMETER;
             if (sep) {
                 *sep = '\0';

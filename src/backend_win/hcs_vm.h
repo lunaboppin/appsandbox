@@ -35,6 +35,7 @@ typedef struct {
     wchar_t os_type[32];          /* L"Windows" or L"Linux" */
     wchar_t image_path[MAX_PATH]; /* ISO path */
     wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
+    wchar_t data_vhdx_path[MAX_PATH]; /* optional appliance-owned data disk */
     wchar_t storage_root[MAX_PATH]; /* complete managed VM tree */
     DWORD   ram_mb;
     DWORD   hdd_gb;
@@ -46,6 +47,8 @@ typedef struct {
     wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
+    BOOL    is_appliance;             /* TRUE = hidden shared-storage appliance */
+    BOOL    allow_missing_shared_resources; /* explicit dependency bypass */
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
@@ -66,6 +69,7 @@ typedef struct {
     wchar_t     name[256];
     wchar_t     os_type[32];
     wchar_t     vhdx_path[MAX_PATH];
+    wchar_t     data_vhdx_path[MAX_PATH];
     wchar_t     storage_root[MAX_PATH];
     wchar_t     image_path[MAX_PATH];
     DWORD       ram_mb;
@@ -90,6 +94,7 @@ typedef struct {
     BOOL        agent_online;     /* TRUE when persistent agent connection is active */
     BOOL        idd_ready;        /* TRUE once the agent reports the display driver is up (idd_status:ok) */
     BOOL        is_template;     /* TRUE = template VM (sysprep after install) */
+    BOOL        is_appliance;    /* TRUE = hidden shared-storage appliance */
     BOOL        install_complete; /* TRUE after guest agent first comes online */
     BOOL        auto_open_display; /* TRUE = open IDD display whenever it becomes ready */
     DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */

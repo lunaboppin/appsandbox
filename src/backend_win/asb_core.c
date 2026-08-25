@@ -20,7 +20,7 @@
 #include "prereq.h"
 #include "ui.h"
 #include "shared_resources.h"
-#include "smb_transport.h"
+#include "shared_appliance.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -369,7 +369,7 @@ ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
     for (i = 0; i < g_vm_count; i++) {
         if (g_vms[i].unique_id == id) return &g_vms[i];
     }
-    return NULL;
+    return shared_appliance_instance_by_id(id);
 }
 
 /* ---- Per-VM state JSON (beside disk.vhdx) ---- */
@@ -425,7 +425,7 @@ static void get_config_path(wchar_t *out, size_t out_len)
    public-key line in pubkey_out (newline-trimmed). ed25519 keeps the public key
    short enough to fit the agent's command buffer. The private key stays host-side
    so clients can connect with `ssh -i id_appsandbox`. Returns TRUE on success. */
-static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
+ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int cap)
 {
     wchar_t base[MAX_PATH], ssh_dir[MAX_PATH], priv[MAX_PATH], pub[MAX_PATH];
     char line[1024] = {0};
@@ -1102,6 +1102,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
     int i;
 
     if (!instance) return;
+    if (shared_appliance_handle_hcs_state(instance, event)) return;
 
     for (i = 0; i < g_vm_count; i++) {
         if (&g_vms[i] != instance) continue;
@@ -1195,12 +1196,7 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
 ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 {
     if (!vm) return;
-    if (!vm->share_network_cleaned) {
-        static const GUID zero_guid = { 0 };
-        if (memcmp(&vm->share_endpoint_id, &zero_guid, sizeof(GUID)) != 0)
-            hcn_delete_endpoint(&vm->share_endpoint_id);
-        vm->share_network_cleaned = TRUE;
-    }
+    shared_appliance_release_client(vm);
     if (vm->network_mode == NET_NONE) return;
     if (vm->network_cleaned) return;
     hcn_delete_endpoint(&vm->endpoint_id);
@@ -1299,70 +1295,11 @@ static BOOL share_ip_in_use(const VmInstance *self, const char *ip)
 /* Provision the app-owned SMB shares and independent HCN endpoint. Failure is
    deliberately non-fatal: resources are marked unavailable and the VM still
    starts with its selected normal network mode (including NET_NONE). */
-static BOOL prepare_shared_transport(VmConfig *config, VmInstance *runtime,
-                                     wchar_t *endpoint_guid, size_t guid_chars)
+static HRESULT prepare_shared_transport(VmConfig *config, VmInstance *runtime,
+                                        wchar_t *endpoint_guid, size_t guid_chars)
 {
-    const char *base;
-    unsigned int hash;
-    int octet, attempts, i, available = 0;
-    HRESULT hr;
-
-    endpoint_guid[0] = L'\0';
-    if (!config || !runtime || config->shared_resource_count <= 0 ||
-        config->is_template || _wcsicmp(config->os_type, L"Windows") != 0)
-        return FALSE;
-
-    base = hcn_share_subnet_base();
-    hash = share_identity_hash(config->name);
-    octet = 2 + (int)(hash % 240u);
-    for (attempts = 0; attempts < 253; attempts++) {
-        sprintf_s(runtime->share_ip, sizeof(runtime->share_ip), "%s.%d", base, octet);
-        if (!share_ip_in_use(runtime, runtime->share_ip)) break;
-        octet++; if (octet > 254) octet = 2;
-    }
-    sprintf_s(runtime->share_host_ip, sizeof(runtime->share_host_ip), "%s.1", base);
-    sprintf_s(runtime->share_mac, sizeof(runtime->share_mac),
-              "02-15-5D-%02X-%02X-%02X",
-              (hash >> 16) & 0xFF, (hash >> 8) & 0xFF, hash & 0xFF);
-
-    hr = hcn_create_share_network(&runtime->share_network_id);
-    if (SUCCEEDED(hr))
-        hr = smb_transport_prepare(config->shared_resources,
-                                   config->shared_resource_count, base);
-    for (i = 0; i < config->shared_resource_count; i++)
-        if (_wcsicmp(config->shared_resources[i].mapping_result, L"unavailable") != 0)
-            available++;
-    if (SUCCEEDED(hr) || available > 0)
-        hr = hcn_create_share_endpoint(&runtime->share_network_id,
-                                       &runtime->share_endpoint_id,
-                                       endpoint_guid, guid_chars,
-                                       runtime->share_ip, runtime->share_mac);
-    if (FAILED(hr) || available == 0) {
-        for (i = 0; i < config->shared_resource_count; i++) {
-            wcscpy_s(config->shared_resources[i].mapping_result,
-                     _countof(config->shared_resources[i].mapping_result), L"unavailable");
-            if (!config->shared_resources[i].failure[0])
-                swprintf_s(config->shared_resources[i].failure,
-                           _countof(config->shared_resources[i].failure),
-                           L"smb_transport_failed:0x%08X", hr);
-        }
-        wcscpy_s(runtime->shared_resource_transport, 16, L"unavailable");
-        swprintf_s(runtime->shared_resource_error, 256,
-                   L"Isolated SMB transport unavailable (0x%08X).", hr);
-        endpoint_guid[0] = L'\0';
-        asb_log(L"Shared-resource transport unavailable for \"%s\" (0x%08X); VM startup continues.",
-                config->name, hr);
-        return FALSE;
-    }
-    memcpy(runtime->shared_resources, config->shared_resources,
-           sizeof(runtime->shared_resources));
-    runtime->shared_resource_count = config->shared_resource_count;
-    wcscpy_s(runtime->shared_resource_transport, 16, L"smb");
-    runtime->shared_resource_error[0] = L'\0';
-    runtime->share_network_cleaned = FALSE;
-    asb_log(L"Attached isolated SMB adapter %S (%S) to \"%s\".",
-            runtime->share_ip, runtime->share_mac, config->name);
-    return TRUE;
+    return shared_appliance_prepare_client(config, runtime, endpoint_guid,
+        guid_chars, config ? config->allow_missing_shared_resources : FALSE);
 }
 
 /* ---- Background VM start thread ---- */
@@ -1448,9 +1385,16 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         }
     }
 
-    if (!shared_upgrade_failed)
-        prepare_shared_transport(&args->config, vm, share_endpoint_guid,
-                                 _countof(share_endpoint_guid));
+    if (!shared_upgrade_failed) {
+        hr = prepare_shared_transport(&args->config, vm, share_endpoint_guid,
+                                      _countof(share_endpoint_guid));
+        if (FAILED(hr)) {
+            asb_log(L"Shared appliance unavailable for \"%s\" (0x%08X).", vm->name, hr);
+            asb_alert(L"The shared-storage appliance is unavailable. Retry or start without shared resources.");
+            HeapFree(GetProcessHeap(), 0, args);
+            return 0;
+        }
+    }
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
     hr = (endpoint_guid_str[0] != L'\0' || share_endpoint_guid[0] != L'\0')
@@ -3081,7 +3025,7 @@ ASB_API HRESULT asb_init(void)
         swprintf_s(g_last_storage_parent, MAX_PATH, L"%s\\AppSandbox", pd);
     }
     shared_resources_init();
-    smb_transport_cleanup_stale();
+    shared_appliance_init();
     {
         int ri;
         for(ri=0;ri<g_vm_count;ri++){
@@ -3089,7 +3033,7 @@ ASB_API HRESULT asb_init(void)
                 g_vms[ri].os_type,g_vms[ri].shared_resource_exclusions,
                 g_vms[ri].shared_resources,ASB_MAX_SHARED_RESOURCES);
             if(g_vms[ri].shared_resource_count)
-                wcscpy_s(g_vms[ri].shared_resource_transport,16,L"smb");
+                wcscpy_s(g_vms[ri].shared_resource_transport,16,L"appliance");
         }
     }
     scan_templates();
@@ -3117,8 +3061,8 @@ ASB_API void asb_cleanup(void)
         hcs_close_vm(&g_vms[i]);
     }
 
+    shared_appliance_cleanup();
     hcs_cleanup();
-    smb_transport_cleanup_stale();
     hcn_cleanup();
     DeleteCriticalSection(&g_cs);
     g_initialized = FALSE;
@@ -3189,7 +3133,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
        stores the public key on the instance (the agent deploys it at runtime). */
     cfg.ssh_deploy_key = config->ssh_deploy_key && config->ssh_enabled;
-    if (cfg.ssh_deploy_key && !ensure_appsandbox_ssh_key(ssh_pubkey, 512)) {
+    if (cfg.ssh_deploy_key && !asb_ensure_ssh_key(ssh_pubkey, 512)) {
         asb_log(L"ssh key: could not prepare AppSandbox key; creating without key deploy.");
         cfg.ssh_deploy_key = FALSE;
     }
@@ -3339,7 +3283,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     memcpy(inst->shared_resources, cfg.shared_resources, sizeof(inst->shared_resources));
     inst->shared_resource_count = cfg.shared_resource_count;
     if (cfg.shared_resource_count)
-        wcscpy_s(inst->shared_resource_transport, 16, L"smb");
+        wcscpy_s(inst->shared_resource_transport, 16, L"appliance");
 
     /* GPU driver shares */
     if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create) {
@@ -3674,8 +3618,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
 /* ---- VM Start ---- */
 
-ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
-                              const wchar_t *branch_name)
+ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
+                                const wchar_t *branch_name,
+                                BOOL allow_missing_shared_resources)
 {
     VmInstance *inst;
     int idx;
@@ -3688,6 +3633,17 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     if (InterlockedCompareExchange(&inst->management_busy, 1, 0) != 0) {
         asb_log(L"VM \"%s\" is busy with another lifecycle operation.", inst->name);
         return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+
+    if (!allow_missing_shared_resources &&
+        shared_resources_build_attachments(inst->os_type,
+            inst->shared_resource_exclusions, inst->shared_resources,
+            ASB_MAX_SHARED_RESOURCES) > 0) {
+        HRESULT dependency_hr = shared_appliance_start(TRUE, 120000);
+        if (FAILED(dependency_hr)) {
+            InterlockedExchange(&inst->management_busy, 0);
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
     }
 
     /* Switch to snapshot/base branch before booting */
@@ -3744,6 +3700,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.shared_resource_count = shared_resources_build_attachments(
             inst->os_type, inst->shared_resource_exclusions,
             args->config.shared_resources, ASB_MAX_SHARED_RESOURCES);
+        args->config.allow_missing_shared_resources = allow_missing_shared_resources;
         memcpy(inst->shared_resources, args->config.shared_resources,
                sizeof(inst->shared_resources));
         inst->shared_resource_count = args->config.shared_resource_count;
@@ -3764,7 +3721,8 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             hcs_terminate_vm(inst);
             hcs_close_vm(inst);
             InterlockedExchange(&inst->management_busy, 0);
-            return asb_vm_start(vm, -1, -1, NULL);
+            return asb_vm_start_ex(vm, -1, -1, NULL,
+                                   allow_missing_shared_resources);
         }
         if (FAILED(hr)) {
             asb_log(L"Error: Failed to start VM (0x%08X)", hr);
@@ -4126,6 +4084,12 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
+}
+
+ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
+                             const wchar_t *branch_name)
+{
+    return asb_vm_start_ex(vm, snap_idx, branch_idx, branch_name, FALSE);
 }
 
 ASB_API HRESULT asb_vm_set_installer_iso(AsbVm vm, const wchar_t *path)
@@ -4675,7 +4639,7 @@ ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,
                                            wchar_t *created_id, size_t created_id_chars)
 {
     HRESULT hr=shared_resources_create(info,confirm_permissions,created_id,created_id_chars);
-    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();}
+    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();shared_appliance_reconcile();}
     return hr;
 }
 
@@ -4688,13 +4652,16 @@ ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
         int i;
         for (i = 0; i < g_vm_count; i++) g_vms[i].shared_resource_pending = TRUE;
         save_vm_list();
+        shared_appliance_reconcile();
     }
     return hr;
 }
 
 ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id)
 {
-    HRESULT hr = shared_resources_remove(id);
+    HRESULT hr;
+    shared_appliance_unpublish_resource(id);
+    hr = shared_resources_remove(id);
     if (SUCCEEDED(hr)) {
         int i;
         for (i = 0; i < g_vm_count; i++) {
@@ -4730,6 +4697,30 @@ ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
     if (SUCCEEDED(hr)) { inst->shared_resource_pending = TRUE; save_vm_list(); }
     return hr;
 }
+
+ASB_API void asb_shared_appliance_get_status(SharedApplianceStatus *out)
+{ shared_appliance_get_status(out); }
+ASB_API HRESULT asb_shared_appliance_setup(const SharedApplianceConfig *config)
+{ return shared_appliance_setup(config); }
+ASB_API HRESULT asb_shared_appliance_start(BOOL wait_ready, DWORD timeout_ms)
+{ return shared_appliance_start(wait_ready, timeout_ms); }
+ASB_API HRESULT asb_shared_appliance_stop(BOOL force)
+{ return shared_appliance_stop(force); }
+ASB_API HRESULT asb_shared_appliance_update(void)
+{ return shared_appliance_update(); }
+ASB_API HRESULT asb_shared_appliance_grow(DWORD new_size_gb)
+{ return shared_appliance_grow(new_size_gb); }
+ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config,
+                                             BOOL switch_backend)
+{ return shared_appliance_rebuild(config, switch_backend); }
+ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id)
+{ return shared_appliance_mount_host_resource(id); }
+ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id)
+{ return shared_appliance_unmount_host_resource(id); }
+ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id)
+{ return shared_appliance_purge_resource(id); }
+ASB_API HRESULT asb_shared_appliance_open_terminal(void)
+{ return shared_appliance_open_terminal(); }
 
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
 {

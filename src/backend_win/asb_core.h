@@ -12,6 +12,7 @@
 
 #include <windows.h>
 #include "shared_resources.h"
+#include "shared_appliance.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -136,7 +137,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config);
    branch_idx: branch index (>= 0) to resume, or -1 to create a new branch.
    branch_name: friendly name for a newly created branch, or NULL for default. */
 ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
-                              const wchar_t *branch_name);
+                             const wchar_t *branch_name);
+ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
+                                const wchar_t *branch_name,
+                                BOOL allow_missing_shared_resources);
 
 /* Graceful shutdown (sends ACPI shutdown signal). */
 ASB_API HRESULT asb_vm_shutdown(AsbVm vm);
@@ -249,6 +253,7 @@ ASB_API void asb_set_last_storage_parent(const wchar_t *path);
 ASB_API const wchar_t *asb_get_last_storage_parent(void);
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress);
 ASB_API BOOL asb_get_suppress_tray_warn(void);
+ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int capacity);
 
 /* ---- Global shared resources (Windows guests) ---- */
 ASB_API int asb_shared_resource_count(void);
@@ -263,6 +268,20 @@ ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id);
 ASB_API BOOL asb_vm_shared_resource_enabled(AsbVm vm, const wchar_t *id);
 ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
                                                    const wchar_t *id, BOOL enabled);
+
+/* ---- Hidden shared-storage appliance ---- */
+ASB_API void asb_shared_appliance_get_status(SharedApplianceStatus *out);
+ASB_API HRESULT asb_shared_appliance_setup(const SharedApplianceConfig *config);
+ASB_API HRESULT asb_shared_appliance_start(BOOL wait_ready, DWORD timeout_ms);
+ASB_API HRESULT asb_shared_appliance_stop(BOOL force);
+ASB_API HRESULT asb_shared_appliance_update(void);
+ASB_API HRESULT asb_shared_appliance_grow(DWORD new_size_gb);
+ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config,
+                                             BOOL switch_backend);
+ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
+ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
+ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
+ASB_API HRESULT asb_shared_appliance_open_terminal(void);
 
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);

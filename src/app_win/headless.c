@@ -274,16 +274,48 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 static int append_shared_resource_json(char *out, int cap, int pos,
                                        const AsbSharedResourceInfo *r)
 {
+    SharedApplianceStatus appliance;
+    asb_shared_appliance_get_status(&appliance);
     pos += sprintf_s(out + pos, cap - pos, "{\"id\":");
     pos = append_wstr(out, cap, pos, r->id);
     pos += sprintf_s(out + pos, cap - pos, ",\"name\":");
     pos = append_wstr(out, cap, pos, r->name);
-    pos += sprintf_s(out + pos, cap - pos, ",\"hostPath\":");
-    pos = append_wstr(out, cap, pos, r->host_path);
+    pos += sprintf_s(out + pos, cap - pos, ",\"storageKind\":\"appliance\",\"legacyHostPath\":");
+    pos = append_wstr(out, cap, pos, r->legacy_host_path);
     pos += sprintf_s(out + pos, cap - pos,
-        ",\"driveLetter\":\"%c\",\"enabled\":%s,\"readOnly\":%s,\"aclCreated\":%s}",
-        r->drive_letter, r->enabled ? "true":"false",
-        r->read_only ? "true":"false", r->acl_created ? "true":"false");
+        ",\"driveLetter\":\"%c\",\"hostDriveLetter\":\"%c\",\"enabled\":%s,\"readOnly\":%s,"
+        "\"availability\":\"%s\",\"applianceState\":%d}",
+        r->drive_letter, r->host_drive_letter ? r->host_drive_letter : '-',
+        r->enabled ? "true":"false",
+        r->read_only ? "true":"false",
+        appliance.ready ? "available" : "unavailable", appliance.state);
+    return pos;
+}
+
+static int append_shared_appliance_json(char *out, int cap,
+                                        const SharedApplianceStatus *s)
+{
+    int pos = sprintf_s(out, cap,
+        "{\"configured\":%s,\"backend\":\"%s\",\"state\":%d,\"progress\":%d,"
+        "\"ready\":%s,\"busy\":%s,\"dataSizeGb\":%lu,\"ramMb\":%lu,"
+        "\"cpuCores\":%lu,\"activeClients\":%ld,\"hostMounts\":%ld,\"storageRoot\":",
+        s->configured ? "true" : "false",
+        s->backend == ASB_APPLIANCE_BACKEND_UBUNTU ? "ubuntu" :
+        s->backend == ASB_APPLIANCE_BACKEND_SERVER_CORE ? "server_core" : "none",
+        s->state, s->progress, s->ready ? "true" : "false",
+        s->busy ? "true" : "false", (unsigned long)s->data_size_gb,
+        (unsigned long)s->ram_mb, (unsigned long)s->cpu_cores,
+        s->active_clients, s->host_mounts);
+    pos = append_wstr(out, cap, pos, s->storage_root);
+    pos += sprintf_s(out + pos, cap - pos, ",\"osVhdxPath\":");
+    pos = append_wstr(out, cap, pos, s->os_vhdx_path);
+    pos += sprintf_s(out + pos, cap - pos, ",\"dataVhdxPath\":");
+    pos = append_wstr(out, cap, pos, s->data_vhdx_path);
+    pos += sprintf_s(out + pos, cap - pos, ",\"progressText\":");
+    pos = append_wstr(out, cap, pos, s->progress_text);
+    pos += sprintf_s(out + pos, cap - pos, ",\"lastError\":");
+    pos = append_wstr(out, cap, pos, s->last_error);
+    pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
 
@@ -622,7 +654,61 @@ static int handle_request(PHTTP_REQUEST req)
         return 0;
     }
 
-    /* ---- Global host-backed shared resources ---- */
+    /* ---- Hidden shared-storage appliance ---- */
+    if (wcscmp(path, L"/v1/shared-appliance") == 0 && verb == HttpVerbGET) {
+        SharedApplianceStatus status;
+        asb_shared_appliance_get_status(&status);
+        append_shared_appliance_json(buf, sizeof(buf), &status);
+        send_json(req->RequestId, 200, "OK", buf);
+        return 0;
+    }
+    if (wcsncmp(path, L"/v1/shared-appliance/", 21) == 0 && verb == HttpVerbPOST) {
+        const wchar_t *action = path + 21;
+        wchar_t body[4096];
+        HRESULT hr = E_INVALIDARG;
+        body_to_wide(req, body, _countof(body));
+        if (wcscmp(action, L"start") == 0) hr = asb_shared_appliance_start(TRUE, 120000);
+        else if (wcscmp(action, L"stop") == 0) {
+            BOOL force = FALSE; json_get_bool(body, L"force", &force);
+            hr = asb_shared_appliance_stop(force);
+        } else if (wcscmp(action, L"update") == 0) hr = asb_shared_appliance_update();
+        else if (wcscmp(action, L"grow") == 0) {
+            int size = 0; json_get_int(body, L"dataSizeGb", &size);
+            hr = asb_shared_appliance_grow((DWORD)size);
+        } else if (wcscmp(action, L"setup") == 0 || wcscmp(action, L"rebuild") == 0) {
+            SharedApplianceConfig config;
+            wchar_t backend[32] = L"";
+            int value;
+            BOOL switch_backend = FALSE;
+            ZeroMemory(&config, sizeof(config));
+            json_get_string(body, L"backend", backend, _countof(backend));
+            config.backend = _wcsicmp(backend, L"ubuntu") == 0 ? ASB_APPLIANCE_BACKEND_UBUNTU :
+                _wcsicmp(backend, L"server_core") == 0 ? ASB_APPLIANCE_BACKEND_SERVER_CORE : 0;
+            json_get_string(body, L"storageParent", config.storage_parent, _countof(config.storage_parent));
+            json_get_string(body, L"adminUser", config.admin_user, _countof(config.admin_user));
+            json_get_string(body, L"adminPassword", config.admin_password, _countof(config.admin_password));
+            json_get_string(body, L"windowsIsoPath", config.windows_iso_path, _countof(config.windows_iso_path));
+            json_get_string(body, L"windowsImageName", config.windows_image_name, _countof(config.windows_image_name));
+            json_get_string(body, L"productKey", config.product_key, _countof(config.product_key));
+            config.data_size_gb = 256;
+            if (json_get_int(body, L"dataSizeGb", &value)) config.data_size_gb = (DWORD)value;
+            if (json_get_int(body, L"ramMb", &value)) config.ram_mb = (DWORD)value;
+            if (json_get_int(body, L"cpuCores", &value)) config.cpu_cores = (DWORD)value;
+            json_get_bool(body, L"switchBackend", &switch_backend);
+            hr = wcscmp(action, L"setup") == 0 ? asb_shared_appliance_setup(&config) :
+                asb_shared_appliance_rebuild(&config, switch_backend);
+            SecureZeroMemory(config.admin_password, sizeof(config.admin_password));
+            SecureZeroMemory(config.product_key, sizeof(config.product_key));
+            SecureZeroMemory(body, sizeof(body));
+        }
+        if (SUCCEEDED(hr)) send_json(req->RequestId, 202, "Accepted", "{\"ok\":true}");
+        else if (hr == HRESULT_FROM_WIN32(ERROR_BUSY))
+            send_err(req->RequestId, 409, "Conflict", "busy", "shared appliance operation already in progress");
+        else send_err(req->RequestId, 400, "Bad Request", "appliance_operation_failed", "shared appliance operation failed");
+        return 0;
+    }
+
+    /* ---- Global appliance-backed shared resources ---- */
     if (wcscmp(path, L"/v1/shared-resources") == 0) {
         if (verb == HttpVerbGET) {
             int count = asb_shared_resource_count();
@@ -640,23 +726,40 @@ static int handle_request(PHTTP_REQUEST req)
             AsbSharedResourceInfo r; BOOL confirm=FALSE; HRESULT hr;
             ZeroMemory(&r,sizeof(r)); body_to_wide(req,body,_countof(body));
             json_get_string(body,L"name",r.name,_countof(r.name));
-            json_get_string(body,L"hostPath",r.host_path,_countof(r.host_path));
+            if (json_get_string(body,L"hostPath",r.host_path,_countof(r.host_path))) {
+                send_err(req->RequestId,400,"Bad Request","host_path_unsupported","hostPath resources are no longer supported; set up the shared appliance and create an empty appliance resource");
+                return 0;
+            }
             { wchar_t dl[8]={0}; json_get_string(body,L"driveLetter",dl,8); r.drive_letter=towupper(dl[0]); }
+            { wchar_t dl[8]={0}; json_get_string(body,L"hostDriveLetter",dl,8); r.host_drive_letter=towupper(dl[0]); }
             if(!json_get_bool(body,L"enabled",&r.enabled))r.enabled=TRUE;
             json_get_bool(body,L"readOnly",&r.read_only);
             json_get_bool(body,L"confirmPermissions",&confirm);
             hr=asb_shared_resource_create(&r,confirm,id,_countof(id));
             if(SUCCEEDED(hr)){pos=sprintf_s(buf,sizeof(buf),"{\"ok\":true,\"id\":");pos=append_wstr(buf,sizeof(buf),pos,id);sprintf_s(buf+pos,sizeof(buf)-pos,"}");send_json(req->RequestId,201,"Created",buf);}
-            else if(hr==HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED))send_err(req->RequestId,409,"Conflict","permissions_confirmation_required","folder ACL confirmation required");
-            else send_err(req->RequestId,400,"Bad Request","invalid_resource","invalid, duplicate, nested, or unsupported resource");
+            else send_err(req->RequestId,400,"Bad Request","invalid_resource","invalid or duplicate appliance resource");
             return 0;
         }
         send_err(req->RequestId,405,"Method Not Allowed","method","unsupported method");return 0;
     }
     if (wcsncmp(path,L"/v1/shared-resources/",21)==0) {
         const wchar_t *id=path+21; wchar_t body[4096]; AsbSharedResourceInfo r; BOOL confirm=FALSE; HRESULT hr;
+        wchar_t resource_id[ASB_SHARED_ID_CHARS];
+        const wchar_t *slash = wcschr(id, L'/');
+        if (slash && verb == HttpVerbPOST) {
+            size_t length = (size_t)(slash - id);
+            if (length >= _countof(resource_id)) length = _countof(resource_id) - 1;
+            wcsncpy_s(resource_id, _countof(resource_id), id, length);
+            if (wcscmp(slash, L"/host-mount") == 0) hr = asb_shared_resource_host_mount(resource_id);
+            else if (wcscmp(slash, L"/host-unmount") == 0) hr = asb_shared_resource_host_unmount(resource_id);
+            else if (wcscmp(slash, L"/purge") == 0) hr = asb_shared_resource_purge(resource_id);
+            else hr = E_INVALIDARG;
+            if (SUCCEEDED(hr)) send_json(req->RequestId, 202, "Accepted", "{\"ok\":true}");
+            else send_err(req->RequestId, 409, "Conflict", "resource_operation_failed", "resource operation requires a ready appliance and stopped dependent VMs");
+            return 0;
+        }
         if(verb==HttpVerbDELETE){hr=asb_shared_resource_remove(id);if(SUCCEEDED(hr))send_json(req->RequestId,200,"OK","{\"ok\":true}");else send_err(req->RequestId,404,"Not Found","not_found","no such resource");return 0;}
-        if(verb==HttpVerbPUT){ZeroMemory(&r,sizeof(r));body_to_wide(req,body,_countof(body));json_get_string(body,L"name",r.name,_countof(r.name));json_get_string(body,L"hostPath",r.host_path,_countof(r.host_path));{wchar_t dl[8]={0};json_get_string(body,L"driveLetter",dl,8);r.drive_letter=towupper(dl[0]);}if(!json_get_bool(body,L"enabled",&r.enabled))r.enabled=TRUE;json_get_bool(body,L"readOnly",&r.read_only);json_get_bool(body,L"confirmPermissions",&confirm);hr=asb_shared_resource_update(id,&r,confirm);if(SUCCEEDED(hr))send_json(req->RequestId,200,"OK","{\"ok\":true,\"pendingNextStart\":true}");else if(hr==HRESULT_FROM_WIN32(ERROR_NOT_FOUND))send_err(req->RequestId,404,"Not Found","not_found","no such resource");else if(hr==HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED))send_err(req->RequestId,409,"Conflict","permissions_confirmation_required","folder ACL confirmation required");else send_err(req->RequestId,400,"Bad Request","invalid_resource","invalid, duplicate, nested, or unsupported resource");return 0;}
+        if(verb==HttpVerbPUT){ZeroMemory(&r,sizeof(r));body_to_wide(req,body,_countof(body));json_get_string(body,L"name",r.name,_countof(r.name));if(json_get_string(body,L"hostPath",r.host_path,_countof(r.host_path))){send_err(req->RequestId,400,"Bad Request","host_path_unsupported","hostPath resources are no longer supported; use appliance storage");return 0;}{wchar_t dl[8]={0};json_get_string(body,L"driveLetter",dl,8);r.drive_letter=towupper(dl[0]);}{wchar_t dl[8]={0};json_get_string(body,L"hostDriveLetter",dl,8);r.host_drive_letter=towupper(dl[0]);}if(!json_get_bool(body,L"enabled",&r.enabled))r.enabled=TRUE;json_get_bool(body,L"readOnly",&r.read_only);hr=asb_shared_resource_update(id,&r,FALSE);if(SUCCEEDED(hr))send_json(req->RequestId,200,"OK","{\"ok\":true,\"pendingNextStart\":true}");else if(hr==HRESULT_FROM_WIN32(ERROR_NOT_FOUND))send_err(req->RequestId,404,"Not Found","not_found","no such resource");else send_err(req->RequestId,400,"Bad Request","invalid_resource","invalid or duplicate appliance resource");return 0;}
         send_err(req->RequestId,405,"Method Not Allowed","method","unsupported method");return 0;
     }
 
@@ -870,11 +973,20 @@ static int handle_request(PHTTP_REQUEST req)
                snapshot with a branchName is how the GUI creates a new branch.
                With no body, boots the current state. */
             wchar_t body[512], bname[128] = {0}; int si = -1, bi = -1;
+            BOOL allow_missing = FALSE;
             body_to_wide(req, body, 512);
             json_get_int(body, L"snapIndex", &si);
             json_get_int(body, L"branchIndex", &bi);
             json_get_string(body, L"branchName", bname, 128);
-            send_hr(req->RequestId, "start", nu, asb_vm_start(vm, si, bi, bname[0] ? bname : NULL));
+            json_get_bool(body, L"allowMissingSharedResources", &allow_missing);
+            {
+                HRESULT start_hr = asb_vm_start_ex(vm, si, bi,
+                    bname[0] ? bname : NULL, allow_missing);
+                if (start_hr == HRESULT_FROM_WIN32(ERROR_NOT_READY))
+                    send_err(req->RequestId, 409, "Conflict", "dependency_unavailable",
+                             "shared-storage appliance is unavailable; retry or set allowMissingSharedResources=true");
+                else send_hr(req->RequestId, "start", nu, start_hr);
+            }
             return 0;
         }
         if (verb == HttpVerbPOST && wcscmp(sub, L"shutdown") == 0)

@@ -608,10 +608,10 @@ HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
         L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}],"
         L"\"Policies\":["
         L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
-        L"\"RemoteAddresses\":\"%S.1/32\",\"RemotePorts\":\"445\","
+        L"\"RemoteAddresses\":\"%S.2/32\",\"RemotePorts\":\"445\"," 
         L"\"Priority\":100,\"Action\":\"Allow\",\"Direction\":\"Out\",\"RuleType\":\"Switch\"}},"
         L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
-        L"\"RemoteAddresses\":\"%S.1/32\",\"RemotePorts\":\"445\","
+        L"\"RemoteAddresses\":\"%S.2/32\",\"RemotePorts\":\"445\"," 
         L"\"Priority\":100,\"Action\":\"Allow\",\"Direction\":\"In\",\"RuleType\":\"Switch\"}},"
         L"{\"Type\":\"ACL\",\"Settings\":{\"Priority\":200,\"Action\":\"Block\","
         L"\"Direction\":\"Out\",\"RuleType\":\"Switch\"}},"
@@ -623,6 +623,57 @@ HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
         wcscpy_s(endpoint_guid_str, str_len, ep_guid_str);
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN shared endpoint error: %s", error_record);
+        LocalFree(error_record);
+    }
+    if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
+    if (network && pfnCloseNet) pfnCloseNet(network);
+    return hr;
+}
+
+HRESULT hcn_create_share_server_endpoint(const GUID *network_id, GUID *endpoint_id,
+                                         wchar_t *endpoint_guid_str, size_t str_len,
+                                         const char *server_ip,
+                                         const char *mac_address)
+{
+    wchar_t net_guid_str[64], ep_guid_str[64], settings[4096];
+    void *network = NULL, *endpoint = NULL;
+    PWSTR error_record = NULL;
+    HRESULT hr;
+
+    if (!g_hcn_dll || !pfnCreateEp || !pfnOpenNet || !server_ip || !mac_address)
+        return E_INVALIDARG;
+    pick_share_base_once();
+    hr = pfnOpenNet(network_id, &network, &error_record);
+    if (error_record) { LocalFree(error_record); error_record = NULL; }
+    if (FAILED(hr)) return hr;
+
+    CoCreateGuid(endpoint_id);
+    guid_to_string(network_id, net_guid_str, _countof(net_guid_str));
+    guid_to_string(endpoint_id, ep_guid_str, _countof(ep_guid_str));
+    swprintf_s(settings, _countof(settings),
+        L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":5},"
+        L"\"HostComputeNetwork\":\"%s\",\"MacAddress\":\"%S\","
+        L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}],"
+        L"\"Policies\":["
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
+        L"\"LocalPorts\":\"445\",\"RemoteAddresses\":\"%S.0/24\","
+        L"\"Priority\":100,\"Action\":\"Allow\",\"Direction\":\"In\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
+        L"\"LocalPorts\":\"22,5986\",\"RemoteAddresses\":\"%S.1/32\","
+        L"\"Priority\":101,\"Action\":\"Allow\",\"Direction\":\"In\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
+        L"\"LocalPorts\":\"445,22,5986\",\"RemoteAddresses\":\"%S.0/24\","
+        L"\"Priority\":102,\"Action\":\"Allow\",\"Direction\":\"Out\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Priority\":200,\"Action\":\"Block\","
+        L"\"Direction\":\"In\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Priority\":200,\"Action\":\"Block\","
+        L"\"Direction\":\"Out\",\"RuleType\":\"Switch\"}}]}",
+        net_guid_str, mac_address, server_ip, g_share_base, g_share_base, g_share_base);
+    hr = pfnCreateEp(network, endpoint_id, settings, &endpoint, &error_record);
+    if (SUCCEEDED(hr) && endpoint_guid_str)
+        wcscpy_s(endpoint_guid_str, str_len, ep_guid_str);
+    if (error_record) {
+        if (FAILED(hr)) ui_log(L"HCN appliance endpoint error: %s", error_record);
         LocalFree(error_record);
     }
     if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);

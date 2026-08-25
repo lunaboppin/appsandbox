@@ -3,7 +3,7 @@
 #include "vm_ssh_proxy.h"
 #include "asb_core.h"
 #include "hcn_network.h"
-#include "smb_transport.h"
+#include "shared_appliance.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -52,7 +52,7 @@ typedef struct AgentConn {
     /* Command synchronization */
     volatile BOOL  cmd_pending;
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
-    char           cmd[64];
+    char           cmd[2048];
     char           rsp[256];
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
 } AgentConn;
@@ -325,7 +325,7 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
                            const char *cmd, char *rsp, int rsp_size)
 {
-    char tagged[1024];
+    char tagged[4096];
     char prefix[32];
     int pfx_len, n;
 
@@ -426,7 +426,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */
         if (vm->shared_resource_count > 0 &&
-            _wcsicmp(vm->shared_resource_transport, L"smb") == 0 &&
+            _wcsicmp(vm->shared_resource_transport, L"appliance") == 0 &&
             vm->share_ip[0] && vm->share_host_ip[0] && vm->share_mac[0]) {
             int ri;
             wchar_t user_w[128], password_w[128];
@@ -453,8 +453,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 notify_agent_status(vm);
                 goto shared_mapping_done;
             }
-            cred_hr = smb_transport_get_credentials(user_w, _countof(user_w),
-                                                     password_w, _countof(password_w));
+            cred_hr = shared_appliance_get_smb_credentials(
+                user_w, _countof(user_w), password_w, _countof(password_w))
+                ? S_OK : HRESULT_FROM_WIN32(ERROR_LOGON_FAILURE);
             if (FAILED(cred_hr)) {
                 swprintf_s(vm->shared_resource_error,
                            _countof(vm->shared_resource_error),
@@ -577,7 +578,7 @@ shared_mapping_done:
 
             /* Check for pending command first */
             if (conn->cmd_pending) {
-                char tagged[512];
+                char tagged[4096];
                 conn->cmd_seq++;
                 sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, conn->cmd);
                 if (send_line(s, tagged) <= 0) break;
@@ -718,6 +719,9 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 {
     AgentConn *conn = find_conn(instance);
     BOOL ok;
+    BOOL redact = command &&
+        (strncmp(command, "appliance_account:", 18) == 0 ||
+         strncmp(command, "shared_smb_map:", 15) == 0);
 
     if (!conn || !instance->agent_online) {
         ui_log(L"Agent: not connected to \"%s\"", instance->name);
@@ -746,7 +750,8 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
        expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
        SetEvent()s cmd_done with an empty rsp on recv<=0, so we return FALSE. */
     if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
-        ui_log(L"Agent: command \"%S\" timed out", command);
+        if (redact) ui_log(L"Agent: credential-bearing command timed out");
+        else ui_log(L"Agent: command \"%S\" timed out", command);
         conn->cmd_pending = FALSE;
         return FALSE;
     }
@@ -755,7 +760,8 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
 
     ok = (strcmp(conn->rsp, "ok") == 0);
-    ui_log(L"Agent: %S -> %S", command, conn->rsp);
+    if (redact) ui_log(L"Agent: credential-bearing command -> %S", conn->rsp);
+    else ui_log(L"Agent: %S -> %S", command, conn->rsp);
     return ok;
 }
 

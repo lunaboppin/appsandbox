@@ -102,6 +102,8 @@
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
+copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
@@ -129,6 +131,8 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
+copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"
@@ -160,6 +164,8 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
+copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
@@ -191,6 +197,8 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
+copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"

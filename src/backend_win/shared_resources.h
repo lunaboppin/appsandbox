@@ -9,12 +9,14 @@
 typedef struct {
     wchar_t id[ASB_SHARED_ID_CHARS];
     wchar_t name[64];
-    wchar_t host_path[MAX_PATH];
+    wchar_t host_path[MAX_PATH];       /* legacy path: migration display only */
+    wchar_t legacy_host_path[MAX_PATH];
     wchar_t drive_letter;
+    wchar_t host_drive_letter;
+    wchar_t storage_kind[16];         /* L"appliance" */
     BOOL enabled;
     BOOL read_only;
-    BOOL acl_created;
-    BOOL smb_acl_created;
+    BOOL retained_data;
 } AsbSharedResourceInfo;
 
 typedef struct {
@@ -22,6 +24,7 @@ typedef struct {
     wchar_t share_name[64];
     wchar_t host_path[MAX_PATH];
     wchar_t drive_letter;
+    wchar_t host_drive_letter;
     BOOL read_only;
     BOOL smb_acl_created;
     wchar_t mapping_result[32];
@@ -31,6 +34,8 @@ typedef struct {
 void shared_resources_init(void);
 int shared_resources_count(void);
 const AsbSharedResourceInfo *shared_resources_get(int index);
+const AsbSharedResourceInfo *shared_resources_find(const wchar_t *id);
+void shared_resources_share_name(const wchar_t *id, wchar_t *out, size_t chars);
 HRESULT shared_resources_create(const AsbSharedResourceInfo *info,
                                 BOOL confirm_permissions,
                                 wchar_t *created_id, size_t created_id_chars);

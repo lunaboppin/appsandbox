@@ -678,7 +678,8 @@ static int handle_request(int fd, HttpReq *r) {
         send_501(fd, @"templates");
         return 0;
     }
-    if ([path hasPrefix:@"/v1/shared-resources"] ||
+    if ([path hasPrefix:@"/v1/shared-appliance"] ||
+        [path hasPrefix:@"/v1/shared-resources"] ||
         [path containsString:@"/shared-resources"]) {
         send_501(fd, @"shared resources");
         return 0;

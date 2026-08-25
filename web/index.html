@@ -252,20 +252,41 @@
     </div>
 </div>
 
-<!-- Application settings: global host-backed shared resources -->
+<!-- Application settings: hidden shared-storage appliance -->
 <div class="modal-overlay win-host-only" id="settings-overlay">
     <div class="modal manage-modal">
+        <fieldset id="shared-appliance-card">
+            <legend>Shared Appliance</legend>
+            <p id="appliance-status">Not configured</p>
+            <div class="form-grid resource-editor">
+                <label for="appliance-backend">Backend:</label>
+                <select id="appliance-backend"><option value="ubuntu">Ubuntu 24.04 LTS / Samba</option><option value="server_core">Windows Server Core</option></select>
+                <label for="appliance-storage-parent">Storage parent:</label>
+                <div class="manage-row"><input id="appliance-storage-parent"><button type="button" onclick="sendCmd('browseApplianceStorage')">Browse...</button></div>
+                <label for="appliance-data-size">Data disk (GB):</label><input id="appliance-data-size" type="number" min="8" value="256">
+                <label for="appliance-admin-user">Administrator:</label><input id="appliance-admin-user" value="appsandbox">
+                <label for="appliance-admin-pass">Password:</label><input id="appliance-admin-pass" type="password" autocomplete="new-password">
+                <label for="appliance-cpu">Advanced resources:</label><div><input id="appliance-cpu" type="number" min="1" value="1" style="width:70px"> vCPU <input id="appliance-ram" type="number" min="512" value="1024" style="width:90px"> MB RAM</div>
+                <label for="appliance-server-iso">Server Core ISO:</label><div class="manage-row"><input id="appliance-server-iso"><button type="button" onclick="sendCmd('browseApplianceIso')">Browse...</button></div>
+                <label for="appliance-server-image">Core WIM image:</label><input id="appliance-server-image" placeholder="Windows Server 2025 SERVERSTANDARDCORE">
+                <label for="appliance-product-key">Optional product key:</label><input id="appliance-product-key" type="password" autocomplete="off">
+            </div>
+            <div class="modal-buttons">
+                <button onclick="startSharedAppliance()">Start</button><button onclick="stopSharedAppliance()">Stop</button>
+                <button onclick="updateSharedAppliance()">Update</button><button onclick="growSharedAppliance()">Grow Disk</button>
+                <button onclick="sendCmd('openSharedApplianceTerminal')">Terminal</button><button onclick="rebuildSharedAppliance()">Rebuild</button><button class="primary" onclick="setupSharedAppliance()">Setup</button>
+            </div>
+        </fieldset>
         <h3>Shared Resources</h3>
-        <p>Enabled folders appear as drives in every Windows VM unless that VM opts out. Shared data stays outside VM storage and checkpoints.</p>
+        <p>Resources live on the appliance data disk and appear in every Windows VM unless that VM opts out. Removing a definition retains its data.</p>
         <div id="settings-resource-list" class="settings-resource-list"></div>
         <fieldset>
             <legend id="resource-editor-title">Add shared resource</legend>
             <input type="hidden" id="resource-id">
             <div class="form-grid resource-editor">
                 <label for="resource-name">Name:</label><input id="resource-name" maxlength="63">
-                <label for="resource-path">Host folder:</label>
-                <div class="manage-row"><input id="resource-path"><button type="button" onclick="sendCmd('browseSharedFolder')">Browse...</button></div>
                 <label for="resource-letter">Drive letter:</label><select id="resource-letter"></select>
+                <label for="resource-host-letter">Optional host letter:</label><select id="resource-host-letter"><option value="">Not mounted</option></select>
                 <label>Options:</label><div><label class="manage-check"><input type="checkbox" id="resource-enabled" checked> Enabled</label> <label class="manage-check"><input type="checkbox" id="resource-readonly"> Read-only</label></div>
             </div>
             <div class="modal-buttons"><button onclick="clearResourceEditor()">Clear</button><button class="primary" onclick="saveResourceEditor()">Save</button></div>

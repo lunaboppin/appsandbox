@@ -57,6 +57,22 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        BOOL ssh_enabled,
                                        const wchar_t *lang);
 
+/* Provisioning media for the hidden shared-storage appliance. */
+HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
+                                        const wchar_t *admin_user,
+                                        const wchar_t *admin_password,
+                                        const wchar_t *smb_user,
+                                        const wchar_t *smb_password,
+                                        const wchar_t *ssh_public_key,
+                                        const wchar_t *res_dir);
+HRESULT iso_create_server_core_resources(const wchar_t *iso_path,
+                                         const wchar_t *vm_name,
+                                         const wchar_t *admin_user,
+                                         wchar_t *admin_password,
+                                         const wchar_t *res_dir,
+                                         const wchar_t *image_name,
+                                         const wchar_t *product_key);
+
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
 
 /* Forward declaration for GPU share list */

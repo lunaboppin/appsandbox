@@ -59,6 +59,12 @@ HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
                                   wchar_t *endpoint_guid_str, size_t str_len,
                                   const char *guest_ip, const char *mac_address);
 
+/* Create the fixed .2 endpoint owned by the hidden storage appliance. */
+HRESULT hcn_create_share_server_endpoint(const GUID *network_id, GUID *endpoint_id,
+                                         wchar_t *endpoint_guid_str, size_t str_len,
+                                         const char *server_ip,
+                                         const char *mac_address);
+
 /* Create an endpoint on a network.
    network_id: the network to attach to.
    endpoint_id: output GUID for the created endpoint.

@@ -95,7 +95,8 @@ class Client:
         return body
 
     # ---- lifecycle (return (http_status, body)) ----
-    def start(self, name, snap_index=-1, branch_index=-1, branch_name=None):
+    def start(self, name, snap_index=-1, branch_index=-1, branch_name=None,
+              allow_missing_shared_resources=False):
         """Start the VM. Optionally boot from a snapshot/branch (mirrors the GUI's
         startVm). Passing snap_index + branch_name boots from that snapshot on a new
         branch -- the GUI's only way to create a branch. No args -> current state."""
@@ -103,6 +104,8 @@ class Client:
         if snap_index != -1:   body["snapIndex"] = snap_index
         if branch_index != -1: body["branchIndex"] = branch_index
         if branch_name:        body["branchName"] = branch_name
+        if allow_missing_shared_resources:
+            body["allowMissingSharedResources"] = True
         return self._req("POST", "/vms/%s/start" % name, body or None)
     def shutdown(self, name): return self._req("POST", "/vms/%s/shutdown" % name)   # graceful
     def stop(self, name):     return self._req("POST", "/vms/%s/stop" % name)       # force
@@ -134,19 +137,41 @@ class Client:
     def host(self):              return self._req("GET", "/host")[1]
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
     def shared_resources(self):  return self._req("GET", "/shared-resources")[1].get("resources", [])
-    def create_shared_resource(self, name, host_path, drive_letter, read_only=False,
-                               enabled=True, confirm_permissions=False):
-        """Create a global Windows shared drive. Set confirm_permissions=True to
-        allow AppSandbox to add its tracked Virtual Machines folder ACE."""
-        return self._req("POST", "/shared-resources", {
-            "name": name, "hostPath": host_path, "driveLetter": drive_letter,
-            "readOnly": read_only, "enabled": enabled,
-            "confirmPermissions": confirm_permissions})
+    def create_shared_resource(self, name, drive_letter, read_only=False,
+                               enabled=True, host_drive_letter=None):
+        """Create an appliance-backed Windows shared drive."""
+        body = {
+            "name": name, "driveLetter": drive_letter,
+            "readOnly": read_only, "enabled": enabled}
+        if host_drive_letter:
+            body["hostDriveLetter"] = host_drive_letter
+        return self._req("POST", "/shared-resources", body)
     def update_shared_resource(self, resource_id, **fields):
         return self._req("PUT", "/shared-resources/%s" % resource_id, fields)
     def remove_shared_resource(self, resource_id):
-        """Remove only the definition and AppSandbox-created ACE; host data remains."""
+        """Unpublish the definition; appliance data remains until explicit purge."""
         return self._req("DELETE", "/shared-resources/%s" % resource_id)
+    def shared_appliance(self):
+        return self._req("GET", "/shared-appliance")[1]
+    def setup_shared_appliance(self, **config):
+        return self._req("POST", "/shared-appliance/setup", config)
+    def start_shared_appliance(self):
+        return self._req("POST", "/shared-appliance/start")
+    def stop_shared_appliance(self, force=False):
+        return self._req("POST", "/shared-appliance/stop", {"force": bool(force)})
+    def update_shared_appliance(self):
+        return self._req("POST", "/shared-appliance/update")
+    def grow_shared_appliance(self, data_size_gb):
+        return self._req("POST", "/shared-appliance/grow", {"dataSizeGb": data_size_gb})
+    def rebuild_shared_appliance(self, switch_backend=False, **config):
+        config["switchBackend"] = bool(switch_backend)
+        return self._req("POST", "/shared-appliance/rebuild", config)
+    def mount_host_resource(self, resource_id):
+        return self._req("POST", "/shared-resources/%s/host-mount" % resource_id)
+    def unmount_host_resource(self, resource_id):
+        return self._req("POST", "/shared-resources/%s/host-unmount" % resource_id)
+    def purge_shared_resource(self, resource_id):
+        return self._req("POST", "/shared-resources/%s/purge" % resource_id)
     def vm_shared_resources(self, name):
         return self._req("GET", "/vms/%s/shared-resources" % name)[1].get("resources", [])
     def set_vm_shared_resource(self, name, resource_id, enabled=True):
