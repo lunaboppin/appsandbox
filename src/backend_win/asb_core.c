@@ -1712,21 +1712,29 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Create HCS VM */
     {
-        VmInstance temp_inst;
+        VmInstance *temp_inst;
         wchar_t share_endpoint_guid[64] = { 0 };
-        ZeroMemory(&temp_inst, sizeof(temp_inst));
+        temp_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                             sizeof(VmInstance));
+        if (!temp_inst) {
+            args->result = E_OUTOFMEMORY;
+            wcscpy_s(args->error_msg, 512, L"Out of memory for HCS VM state");
+            goto done;
+        }
 
-        prepare_shared_transport(&args->config, &temp_inst,
+        prepare_shared_transport(&args->config, temp_inst,
                                  share_endpoint_guid, _countof(share_endpoint_guid));
 
         hr = (args->endpoint_guid[0] != L'\0' || share_endpoint_guid[0] != L'\0')
             ? hcs_create_vm_with_endpoints(&args->config,
                   args->endpoint_guid[0] ? args->endpoint_guid : NULL,
-                  share_endpoint_guid[0] ? share_endpoint_guid : NULL, &temp_inst)
-            : hcs_create_vm(&args->config, &temp_inst);
+                  share_endpoint_guid[0] ? share_endpoint_guid : NULL, temp_inst)
+            : hcs_create_vm(&args->config, temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
+            if (temp_inst->handle)
+                hcs_close_vm(temp_inst);
             /* HCS rejected the VM after we already created the HCN endpoint.
                Free the endpoint so its IP reservation doesn't leak into the
                next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
@@ -1736,15 +1744,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                 args->endpoint_guid[0] = L'\0';
             }
             if (share_endpoint_guid[0])
-                hcn_delete_endpoint(&temp_inst.share_endpoint_id);
+                hcn_delete_endpoint(&temp_inst->share_endpoint_id);
+            HeapFree(GetProcessHeap(), 0, temp_inst);
             goto done;
         }
 
-        hr = hcs_start_vm(&temp_inst);
+        hr = hcs_start_vm(temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
-            hcs_close_vm(&temp_inst);
+            hcs_close_vm(temp_inst);
             /* VM created but failed to start. Free the endpoint so its
                IP reservation doesn't leak into the next attempt. */
             if (args->has_network) {
@@ -1753,16 +1762,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                 args->endpoint_guid[0] = L'\0';
             }
             if (share_endpoint_guid[0])
-                hcn_delete_endpoint(&temp_inst.share_endpoint_id);
+                hcn_delete_endpoint(&temp_inst->share_endpoint_id);
+            HeapFree(GetProcessHeap(), 0, temp_inst);
             goto done;
         }
 
-        /* Allocate heap copy to pass to completion */
-        {
-            VmInstance *heap_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
-            if (heap_inst) memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
-            args->vm_inst = heap_inst;
-        }
+        /* Pass the heap-backed state to completion; keeping it off this
+           worker's 1 MiB stack is essential because VmInstance includes the
+           GPU driver share table. */
+        args->vm_inst = temp_inst;
+        temp_inst = NULL;
 
         args->result = S_OK;
 
@@ -2826,41 +2835,46 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
 
     /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
     {
-        VmInstance temp_inst;
-        ZeroMemory(&temp_inst, sizeof(temp_inst));
+        VmInstance *temp_inst = (VmInstance *)HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
+        if (!temp_inst) {
+            args->result = E_OUTOFMEMORY;
+            wcscpy_s(args->error_msg, 512, L"Out of memory for HCS VM state");
+            goto done;
+        }
 
         hr = (args->endpoint_guid[0] != L'\0')
-            ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, &temp_inst)
-            : hcs_create_vm(&args->config, &temp_inst);
+            ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, temp_inst)
+            : hcs_create_vm(&args->config, temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
+            if (temp_inst->handle)
+                hcs_close_vm(temp_inst);
             if (args->has_network) {
                 hcn_delete_endpoint(&args->endpoint_id);
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
+            HeapFree(GetProcessHeap(), 0, temp_inst);
             goto done;
         }
 
-        hr = hcs_start_vm(&temp_inst);
+        hr = hcs_start_vm(temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
-            hcs_close_vm(&temp_inst);
+            hcs_close_vm(temp_inst);
             if (args->has_network) {
                 hcn_delete_endpoint(&args->endpoint_id);
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
+            HeapFree(GetProcessHeap(), 0, temp_inst);
             goto done;
         }
 
-        {
-            VmInstance *heap_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
-            if (heap_inst) memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
-            args->vm_inst = heap_inst;
-        }
+        args->vm_inst = temp_inst;
 
         args->result = S_OK;
     }
@@ -3101,9 +3115,9 @@ ASB_API void asb_detach(void)
 
 /* ---- VM Create ---- */
 
-ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
+static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
+                                   VmConfig *cfg_storage)
 {
-    VmConfig cfg;
     VmInstance *inst;
     wchar_t vhdx_dir[MAX_PATH];
     wchar_t endpoint_guid_str[64] = { 0 };
@@ -3114,6 +3128,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     BOOL is_template_create;
     int template_idx = -1;
     BOOL from_template = FALSE;
+
+    /* VmConfig contains the complete GPU share table. Keep the per-call
+       configuration off the UI thread's 1 MiB stack. */
+#define cfg (*cfg_storage)
 
     if (!config || !config->name || config->name[0] == L'\0') {
         asb_log(L"Error: VM name is required.");
@@ -3619,6 +3637,25 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     if (g_state_cb) g_state_cb(vm_handle(inst), inst->running, g_state_ud);
     return S_OK;
+#undef cfg
+}
+
+ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
+{
+    VmConfig *cfg_storage;
+    HRESULT hr;
+
+    cfg_storage = (VmConfig *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                        sizeof(VmConfig));
+    if (!cfg_storage) {
+        asb_log(L"Error: Out of memory for VM configuration.");
+        return E_OUTOFMEMORY;
+    }
+
+    hr = asb_vm_create_impl(config, cfg_storage);
+    SecureZeroMemory(cfg_storage, sizeof(*cfg_storage));
+    HeapFree(GetProcessHeap(), 0, cfg_storage);
+    return hr;
 }
 
 /* ---- VM Start ---- */
@@ -4202,8 +4239,8 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
 {
     VmInstance *inst;
     SnapshotTree *tree;
-    SnapshotTree tree_backup, relocated_tree;
-    VmInstance relocated_inst;
+    SnapshotTree *tree_backup = NULL, *relocated_tree = NULL;
+    VmInstance *relocated_inst = NULL;
     wchar_t old_root[MAX_PATH], new_root[MAX_PATH];
     wchar_t old_vhdx[MAX_PATH], old_image[MAX_PATH], old_resources[MAX_PATH], old_storage[MAX_PATH];
     wchar_t *slash;
@@ -4218,6 +4255,17 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
     if (inst->is_template) return E_NOTIMPL;
     hr = management_begin(inst, TRUE);
     if (FAILED(hr)) return hr;
+
+    tree_backup = (SnapshotTree *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                            sizeof(SnapshotTree));
+    relocated_tree = (SnapshotTree *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                               sizeof(SnapshotTree));
+    relocated_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                             sizeof(VmInstance));
+    if (!tree_backup || !relocated_tree || !relocated_inst) {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
 
     attrs = GetFileAttributesW(destination_parent);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -4263,27 +4311,27 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
         goto done;
     }
 
-    tree_backup = *tree;
-    relocated_tree = *tree;
-    relocated_inst = *inst;
+    *tree_backup = *tree;
+    *relocated_tree = *tree;
+    *relocated_inst = *inst;
     wcscpy_s(old_vhdx, MAX_PATH, inst->vhdx_path);
     wcscpy_s(old_image, MAX_PATH, inst->image_path);
     wcscpy_s(old_resources, MAX_PATH, inst->resources_iso_path);
     wcscpy_s(old_storage, MAX_PATH, inst->storage_root);
-    hr = snapshot_relocate(&relocated_tree, &relocated_inst, old_root, new_root);
-    if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst.image_path, MAX_PATH, old_root, new_root);
-    if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst.resources_iso_path, MAX_PATH, old_root, new_root);
-    if (SUCCEEDED(hr)) wcscpy_s(relocated_inst.storage_root, MAX_PATH, new_root);
+    hr = snapshot_relocate(relocated_tree, relocated_inst, old_root, new_root);
+    if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst->image_path, MAX_PATH, old_root, new_root);
+    if (SUCCEEDED(hr)) hr = rewrite_moved_path(relocated_inst->resources_iso_path, MAX_PATH, old_root, new_root);
+    if (SUCCEEDED(hr)) wcscpy_s(relocated_inst->storage_root, MAX_PATH, new_root);
     if (SUCCEEDED(hr)) {
-        *tree = relocated_tree;
-        wcscpy_s(inst->vhdx_path, MAX_PATH, relocated_inst.vhdx_path);
-        wcscpy_s(inst->image_path, MAX_PATH, relocated_inst.image_path);
-        wcscpy_s(inst->resources_iso_path, MAX_PATH, relocated_inst.resources_iso_path);
-        wcscpy_s(inst->storage_root, MAX_PATH, relocated_inst.storage_root);
+        *tree = *relocated_tree;
+        wcscpy_s(inst->vhdx_path, MAX_PATH, relocated_inst->vhdx_path);
+        wcscpy_s(inst->image_path, MAX_PATH, relocated_inst->image_path);
+        wcscpy_s(inst->resources_iso_path, MAX_PATH, relocated_inst->resources_iso_path);
+        wcscpy_s(inst->storage_root, MAX_PATH, relocated_inst->storage_root);
     }
     if (FAILED(hr) || !save_vm_list()) {
         if (SUCCEEDED(hr)) hr = HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
-        *tree = tree_backup;
+        *tree = *tree_backup;
         wcscpy_s(inst->vhdx_path, MAX_PATH, old_vhdx);
         wcscpy_s(inst->image_path, MAX_PATH, old_image);
         wcscpy_s(inst->resources_iso_path, MAX_PATH, old_resources);
@@ -4300,6 +4348,9 @@ ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent)
     else
         asb_log(L"Storage move complete for \"%s\": %s", inst->name, new_root);
 done:
+    HeapFree(GetProcessHeap(), 0, relocated_inst);
+    HeapFree(GetProcessHeap(), 0, relocated_tree);
+    HeapFree(GetProcessHeap(), 0, tree_backup);
     management_end(inst);
     if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
     return hr;

@@ -672,7 +672,7 @@ static HRESULT build_server_core_os(const SharedApplianceConfig *config)
     int pos = 0, start = 0, end = 0, i;
     BOOL have_exit = FALSE;
     HRESULT hr = E_FAIL;
-    GpuDriverShareList no_gpu;
+    GpuDriverShareList *no_gpu;
 
     set_progress(10, L"Applying the Windows Server Core image to the system disk...");
     GetModuleFileNameW(NULL, exe, _countof(exe));
@@ -696,9 +696,14 @@ static HRESULT build_server_core_os(const SharedApplianceConfig *config)
     swprintf_s(file_path, _countof(file_path), L"%s\\SetupComplete.cmd", staging);
     generate_vhdx_setupcomplete(file_path, TRUE);
 
-    ZeroMemory(&no_gpu, sizeof(no_gpu));
+    no_gpu = (GpuDriverShareList *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                             sizeof(GpuDriverShareList));
+    if (!no_gpu)
+        return E_OUTOFMEMORY;
     swprintf_s(manifest, _countof(manifest), L"%s\\manifest.txt", staging);
-    if (generate_vhdx_manifest(manifest, staging, res_dir, &no_gpu, TRUE) < 0)
+    i = generate_vhdx_manifest(manifest, staging, res_dir, no_gpu, TRUE);
+    HeapFree(GetProcessHeap(), 0, no_gpu);
+    if (i < 0)
         return E_FAIL;
 
     swprintf_s(cmdline, _countof(cmdline),
@@ -981,7 +986,7 @@ static DWORD WINAPI ready_worker(LPVOID parameter)
 
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms)
 {
-    VmConfig config;
+    VmConfig *config = NULL;
     wchar_t share_endpoint[64] = L"", maintenance_endpoint[64] = L"";
     char server_ip[32], server_mac[32];
     HRESULT hr;
@@ -1082,16 +1087,24 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
                    agent_hr);
     }
 
-    fill_vm_config(&config, provisioning);
+    config = (VmConfig *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                   sizeof(VmConfig));
+    if (!config) {
+        hr = E_OUTOFMEMORY;
+        goto fail;
+    }
+    fill_vm_config(config, provisioning);
     hcs_destroy_stale(APPLIANCE_VM_NAME);
     ui_log(L"Shared appliance: creating compute system (%S boot)...",
            provisioning ? "provisioning" : "normal");
-    hr = hcs_create_vm_with_endpoints(&config,
+    hr = hcs_create_vm_with_endpoints(config,
         maintenance_endpoint[0] ? maintenance_endpoint : NULL,
         share_endpoint, &g_appliance.runtime);
     if (FAILED(hr)) goto fail;
     hr = hcs_start_vm(&g_appliance.runtime);
     if (FAILED(hr)) goto fail;
+    HeapFree(GetProcessHeap(), 0, config);
+    config = NULL;
     ui_log(L"Shared appliance: VM started; polling for the guest agent...");
     vm_agent_start(&g_appliance.runtime);
     hcs_start_monitor(&g_appliance.runtime);
@@ -1251,6 +1264,10 @@ wait_existing:
     }
     hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 fail:
+    if (config) {
+        SecureZeroMemory(config, sizeof(*config));
+        HeapFree(GetProcessHeap(), 0, config);
+    }
     EnterCriticalSection(&g_appliance.cs);
     set_error_locked(hr,
         hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
