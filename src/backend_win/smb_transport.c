@@ -277,39 +277,85 @@ static void hidden_share_name(const wchar_t *base, wchar_t *out, size_t chars)
     swprintf_s(out, chars, L"%s$", base);
 }
 
+static DWORD run_powershell(const wchar_t *command);
+
+static void log_share_diagnostic(const wchar_t *path)
+{
+    HANDLE file;
+    char utf8[4096];
+    wchar_t message[4096];
+    DWORD bytes = 0;
+    int chars;
+
+    if (!path || !path[0]) return;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    if (!ReadFile(file, utf8, sizeof(utf8) - 1, &bytes, NULL) || bytes == 0) {
+        CloseHandle(file);
+        return;
+    }
+    CloseHandle(file);
+    utf8[bytes] = '\0';
+    chars = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)bytes,
+                                message, (int)_countof(message) - 1);
+    if (chars <= 0) return;
+    message[chars] = L'\0';
+    for (int i = 0; i < chars; ++i) {
+        if (message[i] == L'\r' || message[i] == L'\n') message[i] = L' ';
+    }
+    ui_log(L"[DEBUG-smb42] share provider: %s", message);
+}
+
 static HRESULT ensure_share(const HcsSharedResource *resource)
 {
-    wchar_t share[80];
-    EXPLICIT_ACCESSW ea;
-    PACL dacl = NULL;
-    SECURITY_DESCRIPTOR sd;
-    SHARE_INFO_502 si;
-    DWORD parm = 0, err;
+    static const wchar_t share_script[] =
+        L"$ErrorActionPreference='Stop';$stage='share-query';try{"
+        L"$n=$env:ASB_SHARE_NAME;$p=$env:ASB_SHARE_PATH;$a=$env:ASB_SHARE_ACCOUNT;"
+        L"$ro=$env:ASB_SHARE_READONLY -eq '1';"
+        L"$existing=Get-SmbShare -Name $n -ErrorAction SilentlyContinue;"
+        L"if($existing -and $existing.Path -ne $p){throw 'share path collision'};"
+        L"if(-not $existing){"
+        L"$stage='share-create';$params=@{Name=$n;Path=$p;Temporary=$true};"
+        L"if($ro){$params.ReadAccess=$a}else{$params.FullAccess=$a};"
+        L"New-SmbShare @params -ErrorAction Stop|Out-Null"
+        L"}else{"
+        L"$stage='share-grant';"
+        L"Revoke-SmbShareAccess -Name $n -AccountName $a -Force -ErrorAction SilentlyContinue|Out-Null;"
+        L"if($ro){Grant-SmbShareAccess -Name $n -AccountName $a -AccessRight Read -Force -ErrorAction Stop|Out-Null}"
+        L"else{Grant-SmbShareAccess -Name $n -AccountName $a -AccessRight Full -Force -ErrorAction Stop|Out-Null}"
+        L"};exit 0"
+        L"}catch{$e=$stage+'|'+$_.FullyQualifiedErrorId+'|0x'+"
+        L"$_.Exception.HResult.ToString('X8')+'|'+$_.Exception.Message;"
+        L"try{[IO.File]::WriteAllText($env:ASB_SHARE_ERROR,$e,"
+        L"[Text.UTF8Encoding]::new($false))}catch{};exit 1}";
+    wchar_t share[80], host[MAX_COMPUTERNAME_LENGTH + 1], account[256];
+    wchar_t temp_dir[MAX_PATH], error_path[MAX_PATH] = L"";
+    DWORD host_chars = _countof(host), err;
     hidden_share_name(resource->share_name, share, _countof(share));
-    ZeroMemory(&ea, sizeof(ea));
-    ea.grfAccessPermissions = resource->read_only ? GENERIC_READ : GENERIC_ALL;
-    ea.grfAccessMode = SET_ACCESS;
-    ea.grfInheritance = NO_INHERITANCE;
-    ea.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
-    ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
-    ea.Trustee.ptstrName = (LPWSTR)ASB_SMB_ACCOUNT;
-    err = SetEntriesInAclW(1, &ea, NULL, &dacl);
-    if (err != ERROR_SUCCESS) return HRESULT_FROM_WIN32(err);
-    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-    SetSecurityDescriptorDacl(&sd, TRUE, dacl, FALSE);
-    ZeroMemory(&si, sizeof(si));
-    si.shi502_netname = share;
-    si.shi502_type = STYPE_DISKTREE | STYPE_SPECIAL | STYPE_TEMPORARY;
-    si.shi502_remark = L"AppSandbox isolated shared resource";
-    si.shi502_permissions = ACCESS_ALL;
-    si.shi502_max_uses = (DWORD)-1;
-    si.shi502_path = (LPWSTR)resource->host_path;
-    si.shi502_security_descriptor = &sd;
-    err = NetShareAdd(NULL, 502, (LPBYTE)&si, &parm);
-    if (err == NERR_DuplicateShare || err == ERROR_ALREADY_EXISTS)
-        err = NetShareSetInfo(NULL, share, 502, (LPBYTE)&si, &parm);
-    LocalFree(dacl);
-    return err == NERR_Success ? S_OK : HRESULT_FROM_WIN32(err);
+    if (!GetComputerNameW(host, &host_chars)) return HRESULT_FROM_WIN32(GetLastError());
+    swprintf_s(account, _countof(account), L"%s\\%s", host, ASB_SMB_ACCOUNT);
+    if (GetTempPathW(_countof(temp_dir), temp_dir) &&
+        GetTempFileNameW(temp_dir, L"asb", 0, error_path)) {
+        DeleteFileW(error_path);
+        SetEnvironmentVariableW(L"ASB_SHARE_ERROR", error_path);
+    }
+    SetEnvironmentVariableW(L"ASB_SHARE_NAME", share);
+    SetEnvironmentVariableW(L"ASB_SHARE_PATH", resource->host_path);
+    SetEnvironmentVariableW(L"ASB_SHARE_ACCOUNT", account);
+    SetEnvironmentVariableW(L"ASB_SHARE_READONLY", resource->read_only ? L"1" : L"0");
+    err = run_powershell(share_script);
+    SetEnvironmentVariableW(L"ASB_SHARE_NAME", NULL);
+    SetEnvironmentVariableW(L"ASB_SHARE_PATH", NULL);
+    SetEnvironmentVariableW(L"ASB_SHARE_ACCOUNT", NULL);
+    SetEnvironmentVariableW(L"ASB_SHARE_READONLY", NULL);
+    SetEnvironmentVariableW(L"ASB_SHARE_ERROR", NULL);
+    if (err != ERROR_SUCCESS) {
+        log_share_diagnostic(error_path);
+        ui_log(L"New-SmbShare provisioning failed for %s (status %lu).", share, err);
+    }
+    if (error_path[0]) DeleteFileW(error_path);
+    return err == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(err);
 }
 
 static DWORD run_powershell(const wchar_t *command)

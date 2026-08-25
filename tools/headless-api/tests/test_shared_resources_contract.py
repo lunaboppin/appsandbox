@@ -1,6 +1,6 @@
 """Offline contract checks for custom VM storage and shared resources."""
 from __future__ import annotations
-import ast, re, shutil, subprocess, sys
+import ast, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[3]
@@ -45,9 +45,23 @@ def main():
     check("share_endpoint_guid" in hcs,
           "HCS document cannot attach the isolated SMB endpoint")
     for token in ("CryptProtectData", "CryptUnprotectData", "NetUserAdd",
-                  "NetShareAdd", "STYPE_SPECIAL", "SeDenyInteractiveLogonRight",
+                  "New-SmbShare", "SeDenyInteractiveLogonRight",
                   "New-NetFirewallRule"):
         check(token in smb,f"host SMB provisioning missing {token}")
+    share_start=smb.index("static HRESULT ensure_share")
+    share_provisioner=smb[share_start:
+                          smb.index("static DWORD run_powershell",share_start)]
+    check("New-SmbShare" in share_provisioner and
+          "FullAccess" in share_provisioner and "ReadAccess" in share_provisioner,
+          "host share is not created through the supported SMB provider")
+    check("NetShareAdd" not in share_provisioner,
+          "host share still uses the rejected level-502 security descriptor path")
+    for token in ("ASB_SHARE_NAME", "ASB_SHARE_PATH", "ASB_SHARE_ACCOUNT"):
+        check(token in share_provisioner,
+              f"host share value is not passed safely through the environment: {token}")
+    for token in ("ASB_SHARE_ERROR", "FullyQualifiedErrorId", "share-create", "share-grant"):
+        check(token in share_provisioner,
+              f"host share provisioning does not preserve redacted stage diagnostics: {token}")
     check("smb_transport_prepare" in core and "smb_transport_get_credentials" in vm_agent,
           "VM lifecycle is not connected to the SMB transport")
     check(core.count("prepare_shared_transport(") >= 4 and
@@ -74,8 +88,7 @@ def main():
           "guest SMB password is not passed through an inherited environment variable")
     check("NetShareDel" in smb and "NetUserDel" in smb and "REVOKE_ACCESS" in smb,
           "AppSandbox-owned SMB infrastructure cleanup is incomplete")
-    for token in ("-RemoteAddress", "-InterfaceAlias", "-LocalPort 445",
-                  "GENERIC_READ", "GENERIC_ALL"):
+    for token in ("-RemoteAddress", "-InterfaceAlias", "-LocalPort 445"):
         check(token in smb,f"SMB firewall/access-mode contract missing {token}")
     shared_cmd=agent[agent.index('else if (strncmp(cmd, "shared_smb_map:", 15) == 0)'):
                      agent.index('else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0)')]
@@ -104,13 +117,40 @@ def main():
 
     if sys.platform == "win32":
         powershell=shutil.which("powershell.exe")
+        host_script=re.search(
+            r'static const wchar_t share_script\[\] =\s*((?:L"(?:\\.|[^"\\])*"\s*)+);',
+            smb)
+        check(host_script is not None,"host New-SmbShare PowerShell helper was not found")
+        host_source="".join(ast.literal_eval(part) for part in
+                            re.findall(r'L("(?:\\.|[^"\\])*")',host_script.group(1)))
+        parser=("$s=[Console]::In.ReadToEnd();$t=$null;$e=$null;"
+                "[void][System.Management.Automation.Language.Parser]::ParseInput($s,[ref]$t,[ref]$e);"
+                "if($e.Count){$e|ForEach-Object{$_.Message};exit 1}")
+        result=subprocess.run([powershell,"-NoLogo","-NoProfile","-NonInteractive","-Command",parser],
+                              input=host_source,text=True,capture_output=True)
+        check(result.returncode==0,
+              f"host New-SmbShare PowerShell helper has invalid syntax: {result.stdout}{result.stderr}")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diagnostic=Path(temp_dir)/"share-error.txt"
+            env=os.environ.copy()
+            env.update({
+                "ASB_SHARE_NAME":f"asb_diag_{os.getpid()}$",
+                "ASB_SHARE_PATH":str(Path(temp_dir)/"missing"),
+                "ASB_SHARE_ACCOUNT":r"BUILTIN\Users",
+                "ASB_SHARE_READONLY":"1",
+                "ASB_SHARE_ERROR":str(diagnostic),
+            })
+            result=subprocess.run(
+                [powershell,"-NoLogo","-NoProfile","-NonInteractive","-Command",host_source],
+                text=True,capture_output=True,env=env)
+            check(result.returncode!=0,
+                  "host share diagnostic probe unexpectedly created an invalid share")
+            check(diagnostic.exists() and diagnostic.read_text(encoding="utf-8").startswith("share-create|"),
+                  "host share provider loses its stage/error diagnostic while handling an exception")
         scripts=re.findall(r'static const char script\[\] =\s*((?:"(?:\\.|[^"\\])*"\s*)+);',agent)
         check(len(scripts)>=2,"guest SMB PowerShell helpers were not found")
         for index,encoded in enumerate(scripts):
             source="".join(ast.literal_eval(part) for part in re.findall(r'"(?:\\.|[^"\\])*"',encoded))
-            parser=("$s=[Console]::In.ReadToEnd();$t=$null;$e=$null;"
-                    "[void][System.Management.Automation.Language.Parser]::ParseInput($s,[ref]$t,[ref]$e);"
-                    "if($e.Count){$e|ForEach-Object{$_.Message};exit 1}")
             result=subprocess.run([powershell,"-NoLogo","-NoProfile","-NonInteractive","-Command",parser],
                                   input=source,text=True,capture_output=True)
             check(result.returncode==0,f"guest SMB PowerShell helper {index} has invalid syntax: {result.stdout}{result.stderr}")
