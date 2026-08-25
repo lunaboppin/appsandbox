@@ -1759,6 +1759,55 @@ static int write_agent_script(const wchar_t *path, const char *contents)
     CloseHandle(file); return ERROR_SUCCESS;
 }
 
+static int run_powershell_capture(const wchar_t *script, DWORD timeout_ms,
+                                  char *output, int output_size)
+{
+    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[8192]; DWORD ec, bytes;
+    SECURITY_ATTRIBUTES sa;
+    HANDLE read_end = NULL, write_end = NULL;
+    int pos = 0;
+
+    if (output && output_size > 0) output[0] = '\0';
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&read_end, &write_end, &sa, 0)) return (int)GetLastError();
+    SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = write_end;
+    si.hStdError = write_end;
+    si.hStdInput = NULL;
+    swprintf_s(cmd, _countof(cmd),
+        L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"%s\"",
+        script);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        ec = GetLastError();
+        CloseHandle(read_end); CloseHandle(write_end);
+        return (int)ec;
+    }
+    CloseHandle(write_end);
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(pi.hProcess, 5000);
+        ec = ERROR_TIMEOUT;
+    } else if (!GetExitCodeProcess(pi.hProcess, &ec)) {
+        ec = GetLastError();
+    }
+    if (output && output_size > 1) {
+        while (pos < output_size - 1 &&
+               ReadFile(read_end, output + pos, (DWORD)(output_size - pos - 1),
+                        &bytes, NULL) && bytes > 0)
+            pos += (int)bytes;
+        output[pos] = '\0';
+    }
+    CloseHandle(read_end);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return (int)ec;
+}
+
 static int run_agent_powershell_out(const wchar_t *script_path, DWORD timeout_ms,
                                     char *output, int output_size)
 {
@@ -2109,10 +2158,12 @@ static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars
 {
     FILE *file = NULL;
     DWORD rc;
+    char storage_out[2048];
     if (thumbprint && thumbprint_chars) thumbprint[0] = '\0';
     if (!g_shared_management_ip[0]) return ERROR_INVALID_ADDRESS;
     SetEnvironmentVariableW(L"ASB_MANAGEMENT_HOST", g_shared_management_ip);
-    rc = run_powershell_wait(
+    rc = run_powershell_capture(
+        L"try{ "
         L"$root='C:\\AppSandboxData'; $d=Get-Disk | Where-Object PartitionStyle -eq 'RAW' | Sort-Object Number | Select-Object -Last 1; "
         L"if($d){Initialize-Disk -Number $d.Number -PartitionStyle GPT -ErrorAction Stop; "
         L"$p=New-Partition -DiskNumber $d.Number -UseMaximumSize -ErrorAction Stop; Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel AppSandboxShared -Confirm:$false -ErrorAction Stop | Out-Null}; "
@@ -2120,9 +2171,9 @@ static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars
         L"$part=$v | Get-Partition; "
         L"$have=@($part | Get-PartitionAccessPath | ForEach-Object {$_.AccessPath.TrimEnd('\\')}); "
         L"if($have -notcontains $root){ "
-        L"if(Test-Path $root){$items=@(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue); "
-        L"if($items.Count -gt 0){$n=0;$aside=$root+'.local'; while(Test-Path $aside){$n++;$aside=$root+'.local'+$n}; "
-        L"Rename-Item -LiteralPath $root -NewName (Split-Path $aside -Leaf) -ErrorAction Stop}}; "
+        L"Get-SmbShare -ErrorAction SilentlyContinue | Where-Object {$_.Path -like ($root+'*')} | Remove-SmbShare -Force -ErrorAction SilentlyContinue; "
+        L"if(Test-Path $root){Write-Output 'storage: clearing unmounted directory on the OS disk'; "
+        L"Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop}; "
         L"New-Item -ItemType Directory -Force -Path $root | Out-Null; "
         L"Add-PartitionAccessPath -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -AccessPath $root -ErrorAction Stop}; "
         L"$have=@($part | Get-PartitionAccessPath | ForEach-Object {$_.AccessPath.TrimEnd('\\')}); "
@@ -2142,9 +2193,24 @@ static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars
         L"if(Get-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance SMB' -ErrorAction SilentlyContinue){Remove-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance SMB'}; "
         L"New-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance SMB' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -RemoteAddress $smbnet -Profile Any | Out-Null; "
         L"New-Item -ItemType Directory -Force -Path 'C:\\ProgramData\\AppSandbox' | Out-Null; "
-        L"[IO.File]::WriteAllText('C:\\ProgramData\\AppSandbox\\management-cert.thumbprint',$cert.Thumbprint,[Text.Encoding]::ASCII)",
-        120000);
+        L"[IO.File]::WriteAllText('C:\\ProgramData\\AppSandbox\\management-cert.thumbprint',$cert.Thumbprint,[Text.Encoding]::ASCII); "
+        L"exit 0}catch{Write-Output ('storage error: ' + $_.Exception.Message); exit 1}",
+        120000, storage_out, sizeof(storage_out));
     SetEnvironmentVariableW(L"ASB_MANAGEMENT_HOST", NULL);
+    if (storage_out[0]) {
+        char *line = storage_out, *nl;
+        while (line && *line) {
+            nl = strpbrk(line, "\r\n");
+            if (nl) *nl = '\0';
+            if (*line) {
+                agent_log("appliance_ready: %s", line);
+                agent_log_to_host("appliance_ready: %s", line);
+            }
+            if (!nl) break;
+            line = nl + 1;
+            while (*line == '\r' || *line == '\n') line++;
+        }
+    }
     if (rc != ERROR_SUCCESS || !thumbprint || !thumbprint_chars) return rc;
     if (fopen_s(&file, "C:\\ProgramData\\AppSandbox\\management-cert.thumbprint", "rb") != 0 || !file)
         return ERROR_FILE_NOT_FOUND;
