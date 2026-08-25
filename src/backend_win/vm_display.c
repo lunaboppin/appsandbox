@@ -339,6 +339,7 @@ static const IDispatchVtbl g_sink_vtbl = {
  * ================================================================== */
 
 #define IDC_BTN_SESSION_TOGGLE 5001
+#define IDC_BTN_CTRL_ALT_DEL   5002
 #define TOOLBAR_HEIGHT 30
 /* Private messages for display thread */
 #define WM_DISPLAY_ENHANCE    (WM_USER + 1)
@@ -350,6 +351,7 @@ struct VmDisplay {
     HWND                hwnd;          /* main display window           */
     HWND                ax_hwnd;       /* child hosting ActiveX control */
     HWND                btn_toggle;    /* session mode toggle button    */
+    HWND                btn_cad;       /* Ctrl+Alt+Del button           */
     HWND                main_hwnd;     /* parent app window for notifications */
     volatile BOOL       running;
     BOOL                enhanced_mode; /* TRUE = EnhancedSession pipe   */
@@ -613,6 +615,12 @@ static void STDMETHODCALLTYPE CB_OnConnectionCompleted(
         IDispatch_Release(adv);
         return;
     }
+
+    /* Pin the key the client translates into the session's secure attention
+       sequence, so the toolbar's Ctrl+Alt+Del button has a fixed target
+       regardless of the host's RDP defaults. VK_END = 0x23. */
+    disp_put_long(adv, L"HotKeyCtrlAltDel", 0x23);
+
     IDispatch_Release(adv);
 
     /* 3. Call Connect() on the RDP control */
@@ -860,6 +868,11 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
         4, 2, 150, TOOLBAR_HEIGHT - 4,
         d->hwnd, (HMENU)(INT_PTR)IDC_BTN_SESSION_TOGGLE, d->hInstance, NULL);
 
+    d->btn_cad = CreateWindowExW(0, L"BUTTON", L"Ctrl+Alt+Del",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        158, 2, 130, TOOLBAR_HEIGHT - 4,
+        d->hwnd, (HMENU)(INT_PTR)IDC_BTN_CTRL_ALT_DEL, d->hInstance, NULL);
+
     /* ---- Child window to host the ActiveX RDP control ---- */
 
     d->ax_hwnd = CreateWindowExW(
@@ -1064,6 +1077,54 @@ void vm_display_set_enhanced(VmDisplay *display)
 }
 
 /* ==================================================================
+ * Secure attention sequence
+ * ================================================================== */
+
+/* Ctrl+Alt+Del can't be forwarded from the host: Win32 reserves it and no
+   process ever sees the keystroke. The RDP client instead translates
+   Ctrl+Alt+End into the session's secure attention sequence (the combination
+   is pinned via HotKeyCtrlAltDel when the session connects), so the toolbar
+   button hands keyboard focus to the session and injects that. */
+static void send_ctrl_alt_del(VmDisplay *d)
+{
+    INPUT input[6];
+    HWND focus;
+    int i;
+
+    if (!d || !d->hwnd || !d->ax_hwnd) return;
+    if (d->last_connected <= 0) {
+        ui_log(L"Ctrl+Alt+Del ignored: \"%s\" has no connected session yet.",
+               d->vm ? d->vm->name : L"?");
+        return;
+    }
+
+    /* The RDP control lives in its own child of the ActiveX host. */
+    focus = GetWindow(d->ax_hwnd, GW_CHILD);
+    if (!focus) focus = d->ax_hwnd;
+    SetForegroundWindow(d->hwnd);
+    SetFocus(focus);
+
+    ZeroMemory(input, sizeof(input));
+    for (i = 0; i < 6; i++) input[i].type = INPUT_KEYBOARD;
+    input[0].ki.wVk = VK_CONTROL; input[0].ki.wScan = 0x1D;
+    input[1].ki.wVk = VK_MENU;    input[1].ki.wScan = 0x38;
+    input[2].ki.wVk = VK_END;     input[2].ki.wScan = 0x4F;
+    input[2].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+    input[3] = input[2];
+    input[3].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+    input[4] = input[1];
+    input[4].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[5] = input[0];
+    input[5].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    if (SendInput(6, input, sizeof(INPUT)) != 6)
+        ui_log(L"Error: Ctrl+Alt+Del was not delivered to \"%s\" (%lu)",
+               d->vm ? d->vm->name : L"?", GetLastError());
+    else
+        ui_log(L"Sent Ctrl+Alt+Del to \"%s\".", d->vm ? d->vm->name : L"?");
+}
+
+/* ==================================================================
  * Window procedure
  * ================================================================== */
 
@@ -1146,6 +1207,10 @@ static LRESULT CALLBACK display_wnd_proc(
         if (d && LOWORD(wp) == IDC_BTN_SESSION_TOGGLE) {
             d->enhanced_mode = !d->enhanced_mode;
             display_reconnect(d);
+            return 0;
+        }
+        if (d && LOWORD(wp) == IDC_BTN_CTRL_ALT_DEL) {
+            send_ctrl_alt_del(d);
             return 0;
         }
         break;

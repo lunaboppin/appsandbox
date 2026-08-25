@@ -779,3 +779,77 @@ BOOL vm_agent_ping(VmInstance *instance)
 {
     return vm_agent_send(instance, "ping", NULL, 0, 5000);
 }
+
+/* Map one shared resource into an already-running guest.
+   agent_thread_proc does this for every resource the VM booted with, straight
+   on its own socket; these two go through the queued-command slot so a
+   resource added, dropped or re-scoped while the VM runs takes effect without
+   a restart. Both update the caller's HcsSharedResource bookkeeping. */
+BOOL vm_agent_map_shared_resource(VmInstance *instance, HcsSharedResource *resource)
+{
+    wchar_t user_w[128], password_w[128];
+    char user[256], password[256], share[64], command[1024], response[128] = "";
+    BOOL ok;
+
+    if (!instance || !resource || !resource->drive_letter) return FALSE;
+    if (!instance->running || !instance->agent_online ||
+        _wcsicmp(instance->shared_resource_transport, L"appliance") != 0 ||
+        instance->share_host_ip[0] == '\0') {
+        wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"pending");
+        return FALSE;
+    }
+    if (!shared_appliance_get_smb_credentials(user_w, _countof(user_w),
+                                              password_w, _countof(password_w))) {
+        wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"failed");
+        wcscpy_s(resource->failure, _countof(resource->failure),
+                 L"SMB credential unavailable");
+        return FALSE;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, resource->share_name, -1, share, sizeof(share), NULL, NULL);
+    sprintf_s(command, sizeof(command), "shared_smb_map:%c:%s:%s:%s:%s",
+              (char)resource->drive_letter, instance->share_host_ip, share, user, password);
+    ok = vm_agent_send(instance, command, response, sizeof(response), 60000);
+    SecureZeroMemory(command, sizeof(command));
+    SecureZeroMemory(password, sizeof(password));
+    SecureZeroMemory(password_w, sizeof(password_w));
+    SecureZeroMemory(user, sizeof(user));
+    SecureZeroMemory(user_w, sizeof(user_w));
+    if (ok) {
+        wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"mapped");
+        resource->failure[0] = L'\0';
+        instance->shared_resource_error[0] = L'\0';
+        ui_log(L"Mapped shared resource for \"%s\" at %c:.",
+               instance->name, resource->drive_letter);
+    } else {
+        wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"failed");
+        swprintf_s(resource->failure, _countof(resource->failure), L"%S",
+                   response[0] ? response : "no reply");
+        swprintf_s(instance->shared_resource_error,
+                   _countof(instance->shared_resource_error), L"%c: %S",
+                   resource->drive_letter, response[0] ? response : "no reply");
+        ui_log(L"Shared resource mapping failed for \"%s\" %c: (%S).",
+               instance->name, resource->drive_letter,
+               response[0] ? response : "no reply");
+    }
+    notify_agent_status(instance);
+    return ok;
+}
+
+BOOL vm_agent_unmap_shared_resource(VmInstance *instance, wchar_t drive_letter)
+{
+    char command[64], response[128] = "";
+    BOOL ok;
+    if (!instance || !drive_letter) return FALSE;
+    if (!instance->running || !instance->agent_online) return FALSE;
+    sprintf_s(command, sizeof(command), "shared_smb_unmap:%c", (char)drive_letter);
+    ok = vm_agent_send(instance, command, response, sizeof(response), 60000);
+    if (ok)
+        ui_log(L"Unmapped shared resource for \"%s\" at %c:.", instance->name, drive_letter);
+    else
+        ui_log(L"Shared resource unmap failed for \"%s\" %c: (%S).",
+               instance->name, drive_letter, response[0] ? response : "no reply");
+    notify_agent_status(instance);
+    return ok;
+}

@@ -41,6 +41,13 @@ ASB_API void vm_agent_set_hwnd(HWND hwnd);
 ASB_API BOOL vm_agent_send(VmInstance *instance, const char *command,
                            char *response, int response_max, DWORD timeout_ms);
 
+/* Add or drop one appliance-backed shared resource on a running guest, so a
+   resource created, removed or re-scoped from the UI/API reaches VMs that have
+   it enabled without a restart. Both require an online agent and a VM that
+   booted with the appliance transport; map updates resource->mapping_result. */
+BOOL vm_agent_map_shared_resource(VmInstance *instance, HcsSharedResource *resource);
+BOOL vm_agent_unmap_shared_resource(VmInstance *instance, wchar_t drive_letter);
+
 BOOL vm_agent_shutdown(VmInstance *instance);
 BOOL vm_agent_restart(VmInstance *instance);
 BOOL vm_agent_ping(VmInstance *instance);

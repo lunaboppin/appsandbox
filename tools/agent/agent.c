@@ -1848,7 +1848,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
     if (!MultiByteToWideChar(CP_UTF8, 0, user_a, -1, user, _countof(user)) ||
         !MultiByteToWideChar(CP_UTF8, 0, password_a, -1, password, _countof(password)))
         return (int)GetLastError();
-    swprintf_s(remote, _countof(remote), L"\\\\%S\\%S$", host_a, share_a);
+    swprintf_s(remote, _countof(remote), L"\\\\%S\\%S", host_a, share_a);
     ec = write_agent_script(path, script); if (ec) goto done;
     SetEnvironmentVariableW(L"ASB_SMB_LOCAL", local);
     SetEnvironmentVariableW(L"ASB_SMB_REMOTE", remote);
@@ -1862,6 +1862,32 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
 done:
     SecureZeroMemory(password, sizeof(password));
     SecureZeroMemory(user, sizeof(user));
+    return ec;
+}
+
+/* Drops a mapping made by map_smb_drive_global. Reports success when the drive
+   is already gone so the host can call it unconditionally (a resource that was
+   never mapped, a VM that booted without it, a repeated request). */
+static int unmap_smb_drive_global(const char *letter_a)
+{
+    static const char script[] =
+        "$ErrorActionPreference='SilentlyContinue'\r\n"
+        "$local=$env:ASB_SMB_LOCAL\r\n"
+        "Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue\r\n"
+        "for($i=0;$i -lt 20 -and (Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue);$i++){Start-Sleep -Milliseconds 250}\r\n"
+        "if(Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue){exit 1}\r\n"
+        "exit 0\r\n";
+    const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\shared-smb-unmap.ps1";
+    wchar_t local[4];
+    int ec;
+    if (!letter_a || strlen(letter_a) != 1) return ERROR_INVALID_PARAMETER;
+    swprintf_s(local, _countof(local), L"%c:",
+               towupper((wchar_t)(unsigned char)letter_a[0]));
+    ec = write_agent_script(path, script);
+    if (ec) return ec;
+    SetEnvironmentVariableW(L"ASB_SMB_LOCAL", local);
+    ec = run_agent_powershell(path, 45000);
+    SetEnvironmentVariableW(L"ASB_SMB_LOCAL", NULL);
     return ec;
 }
 
@@ -2009,6 +2035,12 @@ static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars
         L"New-Item -Path WSMan:\\localhost\\Listener -Transport HTTPS -Address * -CertificateThumbPrint $cert.Thumbprint -Force -ErrorAction Stop | Out-Null; "
         L"if(Get-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management' -ErrorAction SilentlyContinue){Remove-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management'}; "
         L"New-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5986 -RemoteAddress $env:ASB_MANAGEMENT_HOST -Profile Any | Out-Null; "
+        /* The private share adapter has no gateway, so Windows classifies it as
+           a public network and the built-in File and Printer Sharing rules stay
+           inactive. Without an explicit rule every client mapping times out. */
+        L"$smbnet=($env:ASB_MANAGEMENT_HOST -replace '\\.\\d+$','.0')+'/24'; "
+        L"if(Get-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance SMB' -ErrorAction SilentlyContinue){Remove-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance SMB'}; "
+        L"New-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance SMB' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -RemoteAddress $smbnet -Profile Any | Out-Null; "
         L"New-Item -ItemType Directory -Force -Path 'C:\\ProgramData\\AppSandbox' | Out-Null; "
         L"[IO.File]::WriteAllText('C:\\ProgramData\\AppSandbox\\management-cert.thumbprint',$cert.Thumbprint,[Text.Encoding]::ASCII)",
         120000);
@@ -2099,11 +2131,20 @@ static DWORD appliance_reconcile_share(const char *arguments)
     MultiByteToWideChar(CP_UTF8, 0, copy, -1, share, _countof(share));
     wcscpy_s(directory, _countof(directory), share);
     { wchar_t *dollar = wcschr(directory, L'$'); if (dollar) *dollar = L'\0'; }
+    /* The share ACL alone is not enough: a directory created on the data volume
+       inherits NTFS rights that do not include the service account, so an rw
+       share would still refuse writes. Grant the account explicitly, and do it
+       on every reconcile so a read-only/read-write flip also takes effect. */
     swprintf_s(script, _countof(script),
         L"$p='C:\\AppSandboxData\\%s'; New-Item -ItemType Directory -Force -Path $p | Out-Null; "
+        L"$acl=Get-Acl -LiteralPath $p; "
+        L"$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
+        L"'AppSandboxShare','%s','ContainerInherit,ObjectInherit','None','Allow'); "
+        L"$acl.SetAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl; "
         L"if(Get-SmbShare -Name '%s' -ErrorAction SilentlyContinue){Remove-SmbShare -Name '%s' -Force}; "
         L"New-SmbShare -Name '%s' -Path $p -%sAccess 'AppSandboxShare' -EncryptData:$false | Out-Null",
-        directory, share, share, share, read_only ? L"Read" : L"Full");
+        directory, read_only ? L"ReadAndExecute" : L"Modify",
+        share, share, share, read_only ? L"Read" : L"Full");
     return run_powershell_wait(script, 30000);
 }
 
@@ -2307,6 +2348,15 @@ static void handle_client(AsbConn *client)
                     REPLY(failure);
                 }
             } else REPLY("invalid");
+        }
+        else if (strncmp(cmd, "shared_smb_unmap:", 17) == 0) {
+            int ec = unmap_smb_drive_global(cmd + 17);
+            if (ec == ERROR_SUCCESS) REPLY("ok");
+            else {
+                char failure[64];
+                sprintf_s(failure, sizeof(failure), "unmap_failed:%lu", (DWORD)ec);
+                REPLY(failure);
+            }
         }
         else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
             REPLY(deploy_ssh_key(cmd + 15) ? "ssh_key_deployed" : "ssh_key_failed");

@@ -1269,6 +1269,19 @@ HRESULT shared_appliance_reconcile(void)
             return E_FAIL;
         }
     }
+    /* build_attachments only returns the enabled definitions, so a resource
+       that was disabled would otherwise stay served under its old name. Its
+       directory and data are left alone -- only the share goes away. */
+    for (i = 0; i < shared_resources_count(); ++i) {
+        const AsbSharedResourceInfo *resource = shared_resources_get(i);
+        wchar_t share_w[64];
+        char share[128];
+        if (!resource || resource->enabled) continue;
+        shared_resources_share_name(resource->id, share_w, _countof(share_w));
+        WideCharToMultiByte(CP_UTF8, 0, share_w, -1, share, sizeof(share), NULL, NULL);
+        sprintf_s(command, sizeof(command), "appliance_remove:%s", share);
+        vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 30000);
+    }
     SecureZeroMemory(admin_password, sizeof(admin_password));
     SecureZeroMemory(smb_password, sizeof(smb_password));
     return S_OK;

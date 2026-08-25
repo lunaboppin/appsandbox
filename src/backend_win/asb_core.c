@@ -4634,12 +4634,109 @@ ASB_API BOOL asb_shared_resource_get(int index, AsbSharedResourceInfo *out)
     return TRUE;
 }
 
+/* Bring one running VM's mapped drives in line with the current resource set.
+   Resources are global, so adding, removing or re-scoping one has to reach
+   every VM that has it enabled. A VM that booted without the appliance
+   transport has no private share adapter, so it keeps the pending flag and
+   picks the change up the next time it starts. */
+static void sync_vm_shared_resources(VmInstance *inst)
+{
+    HcsSharedResource desired[ASB_MAX_SHARED_RESOURCES];
+    HcsSharedResource previous[ASB_MAX_SHARED_RESOURCES];
+    int want, prev, i, j;
+    BOOL synced = TRUE;
+
+    if (!inst || !inst->running || !inst->agent_online) return;
+    if (_wcsicmp(inst->shared_resource_transport, L"appliance") != 0 ||
+        inst->share_host_ip[0] == '\0') return;
+
+    prev = inst->shared_resource_count;
+    if (prev < 0) prev = 0;
+    if (prev > ASB_MAX_SHARED_RESOURCES) prev = ASB_MAX_SHARED_RESOURCES;
+    memcpy(previous, inst->shared_resources, sizeof(previous));
+    ZeroMemory(desired, sizeof(desired));
+    want = shared_resources_build_attachments(inst->os_type,
+        inst->shared_resource_exclusions, desired, ASB_MAX_SHARED_RESOURCES);
+
+    /* Drop first, so a drive letter freed by one resource is available to
+       another in the same pass. Anything whose letter or access mode changed
+       counts as dropped and is re-mapped below. */
+    for (i = 0; i < prev; i++) {
+        if (_wcsicmp(previous[i].mapping_result, L"mapped") != 0) continue;
+        for (j = 0; j < want; j++)
+            if (_wcsicmp(previous[i].id, desired[j].id) == 0 &&
+                previous[i].drive_letter == desired[j].drive_letter &&
+                previous[i].read_only == desired[j].read_only) break;
+        if (j == want)
+            vm_agent_unmap_shared_resource(inst, previous[i].drive_letter);
+    }
+
+    for (i = 0; i < want; i++) {
+        for (j = 0; j < prev; j++)
+            if (_wcsicmp(previous[j].id, desired[i].id) == 0 &&
+                previous[j].drive_letter == desired[i].drive_letter &&
+                previous[j].read_only == desired[i].read_only &&
+                _wcsicmp(previous[j].mapping_result, L"mapped") == 0) break;
+        if (j < prev) { desired[i] = previous[j]; continue; }
+        if (!vm_agent_map_shared_resource(inst, &desired[i])) synced = FALSE;
+    }
+
+    memcpy(inst->shared_resources, desired, sizeof(inst->shared_resources));
+    inst->shared_resource_count = want;
+    inst->shared_resource_pending = !synced;
+}
+
+/* 0 = idle, 1 = a pass is running, 2 = a pass is running and the resource set
+   changed again since it started. */
+static volatile LONG g_share_sync_state;
+
+static DWORD WINAPI share_sync_thread(LPVOID parameter)
+{
+    (void)parameter;
+    for (;;) {
+        HRESULT hr;
+        int i;
+        /* Publish the definitions on the appliance before any guest tries to
+           mount them. An appliance that is stopped has nothing to publish to;
+           start_internal reconciles the whole set the next time it boots. */
+        hr = shared_appliance_reconcile();
+        if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED))
+            asb_log(L"Shared resources will be published when the shared appliance next starts.");
+        else if (FAILED(hr))
+            asb_log(L"Error: Failed to publish shared resources on the appliance (0x%08X)", hr);
+        for (i = 0; i < g_vm_count; i++) sync_vm_shared_resources(&g_vms[i]);
+        save_vm_list();
+        if (InterlockedCompareExchange(&g_share_sync_state, 0, 1) == 1) break;
+        InterlockedExchange(&g_share_sync_state, 1);
+    }
+    return 0;
+}
+
+/* Runs off the caller's thread: publishing and mapping talk to two guests over
+   PowerShell and can take seconds, and the callers are the GUI/API request
+   loops. Guest-visible completion is reported through the agent-status
+   notification each mapping raises. */
+static void request_shared_resource_sync(void)
+{
+    HANDLE thread;
+    if (InterlockedCompareExchange(&g_share_sync_state, 1, 0) != 0) {
+        InterlockedExchange(&g_share_sync_state, 2);
+        return;
+    }
+    thread = CreateThread(NULL, 0, share_sync_thread, NULL, 0, NULL);
+    if (thread) CloseHandle(thread);
+    else {
+        InterlockedExchange(&g_share_sync_state, 0);
+        asb_log(L"Error: Failed to start the shared-resource sync (%lu)", GetLastError());
+    }
+}
+
 ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,
                                            BOOL confirm_permissions,
                                            wchar_t *created_id, size_t created_id_chars)
 {
     HRESULT hr=shared_resources_create(info,confirm_permissions,created_id,created_id_chars);
-    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();shared_appliance_reconcile();}
+    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();request_shared_resource_sync();}
     return hr;
 }
 
@@ -4652,7 +4749,7 @@ ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
         int i;
         for (i = 0; i < g_vm_count; i++) g_vms[i].shared_resource_pending = TRUE;
         save_vm_list();
-        shared_appliance_reconcile();
+        request_shared_resource_sync();
     }
     return hr;
 }
@@ -4670,6 +4767,7 @@ ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id)
             g_vms[i].shared_resource_pending = TRUE;
         }
         save_vm_list();
+        request_shared_resource_sync();
     }
     return hr;
 }
@@ -4694,7 +4792,11 @@ ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
     if (i == shared_resources_count()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     hr = shared_resources_set_excluded(inst->shared_resource_exclusions,
             _countof(inst->shared_resource_exclusions), id, !enabled);
-    if (SUCCEEDED(hr)) { inst->shared_resource_pending = TRUE; save_vm_list(); }
+    if (SUCCEEDED(hr)) {
+        inst->shared_resource_pending = TRUE;
+        save_vm_list();
+        request_shared_resource_sync();
+    }
     return hr;
 }
 
