@@ -4721,6 +4721,8 @@ ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id)
 { return shared_appliance_purge_resource(id); }
 ASB_API HRESULT asb_shared_appliance_open_terminal(void)
 { return shared_appliance_open_terminal(); }
+ASB_API VmInstance *asb_shared_appliance_runtime(void)
+{ return shared_appliance_runtime(); }
 
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
 {

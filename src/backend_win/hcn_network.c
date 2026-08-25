@@ -183,7 +183,7 @@ static BOOL hcn_network_exists(const GUID *id)
     if (!pfnOpenNet) return FALSE;
 
     hr = pfnOpenNet(id, &network, &er);
-    if (er) LocalFree(er);
+    if (er) CoTaskMemFree(er);
     if (SUCCEEDED(hr) && network) {
         if (pfnCloseNet) pfnCloseNet(network);
         return TRUE;
@@ -200,13 +200,13 @@ void hcn_cleanup_stale_networks(void)
     PWSTR er = NULL;
     if (!pfnDeleteNet) return;
     pfnDeleteNet(&APPSANDBOX_NAT_GUID, &er);
-    if (er) { LocalFree(er); er = NULL; }
+    if (er) { CoTaskMemFree(er); er = NULL; }
     pfnDeleteNet(&APPSANDBOX_INTERNAL_GUID, &er);
-    if (er) { LocalFree(er); er = NULL; }
+    if (er) { CoTaskMemFree(er); er = NULL; }
     pfnDeleteNet(&APPSANDBOX_EXTERNAL_GUID, &er);
-    if (er) { LocalFree(er); er = NULL; }
+    if (er) { CoTaskMemFree(er); er = NULL; }
     pfnDeleteNet(&APPSANDBOX_SHARE_GUID, &er);
-    if (er) { LocalFree(er); er = NULL; }
+    if (er) { CoTaskMemFree(er); er = NULL; }
 }
 
 void hcn_cleanup(void)
@@ -215,7 +215,7 @@ void hcn_cleanup(void)
         if (pfnDeleteNet) {
             PWSTR er = NULL;
             pfnDeleteNet(&APPSANDBOX_SHARE_GUID, &er);
-            if (er) LocalFree(er);
+            if (er) CoTaskMemFree(er);
         }
         FreeLibrary(g_hcn_dll);
         g_hcn_dll = NULL;
@@ -387,7 +387,7 @@ HRESULT hcn_create_share_network(GUID *network_id)
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN shared network error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (network && pfnCloseNet) pfnCloseNet(network);
     return hr;
@@ -431,7 +431,7 @@ HRESULT hcn_create_nat_network(GUID *network_id)
 
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN NAT error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (network && pfnCloseNet)
         pfnCloseNet(network);
@@ -465,7 +465,7 @@ HRESULT hcn_create_internal_network(GUID *network_id)
 
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN Internal error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (network && pfnCloseNet) pfnCloseNet(network);
 
@@ -511,7 +511,7 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
 
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN External error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (network && pfnCloseNet) pfnCloseNet(network);
 
@@ -575,7 +575,7 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
 
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN Endpoint error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
     if (network && pfnCloseNet) pfnCloseNet(network);
@@ -596,7 +596,7 @@ HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
         return E_INVALIDARG;
     pick_share_base_once();
     hr = pfnOpenNet(network_id, &network, &error_record);
-    if (error_record) { LocalFree(error_record); error_record = NULL; }
+    if (error_record) { CoTaskMemFree(error_record); error_record = NULL; }
     if (FAILED(hr)) return hr;
 
     CoCreateGuid(endpoint_id);
@@ -623,7 +623,7 @@ HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
         wcscpy_s(endpoint_guid_str, str_len, ep_guid_str);
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN shared endpoint error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
     if (network && pfnCloseNet) pfnCloseNet(network);
@@ -674,7 +674,7 @@ HRESULT hcn_create_share_server_endpoint(const GUID *network_id, GUID *endpoint_
         wcscpy_s(endpoint_guid_str, str_len, ep_guid_str);
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN appliance endpoint error: %s", error_record);
-        LocalFree(error_record);
+        CoTaskMemFree(error_record);
     }
     if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
     if (network && pfnCloseNet) pfnCloseNet(network);

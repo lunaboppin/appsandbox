@@ -759,7 +759,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     if (response && response_max > 0)
         strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
 
-    ok = (strcmp(conn->rsp, "ok") == 0);
+    ok = (strcmp(conn->rsp, "ok") == 0 || strncmp(conn->rsp, "ok:", 3) == 0);
     if (redact) ui_log(L"Agent: credential-bearing command -> %S", conn->rsp);
     else ui_log(L"Agent: %S -> %S", command, conn->rsp);
     return ok;

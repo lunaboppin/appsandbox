@@ -48,6 +48,9 @@ static int g_min_height = 0;
 static VmDisplay *g_displays[ASB_MAX_VMS];
 static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 
+/* Console window for the hidden shared-storage appliance (not in the VM array) */
+static VmDisplay *g_appliance_display = NULL;
+
 /* Custom window messages */
 #define WM_VM_STATE_CHANGED    (WM_APP + 1)
 #define WM_VM_AGENT_STATUS     (WM_APP + 2)
@@ -100,6 +103,34 @@ static BOOL detect_home_edition(void)
     return FALSE;
 }
 
+static void format_hresult_message(HRESULT hr, wchar_t *out, size_t out_chars)
+{
+    wchar_t system_message[512] = L"";
+    DWORD code = HRESULT_FACILITY(hr) == FACILITY_WIN32
+        ? HRESULT_CODE(hr) : (DWORD)hr;
+    wchar_t *newline;
+    if (!out || !out_chars) return;
+    if (hr == E_INVALIDARG) {
+        wcscpy_s(system_message, _countof(system_message),
+            L"Check the backend, storage path, credentials, ISO path, image name, and disk size");
+    } else if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        wcscpy_s(system_message, _countof(system_message),
+            L"The selected appliance folder already exists and is not owned by AppSandbox");
+    } else if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) {
+        wcscpy_s(system_message, _countof(system_message),
+            L"Another appliance operation is already running");
+    } else {
+        FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, code, 0, system_message,
+                       (DWORD)_countof(system_message), NULL);
+    }
+    newline = wcspbrk(system_message, L"\r\n");
+    if (newline) *newline = L'\0';
+    if (!system_message[0]) wcscpy_s(system_message, _countof(system_message),
+                                     L"The appliance operation failed");
+    swprintf_s(out, out_chars, L"%s (0x%08X)", system_message, hr);
+}
+
 /* ---- Forward declarations ---- */
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -126,6 +157,16 @@ static void safe_destroy_idd(int idx)
         VmDisplayIdd *d = g_idd_displays[idx];
         g_idd_displays[idx] = NULL;
         vm_display_idd_destroy(d);
+    }
+}
+
+static void safe_destroy_appliance_display(void)
+{
+    if (g_appliance_display) {
+        VmDisplay *d = g_appliance_display;
+        g_appliance_display = NULL;
+        vm_display_disconnect(d);
+        vm_display_destroy(d);
     }
 }
 
@@ -662,6 +703,39 @@ static void do_connect_idd(int idx)
     if (!g_idd_displays[idx]) ui_log(L"Error: Failed to create IDD display window.");
 }
 
+/* Console viewer for the hidden shared-storage appliance. Uses the RDP
+   basic-session pipe, which renders the Hyper-V Video adapter framebuffer
+   with no guest cooperation -- during unattended provisioning no agent
+   exists yet, so this is the only way to watch the install progress. */
+static void do_connect_appliance_console(void)
+{
+    VmInstance *v;
+    wchar_t pipe[300];
+    int tries;
+    v = asb_shared_appliance_runtime();
+    if (!v || !v->running) { ui_log(L"The shared appliance is not running."); return; }
+    if (g_appliance_display && vm_display_is_open(g_appliance_display)) {
+        ui_log(L"Shared appliance console already open."); return;
+    }
+    safe_destroy_appliance_display();
+
+    /* vmwp.exe creates the pipe a couple of seconds after boot; poll
+       briefly so a click during early startup doesn't fail outright. */
+    swprintf_s(pipe, 300, L"\\\\.\\pipe\\%s.BasicSession", v->name);
+    for (tries = 0; tries < 50; tries++) {
+        if (WaitNamedPipeW(pipe, 0)) break;
+        {
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_SEM_TIMEOUT) break;
+        }
+        Sleep(100);
+    }
+
+    ui_log(L"Opening console display for the shared appliance...");
+    g_appliance_display = vm_display_create(v, g_hInstance, g_hwnd_main);
+    if (!g_appliance_display) ui_log(L"Error: Failed to create the appliance console window.");
+}
+
 /* User-initiated Connect: open BOTH the IDD display and the RDP
    basic-session display side-by-side.
      - IDD renders the in-VM agent's captured framebuffer (Windows: VDD,
@@ -1095,12 +1169,26 @@ static void on_webview2_message(const wchar_t *json)
             return;
         }
         int idx, si = -1, bi = -1;
+        BOOL allow_missing = FALSE;
         wchar_t bname[128] = {0};
         if (json_get_int(json, L"vmIndex", &idx)) {
             json_get_int(json, L"snapIndex", &si);
             json_get_int(json, L"branchIndex", &bi);
             json_get_string(json, L"branchName", bname, 128);
-            asb_vm_start(asb_vm_get(idx), si, bi, bname);
+            json_get_bool(json, L"allowMissingSharedResources", &allow_missing);
+            {
+                HRESULT start_hr = asb_vm_start_ex(asb_vm_get(idx), si, bi, bname,
+                                                   allow_missing);
+                if (!allow_missing &&
+                    start_hr == HRESULT_FROM_WIN32(ERROR_NOT_READY)) {
+                    wchar_t out[1024]; JsonBuilder sj;
+                    jb_init(&sj, out, _countof(out)); jb_object_begin(&sj);
+                    jb_string(&sj, L"type", L"sharedDependencyUnavailable");
+                    jb_int(&sj, L"vmIndex", idx); jb_int(&sj, L"snapIndex", si);
+                    jb_int(&sj, L"branchIndex", bi); jb_string(&sj, L"branchName", bname);
+                    jb_object_end(&sj); webview2_post(out);
+                }
+            }
             send_vm_list();
         }
     } else if (wcscmp(action, L"shutdownVm") == 0) {
@@ -1355,14 +1443,19 @@ static void on_webview2_message(const wchar_t *json)
             SecureZeroMemory(config.admin_password, sizeof(config.admin_password));
             SecureZeroMemory(config.product_key, sizeof(config.product_key));
         }
-        { wchar_t out[1024]; JsonBuilder sj; jb_init(&sj,out,_countof(out));
+        { wchar_t out[1536], message[640] = L""; JsonBuilder sj;
+          if (FAILED(hr)) format_hresult_message(hr, message, _countof(message));
+          jb_init(&sj,out,_countof(out));
           jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedApplianceResult");
           jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);
+          if (FAILED(hr)) jb_string(&sj,L"message",message);
           jb_object_end(&sj);webview2_post(out); }
         send_full_state();
     } else if (wcscmp(action, L"openSharedApplianceTerminal") == 0) {
         HRESULT hr = asb_shared_appliance_open_terminal();
         if (FAILED(hr)) send_manage_result(0, hr);
+    } else if (wcscmp(action, L"openSharedApplianceScreen") == 0) {
+        do_connect_appliance_console();
     } else if (wcscmp(action, L"mountHostResource") == 0 ||
                wcscmp(action, L"openHostResource") == 0 ||
                wcscmp(action, L"unmountHostResource") == 0 ||
@@ -1377,10 +1470,16 @@ static void on_webview2_message(const wchar_t *json)
                 hr = asb_shared_resource_host_unmount(id);
             else hr = asb_shared_resource_purge(id);
             if (SUCCEEDED(hr) && wcscmp(action, L"openHostResource") == 0) {
-                const AsbSharedResourceInfo *resource = shared_resources_find(id);
-                if (resource && resource->host_drive_letter) {
-                    wchar_t drive[4] = { resource->host_drive_letter, L':', L'\\', L'\0' };
-                    ShellExecuteW(g_hwnd_main, L"open", drive, NULL, NULL, SW_SHOWNORMAL);
+                AsbSharedResourceInfo resource;
+                int resource_count = asb_shared_resource_count();
+                int resource_index;
+                for (resource_index = 0; resource_index < resource_count; ++resource_index) {
+                    if (asb_shared_resource_get(resource_index, &resource) &&
+                        _wcsicmp(resource.id, id) == 0 && resource.host_drive_letter) {
+                        wchar_t drive[4] = { resource.host_drive_letter, L':', L'\\', L'\0' };
+                        ShellExecuteW(g_hwnd_main, L"open", drive, NULL, NULL, SW_SHOWNORMAL);
+                        break;
+                    }
                 }
             }
         }
@@ -1738,6 +1837,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_VM_DISPLAY_CLOSED:
     {
         VmInstance *inst = (VmInstance *)lp;
+        if (inst == asb_shared_appliance_runtime()) {
+            if (wp == 0) safe_destroy_appliance_display();
+            return 0;
+        }
         if (inst) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
@@ -1912,6 +2015,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             safe_destroy_rdp(i);
             safe_destroy_idd(i);
         }
+        safe_destroy_appliance_display();
         asb_cleanup();
         PostQuitMessage(0);
         return 0;

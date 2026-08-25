@@ -48,6 +48,7 @@ typedef struct {
     wchar_t data_vhdx_path[MAX_PATH];
     wchar_t admin_user[128];
     wchar_t windows_image_name[256];
+    wchar_t management_cert_thumbprint[128];
     wchar_t last_error[512];
     wchar_t progress_text[256];
 } SharedApplianceStatus;
@@ -84,6 +85,7 @@ HRESULT shared_appliance_open_terminal(void);
 BOOL shared_appliance_handle_hcs_state(VmInstance *instance, DWORD event);
 BOOL shared_appliance_owns_instance(const VmInstance *instance);
 VmInstance *shared_appliance_instance_by_id(UINT64 id);
+VmInstance *shared_appliance_runtime(void);
 BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,
                                           wchar_t *password, size_t password_chars);
 const char *shared_appliance_server_ip(void);

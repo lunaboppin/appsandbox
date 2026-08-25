@@ -23,6 +23,7 @@
 #include <cfgmgr32.h>
 #include <wtsapi32.h>
 #include <userenv.h>
+#include <ntsecapi.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -75,6 +76,7 @@ static HANDLE                g_stop_event;
 static AsbConn *             g_client_sock = NULL; /* Active persistent connection */
 static volatile BOOL         g_os_shutting_down = FALSE;
 static CRITICAL_SECTION      g_send_cs;     /* Protects send_line from concurrent callers */
+static wchar_t               g_shared_management_ip[64];
 
 /* ---- Logging ---- */
 
@@ -1797,6 +1799,19 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
     ec = write_agent_script(path, script); if (ec) return ec;
     SetEnvironmentVariableW(L"ASB_NET_MAC", mac);
     SetEnvironmentVariableW(L"ASB_NET_IP", ip);
+    wcscpy_s(g_shared_management_ip, _countof(g_shared_management_ip), ip);
+    {
+        wchar_t *last_dot = wcsrchr(g_shared_management_ip, L'.');
+        if (!last_dot) {
+            SetEnvironmentVariableW(L"ASB_NET_MAC", NULL);
+            SetEnvironmentVariableW(L"ASB_NET_IP", NULL);
+            g_shared_management_ip[0] = L'\0';
+            return ERROR_INVALID_ADDRESS;
+        }
+        wcscpy_s(last_dot + 1,
+                 _countof(g_shared_management_ip) - (size_t)(last_dot + 1 - g_shared_management_ip),
+                 L"1");
+    }
     ec = run_agent_powershell(path, 30000);
     SetEnvironmentVariableW(L"ASB_NET_MAC", NULL);
     SetEnvironmentVariableW(L"ASB_NET_IP", NULL);
@@ -1971,9 +1986,14 @@ static DWORD run_powershell_wait(const wchar_t *script, DWORD timeout_ms)
     return exit_code;
 }
 
-static DWORD appliance_prepare_storage(void)
+static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars)
 {
-    return run_powershell_wait(
+    FILE *file = NULL;
+    DWORD rc;
+    if (thumbprint && thumbprint_chars) thumbprint[0] = '\0';
+    if (!g_shared_management_ip[0]) return ERROR_INVALID_ADDRESS;
+    SetEnvironmentVariableW(L"ASB_MANAGEMENT_HOST", g_shared_management_ip);
+    rc = run_powershell_wait(
         L"$root='C:\\AppSandboxData'; $d=Get-Disk | Where-Object PartitionStyle -eq 'RAW' | Sort-Object Number | Select-Object -Last 1; "
         L"if($d){Initialize-Disk -Number $d.Number -PartitionStyle GPT -ErrorAction Stop; "
         L"$p=New-Partition -DiskNumber $d.Number -UseMaximumSize -ErrorAction Stop; Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel AppSandboxShared -Confirm:$false -ErrorAction Stop}; "
@@ -1981,8 +2001,29 @@ static DWORD appliance_prepare_storage(void)
         L"$v=Get-Volume -FileSystemLabel AppSandboxShared -ErrorAction Stop; "
         L"if(-not (Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue | Get-PartitionAccessPath | Where-Object AccessPath -eq ($root+'\\'))){ "
         L"Add-PartitionAccessPath -DiskNumber ($v | Get-Partition).DiskNumber -PartitionNumber ($v | Get-Partition).PartitionNumber -AccessPath ($root+'\\') -ErrorAction SilentlyContinue}; "
-        L"Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Confirm:$false -ErrorAction Stop",
+        L"Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Confirm:$false -ErrorAction Stop; "
+        L"$cert=Get-ChildItem Cert:\\LocalMachine\\My | Where-Object FriendlyName -eq 'AppSandbox Shared Appliance Management' | Select-Object -First 1; "
+        L"if(-not $cert){$cert=New-SelfSignedCertificate -DnsName 'AppSandbox.SharedAppliance' -FriendlyName 'AppSandbox Shared Appliance Management' -CertStoreLocation 'Cert:\\LocalMachine\\My' -KeyExportPolicy NonExportable -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(10) -ErrorAction Stop}; "
+        L"Enable-PSRemoting -SkipNetworkProfileCheck -Force -ErrorAction Stop; "
+        L"Get-ChildItem WSMan:\\localhost\\Listener | Where-Object {$_.Keys -contains 'Transport=HTTPS'} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "
+        L"New-Item -Path WSMan:\\localhost\\Listener -Transport HTTPS -Address * -CertificateThumbPrint $cert.Thumbprint -Force -ErrorAction Stop | Out-Null; "
+        L"if(Get-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management' -ErrorAction SilentlyContinue){Remove-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management'}; "
+        L"New-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5986 -RemoteAddress $env:ASB_MANAGEMENT_HOST -Profile Any | Out-Null; "
+        L"New-Item -ItemType Directory -Force -Path 'C:\\ProgramData\\AppSandbox' | Out-Null; "
+        L"[IO.File]::WriteAllText('C:\\ProgramData\\AppSandbox\\management-cert.thumbprint',$cert.Thumbprint,[Text.Encoding]::ASCII)",
         120000);
+    SetEnvironmentVariableW(L"ASB_MANAGEMENT_HOST", NULL);
+    if (rc != ERROR_SUCCESS || !thumbprint || !thumbprint_chars) return rc;
+    if (fopen_s(&file, "C:\\ProgramData\\AppSandbox\\management-cert.thumbprint", "rb") != 0 || !file)
+        return ERROR_FILE_NOT_FOUND;
+    if (!fgets(thumbprint, (int)thumbprint_chars, file)) rc = ERROR_INVALID_DATA;
+    fclose(file);
+    if (rc == ERROR_SUCCESS) {
+        char *end = strpbrk(thumbprint, "\r\n");
+        if (end) *end = '\0';
+        if (!thumbprint[0]) rc = ERROR_INVALID_DATA;
+    }
+    return rc;
 }
 
 static DWORD appliance_set_account(const char *arguments)
@@ -2002,7 +2043,39 @@ static DWORD appliance_set_account(const char *arguments)
     rc = run_powershell_wait(
         L"$u=$env:ASB_APPLIANCE_USER; $s=ConvertTo-SecureString $env:ASB_APPLIANCE_PASSWORD -AsPlainText -Force; "
         L"if(Get-LocalUser -Name $u -ErrorAction SilentlyContinue){Set-LocalUser -Name $u -Password $s -PasswordNeverExpires $true}"
-        L"else{New-LocalUser -Name $u -Password $s -PasswordNeverExpires -UserMayNotChangePassword | Out-Null}", 30000);
+        L"else{New-LocalUser -Name $u -Password $s -PasswordNeverExpires -UserMayNotChangePassword | Out-Null}; "
+        L"Remove-LocalGroupMember -Group 'Administrators' -Member $u -ErrorAction SilentlyContinue", 30000);
+    if (rc == ERROR_SUCCESS) {
+        BYTE sid[SECURITY_MAX_SID_SIZE];
+        wchar_t domain[256];
+        DWORD sid_bytes = sizeof(sid), domain_chars = _countof(domain);
+        SID_NAME_USE sid_type;
+        LSA_OBJECT_ATTRIBUTES attributes;
+        LSA_HANDLE policy = NULL;
+        LSA_UNICODE_STRING rights[2];
+        wchar_t deny_interactive[] = L"SeDenyInteractiveLogonRight";
+        wchar_t deny_remote[] = L"SeDenyRemoteInteractiveLogonRight";
+        if (!LookupAccountNameW(NULL, user, sid, &sid_bytes, domain, &domain_chars, &sid_type)) {
+            rc = GetLastError();
+        } else {
+            ZeroMemory(&attributes, sizeof(attributes));
+            attributes.Length = sizeof(attributes);
+            rights[0].Buffer = deny_interactive;
+            rights[0].Length = (USHORT)(wcslen(deny_interactive) * sizeof(wchar_t));
+            rights[0].MaximumLength = rights[0].Length + sizeof(wchar_t);
+            rights[1].Buffer = deny_remote;
+            rights[1].Length = (USHORT)(wcslen(deny_remote) * sizeof(wchar_t));
+            rights[1].MaximumLength = rights[1].Length + sizeof(wchar_t);
+            {
+                NTSTATUS status = LsaOpenPolicy(NULL, &attributes,
+                    POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT, &policy);
+                if (status == 0)
+                    status = LsaAddAccountRights(policy, sid, rights, _countof(rights));
+                if (policy) LsaClose(policy);
+                if (status != 0) rc = LsaNtStatusToWinError(status);
+            }
+        }
+    }
     SetEnvironmentVariableW(L"ASB_APPLIANCE_PASSWORD", NULL);
     SetEnvironmentVariableW(L"ASB_APPLIANCE_USER", NULL);
     SecureZeroMemory(password, sizeof(password));
@@ -2160,8 +2233,13 @@ static void handle_client(AsbConn *client)
             REPLY("ok");
         }
         else if (strcmp(cmd, "appliance_ready") == 0) {
-            DWORD ec = appliance_prepare_storage();
-            if (ec == 0) REPLY("ok");
+            char thumbprint[128];
+            DWORD ec = appliance_prepare_storage(thumbprint, sizeof(thumbprint));
+            if (ec == 0) {
+                char reply[160];
+                sprintf_s(reply, sizeof(reply), "ok:%s", thumbprint);
+                REPLY(reply);
+            }
             else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
         }
         else if (strncmp(cmd, "appliance_account:", 18) == 0) {

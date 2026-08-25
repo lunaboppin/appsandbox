@@ -151,6 +151,7 @@ window.onHostMessage = function(msg) {
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
+        case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
         case 'manageResult':  onManageResult(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
@@ -1736,6 +1737,8 @@ function showModal(title, message, confirmText, opts) {
     var confirmBtn = document.getElementById('modal-confirm-btn');
     confirmBtn.textContent = confirmText || 'Confirm';
     confirmBtn.className = (opts && opts.confirmClass) || 'danger';
+    document.getElementById('modal-cancel-btn').textContent =
+        (opts && opts.cancelText) || 'Cancel';
     var cb = document.getElementById('modal-dont-show');
     if (cb) cb.parentElement.style.display = 'none';
     var inputRow = document.getElementById('modal-input-row');
@@ -1772,6 +1775,21 @@ function modalResolve(result) {
         }
         pendingConfirm = null;
     }
+}
+
+function onSharedDependencyUnavailable(msg) {
+    showModal('Shared appliance unavailable',
+        'The shared-storage appliance did not become ready. Retry the dependency, or start this VM without shared drives for this boot.',
+        'Retry', { confirmClass: 'primary', cancelText: 'Start Without Shared Drives' })
+        .then(function(retry) {
+            sendCmd('startVm', {
+                vmIndex: msg.vmIndex,
+                snapIndex: msg.snapIndex,
+                branchIndex: msg.branchIndex,
+                branchName: msg.branchName || '',
+                allowMissingSharedResources: !retry
+            });
+        });
 }
 
 /* ---- Minimum size reporting ---- */

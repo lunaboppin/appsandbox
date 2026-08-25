@@ -17,6 +17,7 @@
 #include <io.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <stdlib.h>
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -34,7 +35,8 @@
 #else
 #define UBUNTU_IMAGE_NAME L"noble-server-cloudimg-amd64.img"
 #endif
-#define UBUNTU_IMAGE_BASE L"https://cloud-images.ubuntu.com/noble/current/"
+#define UBUNTU_IMAGE_BUILD L"20260814"
+#define UBUNTU_IMAGE_BASE L"https://cloud-images.ubuntu.com/noble/" UBUNTU_IMAGE_BUILD L"/"
 /* iso_create_appliance_cloud_init emits a NoCloud seed with label CIDATA. */
 
 typedef struct {
@@ -73,6 +75,50 @@ typedef struct {
 
 static SharedApplianceGlobal g_appliance;
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
+static volatile LONG g_setup_invalid_parameter;
+static wchar_t g_setup_invalid_function[128];
+static wchar_t g_setup_invalid_expression[256];
+static wchar_t g_setup_invalid_file[MAX_PATH];
+static unsigned int g_setup_invalid_line;
+
+static void __cdecl setup_invalid_parameter_handler(const wchar_t *expression,
+                                                     const wchar_t *function,
+                                                     const wchar_t *file,
+                                                     unsigned int line,
+                                                     uintptr_t reserved)
+{
+    (void)reserved;
+    lstrcpynW(g_setup_invalid_function, function ? function : L"?",
+              _countof(g_setup_invalid_function));
+    lstrcpynW(g_setup_invalid_expression, expression ? expression : L"?",
+              _countof(g_setup_invalid_expression));
+    lstrcpynW(g_setup_invalid_file, file ? file : L"?",
+              _countof(g_setup_invalid_file));
+    g_setup_invalid_line = line;
+    InterlockedExchange(&g_setup_invalid_parameter, 1);
+}
+
+static void begin_invalid_parameter_capture(_invalid_parameter_handler *previous)
+{
+    g_setup_invalid_function[0] = L'\0';
+    g_setup_invalid_expression[0] = L'\0';
+    g_setup_invalid_file[0] = L'\0';
+    g_setup_invalid_line = 0;
+    InterlockedExchange(&g_setup_invalid_parameter, 0);
+    *previous = _set_invalid_parameter_handler(setup_invalid_parameter_handler);
+}
+
+static HRESULT end_invalid_parameter_capture(_invalid_parameter_handler previous,
+                                             HRESULT hr)
+{
+    _set_invalid_parameter_handler(previous);
+    if (InterlockedCompareExchange(&g_setup_invalid_parameter, 0, 0) == 0)
+        return hr;
+    ui_log(L"[DEBUG-crt91] invalid CRT parameter: function=%s expression=%s file=%s line=%u",
+           g_setup_invalid_function, g_setup_invalid_expression,
+           g_setup_invalid_file, g_setup_invalid_line);
+    return E_INVALIDARG;
+}
 
 static void program_data_root(wchar_t *out, size_t chars)
 {
@@ -236,6 +282,7 @@ static HRESULT save_config_locked(void)
     fwprintf(file, L"SeedIso=%s\n", g_appliance.seed_iso_path);
     fwprintf(file, L"WindowsIso=%s\n", g_appliance.windows_iso_path);
     fwprintf(file, L"WindowsImage=%s\n", g_appliance.status.windows_image_name);
+    fwprintf(file, L"ManagementCert=%s\n", g_appliance.status.management_cert_thumbprint);
     fwprintf(file, L"AdminUser=%s\n", g_appliance.status.admin_user);
     fwprintf(file, L"DataSizeGB=%lu\n", g_appliance.status.data_size_gb);
     fwprintf(file, L"RamMB=%lu\n", g_appliance.status.ram_mb);
@@ -419,6 +466,7 @@ static void load_config(void)
         else if (wcsncmp(line, L"SeedIso=", 8) == 0) wcscpy_s(g_appliance.seed_iso_path, MAX_PATH, line + 8);
         else if (wcsncmp(line, L"WindowsIso=", 11) == 0) wcscpy_s(g_appliance.windows_iso_path, MAX_PATH, line + 11);
         else if (wcsncmp(line, L"WindowsImage=", 13) == 0) wcscpy_s(g_appliance.status.windows_image_name, 256, line + 13);
+        else if (wcsncmp(line, L"ManagementCert=", 15) == 0) wcscpy_s(g_appliance.status.management_cert_thumbprint, 128, line + 15);
         else if (wcsncmp(line, L"AdminUser=", 10) == 0) wcscpy_s(g_appliance.status.admin_user, 128, line + 10);
         else if (wcsncmp(line, L"DataSizeGB=", 11) == 0) g_appliance.status.data_size_gb = _wtoi(line + 11);
         else if (wcsncmp(line, L"RamMB=", 6) == 0) g_appliance.status.ram_mb = _wtoi(line + 6);
@@ -631,7 +679,9 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     wchar_t share_endpoint[64] = L"", maintenance_endpoint[64] = L"";
     char server_ip[32], server_mac[32];
     HRESULT hr;
-    ULONGLONG deadline;
+    ULONGLONG deadline, wait_started, last_report;
+    BOOL announced_agent;
+    DWORD elapsed_seconds, saved_progress;
     char response[256];
     const char *base;
 
@@ -697,7 +747,33 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
 wait_existing:
     if (!wait_ready) return S_OK;
     deadline = GetTickCount64() + (timeout_ms ? timeout_ms : 120000);
+    wait_started = GetTickCount64();
+    last_report = wait_started;
+    announced_agent = FALSE;
     while (GetTickCount64() < deadline) {
+        /* Unattended installs run 10-30+ minutes with no agent to talk to.
+           Without the heartbeat below the UI sits frozen at 65% and any
+           terminal request fails with ERROR_NOT_READY, looking like a hang. */
+        if (!announced_agent && g_appliance.runtime.agent_online) {
+            announced_agent = TRUE;
+            set_progress(90, L"Appliance agent online; verifying readiness...");
+        }
+        if (GetTickCount64() - last_report >= 60000) {
+            elapsed_seconds = (DWORD)((GetTickCount64() - wait_started) / 1000);
+            EnterCriticalSection(&g_appliance.cs);
+            saved_progress = g_appliance.status.progress;
+            LeaveCriticalSection(&g_appliance.cs);
+            if (g_appliance.runtime.agent_online)
+                set_progress(max(saved_progress, 90), L"Verifying the shared appliance agent...");
+            else if (provisioning) {
+                wchar_t heartbeat[256];
+                swprintf_s(heartbeat, _countof(heartbeat),
+                           L"Unattended OS install running in the appliance (%u:%02u elapsed)...",
+                           elapsed_seconds / 60, elapsed_seconds % 60);
+                set_progress(min(66 + elapsed_seconds / 60, 92), heartbeat);
+            }
+            last_report = GetTickCount64();
+        }
         if (g_appliance.runtime.agent_online) {
             if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE) {
                 char net_command[128];
@@ -707,6 +783,15 @@ wait_existing:
             }
             if (vm_agent_send(&g_appliance.runtime, "appliance_ready",
                               response, sizeof(response), 15000)) {
+                if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE &&
+                    strncmp(response, "ok:", 3) == 0 && response[3]) {
+                    MultiByteToWideChar(CP_UTF8, 0, response + 3, -1,
+                                        g_appliance.status.management_cert_thumbprint,
+                                        _countof(g_appliance.status.management_cert_thumbprint));
+                    EnterCriticalSection(&g_appliance.cs);
+                    save_config_locked();
+                    LeaveCriticalSection(&g_appliance.cs);
+                }
                 hr = shared_appliance_reconcile();
                 if (FAILED(hr)) goto fail;
                 EnterCriticalSection(&g_appliance.cs);
@@ -725,7 +810,10 @@ wait_existing:
     hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 fail:
     EnterCriticalSection(&g_appliance.cs);
-    set_error_locked(hr, L"Failed to start or verify the shared appliance");
+    set_error_locked(hr,
+        hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+            ? L"The shared appliance did not become ready within the allotted time"
+            : L"Failed to start or verify the shared appliance");
     LeaveCriticalSection(&g_appliance.cs);
     return hr;
 }
@@ -765,7 +853,12 @@ static DWORD WINAPI setup_worker(LPVOID parameter)
     if (FAILED(hr)) goto failed;
 
     set_progress(65, L"Booting appliance for unattended provisioning...");
-    hr = start_internal(TRUE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+    {
+        _invalid_parameter_handler previous_handler;
+        begin_invalid_parameter_capture(&previous_handler);
+        hr = start_internal(TRUE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+        hr = end_invalid_parameter_capture(previous_handler, hr);
+    }
     if (FAILED(hr)) goto failed;
     EnterCriticalSection(&g_appliance.cs);
     g_appliance.status.configured = TRUE;
@@ -838,6 +931,7 @@ HRESULT shared_appliance_setup(const SharedApplianceConfig *config)
     HRESULT hr;
     wchar_t root[MAX_PATH], smb_password[128];
     DWORD attrs;
+    BOOL owned_stale_root = FALSE;
     if (!config || (config->backend != ASB_APPLIANCE_BACKEND_UBUNTU &&
         config->backend != ASB_APPLIANCE_BACKEND_SERVER_CORE) ||
         !config->admin_user[0] || !config->admin_password[0] ||
@@ -854,8 +948,15 @@ HRESULT shared_appliance_setup(const SharedApplianceConfig *config)
     hr = validate_storage_parent(config->storage_parent); if (FAILED(hr)) return hr;
     swprintf_s(root, _countof(root), L"%s\\AppSandboxSharedAppliance", config->storage_parent);
     attrs = GetFileAttributesW(root);
-    if (attrs != INVALID_FILE_ATTRIBUTES && !g_appliance.status.configured)
-        return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+    if (attrs != INVALID_FILE_ATTRIBUTES && !g_appliance.status.configured) {
+        /* A terminated first-time setup leaves the atomically persisted config
+           and its partial managed tree behind. Reuse only that exact tree;
+           an unrelated directory with the reserved name remains a collision. */
+        owned_stale_root = g_appliance.status.storage_root[0] &&
+            _wcsicmp(g_appliance.status.storage_root, root) == 0;
+        if (!owned_stale_root)
+            return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+    }
     hr = ensure_directory(root); if (FAILED(hr)) return hr;
     hr = generate_password(smb_password, _countof(smb_password)); if (FAILED(hr)) return hr;
     hr = save_credentials(config->admin_password, smb_password);
@@ -1245,7 +1346,7 @@ HRESULT shared_appliance_unpublish_resource(const wchar_t *resource_id)
 
 HRESULT shared_appliance_open_terminal(void)
 {
-    wchar_t command[2048], program_data[MAX_PATH], private_key[MAX_PATH];
+    wchar_t command[4096], program_data[MAX_PATH], private_key[MAX_PATH];
     if (!g_appliance.status.ready) return HRESULT_FROM_WIN32(ERROR_NOT_READY);
     if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU) {
         if (!GetEnvironmentVariableW(L"ProgramData", program_data, _countof(program_data)))
@@ -1257,9 +1358,19 @@ HRESULT shared_appliance_open_terminal(void)
                    private_key, g_appliance.status.admin_user,
                    shared_appliance_server_ip());
     } else {
+        if (!g_appliance.status.management_cert_thumbprint[0])
+            return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         swprintf_s(command, _countof(command),
-          L"wt.exe -w 0 new-tab powershell.exe -NoExit -Command \"Enter-PSSession -ComputerName %S -UseSSL -Credential (Get-Credential '%s')\"",
-          shared_appliance_server_ip(), g_appliance.status.admin_user);
+          L"wt.exe -w 0 new-tab powershell.exe -NoExit -Command \""
+          L"$ip='%S';$expected='%s';$tcp=[Net.Sockets.TcpClient]::new();"
+          L"$tcp.Connect($ip,5986);$tls=[Net.Security.SslStream]::new($tcp.GetStream(),$false,{$true});"
+          L"$tls.AuthenticateAsClient('AppSandbox.SharedAppliance');"
+          L"$actual=$tls.RemoteCertificate.GetCertHashString();$tls.Dispose();$tcp.Dispose();"
+          L"if($actual -ne $expected){throw 'Shared appliance management certificate mismatch'};"
+          L"$o=New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck;"
+          L"Enter-PSSession -ComputerName $ip -UseSSL -SessionOption $o -Credential (Get-Credential '%s')\"",
+          shared_appliance_server_ip(), g_appliance.status.management_cert_thumbprint,
+          g_appliance.status.admin_user);
     }
     return launch_process(command);
 }
@@ -1318,6 +1429,12 @@ BOOL shared_appliance_owns_instance(const VmInstance *instance)
 VmInstance *shared_appliance_instance_by_id(UINT64 id)
 {
     return id == APPLIANCE_UNIQUE_ID ? &g_appliance.runtime : NULL;
+}
+
+/* Live instance for UI console viewers; NULL before initialization. */
+VmInstance *shared_appliance_runtime(void)
+{
+    return g_appliance.initialized ? &g_appliance.runtime : NULL;
 }
 
 BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,

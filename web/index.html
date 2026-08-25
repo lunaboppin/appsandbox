@@ -268,13 +268,19 @@
                 <label for="appliance-admin-pass">Password:</label><input id="appliance-admin-pass" type="password" autocomplete="new-password">
                 <label for="appliance-cpu">Advanced resources:</label><div><input id="appliance-cpu" type="number" min="1" value="1" style="width:70px"> vCPU <input id="appliance-ram" type="number" min="512" value="1024" style="width:90px"> MB RAM</div>
                 <label for="appliance-server-iso">Server Core ISO:</label><div class="manage-row"><input id="appliance-server-iso"><button type="button" onclick="sendCmd('browseApplianceIso')">Browse...</button></div>
-                <label for="appliance-server-image">Core WIM image:</label><input id="appliance-server-image" placeholder="Windows Server 2025 SERVERSTANDARDCORE">
+                <label for="appliance-server-image">Core WIM image:</label><input id="appliance-server-image" list="appliance-server-images" placeholder="Select or enter the exact install.wim image name">
+                <datalist id="appliance-server-images">
+                    <option value="Windows Server 2025 Standard"></option>
+                    <option value="Windows Server 2025 Datacenter"></option>
+                    <option value="Windows Server 2022 Standard"></option>
+                    <option value="Windows Server 2022 Datacenter"></option>
+                </datalist>
                 <label for="appliance-product-key">Optional product key:</label><input id="appliance-product-key" type="password" autocomplete="off">
             </div>
             <div class="modal-buttons">
                 <button onclick="startSharedAppliance()">Start</button><button onclick="stopSharedAppliance()">Stop</button>
                 <button onclick="updateSharedAppliance()">Update</button><button onclick="growSharedAppliance()">Grow Disk</button>
-                <button onclick="sendCmd('openSharedApplianceTerminal')">Terminal</button><button onclick="rebuildSharedAppliance()">Rebuild</button><button class="primary" onclick="setupSharedAppliance()">Setup</button>
+                <button onclick="sendCmd('openSharedApplianceScreen')">Screen</button><button onclick="sendCmd('openSharedApplianceTerminal')">Terminal</button><button onclick="rebuildSharedAppliance()">Rebuild</button><button class="primary" onclick="setupSharedAppliance()">Setup</button>
             </div>
         </fieldset>
         <h3>Shared Resources</h3>
@@ -308,7 +314,7 @@
             <input type="text" id="modal-input" style="width:100%; margin-top:4px;" autocorrect="off" autocapitalize="off" spellcheck="false">
         </div>
         <div class="modal-buttons">
-            <button onclick="modalResolve(false)">Cancel</button>
+            <button onclick="modalResolve(false)" id="modal-cancel-btn">Cancel</button>
             <button class="danger" onclick="modalResolve(true)" id="modal-confirm-btn">Delete</button>
         </div>
     </div>

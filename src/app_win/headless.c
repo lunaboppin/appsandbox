@@ -743,7 +743,7 @@ static int handle_request(PHTTP_REQUEST req)
         send_err(req->RequestId,405,"Method Not Allowed","method","unsupported method");return 0;
     }
     if (wcsncmp(path,L"/v1/shared-resources/",21)==0) {
-        const wchar_t *id=path+21; wchar_t body[4096]; AsbSharedResourceInfo r; BOOL confirm=FALSE; HRESULT hr;
+        const wchar_t *id=path+21; wchar_t body[4096]; AsbSharedResourceInfo r; HRESULT hr;
         wchar_t resource_id[ASB_SHARED_ID_CHARS];
         const wchar_t *slash = wcschr(id, L'/');
         if (slash && verb == HttpVerbPOST) {

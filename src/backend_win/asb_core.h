@@ -282,6 +282,9 @@ ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
 ASB_API HRESULT asb_shared_appliance_open_terminal(void);
+/* Raw appliance runtime for the UI console viewer (see vm_display.h).
+   NULL before initialization; check ->running before use. */
+ASB_API VmInstance *asb_shared_appliance_runtime(void);
 
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);

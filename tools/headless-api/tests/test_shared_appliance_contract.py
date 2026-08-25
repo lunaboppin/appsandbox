@@ -52,9 +52,13 @@ def main() -> None:
     for token in ("CryptProtectData", "CryptUnprotectData", "shared-appliance.cfg",
                   "shared-appliance.cred", "ReplaceFileW", "SecureZeroMemory"):
         check(token in impl, f"appliance persistence/credential contract missing {token}")
+    for token in ("ManagementCert=", "AuthenticateAsClient", "GetCertHashString",
+                  "certificate mismatch"):
+        check(token in impl, f"Server Core certificate pinning missing {token}")
     for token in ("cloud-images.ubuntu.com", "noble-server-cloudimg-amd64.img",
-                  "SHA256SUMS", "--qcow2-to-vhdx", "CIDATA"):
+                  "UBUNTU_IMAGE_BUILD", "SHA256SUMS", "--qcow2-to-vhdx", "CIDATA"):
         check(token in impl, f"managed Ubuntu appliance provisioning missing {token}")
+    check("/current/" not in impl, "Ubuntu appliance image still follows a moving alias")
     for token in ("server_core", "windows_image_name", "product_key"):
         check(token in impl + header, f"Server Core provisioning missing {token}")
 
@@ -72,6 +76,9 @@ def main() -> None:
                     "appliance_remove:", "appliance_purge:", "appliance_grow:"):
         check(command in win_agent, f"Windows appliance agent missing {command}")
         check(command in linux_agent, f"Linux appliance agent missing {command}")
+    for token in ("New-SelfSignedCertificate", "WSMan:\\\\localhost\\\\Listener",
+                  "ASB_MANAGEMENT_HOST", "management-cert.thumbprint"):
+        check(token in win_agent, f"Server Core management provisioning missing {token}")
 
     for token in ("host_drive_letter", "legacy_host_path", "storage_kind"):
         check(token in resource_header + resources,
@@ -85,6 +92,9 @@ def main() -> None:
     for token in ("setupSharedAppliance", "startSharedAppliance", "stopSharedAppliance",
                   "growSharedAppliance", "rebuildSharedAppliance", "mountHostResource"):
         check(token in js + ui, f"WebView appliance action missing {token}")
+    for token in ("sharedDependencyUnavailable", "allowMissingSharedResources",
+                  "Start Without Shared Drives"):
+        check(token in js + ui, f"GUI dependency bypass missing {token}")
 
     for route in ("/shared-appliance", "/host-mount", "/host-unmount", "/purge"):
         check(route in headless, f"headless appliance route missing {route}")
