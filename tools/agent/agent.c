@@ -2072,11 +2072,25 @@ static DWORD appliance_set_account(const char *arguments)
     MultiByteToWideChar(CP_UTF8, 0, separator, -1, password, _countof(password));
     SetEnvironmentVariableW(L"ASB_APPLIANCE_USER", user);
     SetEnvironmentVariableW(L"ASB_APPLIANCE_PASSWORD", password);
+    /* Uses the WinNT ADSI provider rather than New-LocalUser/Set-LocalUser:
+       those live in the Microsoft.PowerShell.LocalAccounts module, which is
+       absent from trimmed Windows images, and a missing cmdlet exits the whole
+       script with a bare 1 that says nothing. ADSI is part of the OS.
+       No double quotes: the caller wraps this script in them.
+       0x10000 = DONT_EXPIRE_PASSWD, 0x2 = ACCOUNTDISABLE. */
     rc = run_powershell_wait(
-        L"$u=$env:ASB_APPLIANCE_USER; $s=ConvertTo-SecureString $env:ASB_APPLIANCE_PASSWORD -AsPlainText -Force; "
-        L"if(Get-LocalUser -Name $u -ErrorAction SilentlyContinue){Set-LocalUser -Name $u -Password $s -PasswordNeverExpires $true}"
-        L"else{New-LocalUser -Name $u -Password $s -PasswordNeverExpires -UserMayNotChangePassword | Out-Null}; "
-        L"Remove-LocalGroupMember -Group 'Administrators' -Member $u -ErrorAction SilentlyContinue", 30000);
+        L"try{"
+        L"$n=$env:ASB_APPLIANCE_USER; $p=$env:ASB_APPLIANCE_PASSWORD; $c=$env:COMPUTERNAME; "
+        L"$root=[ADSI]('WinNT://'+$c); $u=$null; "
+        L"try{$t=[ADSI]('WinNT://'+$c+'/'+$n+',user'); if($t.Name){$u=$t}}catch{$u=$null}; "
+        L"if(-not $u){$u=$root.Create('User',$n)}; "
+        L"$u.SetPassword($p); $u.SetInfo(); "
+        L"$f=[int]$u.UserFlags.Value; "
+        L"$u.UserFlags.Value=(($f -bor 0x10000) -band (-bnot 0x2)); $u.SetInfo()"
+        L"}catch{$e=([int]$_.Exception.HResult -band 0xffff); if($e -eq 0){$e=1}; exit $e}; "
+        L"try{$g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); "
+        L"$g.Remove(('WinNT://'+$env:COMPUTERNAME+'/'+$env:ASB_APPLIANCE_USER+',user'))}catch{}; "
+        L"exit 0", 30000);
     if (rc == ERROR_SUCCESS) {
         BYTE sid[SECURITY_MAX_SID_SIZE];
         wchar_t domain[256];

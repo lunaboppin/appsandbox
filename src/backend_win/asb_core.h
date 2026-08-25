@@ -292,6 +292,11 @@ ASB_API void asb_set_hinstance(HINSTANCE hInst);
 /* Set the HWND for IDD probe notifications (WM_APP+7). */
 ASB_API void asb_idd_probe_set_hwnd(HWND hwnd);
 
+/* Refresh the guest agent binary on an offline Windows VHDX. Used by the VM
+   start path and by the shared appliance, whose own OS disk otherwise keeps
+   whatever agent it was provisioned with. Not exported: same-DLL callers only. */
+HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path);
+
 /* ---- Internal access (for the UI layer) ---- */
 
 /* Get the raw VmInstance pointer (defined in hcs_vm.h).

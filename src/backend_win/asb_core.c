@@ -933,6 +933,11 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
     return hr;
 }
 
+HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path)
+{
+    return upgrade_windows_agent_offline(vhdx_path);
+}
+
 static BOOL path_is_within(const wchar_t *path, const wchar_t *root)
 {
     size_t n;
@@ -4694,14 +4699,26 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
 {
     (void)parameter;
     for (;;) {
-        HRESULT hr;
-        int i;
+        SharedApplianceStatus appliance;
+        HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        int attempt, i;
         /* Publish the definitions on the appliance before any guest tries to
-           mount them. An appliance that is stopped has nothing to publish to;
-           start_internal reconciles the whole set the next time it boots. */
-        hr = shared_appliance_reconcile();
-        if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED))
-            asb_log(L"Shared resources will be published when the shared appliance next starts.");
+           mount them. A stopped appliance has nothing to publish to and
+           republishes the whole set when it next boots; one that is mid-start
+           is worth waiting for, since the change was made for the VM the user
+           is starting right now. */
+        for (attempt = 0; attempt < 150; ++attempt) {
+            hr = shared_appliance_reconcile();
+            if (hr != HRESULT_FROM_WIN32(ERROR_NOT_READY)) break;
+            shared_appliance_get_status(&appliance);
+            if (appliance.state != ASB_APPLIANCE_STATE_STARTING &&
+                appliance.state != ASB_APPLIANCE_STATE_PROVISIONING &&
+                appliance.state != ASB_APPLIANCE_STATE_UPDATING) break;
+            Sleep(2000);
+        }
+        if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED) ||
+            hr == HRESULT_FROM_WIN32(ERROR_NOT_READY))
+            asb_log(L"Shared resources will be published when the shared appliance is ready.");
         else if (FAILED(hr))
             asb_log(L"Error: Failed to publish shared resources on the appliance (0x%08X)", hr);
         for (i = 0; i < g_vm_count; i++) sync_vm_shared_resources(&g_vms[i]);

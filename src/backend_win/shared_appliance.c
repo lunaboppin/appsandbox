@@ -48,6 +48,7 @@ typedef struct {
 
 typedef struct {
     CRITICAL_SECTION cs;
+    CRITICAL_SECTION command_cs;
     BOOL initialized;
     SharedApplianceStatus status;
     wchar_t windows_iso_path[MAX_PATH];
@@ -75,6 +76,7 @@ typedef struct {
 
 static SharedApplianceGlobal g_appliance;
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
+static HRESULT reconcile_internal(void);
 static volatile LONG g_setup_invalid_parameter;
 static wchar_t g_setup_invalid_function[128];
 static wchar_t g_setup_invalid_expression[256];
@@ -161,6 +163,21 @@ static void set_progress(int pct, const wchar_t *text)
                        _countof(g_appliance.status.progress_text), text);
     LeaveCriticalSection(&g_appliance.cs);
     if (text) ui_log(L"Shared appliance: %s", text);
+}
+
+/* Every host->appliance command funnels through here. vm_agent_send keeps a
+   single command slot per VM, so two callers -- the start/readiness sequence
+   and a resource sync, say -- would overwrite each other's command and desync
+   the agent protocol, which shows up as an empty reply and a dropped agent
+   connection. */
+static BOOL appliance_send(const char *command, char *response,
+                           int response_max, DWORD timeout_ms)
+{
+    BOOL ok;
+    EnterCriticalSection(&g_appliance.command_cs);
+    ok = vm_agent_send(&g_appliance.runtime, command, response, response_max, timeout_ms);
+    LeaveCriticalSection(&g_appliance.command_cs);
+    return ok;
 }
 
 static HRESULT ensure_directory(const wchar_t *path)
@@ -827,9 +844,9 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     char server_ip[32], server_mac[32];
     HRESULT hr;
     ULONGLONG deadline, wait_started, last_report, last_vhdx_bytes;
-    BOOL announced_agent;
+    BOOL announced_agent, net_configured;
     DWORD elapsed_seconds, saved_progress;
-    char response[256];
+    char response[256] = "";
     const char *base;
 
     EnterCriticalSection(&g_appliance.cs);
@@ -887,6 +904,19 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
        CRT on every unwrapped boot. */
     wcscpy_s(g_appliance.runtime.shared_resource_transport,
              _countof(g_appliance.runtime.shared_resource_transport), L"appliance");
+    /* The appliance keeps whatever agent it was provisioned with -- nothing
+       else ever refreshes it -- so a guest-side fix would only reach a rebuilt
+       appliance. Refresh it here, while the disk is still offline. Failure is
+       not fatal: the existing agent may well be current. */
+    if (!provisioning &&
+        g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE) {
+        HRESULT agent_hr = asb_upgrade_windows_agent_offline(
+            g_appliance.status.os_vhdx_path);
+        if (FAILED(agent_hr))
+            ui_log(L"Shared appliance: could not refresh the appliance agent (0x%08X); using the installed one.",
+                   agent_hr);
+    }
+
     fill_vm_config(&config, provisioning);
     hcs_destroy_stale(APPLIANCE_VM_NAME);
     ui_log(L"Shared appliance: creating compute system (%S boot)...",
@@ -907,6 +937,7 @@ wait_existing:
     wait_started = GetTickCount64();
     last_report = wait_started;
     announced_agent = FALSE;
+    net_configured = FALSE;
     file_size_bytes(g_appliance.status.os_vhdx_path, &last_vhdx_bytes);
     while (GetTickCount64() < deadline) {
         /* Unattended installs run 10-30+ minutes with no agent to talk to.
@@ -955,14 +986,27 @@ wait_existing:
             last_report = GetTickCount64();
         }
         if (g_appliance.runtime.agent_online) {
-            if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE) {
+            /* Both commands are long-running guest work: shared_net waits up
+               to 30s for the private adapter to appear, and appliance_ready
+               initializes the data disk, enables PSRemoting and mints the
+               management certificate -- minutes on a first boot. A short
+               timeout here does not cancel the guest, it just re-sends on the
+               next pass, so the agent ends up serving a backlog of overlapping
+               heavy commands and the connection eventually drops. Send each
+               one once and wait for the guest's own answer. */
+            if (!net_configured &&
+                g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE) {
                 char net_command[128];
                 sprintf_s(net_command, sizeof(net_command), "shared_net:%s:%s",
                           g_appliance.runtime.share_mac, g_appliance.runtime.share_ip);
-                vm_agent_send(&g_appliance.runtime, net_command, response, sizeof(response), 15000);
+                if (appliance_send(net_command, response, sizeof(response), 60000))
+                    net_configured = TRUE;
+                else
+                    ui_log(L"Shared appliance: private adapter configuration failed (%S); retrying.",
+                           response[0] ? response : "no reply");
             }
-            if (vm_agent_send(&g_appliance.runtime, "appliance_ready",
-                              response, sizeof(response), 15000)) {
+            if (appliance_send("appliance_ready",
+                              response, sizeof(response), 300000)) {
                 if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE &&
                     strncmp(response, "ok:", 3) == 0 && response[3]) {
                     MultiByteToWideChar(CP_UTF8, 0, response + 3, -1,
@@ -972,7 +1016,9 @@ wait_existing:
                     save_config_locked();
                     LeaveCriticalSection(&g_appliance.cs);
                 }
-                hr = shared_appliance_reconcile();
+                /* Not the public entry point: status.ready is still FALSE
+                   here, and this is the pass that publishes the whole set. */
+                hr = reconcile_internal();
                 if (FAILED(hr)) goto fail;
                 EnterCriticalSection(&g_appliance.cs);
                 g_appliance.status.state = ASB_APPLIANCE_STATE_READY;
@@ -1088,6 +1134,7 @@ void shared_appliance_init(void)
     if (g_appliance.initialized) return;
     ZeroMemory(&g_appliance, sizeof(g_appliance));
     InitializeCriticalSection(&g_appliance.cs);
+    InitializeCriticalSection(&g_appliance.command_cs);
     g_appliance.initialized = TRUE;
     g_appliance.status.state = ASB_APPLIANCE_STATE_UNCONFIGURED;
     g_appliance.status.data_size_gb = 256;
@@ -1236,13 +1283,27 @@ HRESULT shared_appliance_stop(BOOL force)
     return hr;
 }
 
+/* Publishing before the startup pass has run appliance_ready would create the
+   share directories under a mount point the data volume is not mounted on yet,
+   and would race the startup command sequence. The startup pass publishes the
+   whole set itself, so deferring costs nothing. */
 HRESULT shared_appliance_reconcile(void)
+{
+    if (!g_appliance.runtime.agent_online)
+        return HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
+    if (!g_appliance.status.ready)
+        return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    return reconcile_internal();
+}
+
+static HRESULT reconcile_internal(void)
 {
     wchar_t admin_password[256], smb_password[256], smb_user[128];
     char user[128], password[256], command[1024], response[256];
     int i, count;
     HcsSharedResource resources[ASB_MAX_SHARED_RESOURCES];
     HRESULT hr;
+    response[0] = '\0';   /* a send that never reaches the guest leaves it untouched */
     if (!g_appliance.runtime.agent_online) return HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
     hr = load_credentials(admin_password, _countof(admin_password), smb_password, _countof(smb_password));
     if (FAILED(hr)) return hr;
@@ -1250,7 +1311,12 @@ HRESULT shared_appliance_reconcile(void)
     WideCharToMultiByte(CP_UTF8, 0, smb_user, -1, user, sizeof(user), NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, smb_password, -1, password, sizeof(password), NULL, NULL);
     sprintf_s(command, sizeof(command), "appliance_account:%s:%s", user, password);
-    if (!vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 30000)) {
+    if (!appliance_send(command, response, sizeof(response), 30000)) {
+        /* vm_agent_send redacts this command, so name the step here or the
+           only trace of the failure is an anonymous "credential-bearing
+           command" line. The reply carries the guest's Win32/HRESULT code. */
+        ui_log(L"Shared appliance: creating the %s SMB service account failed (%S).",
+               APPLIANCE_SERVICE_USER, response[0] ? response : "no reply");
         SecureZeroMemory(admin_password, sizeof(admin_password));
         SecureZeroMemory(smb_password, sizeof(smb_password));
         SecureZeroMemory(password, sizeof(password));
@@ -1263,7 +1329,9 @@ HRESULT shared_appliance_reconcile(void)
         WideCharToMultiByte(CP_UTF8, 0, resources[i].share_name, -1, share, sizeof(share), NULL, NULL);
         sprintf_s(command, sizeof(command), "appliance_reconcile:%s:%s",
                   share, resources[i].read_only ? "ro" : "rw");
-        if (!vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 30000)) {
+        if (!appliance_send(command, response, sizeof(response), 30000)) {
+            ui_log(L"Shared appliance: publishing share %S failed (%S).",
+                   share, response[0] ? response : "no reply");
             SecureZeroMemory(admin_password, sizeof(admin_password));
             SecureZeroMemory(smb_password, sizeof(smb_password));
             return E_FAIL;
@@ -1280,7 +1348,7 @@ HRESULT shared_appliance_reconcile(void)
         shared_resources_share_name(resource->id, share_w, _countof(share_w));
         WideCharToMultiByte(CP_UTF8, 0, share_w, -1, share, sizeof(share), NULL, NULL);
         sprintf_s(command, sizeof(command), "appliance_remove:%s", share);
-        vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 30000);
+        appliance_send(command, response, sizeof(response), 30000);
     }
     SecureZeroMemory(admin_password, sizeof(admin_password));
     SecureZeroMemory(smb_password, sizeof(smb_password));
@@ -1389,7 +1457,7 @@ HRESULT shared_appliance_grow(DWORD new_size_gb)
     if (FAILED(hr)) return hr;
     hr = shared_appliance_start(TRUE, 120000); if (FAILED(hr)) return hr;
     sprintf_s(command, sizeof(command), "appliance_grow:%lu", new_size_gb);
-    if (!vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 120000))
+    if (!appliance_send(command, response, sizeof(response), 120000))
         guest_hr = HRESULT_FROM_WIN32(ERROR_GEN_FAILURE);
     EnterCriticalSection(&g_appliance.cs);
     g_appliance.status.data_size_gb = new_size_gb;
@@ -1418,7 +1486,7 @@ HRESULT shared_appliance_update(void)
     g_appliance.status.state = ASB_APPLIANCE_STATE_UPDATING;
     g_appliance.status.busy = TRUE;
     LeaveCriticalSection(&g_appliance.cs);
-    if (!vm_agent_send(&g_appliance.runtime, "appliance_update", response, sizeof(response), 30 * 60 * 1000))
+    if (!appliance_send("appliance_update", response, sizeof(response), 30 * 60 * 1000))
         hr = E_FAIL;
     shared_appliance_stop(FALSE);
     if (SUCCEEDED(hr)) hr = start_internal(FALSE, TRUE, 120000);
@@ -1532,7 +1600,7 @@ HRESULT shared_appliance_purge_resource(const wchar_t *resource_id)
     shared_resources_share_name(resource->id, share_w, _countof(share_w));
     WideCharToMultiByte(CP_UTF8, 0, share_w, -1, share, sizeof(share), NULL, NULL);
     sprintf_s(command, sizeof(command), "appliance_purge:%s", share);
-    return vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 120000) ? S_OK : E_FAIL;
+    return appliance_send(command, response, sizeof(response), 120000) ? S_OK : E_FAIL;
 }
 
 HRESULT shared_appliance_unpublish_resource(const wchar_t *resource_id)
@@ -1545,7 +1613,7 @@ HRESULT shared_appliance_unpublish_resource(const wchar_t *resource_id)
     shared_resources_share_name(resource->id, share_w, _countof(share_w));
     WideCharToMultiByte(CP_UTF8, 0, share_w, -1, share, sizeof(share), NULL, NULL);
     sprintf_s(command, sizeof(command), "appliance_remove:%s", share);
-    return vm_agent_send(&g_appliance.runtime, command, response, sizeof(response), 30000)
+    return appliance_send(command, response, sizeof(response), 30000)
         ? S_OK : E_FAIL;
 }
 
