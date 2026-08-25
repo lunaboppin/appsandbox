@@ -1908,7 +1908,14 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         " $ready=$false;for($i=0;$i -lt 20 -and -not $ready;$i++){$ready=Test-Path ($local+'\\');if(-not $ready){Start-Sleep -Milliseconds 250}}\r\n"
         " if(-not $ready){Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue;exit 3}\r\n"
         " exit 0\r\n"
-        "}catch{$c=([int]$_.Exception.HResult -band 0xffff);if($c -eq 0){$c=1};exit $c}\r\n";
+        "}catch{\r\n"
+        " $c=([int]$_.Exception.HResult -band 0xffff);if($c -eq 0){$c=1}\r\n"
+        " Write-Output ('target=' + $remote + ' user=' + $env:ASB_SMB_USER)\r\n"
+        " Write-Output ('error=' + $_.Exception.GetType().FullName + ': ' + $_.Exception.Message)\r\n"
+        " $t=Test-NetConnection -ComputerName ($remote -split '\\\\')[2] -Port 445 -WarningAction SilentlyContinue\r\n"
+        " Write-Output ('tcp445=' + $t.TcpTestSucceeded + ' ping=' + $t.PingSucceeded)\r\n"
+        " exit $c\r\n"
+        "}\r\n";
     const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\shared-smb-map.ps1";
     wchar_t local[4], remote[256], user[256], password[256]; int ec;
     if (!letter_a || strlen(letter_a) != 1 || !host_a || !share_a || !user_a || !password_a)
@@ -1923,7 +1930,24 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
     SetEnvironmentVariableW(L"ASB_SMB_REMOTE", remote);
     SetEnvironmentVariableW(L"ASB_SMB_USER", user);
     SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
-    ec = run_agent_powershell(path, 45000);
+    {
+        char out[2048];
+        ec = run_agent_powershell_out(path, 90000, out, sizeof(out));
+        if (out[0]) {
+            char *line = out, *nl;
+            while (line && *line) {
+                nl = strpbrk(line, "\r\n");
+                if (nl) *nl = '\0';
+                if (*line) {
+                    agent_log("shared_smb_map: %s", line);
+                    agent_log_to_host("shared_smb_map: %s", line);
+                }
+                if (!nl) break;
+                line = nl + 1;
+                while (*line == '\r' || *line == '\n') line++;
+            }
+        }
+    }
     SetEnvironmentVariableW(L"ASB_SMB_LOCAL", NULL);
     SetEnvironmentVariableW(L"ASB_SMB_REMOTE", NULL);
     SetEnvironmentVariableW(L"ASB_SMB_USER", NULL);
