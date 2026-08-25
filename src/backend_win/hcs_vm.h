@@ -77,6 +77,12 @@ typedef struct {
     wchar_t     net_adapter[256];     /* Adapter name for External network */
     GUID        network_id;
     GUID        endpoint_id;
+    GUID        share_network_id;
+    GUID        share_endpoint_id;
+    char        share_ip[32];
+    char        share_host_ip[32];
+    char        share_mac[32];
+    BOOL        share_network_cleaned;
     GUID        runtime_id;           /* VM RuntimeId for AF_HYPERV connections */
     wchar_t     resources_iso_path[MAX_PATH];
     BOOL        running;
@@ -120,7 +126,7 @@ typedef struct {
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
     HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
     int         shared_resource_count;
-    wchar_t     shared_resource_transport[16]; /* vsmb, smb, unavailable */
+    wchar_t     shared_resource_transport[16]; /* smb or unavailable */
     wchar_t     shared_resource_error[256];
     BOOL        shared_resource_pending;
 } VmInstance;
@@ -198,10 +204,18 @@ ASB_API void hcs_stop_monitor(VmInstance *instance);
 HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpoint_guid,
                                      VmInstance *instance);
 
+/* Create a VM with its normal endpoint and an independent shared-resource
+   endpoint. Either endpoint may be NULL. */
+HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
+                                     const wchar_t *endpoint_guid,
+                                     const wchar_t *share_endpoint_guid,
+                                     VmInstance *instance);
+
 /* Build the HCS JSON document for creating a VM.
    json_out must be at least json_out_chars wide chars.
    endpoint_guid is the HCN endpoint GUID string (NULL if no network). */
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
+                       const wchar_t *share_endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars);
 
 /* Compute the AppSandbox service GUID for a guest OS and port.

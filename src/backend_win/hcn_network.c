@@ -94,6 +94,11 @@ static const GUID APPSANDBOX_EXTERNAL_GUID = {
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x88 }
 };
 
+static const GUID APPSANDBOX_SHARE_GUID = {
+    0xA5B01234, 0x5678, 0x9ABC,
+    { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x99 }
+};
+
 /* Find the adapter that carries the default route (0.0.0.0/0). */
 /* Find a physical adapter that is UP, has a default gateway, and isn't virtual.
    Prefers Ethernet (IF_TYPE_ETHERNET_CSMACD) over Wi-Fi (IF_TYPE_IEEE80211). */
@@ -200,11 +205,18 @@ void hcn_cleanup_stale_networks(void)
     if (er) { LocalFree(er); er = NULL; }
     pfnDeleteNet(&APPSANDBOX_EXTERNAL_GUID, &er);
     if (er) { LocalFree(er); er = NULL; }
+    pfnDeleteNet(&APPSANDBOX_SHARE_GUID, &er);
+    if (er) { LocalFree(er); er = NULL; }
 }
 
 void hcn_cleanup(void)
 {
     if (g_hcn_dll) {
+        if (pfnDeleteNet) {
+            PWSTR er = NULL;
+            pfnDeleteNet(&APPSANDBOX_SHARE_GUID, &er);
+            if (er) LocalFree(er);
+        }
         FreeLibrary(g_hcn_dll);
         g_hcn_dll = NULL;
     }
@@ -226,6 +238,7 @@ void hcn_cleanup(void)
  * ------------------------------------------------------------------------- */
 
 static char g_nat_base[16];   /* "192.168.42" or "192.168.142", no trailing dot */
+static char g_share_base[16]; /* isolated SMB subnet, no trailing dot */
 
 typedef struct { DWORD network; int prefix_len; } SubnetInfo;
 
@@ -308,6 +321,76 @@ const char *hcn_nat_subnet_base(void)
 {
     pick_nat_base_once();
     return g_nat_base;
+}
+
+static void pick_share_base_once(void)
+{
+    static const char *CANDIDATES[] = {
+        "192.168.243", "192.168.244", "172.29.243", "172.29.244", NULL
+    };
+    SubnetInfo used[64];
+    int n_used, i, j;
+
+    if (g_share_base[0]) return;
+    pick_nat_base_once();
+    n_used = collect_inuse_subnets(used, _countof(used));
+    for (i = 0; CANDIDATES[i]; i++) {
+        int a, b, c;
+        DWORD candidate, nat_candidate = 0;
+        BOOL conflict = FALSE;
+        if (sscanf_s(CANDIDATES[i], "%d.%d.%d", &a, &b, &c) != 3) continue;
+        candidate = ((DWORD)a << 24) | ((DWORD)b << 16) | ((DWORD)c << 8);
+        if (sscanf_s(g_nat_base, "%d.%d.%d", &a, &b, &c) == 3)
+            nat_candidate = ((DWORD)a << 24) | ((DWORD)b << 16) | ((DWORD)c << 8);
+        if (nat_candidate && ranges_overlap(candidate, 24, nat_candidate, 24))
+            conflict = TRUE;
+        for (j = 0; !conflict && j < n_used; j++) {
+            if (ranges_overlap(candidate, 24, used[j].network, used[j].prefix_len))
+                conflict = TRUE;
+        }
+        if (!conflict) {
+            strcpy_s(g_share_base, sizeof(g_share_base), CANDIDATES[i]);
+            ui_log(L"Shared-resource subnet: %S.0/24 (host %S.1)",
+                   g_share_base, g_share_base);
+            return;
+        }
+    }
+    strcpy_s(g_share_base, sizeof(g_share_base), CANDIDATES[0]);
+    ui_log(L"WARNING: all shared-resource subnet candidates overlap; using %S.0/24.",
+           g_share_base);
+}
+
+const char *hcn_share_subnet_base(void)
+{
+    pick_share_base_once();
+    return g_share_base;
+}
+
+HRESULT hcn_create_share_network(GUID *network_id)
+{
+    wchar_t settings[1024];
+    void *network = NULL;
+    PWSTR error_record = NULL;
+    HRESULT hr;
+
+    if (!g_hcn_dll || !pfnCreateNet) return E_NOT_VALID_STATE;
+    *network_id = APPSANDBOX_SHARE_GUID;
+    if (hcn_network_exists(&APPSANDBOX_SHARE_GUID)) return S_OK;
+    pick_share_base_once();
+    swprintf_s(settings, _countof(settings),
+        L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+        L"\"Name\":\"AppSandboxSharedResources\",\"Type\":\"NAT\","
+        L"\"Ipams\":[{\"Type\":\"Static\",\"Subnets\":[{"
+        L"\"IpAddressPrefix\":\"%S.0/24\","
+        L"\"Routes\":[{\"NextHop\":\"%S.1\",\"DestinationPrefix\":\"0.0.0.0/0\"}]"
+        L"}]}]}", g_share_base, g_share_base);
+    hr = pfnCreateNet(network_id, settings, &network, &error_record);
+    if (error_record) {
+        if (FAILED(hr)) ui_log(L"HCN shared network error: %s", error_record);
+        LocalFree(error_record);
+    }
+    if (network && pfnCloseNet) pfnCloseNet(network);
+    return hr;
 }
 
 HRESULT hcn_create_nat_network(GUID *network_id)
@@ -497,6 +580,53 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
     if (network && pfnCloseNet) pfnCloseNet(network);
 
+    return hr;
+}
+
+HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
+                                  wchar_t *endpoint_guid_str, size_t str_len,
+                                  const char *guest_ip, const char *mac_address)
+{
+    wchar_t net_guid_str[64], ep_guid_str[64], settings[4096];
+    void *network = NULL, *endpoint = NULL;
+    PWSTR error_record = NULL;
+    HRESULT hr;
+
+    if (!g_hcn_dll || !pfnCreateEp || !pfnOpenNet || !guest_ip || !mac_address)
+        return E_INVALIDARG;
+    pick_share_base_once();
+    hr = pfnOpenNet(network_id, &network, &error_record);
+    if (error_record) { LocalFree(error_record); error_record = NULL; }
+    if (FAILED(hr)) return hr;
+
+    CoCreateGuid(endpoint_id);
+    guid_to_string(network_id, net_guid_str, _countof(net_guid_str));
+    guid_to_string(endpoint_id, ep_guid_str, _countof(ep_guid_str));
+    swprintf_s(settings, _countof(settings),
+        L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":5},"
+        L"\"HostComputeNetwork\":\"%s\",\"MacAddress\":\"%S\","
+        L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}],"
+        L"\"Policies\":["
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
+        L"\"RemoteAddresses\":\"%S.1/32\",\"RemotePorts\":\"445\","
+        L"\"Priority\":100,\"Action\":\"Allow\",\"Direction\":\"Out\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Protocols\":\"6\","
+        L"\"RemoteAddresses\":\"%S.1/32\",\"RemotePorts\":\"445\","
+        L"\"Priority\":100,\"Action\":\"Allow\",\"Direction\":\"In\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Priority\":200,\"Action\":\"Block\","
+        L"\"Direction\":\"Out\",\"RuleType\":\"Switch\"}},"
+        L"{\"Type\":\"ACL\",\"Settings\":{\"Priority\":200,\"Action\":\"Block\","
+        L"\"Direction\":\"In\",\"RuleType\":\"Switch\"}}]}",
+        net_guid_str, mac_address, guest_ip, g_share_base, g_share_base);
+    hr = pfnCreateEp(network, endpoint_id, settings, &endpoint, &error_record);
+    if (SUCCEEDED(hr) && endpoint_guid_str)
+        wcscpy_s(endpoint_guid_str, str_len, ep_guid_str);
+    if (error_record) {
+        if (FAILED(hr)) ui_log(L"HCN shared endpoint error: %s", error_record);
+        LocalFree(error_record);
+    }
+    if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
+    if (network && pfnCloseNet) pfnCloseNet(network);
     return hr;
 }
 

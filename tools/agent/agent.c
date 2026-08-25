@@ -769,11 +769,6 @@ static HANDLE g_input_process = NULL;
 static DWORD  g_input_session = 0xFFFFFFFF;  /* session the helper was spawned into */
 static volatile BOOL g_input_monitor_running = FALSE;
 static HANDLE g_input_monitor_thread = NULL;
-typedef struct { char letter; char share[64]; } SharedMapRequest;
-static SharedMapRequest g_shared_maps[16];
-static int g_shared_map_count;
-static DWORD g_shared_map_session = 0xFFFFFFFF;
-static BOOL spawn_vsmb_mapper(char letter, const char *share, DWORD *exit_code);
 
 static void kill_input_helper(void)
 {
@@ -878,15 +873,6 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
                 }
                 agent_log("Input monitor: helper died, respawning in session %lu.", cur_session);
                 spawn_input_in_session(cur_session);
-            }
-            if (cur_session != g_shared_map_session) {
-                int mi;
-                for (mi = 0; mi < g_shared_map_count; mi++) {
-                    DWORD ec = 0;
-                    spawn_vsmb_mapper(g_shared_maps[mi].letter,
-                                      g_shared_maps[mi].share, &ec);
-                }
-                g_shared_map_session = cur_session;
             }
         }
 
@@ -1757,60 +1743,111 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
     send_reply(client, tag, "ok");
 }
 
-/* Define a drive in the interactive user's DOS-device namespace. VSMB is a
-   synthetic filesystem device, so this requires neither networking nor
-   credentials. */
-static int map_vsmb_drive_child(const char *letter_a, const char *share_a)
+static int write_agent_script(const wchar_t *path, const char *contents)
 {
-    wchar_t drive[3], share[64], target[256], existing[1024];
-    if (!letter_a || !share_a || strlen(letter_a) != 1) return 2;
-    drive[0] = (wchar_t)toupper((unsigned char)letter_a[0]);
-    drive[1] = L':'; drive[2] = L'\0';
-    MultiByteToWideChar(CP_UTF8, 0, share_a, -1, share, _countof(share));
-    swprintf_s(target, _countof(target),
-        L"\\??\\VMSMB\\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\\%s", share);
-    if (QueryDosDeviceW(drive, existing, _countof(existing))) {
-        if (_wcsicmp(existing, target) == 0) {
-            wchar_t root[4]={drive[0],L':',L'\\',L'\0'};
-            return GetFileAttributesW(root)!=INVALID_FILE_ATTRIBUTES?0:4;
-        }
-        return 3; /* requested letter is occupied; never substitute */
+    HANDLE file; DWORD written; size_t bytes = strlen(contents);
+    CreateDirectoryW(L"C:\\ProgramData\\AppSandbox", NULL);
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (file == INVALID_HANDLE_VALUE) return (int)GetLastError();
+    if (!WriteFile(file, contents, (DWORD)bytes, &written, NULL) || written != bytes ||
+        !FlushFileBuffers(file)) {
+        DWORD err = GetLastError(); CloseHandle(file); return (int)err;
     }
-    if (!DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_NO_BROADCAST_SYSTEM,
-                          drive, target)) return (int)GetLastError();
-    {
-        wchar_t root[4]={drive[0],L':',L'\\',L'\0'};
-        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES){
-            DefineDosDeviceW(DDD_REMOVE_DEFINITION|DDD_EXACT_MATCH_ON_REMOVE|
-                             DDD_RAW_TARGET_PATH|DDD_NO_BROADCAST_SYSTEM,drive,target);
-            return 4;
-        }
-    }
-    return 0;
+    CloseHandle(file); return ERROR_SUCCESS;
 }
 
-static BOOL spawn_vsmb_mapper(char letter, const char *share, DWORD *exit_code)
+static int run_agent_powershell(const wchar_t *script_path, DWORD timeout_ms)
 {
-    DWORD session = WTSGetActiveConsoleSessionId();
-    HANDLE token = NULL;
-    LPVOID env = NULL;
-    wchar_t exe[MAX_PATH], share_w[64], cmd[MAX_PATH + 160];
-    STARTUPINFOW si; PROCESS_INFORMATION pi;
-    if (session == 0xFFFFFFFF || !WTSQueryUserToken(session, &token)) return FALSE;
-    CreateEnvironmentBlock(&env, token, FALSE);
-    GetModuleFileNameW(NULL, exe, MAX_PATH);
-    MultiByteToWideChar(CP_UTF8, 0, share, -1, share_w, _countof(share_w));
-    swprintf_s(cmd, _countof(cmd), L"\"%s\" --map-drive %c %s", exe, letter, share_w);
-    ZeroMemory(&si,sizeof(si));si.cb=sizeof(si);si.lpDesktop=L"WinSta0\\Default";
-    ZeroMemory(&pi,sizeof(pi));
-    if (!CreateProcessAsUserW(token, NULL, cmd, NULL, NULL, FALSE,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, NULL, &si, &pi)) {
-        if (env) DestroyEnvironmentBlock(env); CloseHandle(token); return FALSE;
-    }
-    WaitForSingleObject(pi.hProcess, 10000);
-    GetExitCodeProcess(pi.hProcess, exit_code);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    if (env) DestroyEnvironmentBlock(env); CloseHandle(token); return TRUE;
+    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024]; DWORD ec;
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+    swprintf_s(cmd, _countof(cmd),
+        L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
+        script_path);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi))
+        return (int)GetLastError();
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT); ec = ERROR_TIMEOUT;
+    } else if (!GetExitCodeProcess(pi.hProcess, &ec)) ec = GetLastError();
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return (int)ec;
+}
+
+static int configure_shared_nic(const char *mac_a, const char *ip_a)
+{
+    static const char script[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "$m=$env:ASB_NET_MAC -replace '[:-]',''\r\n"
+        "$a=$null\r\n"
+        "for($i=0;$i -lt 60 -and -not $a;$i++){\r\n"
+        " $a=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {(($_.MacAddress) -replace '[:-]','') -eq $m} | Select-Object -First 1\r\n"
+        " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
+        "}\r\n"
+        "if(-not $a){exit 1168}\r\n"
+        "Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 9999 -ErrorAction Stop\r\n"
+        "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+        "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NET_IP -PrefixLength 24 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
+        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue\r\n"
+        "exit 0\r\n";
+    const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\shared-net.ps1";
+    wchar_t mac[64], ip[64]; int ec;
+    if (!MultiByteToWideChar(CP_UTF8, 0, mac_a, -1, mac, _countof(mac)) ||
+        !MultiByteToWideChar(CP_UTF8, 0, ip_a, -1, ip, _countof(ip)))
+        return (int)GetLastError();
+    ec = write_agent_script(path, script); if (ec) return ec;
+    SetEnvironmentVariableW(L"ASB_NET_MAC", mac);
+    SetEnvironmentVariableW(L"ASB_NET_IP", ip);
+    ec = run_agent_powershell(path, 30000);
+    SetEnvironmentVariableW(L"ASB_NET_MAC", NULL);
+    SetEnvironmentVariableW(L"ASB_NET_IP", NULL);
+    return ec;
+}
+
+/* New-SmbGlobalMapping publishes the drive to every user and service inside
+   the guest. The password exists only in this service's inherited child
+   environment and is never placed on a command line or written to disk. */
+static int map_smb_drive_global(const char *letter_a, const char *host_a,
+                                const char *share_a, const char *user_a,
+                                const char *password_a)
+{
+    static const char script[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "$local=$env:ASB_SMB_LOCAL\r\n"
+        "$remote=$env:ASB_SMB_REMOTE\r\n"
+        "$existing=Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue\r\n"
+        "if($existing){if($existing.RemotePath -ieq $remote -and (Test-Path ($local+'\\'))){exit 0}else{exit 85}}\r\n"
+        "if(Test-Path ($local+'\\')){exit 85}\r\n"
+        "$secure=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force\r\n"
+        "$cred=[System.Management.Automation.PSCredential]::new($env:ASB_SMB_USER,$secure)\r\n"
+        "try{\r\n"
+        " New-SmbGlobalMapping -LocalPath $local -RemotePath $remote -Credential $cred -Persistent $false -RequireIntegrity $true -ErrorAction Stop | Out-Null\r\n"
+        " $ready=$false;for($i=0;$i -lt 20 -and -not $ready;$i++){$ready=Test-Path ($local+'\\');if(-not $ready){Start-Sleep -Milliseconds 250}}\r\n"
+        " if(-not $ready){Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue;exit 3}\r\n"
+        " exit 0\r\n"
+        "}catch{$c=([int]$_.Exception.HResult -band 0xffff);if($c -eq 0){$c=1};exit $c}\r\n";
+    const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\shared-smb-map.ps1";
+    wchar_t local[4], remote[256], user[256], password[256]; int ec;
+    if (!letter_a || strlen(letter_a) != 1 || !host_a || !share_a || !user_a || !password_a)
+        return ERROR_INVALID_PARAMETER;
+    swprintf_s(local, _countof(local), L"%c:", towupper((wchar_t)(unsigned char)letter_a[0]));
+    if (!MultiByteToWideChar(CP_UTF8, 0, user_a, -1, user, _countof(user)) ||
+        !MultiByteToWideChar(CP_UTF8, 0, password_a, -1, password, _countof(password)))
+        return (int)GetLastError();
+    swprintf_s(remote, _countof(remote), L"\\\\%S\\%S$", host_a, share_a);
+    ec = write_agent_script(path, script); if (ec) goto done;
+    SetEnvironmentVariableW(L"ASB_SMB_LOCAL", local);
+    SetEnvironmentVariableW(L"ASB_SMB_REMOTE", remote);
+    SetEnvironmentVariableW(L"ASB_SMB_USER", user);
+    SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
+    ec = run_agent_powershell(path, 45000);
+    SetEnvironmentVariableW(L"ASB_SMB_LOCAL", NULL);
+    SetEnvironmentVariableW(L"ASB_SMB_REMOTE", NULL);
+    SetEnvironmentVariableW(L"ASB_SMB_USER", NULL);
+    SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", NULL);
+done:
+    SecureZeroMemory(password, sizeof(password));
+    SecureZeroMemory(user, sizeof(user));
+    return ec;
 }
 
 /* ---- Persistent client handler ---- */
@@ -1996,7 +2033,10 @@ static void handle_client(AsbConn *client)
                 }
             }
 
-        agent_log("Command: %s", buf);
+        if (strncmp(cmd, "shared_smb_map:", 15) == 0)
+            agent_log("Command: shared_smb_map:<redacted>");
+        else
+            agent_log("Command: %s", buf);
 
         /* Helper macro: send response with tag prefix */
         #define REPLY(msg) send_reply(client, tag, msg)
@@ -2004,27 +2044,37 @@ static void handle_client(AsbConn *client)
         if (strcmp(cmd, "ping") == 0) {
             REPLY("ok");
         }
-        else if (strncmp(cmd, "shared_map:", 11) == 0) {
+        else if (strncmp(cmd, "shared_net:", 11) == 0) {
             char *arg = cmd + 11, *sep = strchr(arg, ':');
-            DWORD ec = ERROR_INVALID_PARAMETER;
-            if (sep && sep == arg + 1) {
+            int ec = ERROR_INVALID_PARAMETER;
+            if (sep) {
                 *sep = '\0';
-                {
-                    int mi, slot = -1;
-                    char letter = (char)toupper((unsigned char)arg[0]);
-                    for (mi = 0; mi < g_shared_map_count; mi++)
-                        if (g_shared_maps[mi].letter == letter) { slot = mi; break; }
-                    if (slot < 0 && g_shared_map_count < 16) slot = g_shared_map_count++;
-                    if (slot >= 0) {
-                        g_shared_maps[slot].letter = letter;
-                        strncpy_s(g_shared_maps[slot].share,
-                                  sizeof(g_shared_maps[slot].share), sep + 1, _TRUNCATE);
-                    }
-                }
-                if (spawn_vsmb_mapper((char)toupper((unsigned char)arg[0]), sep + 1, &ec) && ec == 0)
+                ec = configure_shared_nic(arg, sep + 1);
+                if (ec == ERROR_SUCCESS) REPLY("ok");
+                else { char failure[64]; sprintf_s(failure, sizeof(failure),
+                       "net_failed:%lu", (DWORD)ec); REPLY(failure); }
+            } else REPLY("invalid");
+        }
+        else if (strncmp(cmd, "shared_smb_map:", 15) == 0) {
+            char *ctx = NULL, *arg = cmd + 15;
+            char *letter = strtok_s(arg, ":", &ctx);
+            char *host = strtok_s(NULL, ":", &ctx);
+            char *share = strtok_s(NULL, ":", &ctx);
+            char *user = strtok_s(NULL, ":", &ctx);
+            char *password = strtok_s(NULL, ":", &ctx);
+            int ec = ERROR_INVALID_PARAMETER;
+            if (letter && strlen(letter) == 1 && host && share && user && password) {
+                ec = map_smb_drive_global(letter, host, share, user, password);
+                SecureZeroMemory(password, strlen(password));
+                if (ec == ERROR_SUCCESS)
                     REPLY("ok");
-                else if (ec == 3) REPLY("drive_collision");
-                else REPLY("map_failed");
+                else if (ec == ERROR_ALREADY_ASSIGNED)
+                    REPLY("drive_collision");
+                else {
+                    char failure[64];
+                    sprintf_s(failure, sizeof(failure), "map_failed:%lu", (DWORD)ec);
+                    REPLY(failure);
+                }
             } else REPLY("invalid");
         }
         else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
@@ -2758,9 +2808,7 @@ int main(int argc, char *argv[])
             return install_service();
         if (strcmp(argv[1], "--remove") == 0)
             return remove_service();
-        if (strcmp(argv[1], "--map-drive") == 0 && argc == 4)
-            return map_vsmb_drive_child(argv[2], argv[3]);
-        printf("Usage: appsandbox-agent.exe [--install | --remove | --map-drive LETTER SHARE]\n");
+        printf("Usage: appsandbox-agent.exe [--install | --remove]\n");
         return 1;
     }
 

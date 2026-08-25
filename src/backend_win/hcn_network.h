@@ -48,6 +48,17 @@ HRESULT hcn_create_internal_network(GUID *network_id);
    Returns S_OK on success. */
 HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_name);
 
+/* Dedicated AppSandbox shared-resource network. It is independent of the
+   VM's selected network mode and has no guest default route or DNS. */
+HRESULT hcn_create_share_network(GUID *network_id);
+const char *hcn_share_subnet_base(void);
+
+/* Create a statically addressed endpoint on the shared-resource network.
+   ACLs permit only signed-SMB traffic to the host address. */
+HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,
+                                  wchar_t *endpoint_guid_str, size_t str_len,
+                                  const char *guest_ip, const char *mac_address);
+
 /* Create an endpoint on a network.
    network_id: the network to attach to.
    endpoint_id: output GUID for the created endpoint.

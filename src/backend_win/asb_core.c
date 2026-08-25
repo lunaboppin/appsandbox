@@ -20,6 +20,7 @@
 #include "prereq.h"
 #include "ui.h"
 #include "shared_resources.h"
+#include "smb_transport.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -878,7 +879,7 @@ static void remember_storage_parent(const wchar_t *root)
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
 
-/* Update the guest agent on the active writable VHDX before attaching VSMB.
+/* Update the guest agent on the active writable VHDX before attaching SMB.
    Only the active disk is mounted; checkpoint parents remain frozen. */
 static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
 {
@@ -899,13 +900,18 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
     if(GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES)return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     before=GetLogicalDrives();
     st.DeviceId=VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;st.VendorId=ASB_VHDX_VENDOR_MS;
-    ZeroMemory(&op,sizeof(op));op.Version=OPEN_VIRTUAL_DISK_VERSION_2;
+    /* Version 1 is sufficient for attaching the active writable chain and is
+       accepted by every VirtDisk provider that supports VHDX.  Version 2 is
+       intended for information/read-only/resiliency options and has produced
+       ERROR_INVALID_PARAMETER on some host builds when used for attachment. */
+    ZeroMemory(&op,sizeof(op));op.Version=OPEN_VIRTUAL_DISK_VERSION_1;
+    op.Version1.RWDepth=OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT;
     result=OpenVirtualDisk(&st,vhdx_path,VIRTUAL_DISK_ACCESS_ATTACH_RW,
         OPEN_VIRTUAL_DISK_FLAG_NONE,&op,&disk);
-    if(result!=ERROR_SUCCESS)return HRESULT_FROM_WIN32(result);
+    if(result!=ERROR_SUCCESS){asb_log(L"Shared-resource agent upgrade: OpenVirtualDisk failed (%lu).",result);return HRESULT_FROM_WIN32(result);}
     ZeroMemory(&ap,sizeof(ap));ap.Version=ATTACH_VIRTUAL_DISK_VERSION_1;
     result=AttachVirtualDisk(disk,NULL,ATTACH_VIRTUAL_DISK_FLAG_NONE,0,&ap,NULL);
-    if(result!=ERROR_SUCCESS){CloseHandle(disk);return HRESULT_FROM_WIN32(result);}
+    if(result!=ERROR_SUCCESS){asb_log(L"Shared-resource agent upgrade: AttachVirtualDisk failed (%lu).",result);CloseHandle(disk);return HRESULT_FROM_WIN32(result);}
     for(wait=0;wait<100;wait++){after=GetLogicalDrives()&~before;if(after)break;Sleep(100);}
     after=GetLogicalDrives()&~before;
     for(bit=0;bit<26;bit++)if(after&(1u<<bit)){
@@ -914,13 +920,15 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
         swprintf_s(dest,MAX_PATH,L"%c:\\Windows\\AppSandbox\\appsandbox-agent.exe",L'A'+bit);
         swprintf_s(temp,MAX_PATH,L"%s.new",dest);
         if(SUCCEEDED(sha256_file(source,a))&&SUCCEEDED(sha256_file(dest,b))&&memcmp(a,b,32)==0){hr=S_OK;break;}
-        if(!CopyFileW(source,temp,FALSE)){hr=HRESULT_FROM_WIN32(GetLastError());break;}
-        if(!MoveFileExW(temp,dest,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){hr=HRESULT_FROM_WIN32(GetLastError());DeleteFileW(temp);break;}
+        if(!CopyFileW(source,temp,FALSE)){result=GetLastError();asb_log(L"Shared-resource agent upgrade: CopyFile failed (%lu).",result);hr=HRESULT_FROM_WIN32(result);break;}
+        if(!MoveFileExW(temp,dest,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){result=GetLastError();asb_log(L"Shared-resource agent upgrade: MoveFileEx failed (%lu).",result);hr=HRESULT_FROM_WIN32(result);DeleteFileW(temp);break;}
         hr=sha256_file(dest,b);if(SUCCEEDED(hr)){hr=sha256_file(source,a);if(SUCCEEDED(hr)&&memcmp(a,b,32)!=0)hr=HRESULT_FROM_WIN32(ERROR_CRC);}
+        if(FAILED(hr))asb_log(L"Shared-resource agent upgrade: verification failed (0x%08X).",hr);
         break;
     }
     if(!after)hr=HRESULT_FROM_WIN32(ERROR_NOT_READY);
-    DetachVirtualDisk(disk,DETACH_VIRTUAL_DISK_FLAG_NONE,0);
+    result=DetachVirtualDisk(disk,DETACH_VIRTUAL_DISK_FLAG_NONE,0);
+    if(result!=ERROR_SUCCESS)asb_log(L"Warning: shared-resource agent upgrade detach failed (%lu).",result);
     CloseHandle(disk);
     return hr;
 }
@@ -984,7 +992,8 @@ static HRESULT sha256_file(const wchar_t *path, BYTE digest[32])
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_HASH_HANDLE hash = NULL;
     HANDLE file = INVALID_HANDLE_VALUE;
-    BYTE *object = NULL, buffer[1024 * 1024];
+    BYTE *object = NULL, *buffer = NULL;
+    const DWORD buffer_size = 1024 * 1024;
     DWORD object_size = 0, value_size = 0, read = 0;
     NTSTATUS status;
     HRESULT hr = E_FAIL;
@@ -996,13 +1005,18 @@ static HRESULT sha256_file(const wchar_t *path, BYTE digest[32])
     if (status < 0) goto done;
     object = (BYTE *)HeapAlloc(GetProcessHeap(), 0, object_size);
     if (!object) { hr = E_OUTOFMEMORY; goto done; }
+    /* sha256_file is also called from lifecycle worker threads, whose default
+       stack is only 1 MiB.  Keeping the I/O buffer on that stack caused a
+       STATUS_STACK_OVERFLOW immediately after an offline VHDX mount. */
+    buffer = (BYTE *)HeapAlloc(GetProcessHeap(), 0, buffer_size);
+    if (!buffer) { hr = E_OUTOFMEMORY; goto done; }
     status = BCryptCreateHash(alg, &hash, object, object_size, NULL, 0, 0);
     if (status < 0) goto done;
     file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                        FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (file == INVALID_HANDLE_VALUE) { hr = HRESULT_FROM_WIN32(GetLastError()); goto done; }
     for (;;) {
-        if (!ReadFile(file, buffer, sizeof(buffer), &read, NULL)) {
+        if (!ReadFile(file, buffer, buffer_size, &read, NULL)) {
             hr = HRESULT_FROM_WIN32(GetLastError()); goto done;
         }
         if (read == 0) break;
@@ -1012,7 +1026,10 @@ static HRESULT sha256_file(const wchar_t *path, BYTE digest[32])
     status = BCryptFinishHash(hash, digest, 32, 0);
     if (status >= 0) hr = S_OK;
 done:
-    SecureZeroMemory(buffer, sizeof(buffer));
+    if (buffer) {
+        SecureZeroMemory(buffer, buffer_size);
+        HeapFree(GetProcessHeap(), 0, buffer);
+    }
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
     if (hash) BCryptDestroyHash(hash);
     if (object) HeapFree(GetProcessHeap(), 0, object);
@@ -1178,6 +1195,12 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
 ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 {
     if (!vm) return;
+    if (!vm->share_network_cleaned) {
+        static const GUID zero_guid = { 0 };
+        if (memcmp(&vm->share_endpoint_id, &zero_guid, sizeof(GUID)) != 0)
+            hcn_delete_endpoint(&vm->share_endpoint_id);
+        vm->share_network_cleaned = TRUE;
+    }
     if (vm->network_mode == NET_NONE) return;
     if (vm->network_cleaned) return;
     hcn_delete_endpoint(&vm->endpoint_id);
@@ -1256,6 +1279,92 @@ static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
     return hr;
 }
 
+static unsigned int share_identity_hash(const wchar_t *name)
+{
+    unsigned int h = 2166136261u;
+    while (name && *name) { h ^= (unsigned int)towlower(*name++); h *= 16777619u; }
+    return h;
+}
+
+static BOOL share_ip_in_use(const VmInstance *self, const char *ip)
+{
+    int i;
+    for (i = 0; i < g_vm_count; i++)
+        if (&g_vms[i] != self && g_vms[i].share_ip[0] &&
+            strcmp(g_vms[i].share_ip, ip) == 0 && g_vms[i].running)
+            return TRUE;
+    return FALSE;
+}
+
+/* Provision the app-owned SMB shares and independent HCN endpoint. Failure is
+   deliberately non-fatal: resources are marked unavailable and the VM still
+   starts with its selected normal network mode (including NET_NONE). */
+static BOOL prepare_shared_transport(VmConfig *config, VmInstance *runtime,
+                                     wchar_t *endpoint_guid, size_t guid_chars)
+{
+    const char *base;
+    unsigned int hash;
+    int octet, attempts, i, available = 0;
+    HRESULT hr;
+
+    endpoint_guid[0] = L'\0';
+    if (!config || !runtime || config->shared_resource_count <= 0 ||
+        config->is_template || _wcsicmp(config->os_type, L"Windows") != 0)
+        return FALSE;
+
+    base = hcn_share_subnet_base();
+    hash = share_identity_hash(config->name);
+    octet = 2 + (int)(hash % 240u);
+    for (attempts = 0; attempts < 253; attempts++) {
+        sprintf_s(runtime->share_ip, sizeof(runtime->share_ip), "%s.%d", base, octet);
+        if (!share_ip_in_use(runtime, runtime->share_ip)) break;
+        octet++; if (octet > 254) octet = 2;
+    }
+    sprintf_s(runtime->share_host_ip, sizeof(runtime->share_host_ip), "%s.1", base);
+    sprintf_s(runtime->share_mac, sizeof(runtime->share_mac),
+              "02-15-5D-%02X-%02X-%02X",
+              (hash >> 16) & 0xFF, (hash >> 8) & 0xFF, hash & 0xFF);
+
+    hr = hcn_create_share_network(&runtime->share_network_id);
+    if (SUCCEEDED(hr))
+        hr = smb_transport_prepare(config->shared_resources,
+                                   config->shared_resource_count, base);
+    for (i = 0; i < config->shared_resource_count; i++)
+        if (_wcsicmp(config->shared_resources[i].mapping_result, L"unavailable") != 0)
+            available++;
+    if (SUCCEEDED(hr) || available > 0)
+        hr = hcn_create_share_endpoint(&runtime->share_network_id,
+                                       &runtime->share_endpoint_id,
+                                       endpoint_guid, guid_chars,
+                                       runtime->share_ip, runtime->share_mac);
+    if (FAILED(hr) || available == 0) {
+        for (i = 0; i < config->shared_resource_count; i++) {
+            wcscpy_s(config->shared_resources[i].mapping_result,
+                     _countof(config->shared_resources[i].mapping_result), L"unavailable");
+            if (!config->shared_resources[i].failure[0])
+                swprintf_s(config->shared_resources[i].failure,
+                           _countof(config->shared_resources[i].failure),
+                           L"smb_transport_failed:0x%08X", hr);
+        }
+        wcscpy_s(runtime->shared_resource_transport, 16, L"unavailable");
+        swprintf_s(runtime->shared_resource_error, 256,
+                   L"Isolated SMB transport unavailable (0x%08X).", hr);
+        endpoint_guid[0] = L'\0';
+        asb_log(L"Shared-resource transport unavailable for \"%s\" (0x%08X); VM startup continues.",
+                config->name, hr);
+        return FALSE;
+    }
+    memcpy(runtime->shared_resources, config->shared_resources,
+           sizeof(runtime->shared_resources));
+    runtime->shared_resource_count = config->shared_resource_count;
+    wcscpy_s(runtime->shared_resource_transport, 16, L"smb");
+    runtime->shared_resource_error[0] = L'\0';
+    runtime->share_network_cleaned = FALSE;
+    asb_log(L"Attached isolated SMB adapter %S (%S) to \"%s\".",
+            runtime->share_ip, runtime->share_mac, config->name);
+    return TRUE;
+}
+
 /* ---- Background VM start thread ---- */
 
 typedef struct {
@@ -1272,6 +1381,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     VmInstance *vm = args->vm;
     HRESULT hr;
     wchar_t endpoint_guid_str[64] = { 0 };
+    wchar_t share_endpoint_guid[64] = { 0 };
     BOOL shared_upgrade_failed = FALSE;
 
     /* Allocate NAT IP before endpoint creation (only for NAT mode) */
@@ -1338,9 +1448,15 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         }
     }
 
+    if (!shared_upgrade_failed)
+        prepare_shared_transport(&args->config, vm, share_endpoint_guid,
+                                 _countof(share_endpoint_guid));
+
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
-    hr = (endpoint_guid_str[0] != L'\0')
-        ? hcs_create_vm_with_endpoint(&args->config, endpoint_guid_str, vm)
+    hr = (endpoint_guid_str[0] != L'\0' || share_endpoint_guid[0] != L'\0')
+        ? hcs_create_vm_with_endpoints(&args->config,
+              endpoint_guid_str[0] ? endpoint_guid_str : NULL,
+              share_endpoint_guid[0] ? share_endpoint_guid : NULL, vm)
         : hcs_create_vm(&args->config, vm);
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
@@ -1351,6 +1467,10 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         if (endpoint_guid_str[0] != L'\0') {
             hcn_delete_endpoint(&args->endpoint_id);
             endpoint_guid_str[0] = L'\0';
+        }
+        if (share_endpoint_guid[0] != L'\0') {
+            hcn_delete_endpoint(&vm->share_endpoint_id);
+            share_endpoint_guid[0] = L'\0';
         }
         InterlockedExchange(&vm->management_busy, 0);
         if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
@@ -1363,6 +1483,10 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         wcscpy_s(vm->shared_resource_transport, 16, L"unavailable");
         wcscpy_s(vm->shared_resource_error, 256,
                  L"Guest agent upgrade failed; shared drives disabled for this boot.");
+    } else if (args->config.shared_resource_count > 0 && !share_endpoint_guid[0]) {
+        wcscpy_s(vm->shared_resource_transport, 16, L"unavailable");
+        wcscpy_s(vm->shared_resource_error, 256,
+                 L"Isolated SMB transport unavailable for this boot.");
     }
 
     asb_log(L"Starting VM \"%s\"...", vm->name);
@@ -1371,6 +1495,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         asb_log(L"Error: Failed to start VM (0x%08X)", hr);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
+        hcs_close_vm(vm);
+        asb_vm_cleanup_network(vm);
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
         /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
@@ -1638,10 +1764,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
     /* Create HCS VM */
     {
         VmInstance temp_inst;
+        wchar_t share_endpoint_guid[64] = { 0 };
         ZeroMemory(&temp_inst, sizeof(temp_inst));
 
-        hr = (args->endpoint_guid[0] != L'\0')
-            ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, &temp_inst)
+        prepare_shared_transport(&args->config, &temp_inst,
+                                 share_endpoint_guid, _countof(share_endpoint_guid));
+
+        hr = (args->endpoint_guid[0] != L'\0' || share_endpoint_guid[0] != L'\0')
+            ? hcs_create_vm_with_endpoints(&args->config,
+                  args->endpoint_guid[0] ? args->endpoint_guid : NULL,
+                  share_endpoint_guid[0] ? share_endpoint_guid : NULL, &temp_inst)
             : hcs_create_vm(&args->config, &temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
@@ -1654,6 +1786,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
+            if (share_endpoint_guid[0])
+                hcn_delete_endpoint(&temp_inst.share_endpoint_id);
             goto done;
         }
 
@@ -1669,6 +1803,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
+            if (share_endpoint_guid[0])
+                hcn_delete_endpoint(&temp_inst.share_endpoint_id);
             goto done;
         }
 
@@ -1720,6 +1856,12 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    inst->share_network_id = heap_inst->share_network_id;
+                    inst->share_endpoint_id = heap_inst->share_endpoint_id;
+                    strcpy_s(inst->share_ip, sizeof(inst->share_ip), heap_inst->share_ip);
+                    strcpy_s(inst->share_host_ip, sizeof(inst->share_host_ip), heap_inst->share_host_ip);
+                    strcpy_s(inst->share_mac, sizeof(inst->share_mac), heap_inst->share_mac);
+                    inst->share_network_cleaned = heap_inst->share_network_cleaned;
                     memcpy(inst->shared_resources, heap_inst->shared_resources,
                            sizeof(inst->shared_resources));
                     inst->shared_resource_count = heap_inst->shared_resource_count;
@@ -2939,6 +3081,7 @@ ASB_API HRESULT asb_init(void)
         swprintf_s(g_last_storage_parent, MAX_PATH, L"%s\\AppSandbox", pd);
     }
     shared_resources_init();
+    smb_transport_cleanup_stale();
     {
         int ri;
         for(ri=0;ri<g_vm_count;ri++){
@@ -2946,7 +3089,7 @@ ASB_API HRESULT asb_init(void)
                 g_vms[ri].os_type,g_vms[ri].shared_resource_exclusions,
                 g_vms[ri].shared_resources,ASB_MAX_SHARED_RESOURCES);
             if(g_vms[ri].shared_resource_count)
-                wcscpy_s(g_vms[ri].shared_resource_transport,16,L"vsmb");
+                wcscpy_s(g_vms[ri].shared_resource_transport,16,L"smb");
         }
     }
     scan_templates();
@@ -2975,6 +3118,7 @@ ASB_API void asb_cleanup(void)
     }
 
     hcs_cleanup();
+    smb_transport_cleanup_stale();
     hcn_cleanup();
     DeleteCriticalSection(&g_cs);
     g_initialized = FALSE;
@@ -3014,6 +3158,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     VmInstance *inst;
     wchar_t vhdx_dir[MAX_PATH];
     wchar_t endpoint_guid_str[64] = { 0 };
+    wchar_t share_endpoint_guid[64] = { 0 };
     wchar_t ssh_pubkey[512] = { 0 };
     HRESULT hr;
     int existing_idx;
@@ -3194,7 +3339,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     memcpy(inst->shared_resources, cfg.shared_resources, sizeof(inst->shared_resources));
     inst->shared_resource_count = cfg.shared_resource_count;
     if (cfg.shared_resource_count)
-        wcscpy_s(inst->shared_resource_transport, 16, L"vsmb");
+        wcscpy_s(inst->shared_resource_transport, 16, L"smb");
 
     /* GPU driver shares */
     if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create) {
@@ -3459,9 +3604,13 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
 
     /* Create HCS VM */
+    prepare_shared_transport(&cfg, inst, share_endpoint_guid,
+                             _countof(share_endpoint_guid));
     asb_log(L"Creating %sVM \"%s\"...", is_template_create ? L"template " : L"", cfg.name);
-    hr = (endpoint_guid_str[0] != L'\0')
-        ? hcs_create_vm_with_endpoint(&cfg, endpoint_guid_str, inst)
+    hr = (endpoint_guid_str[0] != L'\0' || share_endpoint_guid[0] != L'\0')
+        ? hcs_create_vm_with_endpoints(&cfg,
+              endpoint_guid_str[0] ? endpoint_guid_str : NULL,
+              share_endpoint_guid[0] ? share_endpoint_guid : NULL, inst)
         : hcs_create_vm(&cfg, inst);
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
@@ -3471,6 +3620,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         if (endpoint_guid_str[0] != L'\0') {
             hcn_delete_endpoint(&inst->endpoint_id);
             endpoint_guid_str[0] = L'\0';
+        }
+        if (share_endpoint_guid[0] != L'\0') {
+            hcn_delete_endpoint(&inst->share_endpoint_id);
+            share_endpoint_guid[0] = L'\0';
         }
         remove_dir_recursive(vhdx_dir);
         return hr;
@@ -3505,6 +3658,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         asb_log(L"VM \"%s\" %s.", cfg.name, is_template_create ? L"started (template)" : L"created and started");
     } else {
         asb_log(L"VM \"%s\" created but failed to start (0x%08X).", cfg.name, hr);
+        hcs_close_vm(inst);
+        asb_vm_cleanup_network(inst);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
         else

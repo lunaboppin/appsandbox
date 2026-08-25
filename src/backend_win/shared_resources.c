@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "shared_resources.h"
+#include "smb_transport.h"
 #include "asb_core.h"
 #include <aclapi.h>
 #include <sddl.h>
@@ -127,9 +128,10 @@ static HRESULT save_locked(void)
     fwprintf(f, L"Version=1\n");
     for (i = 0; i < g_resource_count; i++) {
         AsbSharedResourceInfo *r = &g_resources[i];
-        fwprintf(f, L"[Resource]\nId=%s\nName=%s\nPath=%s\nDriveLetter=%c\nEnabled=%d\nReadOnly=%d\nAclCreated=%d\n",
+        fwprintf(f, L"[Resource]\nId=%s\nName=%s\nPath=%s\nDriveLetter=%c\nEnabled=%d\nReadOnly=%d\nAclCreated=%d\nSmbAclCreated=%d\n",
                  r->id, r->name, r->host_path, r->drive_letter,
-                 r->enabled ? 1 : 0, r->read_only ? 1 : 0, r->acl_created ? 1 : 0);
+                 r->enabled ? 1 : 0, r->read_only ? 1 : 0, r->acl_created ? 1 : 0,
+                 r->smb_acl_created ? 1 : 0);
     }
     fflush(f);
     FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
@@ -166,6 +168,7 @@ void shared_resources_init(void)
             else if (cur && wcsncmp(line,L"Enabled=",8)==0) cur->enabled=_wtoi(line+8)!=0;
             else if (cur && wcsncmp(line,L"ReadOnly=",9)==0) cur->read_only=_wtoi(line+9)!=0;
             else if (cur && wcsncmp(line,L"AclCreated=",11)==0) cur->acl_created=_wtoi(line+11)!=0;
+            else if (cur && wcsncmp(line,L"SmbAclCreated=",14)==0) cur->smb_acl_created=_wtoi(line+14)!=0;
         }
         fclose(f);
     }
@@ -250,6 +253,7 @@ HRESULT shared_resources_update(const wchar_t *id, const AsbSharedResourceInfo *
     wcscpy_s(n.id,ASB_SHARED_ID_CHARS,old.id);
     changed=(_wcsicmp(old.host_path,n.host_path)!=0 || old.read_only!=n.read_only);
     n.acl_created=!changed ? old.acl_created : FALSE;
+    n.smb_acl_created=!changed ? old.smb_acl_created : FALSE;
     if(changed && old.acl_created){
         if(!confirm){LeaveCriticalSection(&g_resource_cs);return HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED);}
         hr=set_vm_group_acl(n.host_path,n.read_only,FALSE);if(FAILED(hr)){LeaveCriticalSection(&g_resource_cs);return hr;}
@@ -267,6 +271,8 @@ HRESULT shared_resources_update(const wchar_t *id, const AsbSharedResourceInfo *
             else {set_vm_group_acl(n.host_path,n.read_only,TRUE);if(old.acl_created)set_vm_group_acl(old.host_path,old.read_only,FALSE);}
         }
     }
+    if (SUCCEEDED(hr) && changed)
+        smb_transport_remove_resource(old.id, old.host_path, old.smb_acl_created);
     LeaveCriticalSection(&g_resource_cs); return hr;
 }
 
@@ -277,7 +283,11 @@ HRESULT shared_resources_remove(const wchar_t *id)
     if(idx<0){LeaveCriticalSection(&g_resource_cs);return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);}
     old=g_resources[idx];for(i=idx;i<g_resource_count-1;i++)g_resources[i]=g_resources[i+1];g_resource_count--;
     hr=save_locked();if(FAILED(hr)){for(i=g_resource_count;i>idx;i--)g_resources[i]=g_resources[i-1];g_resources[idx]=old;g_resource_count++;}
-    else if(old.acl_created)set_vm_group_acl(old.host_path,old.read_only,TRUE);
+    else {
+        smb_transport_remove_resource(old.id, old.host_path, old.smb_acl_created);
+        if(old.acl_created)set_vm_group_acl(old.host_path,old.read_only,TRUE);
+        if(g_resource_count==0)smb_transport_cleanup_unused();
+    }
     LeaveCriticalSection(&g_resource_cs);return hr;
 }
 
@@ -296,6 +306,22 @@ HRESULT shared_resources_set_excluded(wchar_t *list,size_t chars,const wchar_t *
     wcscpy_s(list,chars,out);return S_OK;
 }
 
+HRESULT shared_resources_set_smb_acl_created(const wchar_t *id, BOOL created)
+{
+    int idx; HRESULT hr;
+    EnterCriticalSection(&g_resource_cs);
+    idx = find_id(id);
+    if (idx < 0) { LeaveCriticalSection(&g_resource_cs); return HRESULT_FROM_WIN32(ERROR_NOT_FOUND); }
+    if (g_resources[idx].smb_acl_created == created) {
+        LeaveCriticalSection(&g_resource_cs); return S_OK;
+    }
+    g_resources[idx].smb_acl_created = created;
+    hr = save_locked();
+    if (FAILED(hr)) g_resources[idx].smb_acl_created = !created;
+    LeaveCriticalSection(&g_resource_cs);
+    return hr;
+}
+
 int shared_resources_build_attachments(const wchar_t *os_type,const wchar_t *exclusions,
                                        HcsSharedResource *out,int capacity)
 {
@@ -309,6 +335,7 @@ int shared_resources_build_attachments(const wchar_t *os_type,const wchar_t *exc
             out[n].share_name[si]=L'\0';
         }
         out[n].drive_letter=r->drive_letter;out[n].read_only=r->read_only;
+        out[n].smb_acl_created=r->smb_acl_created;
         wcscpy_s(out[n].mapping_result,32,L"pending");out[n].failure[0]=L'\0';n++;
     }LeaveCriticalSection(&g_resource_cs);return n;
 }

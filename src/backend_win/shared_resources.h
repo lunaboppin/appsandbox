@@ -14,6 +14,7 @@ typedef struct {
     BOOL enabled;
     BOOL read_only;
     BOOL acl_created;
+    BOOL smb_acl_created;
 } AsbSharedResourceInfo;
 
 typedef struct {
@@ -22,6 +23,7 @@ typedef struct {
     wchar_t host_path[MAX_PATH];
     wchar_t drive_letter;
     BOOL read_only;
+    BOOL smb_acl_created;
     wchar_t mapping_result[32];
     wchar_t failure[128];
 } HcsSharedResource;
@@ -42,5 +44,6 @@ int shared_resources_build_attachments(const wchar_t *os_type,
 BOOL shared_resources_is_excluded(const wchar_t *exclusions, const wchar_t *id);
 HRESULT shared_resources_set_excluded(wchar_t *exclusions, size_t exclusions_chars,
                                       const wchar_t *id, BOOL excluded);
+HRESULT shared_resources_set_smb_acl_created(const wchar_t *id, BOOL created);
 
 #endif

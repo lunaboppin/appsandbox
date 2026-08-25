@@ -3,6 +3,7 @@
 #include "vm_ssh_proxy.h"
 #include "asb_core.h"
 #include "hcn_network.h"
+#include "smb_transport.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -324,7 +325,7 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
                            const char *cmd, char *rsp, int rsp_size)
 {
-    char tagged[512];
+    char tagged[1024];
     char prefix[32];
     int pfx_len, n;
 
@@ -421,22 +422,68 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             notify_agent_status(vm);
         }
 
-        /* Recreate deterministic VSMB drive mappings in the current
-           interactive session after every agent connection/logon. A single
-           unavailable resource is reported but never blocks startup. */
-        if (vm->shared_resource_count > 0) {
+        /* Configure the independent host-only NIC, then recreate signed global
+           SMB mappings after every agent connection. Credentials are redacted
+           from logs and scrubbed immediately after delivery. */
+        if (vm->shared_resource_count > 0 &&
+            _wcsicmp(vm->shared_resource_transport, L"smb") == 0 &&
+            vm->share_ip[0] && vm->share_host_ip[0] && vm->share_mac[0]) {
             int ri;
+            wchar_t user_w[128], password_w[128];
+            char user[256], password[256];
+            char net_cmd[128];
+            HRESULT cred_hr;
             vm->shared_resource_error[0] = L'\0';
+            sprintf_s(net_cmd, sizeof(net_cmd), "shared_net:%s:%s",
+                      vm->share_mac, vm->share_ip);
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, net_cmd, buf, sizeof(buf));
+            if (n <= 0) goto disconnected;
+            if (strcmp(buf, "ok") != 0) {
+                swprintf_s(vm->shared_resource_error,
+                           _countof(vm->shared_resource_error),
+                           L"Private SMB adapter configuration failed: %S", buf);
+                for (ri = 0; ri < vm->shared_resource_count; ri++) {
+                    wcscpy_s(vm->shared_resources[ri].mapping_result,
+                             _countof(vm->shared_resources[ri].mapping_result), L"unavailable");
+                    swprintf_s(vm->shared_resources[ri].failure,
+                               _countof(vm->shared_resources[ri].failure), L"%S", buf);
+                }
+                ui_log(L"Shared-resource adapter failed for \"%s\" (%S).",
+                       vm->name, buf);
+                notify_agent_status(vm);
+                goto shared_mapping_done;
+            }
+            cred_hr = smb_transport_get_credentials(user_w, _countof(user_w),
+                                                     password_w, _countof(password_w));
+            if (FAILED(cred_hr)) {
+                swprintf_s(vm->shared_resource_error,
+                           _countof(vm->shared_resource_error),
+                           L"SMB credential unavailable: 0x%08X", cred_hr);
+                ui_log(L"Shared-resource credentials unavailable for \"%s\" (0x%08X).",
+                       vm->name, cred_hr);
+                notify_agent_status(vm);
+                goto shared_mapping_done;
+            }
+            WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
             for (ri = 0; ri < vm->shared_resource_count; ri++) {
-                char map_cmd[128], share[64];
+                char map_cmd[1024], share[64];
                 HcsSharedResource *r = &vm->shared_resources[ri];
+                if (_wcsicmp(r->mapping_result, L"unavailable") == 0) continue;
                 WideCharToMultiByte(CP_UTF8, 0, r->share_name, -1,
                                     share, sizeof(share), NULL, NULL);
-                sprintf_s(map_cmd, sizeof(map_cmd), "shared_map:%c:%s",
-                          (char)r->drive_letter, share);
+                sprintf_s(map_cmd, sizeof(map_cmd), "shared_smb_map:%c:%s:%s:%s:%s",
+                          (char)r->drive_letter, vm->share_host_ip, share, user, password);
                 n = send_tagged_cmd(s, vm, &conn->cmd_seq,
                                     map_cmd, buf, sizeof(buf));
-                if (n <= 0) goto disconnected;
+                SecureZeroMemory(map_cmd, sizeof(map_cmd));
+                if (n <= 0) {
+                    SecureZeroMemory(password_w, sizeof(password_w));
+                    SecureZeroMemory(password, sizeof(password));
+                    SecureZeroMemory(user_w, sizeof(user_w));
+                    SecureZeroMemory(user, sizeof(user));
+                    goto disconnected;
+                }
                 if (strcmp(buf, "ok") != 0) {
                     wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"failed");
                     swprintf_s(r->failure, _countof(r->failure), L"%S", buf);
@@ -452,8 +499,13 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                            vm->name, r->drive_letter);
                 }
             }
+            SecureZeroMemory(password_w, sizeof(password_w));
+            SecureZeroMemory(password, sizeof(password));
+            SecureZeroMemory(user_w, sizeof(user_w));
+            SecureZeroMemory(user, sizeof(user));
             notify_agent_status(vm);
         }
+shared_mapping_done:
 
         /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
            subnet's .1; prefix length is always /24 for our NAT. */
