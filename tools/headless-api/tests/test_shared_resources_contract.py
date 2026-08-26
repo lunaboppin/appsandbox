@@ -84,6 +84,20 @@ def main():
     check(host_agent.index("if (!configure_guest_nat") <
           host_agent.index("sprintf_s(map_cmd"),
           "NAT configuration is sent before slow appliance SMB mapping")
+    style = read("web/style.css")
+    check("input:not([type])" in style and
+          "settings-resource-actions" in style and
+          "settings-resource-details" in js,
+          "shared appliance fields and resource rows use the shared control theme")
+    for tooltip in ("Start the shared appliance VM.",
+                    "Choose the parent folder where the shared appliance files are stored.",
+                    "Open this resource in File Explorer on the host.",
+                    "Permanently delete all data stored in this resource."):
+        check(tooltip in html + js,
+              f"shared settings button tooltip missing: {tooltip}")
+    for edition in ("Windows Server 2019 Standard", "Windows Server 2019 Datacenter"):
+        check(edition in html,
+              f"Windows Server WIM image dropdown missing: {edition}")
     check("hcn_get_endpoint_mac" in hcs and
           "default_mac_field" in hcs and
           r'L"\"Default\":{\"EndpointId\":\"%s\"%s}' in hcs,

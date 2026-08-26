@@ -1261,7 +1261,48 @@ function closeSettingsModal(){document.getElementById('settings-overlay').classL
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}
 function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-editor-title').textContent='Add shared resource';}
 function editResource(id){var r=sharedResources.find(function(x){return x.id===id;});if(!r)return;populateResourceLetters();document.getElementById('resource-id').value=r.id;document.getElementById('resource-name').value=r.name;document.getElementById('resource-letter').value=r.driveLetter;document.getElementById('resource-host-letter').value=r.hostDriveLetter||'';document.getElementById('resource-enabled').checked=!!r.enabled;document.getElementById('resource-readonly').checked=!!r.readOnly;document.getElementById('resource-editor-title').textContent='Edit shared resource';}
-function renderSettingsResources(){var box=document.getElementById('settings-resource-list');if(!box)return;box.innerHTML='';sharedResources.forEach(function(r){var row=document.createElement('div');row.className='settings-resource-row';var text=document.createElement('span');text.textContent=r.driveLetter+': '+r.name+(r.readOnly?' (read-only)':' (read/write)')+(r.enabled?'':' [disabled]')+(r.legacyHostPath?' — legacy folder disconnected and untouched: '+r.legacyHostPath:'');var edit=document.createElement('button');edit.textContent='Edit';edit.onclick=function(){editResource(r.id);};var mount=document.createElement('button');mount.textContent='Mount Host';mount.onclick=function(){mountHostResource(r.id);};var open=document.createElement('button');open.textContent='Open Share';open.onclick=function(){sendCmd('openHostResource',{id:r.id});};var unmount=document.createElement('button');unmount.textContent='Unmount';unmount.onclick=function(){sendCmd('unmountHostResource',{id:r.id});};var purge=document.createElement('button');purge.className='danger';purge.textContent='Purge Data';purge.onclick=function(){showModal('Permanently purge data','Permanently delete all appliance data for '+r.name+'? This cannot be undone.','Purge').then(function(ok){if(ok)sendCmd('purgeSharedResource',{id:r.id});});};var del=document.createElement('button');del.className='danger';del.textContent='Remove';del.onclick=function(){showModal('Remove shared resource','Unpublish '+r.name+'? Its appliance directory will be retained.','Remove').then(function(ok){if(ok)sendCmd('deleteSharedResource',{id:r.id});});};row.append(text,edit,mount,open,unmount,purge,del);box.appendChild(row);});if(!box.children.length)box.textContent='No shared resources configured.';}
+function renderSettingsResources(){
+    var box=document.getElementById('settings-resource-list');
+    if(!box)return;
+    box.innerHTML='';
+    sharedResources.forEach(function(r){
+        var row=document.createElement('div');
+        row.className='settings-resource-row';
+        var details=document.createElement('div');
+        details.className='settings-resource-details';
+        var name=document.createElement('span');
+        name.className='settings-resource-name';
+        name.textContent=r.driveLetter+': '+r.name;
+        var meta=document.createElement('span');
+        meta.className='settings-resource-meta';
+        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.enabled?'':' · Disabled')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
+        details.append(name,meta);
+        var actions=document.createElement('div');
+        actions.className='settings-resource-actions';
+        var edit=document.createElement('button');
+        edit.type='button';edit.textContent='Edit';edit.title='Edit this shared resource definition.';
+        edit.onclick=function(){editResource(r.id);};
+        var mount=document.createElement('button');
+        mount.type='button';mount.textContent='Mount Host';mount.title='Mount this resource on the host using its configured host drive letter.';
+        mount.onclick=function(){mountHostResource(r.id);};
+        var open=document.createElement('button');
+        open.type='button';open.textContent='Open Share';open.title='Open this resource in File Explorer on the host.';
+        open.onclick=function(){sendCmd('openHostResource',{id:r.id});};
+        var unmount=document.createElement('button');
+        unmount.type='button';unmount.textContent='Unmount';unmount.title='Unmount this resource from the host.';
+        unmount.onclick=function(){sendCmd('unmountHostResource',{id:r.id});};
+        var purge=document.createElement('button');
+        purge.type='button';purge.className='danger';purge.textContent='Purge Data';purge.title='Permanently delete all data stored in this resource.';
+        purge.onclick=function(){showModal('Permanently purge data','Permanently delete all appliance data for '+r.name+'? This cannot be undone.','Purge').then(function(ok){if(ok)sendCmd('purgeSharedResource',{id:r.id});});};
+        var del=document.createElement('button');
+        del.type='button';del.className='danger';del.textContent='Remove';del.title='Remove this resource definition while retaining its appliance data.';
+        del.onclick=function(){showModal('Remove shared resource','Unpublish '+r.name+'? Its appliance directory will be retained.','Remove').then(function(ok){if(ok)sendCmd('deleteSharedResource',{id:r.id});});};
+        actions.append(edit,mount,open,unmount,purge,del);
+        row.append(details,actions);
+        box.appendChild(row);
+    });
+    if(!box.children.length)box.textContent='No shared resources configured.';
+}
 function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked};if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
 function onSharedResourceResult(msg){if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 

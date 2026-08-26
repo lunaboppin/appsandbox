@@ -16,7 +16,7 @@
     <div class="section-header">
         <h2>Sandboxes</h2>
         <div class="header-actions">
-            <button class="win-host-only" onclick="openSettingsModal()">Shared Resources</button>
+            <button class="win-host-only" onclick="openSettingsModal()" title="Open the shared appliance and shared resource settings.">Shared Resources</button>
             <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
         </div>
     </div>
@@ -262,25 +262,27 @@
                 <label for="appliance-backend">Backend:</label>
                 <select id="appliance-backend"><option value="ubuntu">Ubuntu 24.04 LTS / Samba</option><option value="server_core">Windows Server Core</option></select>
                 <label for="appliance-storage-parent">Storage parent:</label>
-                <div class="manage-row"><input id="appliance-storage-parent"><button type="button" onclick="sendCmd('browseApplianceStorage')">Browse...</button></div>
+                <div class="manage-row"><input id="appliance-storage-parent"><button type="button" onclick="sendCmd('browseApplianceStorage')" title="Choose the parent folder where the shared appliance files are stored.">Browse...</button></div>
                 <label for="appliance-data-size">Data disk (GB):</label><input id="appliance-data-size" type="number" min="8" value="256">
                 <label for="appliance-admin-user">Administrator:</label><input id="appliance-admin-user" value="appsandbox">
                 <label for="appliance-admin-pass">Password:</label><input id="appliance-admin-pass" type="password" autocomplete="new-password">
                 <label for="appliance-cpu">Advanced resources:</label><div><input id="appliance-cpu" type="number" min="1" value="1" style="width:70px"> vCPU <input id="appliance-ram" type="number" min="512" value="1024" style="width:90px"> MB RAM</div>
-                <label for="appliance-server-iso">Server Core ISO:</label><div class="manage-row"><input id="appliance-server-iso"><button type="button" onclick="sendCmd('browseApplianceIso')">Browse...</button></div>
+                <label for="appliance-server-iso">Server Core ISO:</label><div class="manage-row"><input id="appliance-server-iso"><button type="button" onclick="sendCmd('browseApplianceIso')" title="Choose the Windows Server Core installation ISO.">Browse...</button></div>
                 <label for="appliance-server-image">Core WIM image:</label><input id="appliance-server-image" list="appliance-server-images" placeholder="Select or enter the exact install.wim image name">
                 <datalist id="appliance-server-images">
                     <option value="Windows Server 2025 Standard"></option>
                     <option value="Windows Server 2025 Datacenter"></option>
                     <option value="Windows Server 2022 Standard"></option>
                     <option value="Windows Server 2022 Datacenter"></option>
+                    <option value="Windows Server 2019 Standard"></option>
+                    <option value="Windows Server 2019 Datacenter"></option>
                 </datalist>
                 <label for="appliance-product-key">Optional product key:</label><input id="appliance-product-key" type="password" autocomplete="off">
             </div>
             <div class="modal-buttons">
-                <button onclick="startSharedAppliance()">Start</button><button onclick="stopSharedAppliance()">Stop</button>
-                <button onclick="updateSharedAppliance()">Update</button><button onclick="growSharedAppliance()">Grow Disk</button>
-                <button onclick="sendCmd('openSharedApplianceScreen')">Screen</button><button onclick="sendCmd('openSharedApplianceTerminal')">Terminal</button><button onclick="rebuildSharedAppliance()">Rebuild</button><button class="primary" onclick="setupSharedAppliance()">Setup</button>
+                <button type="button" onclick="startSharedAppliance()" title="Start the shared appliance VM.">Start</button><button type="button" onclick="stopSharedAppliance()" title="Stop the shared appliance VM.">Stop</button>
+                <button type="button" onclick="updateSharedAppliance()" title="Apply the appliance's current configuration.">Update</button><button type="button" onclick="growSharedAppliance()" title="Increase the size of the appliance data disk.">Grow Disk</button>
+                <button type="button" onclick="sendCmd('openSharedApplianceScreen')" title="Open the shared appliance console screen.">Screen</button><button type="button" onclick="sendCmd('openSharedApplianceTerminal')" title="Open a terminal connected to the shared appliance.">Terminal</button><button type="button" onclick="rebuildSharedAppliance()" title="Rebuild the appliance OS while preserving its data disk.">Rebuild</button><button type="button" class="primary" onclick="setupSharedAppliance()" title="Create and configure the shared appliance from these settings.">Setup</button>
             </div>
         </fieldset>
         <h3>Shared Resources</h3>
@@ -295,9 +297,9 @@
                 <label for="resource-host-letter">Optional host letter:</label><select id="resource-host-letter"><option value="">Not mounted</option></select>
                 <label>Options:</label><div><label class="manage-check"><input type="checkbox" id="resource-enabled" checked> Enabled</label> <label class="manage-check"><input type="checkbox" id="resource-readonly"> Read-only</label></div>
             </div>
-            <div class="modal-buttons"><button onclick="clearResourceEditor()">Clear</button><button class="primary" onclick="saveResourceEditor()">Save</button></div>
+            <div class="modal-buttons"><button type="button" onclick="clearResourceEditor()" title="Clear the shared resource editor and prepare a new resource.">Clear</button><button type="button" class="primary" onclick="saveResourceEditor()" title="Save this shared resource definition.">Save</button></div>
         </fieldset>
-        <div class="modal-buttons"><button onclick="closeSettingsModal()">Close</button></div>
+        <div class="modal-buttons"><button type="button" onclick="closeSettingsModal()" title="Close shared appliance settings.">Close</button></div>
     </div>
 </div>
 
