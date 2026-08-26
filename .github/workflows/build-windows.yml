@@ -27,7 +27,7 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Verify signing runner prerequisites
-        shell: pwsh
+        shell: powershell
         run: |
           $kitRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
           $requiredTools = @(
@@ -45,7 +45,7 @@ jobs:
           Write-Host 'The release script will verify the EV YubiKey and certificate.'
 
       - name: Create temporary Partner Center credentials
-        shell: pwsh
+        shell: powershell
         env:
           PARTNER_CENTER_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
           PARTNER_CENTER_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
@@ -71,7 +71,7 @@ jobs:
           Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'appsandbox-partner-credential-created') -Value '1' -Encoding ascii
 
       - name: Build, EV-sign, attest, and package
-        shell: pwsh
+        shell: powershell
         run: |
           # MSBuild's native launcher rejects duplicate PATH/Path entries on
           # some Windows service environments.
@@ -100,7 +100,7 @@ jobs:
           Write-Host "Signed package: $($zips[0].FullName)"
 
       - name: Verify signed package contents
-        shell: pwsh
+        shell: powershell
         run: |
           $kitRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
           $signtool = Get-ChildItem -LiteralPath (Join-Path $kitRoot 'bin') -Recurse -Filter 'signtool.exe' -File |
@@ -144,7 +144,7 @@ jobs:
 
       - name: Remove temporary Partner Center credentials
         if: always()
-        shell: pwsh
+        shell: powershell
         run: |
           $marker = Join-Path $env:RUNNER_TEMP 'appsandbox-partner-credential-created'
           $credentialPath = Join-Path $env:GITHUB_WORKSPACE 'tools\sign\partner-center.local.json'
