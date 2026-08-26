@@ -77,6 +77,7 @@ static AsbConn *             g_client_sock = NULL; /* Active persistent connecti
 static volatile BOOL         g_os_shutting_down = FALSE;
 static CRITICAL_SECTION      g_send_cs;     /* Protects send_line from concurrent callers */
 static wchar_t               g_shared_management_ip[64];
+static char                  g_shared_nic_mac[64];
 
 /* ---- Logging ---- */
 
@@ -1890,13 +1891,30 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
         " }\r\n"
         " exit 1168\r\n"
         "}\r\n"
+        "if($a.Status -ne 'Up'){Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction SilentlyContinue}\r\n"
+        "for($i=0;$i -lt 20;$i++){\r\n"
+        " $a=Get-NetAdapter -InterfaceIndex $a.ifIndex -IncludeHidden -ErrorAction SilentlyContinue\r\n"
+        " if($a -and $a.Status -eq 'Up'){break}\r\n"
+        " Start-Sleep -Milliseconds 250\r\n"
+        "}\r\n"
+        "if(-not $a -or $a.Status -ne 'Up'){\r\n"
+        " Write-Output ('adapter not ready status=' + $a.Status + ' if=' + $a.ifIndex)\r\n"
+        " exit 1168\r\n"
+        "}\r\n"
         "Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 9999 -ErrorAction Stop\r\n"
         "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NET_IP -PrefixLength 24 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
         "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue\r\n"
-        "exit 0\r\n";
+        "for($i=0;$i -lt 20;$i++){\r\n"
+        " if(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NET_IP}){exit 0}\r\n"
+        " Start-Sleep -Milliseconds 250\r\n"
+        "}\r\n"
+        "Write-Output ('assigned ip not found=' + $env:ASB_NET_IP + ' if=' + $a.ifIndex)\r\n"
+        "exit 1168\r\n";
     const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\shared-net.ps1";
     wchar_t mac[64], ip[64]; int ec;
+    if (!mac_a || !ip_a) return ERROR_INVALID_PARAMETER;
+    strcpy_s(g_shared_nic_mac, sizeof(g_shared_nic_mac), mac_a);
     if (!MultiByteToWideChar(CP_UTF8, 0, mac_a, -1, mac, _countof(mac)) ||
         !MultiByteToWideChar(CP_UTF8, 0, ip_a, -1, ip, _countof(ip)))
         return (int)GetLastError();
@@ -1936,6 +1954,69 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
     return ec;
 }
 
+/* Configure the normal NAT adapter by excluding the private shared-resource
+   adapter's MAC. The guest can have more than one adapter and Windows does
+   not guarantee that the internet-facing one is named "Ethernet". */
+static int configure_nat_nic(const char *ip_a, const char *prefix_a,
+                             const char *gateway_a)
+{
+    static const char script[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "$shared=$env:ASB_SHARED_NIC_MAC -replace '[:-]',''\r\n"
+        "$a=$null\r\n"
+        "for($i=0;$i -lt 60 -and -not $a;$i++){\r\n"
+        " $a=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {\r\n"
+        "  $_.Status -eq 'Up' -and ((($_.MacAddress) -replace '[:-]','') -ne $shared)\r\n"
+        " } | Select-Object -First 1\r\n"
+        " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
+        "}\r\n"
+        "if(-not $a){Write-Output 'normal NAT adapter not found';exit 1168}\r\n"
+        "Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 10 -ErrorAction Stop\r\n"
+        "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+        "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NAT_IP -PrefixLength ([int]$env:ASB_NAT_PREFIX) -DefaultGateway $env:ASB_NAT_GATEWAY -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
+        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($env:ASB_NAT_GATEWAY,'8.8.8.8') -ErrorAction Stop\r\n"
+        "for($i=0;$i -lt 20;$i++){\r\n"
+        " $ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NAT_IP}\r\n"
+        " $route=Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {$_.NextHop -eq $env:ASB_NAT_GATEWAY}\r\n"
+        " if($ip -and $route){Write-Output ('configured adapter=' + $a.Name + ' if=' + $a.ifIndex);exit 0}\r\n"
+        " Start-Sleep -Milliseconds 250\r\n"
+        "}\r\n"
+        "Write-Output ('NAT IP or gateway route not present on adapter=' + $a.Name + ' if=' + $a.ifIndex)\r\n"
+        "exit 1168\r\n";
+    const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\nat-net.ps1";
+    wchar_t ip[64], prefix[16], gateway[64];
+    char out[2048];
+    int ec;
+
+    if (!ip_a || !prefix_a || !gateway_a ||
+        !MultiByteToWideChar(CP_UTF8, 0, ip_a, -1, ip, _countof(ip)) ||
+        !MultiByteToWideChar(CP_UTF8, 0, prefix_a, -1, prefix, _countof(prefix)) ||
+        !MultiByteToWideChar(CP_UTF8, 0, gateway_a, -1, gateway, _countof(gateway)))
+        return ERROR_INVALID_PARAMETER;
+    ec = write_agent_script(path, script); if (ec) return ec;
+    SetEnvironmentVariableA("ASB_SHARED_NIC_MAC", g_shared_nic_mac);
+    SetEnvironmentVariableW(L"ASB_NAT_IP", ip);
+    SetEnvironmentVariableW(L"ASB_NAT_PREFIX", prefix);
+    SetEnvironmentVariableW(L"ASB_NAT_GATEWAY", gateway);
+    ec = run_agent_powershell_out(path, 120000, out, sizeof(out));
+    if (out[0]) {
+        char *line = out, *nl;
+        while (line && *line) {
+            nl = strpbrk(line, "\r\n");
+            if (nl) *nl = '\0';
+            if (*line) agent_log("nat_net: %s", line);
+            if (!nl) break;
+            line = nl + 1;
+            while (*line == '\r' || *line == '\n') line++;
+        }
+    }
+    SetEnvironmentVariableA("ASB_SHARED_NIC_MAC", NULL);
+    SetEnvironmentVariableW(L"ASB_NAT_IP", NULL);
+    SetEnvironmentVariableW(L"ASB_NAT_PREFIX", NULL);
+    SetEnvironmentVariableW(L"ASB_NAT_GATEWAY", NULL);
+    return ec;
+}
+
 /* New-SmbGlobalMapping publishes the drive to every user and service inside
    the guest. The password exists only in this service's inherited child
    environment and is never placed on a command line or written to disk. */
@@ -1947,29 +2028,45 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         "$ErrorActionPreference='Stop'\r\n"
         "$local=$env:ASB_SMB_LOCAL\r\n"
         "$remote=$env:ASB_SMB_REMOTE\r\n"
-        "$existing=Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue\r\n"
-        "if($existing){if($existing.RemotePath -ieq $remote -and (Test-Path ($local+'\\'))){exit 0}else{exit 85}}\r\n"
-        "if(Test-Path ($local+'\\')){exit 85}\r\n"
+        "$root=$local+'\\'\r\n"
+        "$last=''\r\n"
         "$h=($remote -split '\\\\')[2]\r\n"
         "$secure=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force\r\n"
         "$cred=[System.Management.Automation.PSCredential]::new(($h+'\\'+$env:ASB_SMB_USER),$secure)\r\n"
-        "try{\r\n"
-        " New-SmbGlobalMapping -LocalPath $local -RemotePath $remote -Credential $cred -Persistent $false -RequireIntegrity $true -ErrorAction Stop | Out-Null\r\n"
-        "}catch{\r\n"
-        " $c=([int]$_.Exception.HResult -band 0xffff);if($c -eq 0){$c=1}\r\n"
-        " Write-Output ('map failed user=' + $h + '\\' + $env:ASB_SMB_USER + ' target=' + $remote + ': ' + $_.Exception.Message)\r\n"
-        " $t=Test-NetConnection -ComputerName $h -Port 445 -WarningAction SilentlyContinue\r\n"
-        " Write-Output ('tcp445=' + $t.TcpTestSucceeded + ' src=' + $t.SourceAddress.IPAddress)\r\n"
-        " foreach($ln in @('Microsoft-Windows-SMBClient/Connectivity','Microsoft-Windows-SMBClient/Security','Microsoft-Windows-SMBClient/Operational')){\r\n"
-        "  Get-WinEvent -LogName $ln -MaxEvents 3 -ErrorAction SilentlyContinue | ForEach-Object {\r\n"
-        "   Write-Output ('evt ' + $ln.Split('/')[-1] + ' id=' + $_.Id + ' ' + (($_.Message -replace '\\s+',' ')).Substring(0,[Math]::Min(220,($_.Message -replace '\\s+',' ').Length)))\r\n"
+        "$code=1\r\n"
+        "for($attempt=0;$attempt -lt 5;$attempt++){\r\n"
+        " try{\r\n"
+        "  $existing=Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue\r\n"
+        "  if($existing){\r\n"
+        "   if($existing.RemotePath -ieq $remote){\r\n"
+        "    try{$null=Get-Item -LiteralPath $root -Force -ErrorAction Stop;exit 0}catch{$last=$_.Exception.Message}\r\n"
+        "   }\r\n"
+        "   Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction Stop\r\n"
+        "   for($i=0;$i -lt 20 -and (Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue);$i++){Start-Sleep -Milliseconds 250}\r\n"
         "  }\r\n"
+        "  if(Test-Path -LiteralPath $root -ErrorAction SilentlyContinue){exit 85}\r\n"
+        "  New-SmbGlobalMapping -LocalPath $local -RemotePath $remote -Credential $cred -Persistent $false -RequireIntegrity $true -ErrorAction Stop | Out-Null\r\n"
+        "  for($i=0;$i -lt 20;$i++){\r\n"
+        "   try{$null=Get-Item -LiteralPath $root -Force -ErrorAction Stop;exit 0}catch{$last=$_.Exception.Message}\r\n"
+        "   Start-Sleep -Milliseconds 250\r\n"
+        "  }\r\n"
+        "  Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue\r\n"
+        " }catch{\r\n"
+        "  $code=([int]$_.Exception.HResult -band 0xffff);if($code -eq 0){$code=1};$last=$_.Exception.Message\r\n"
+        "  Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue\r\n"
         " }\r\n"
-        " exit $c\r\n"
+        " if($attempt -lt 4){Start-Sleep -Milliseconds 750}\r\n"
         "}\r\n"
-        "$ready=$false;for($i=0;$i -lt 20 -and -not $ready;$i++){$ready=Test-Path ($local+'\\');if(-not $ready){Start-Sleep -Milliseconds 250}}\r\n"
-        "if(-not $ready){Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue;exit 3}\r\n"
-        "exit 0\r\n";
+        "if(-not $last){$last='mapped drive was not readable'}\r\n"
+        "Write-Output ('map failed user=' + $h + '\\' + $env:ASB_SMB_USER + ' target=' + $remote + ': ' + $last)\r\n"
+        "$t=Test-NetConnection -ComputerName $h -Port 445 -WarningAction SilentlyContinue\r\n"
+        "Write-Output ('tcp445=' + $t.TcpTestSucceeded + ' src=' + $t.SourceAddress.IPAddress)\r\n"
+        "foreach($ln in @('Microsoft-Windows-SMBClient/Connectivity','Microsoft-Windows-SMBClient/Security','Microsoft-Windows-SMBClient/Operational')){\r\n"
+        " Get-WinEvent -LogName $ln -MaxEvents 3 -ErrorAction SilentlyContinue | ForEach-Object {\r\n"
+        "  Write-Output ('evt ' + $ln.Split('/')[-1] + ' id=' + $_.Id + ' ' + (($_.Message -replace '\\s+',' ')).Substring(0,[Math]::Min(220,($_.Message -replace '\\s+',' ').Length)))\r\n"
+        " }\r\n"
+        "}\r\n"
+        "exit $code\r\n";
     const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\shared-smb-map.ps1";
     wchar_t local[4], remote[256], user[256], password[256]; int ec;
     if (!letter_a || strlen(letter_a) != 1 || !host_a || !share_a || !user_a || !password_a)
@@ -2621,71 +2718,9 @@ static void handle_client(AsbConn *client)
             }
 
             if (ip[0] && prefix[0] && gateway[0]) {
-                wchar_t wcmd[512];
-                STARTUPINFOW si;
-                PROCESS_INFORMATION pi;
-                DWORD exit_code = 1;
-
-                swprintf_s(wcmd, 512,
-                    L"netsh interface ip set address \"Ethernet\" static %S %S %S",
-                    ip,
-                    /* Convert prefix length to subnet mask */
-                    atoi(prefix) == 16 ? "255.255.0.0" :
-                    atoi(prefix) == 24 ? "255.255.255.0" :
-                    atoi(prefix) == 8  ? "255.0.0.0" : "255.255.255.0",
-                    gateway);
-
-                agent_log("Setting IP: %S", wcmd);
-
-                ZeroMemory(&si, sizeof(si));
-                si.cb = sizeof(si);
-                ZeroMemory(&pi, sizeof(pi));
-
-                if (CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
-                                   CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-                    WaitForSingleObject(pi.hProcess, 10000);
-                    GetExitCodeProcess(pi.hProcess, &exit_code);
-                    CloseHandle(pi.hProcess);
-                    CloseHandle(pi.hThread);
-                }
-
-                /* Set DNS to gateway (host NAT) + 8.8.8.8 fallback */
-                if (exit_code == 0) {
-                    wchar_t dns_cmd[512];
-                    STARTUPINFOW si2;
-                    PROCESS_INFORMATION pi2;
-
-                    swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip set dns \"Ethernet\" static %S", gateway);
-                    ZeroMemory(&si2, sizeof(si2));
-                    si2.cb = sizeof(si2);
-                    ZeroMemory(&pi2, sizeof(pi2));
-                    if (CreateProcessW(NULL, dns_cmd, NULL, NULL, FALSE,
-                                       CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
-                        WaitForSingleObject(pi2.hProcess, 10000);
-                        CloseHandle(pi2.hProcess);
-                        CloseHandle(pi2.hThread);
-                    }
-
-                    swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip add dns \"Ethernet\" 8.8.8.8 index=2");
-                    ZeroMemory(&si2, sizeof(si2));
-                    si2.cb = sizeof(si2);
-                    ZeroMemory(&pi2, sizeof(pi2));
-                    if (CreateProcessW(NULL, dns_cmd, NULL, NULL, FALSE,
-                                       CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
-                        WaitForSingleObject(pi2.hProcess, 10000);
-                        CloseHandle(pi2.hProcess);
-                        CloseHandle(pi2.hThread);
-                    }
-
-                    agent_log("IP configured: %s/%s gw %s dns %s,8.8.8.8",
-                              ip, prefix, gateway, gateway);
-                    REPLY("ok");
-                } else {
-                    agent_log("netsh failed (exit %lu)", exit_code);
-                    REPLY("error:netsh_failed");
-                }
+                int exit_code = configure_nat_nic(ip, prefix, gateway);
+                if (exit_code == 0) REPLY("ok");
+                else REPLY("error:nat_net_failed");
             } else {
                 agent_log("set_ip: bad format: %s", cmd);
                 REPLY("error:bad_format");

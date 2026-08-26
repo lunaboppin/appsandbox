@@ -1233,6 +1233,9 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
             swprintf_s(file_path, MAX_PATH, L"%s\\devcon.exe", drivers_staging);
             if (GetFileAttributesW(vdd_src) != INVALID_FILE_ATTRIBUTES)
                 CopyFileW(vdd_src, file_path, FALSE);
+            ui_log(L"Staged AppSandboxVDD driver files for the Windows VM.");
+        } else {
+            ui_log(L"Warning: AppSandboxVDD driver bundle not found; the Windows VM IDD display will not be available.");
         }
     }
 
@@ -1995,6 +1998,8 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                     count++;
                 }
             }
+        } else {
+            ui_log(L"Warning: AppSandboxVDD driver bundle not found; the new Windows VM IDD display will not be available.");
         }
     }
 

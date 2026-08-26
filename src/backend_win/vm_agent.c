@@ -302,6 +302,10 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
            gates display-open on it. */
         vm->idd_ready = (strcmp(buf + 11, "ok") == 0);
         ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
+        /* The initial status can be a transient not_found/stopped result.
+           Notify the UI on every status change so a later periodic recovery
+           to "ok" can open the display without requiring a VM restart. */
+        notify_agent_status(vm);
     } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
         ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
         /* NULL-guard like notify_agent_status: headless never sets the HWND,

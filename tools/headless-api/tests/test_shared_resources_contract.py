@@ -50,12 +50,27 @@ def main():
 
     check("New-SmbGlobalMapping" in agent and "-RequireIntegrity $true" in agent,
           "guest does not create a signed global SMB mapping")
+    check("Get-Item -LiteralPath $root -Force -ErrorAction Stop" in agent and
+          "for($attempt=0;$attempt -lt 5;$attempt++)" in agent and
+          "Remove-SmbGlobalMapping -LocalPath $local -Force" in agent,
+          "guest can report an SMB drive mapped before its root is readable")
+    check("Enable-NetAdapter -Name $a.Name" in agent and
+          "Status -eq 'Up'" in agent and
+          "Get-NetIPAddress -InterfaceIndex $a.ifIndex" in agent,
+          "shared NIC readiness is verified before SMB mapping")
+    check('L"netsh interface ip set address \\\"Ethernet\\\"' not in agent and
+          'L"netsh interface ip set dns \\\"Ethernet\\\"' not in agent,
+          "NAT configuration does not hard-code the guest adapter name")
+    check("configure_nat_nic" in agent and
+          "ASB_SHARED_NIC_MAC" in agent and
+          "Get-NetRoute" in agent,
+          "NAT configuration selects the non-share adapter and verifies its route")
     check("shared_appliance_get_smb_credentials" in host_agent,
           "client mappings do not use appliance DPAPI credentials")
     check("strrchr(arg, ':')" in agent,
           "shared NIC parser can still split inside the deterministic MAC address")
     nic = agent[agent.index("static int configure_shared_nic"):
-                agent.index("static int map_smb_drive_global")]
+                agent.index("static int configure_nat_nic")]
     check("-DefaultGateway" not in nic and "New-NetIPAddress" in nic,
           "private NIC configuration can alter the guest default route")
     check("drive_collision" in agent and "map_failed:%lu" in agent,

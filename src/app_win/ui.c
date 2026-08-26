@@ -693,6 +693,15 @@ static void do_connect_idd(int idx)
     if (idx < 0 || idx >= asb_vm_count()) return;
     v = asb_vm_instance(asb_vm_get(idx));
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
+    /* The frame service is a single-consumer channel.  Do not create a
+       window until the guest has reported that AppSandboxVDD is running;
+       otherwise auto-open races the guest setup and leaves a permanent
+       black window with no useful diagnostic. */
+    if (!asb_vm_idd_ready(asb_vm_get(idx))) {
+        ui_log(L"IDD display for \"%s\" is not ready (guest VDD driver is not running).",
+               v->name);
+        return;
+    }
     if (g_idd_displays[idx] && vm_display_idd_is_open(g_idd_displays[idx])) {
         vm_display_idd_focus(g_idd_displays[idx]);
         return;
@@ -1762,11 +1771,13 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (inst->auto_open_display && g_displays[i] && vm_display_is_open(g_displays[i])) {
+                if (inst->auto_open_display && asb_vm_idd_ready(asb_vm_get(i)) &&
+                    g_displays[i] && vm_display_is_open(g_displays[i])) {
                     ui_log(L"Agent online - switching \"%s\" from RDP to IDD.", inst->name);
                     safe_destroy_rdp(i);
                     do_connect_idd(i);
-                } else if (inst->auto_open_display && !g_idd_displays[i] && !inst->shutdown_requested) {
+                } else if (inst->auto_open_display && asb_vm_idd_ready(asb_vm_get(i)) &&
+                           !g_idd_displays[i] && !inst->shutdown_requested) {
                     do_connect_idd(i);
                 }
                 break;
@@ -1786,7 +1797,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (!g_idd_displays[i]) {
+                if (asb_vm_idd_ready(asb_vm_get(i)) && !g_idd_displays[i]) {
                     ui_log(L"VDD ready - opening IDD display for \"%s\".", inst->name);
                     do_connect_idd(i);
                 }
@@ -1826,7 +1837,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             inst->hyperv_video_off = TRUE;
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (g_displays[i] && vm_display_is_open(g_displays[i])) {
+                if (asb_vm_idd_ready(asb_vm_get(i)) &&
+                    g_displays[i] && vm_display_is_open(g_displays[i])) {
                     ui_log(L"Hyper-V Video disabled - switching to IDD.");
                     safe_destroy_rdp(i);
                     do_connect_idd(i);
