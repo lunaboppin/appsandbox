@@ -1958,53 +1958,73 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
    adapter's MAC. The guest can have more than one adapter and Windows does
    not guarantee that the internet-facing one is named "Ethernet". */
 static int configure_nat_nic(const char *ip_a, const char *prefix_a,
-                             const char *gateway_a)
+                             const char *gateway_a, const char *mac_a)
 {
     static const char script[] =
         "$ErrorActionPreference='Stop'\r\n"
         "$shared=$env:ASB_SHARED_NIC_MAC -replace '[:-]',''\r\n"
+        "$want=$env:ASB_NAT_NIC_MAC -replace '[:-]',''\r\n"
         "$a=$null\r\n"
         "for($i=0;$i -lt 60 -and -not $a;$i++){\r\n"
-        " $a=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {\r\n"
-        "  $_.Status -eq 'Up' -and ((($_.MacAddress) -replace '[:-]','') -ne $shared)\r\n"
-        " } | Select-Object -First 1\r\n"
+        " $candidates=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {\r\n"
+        "  $_.MacAddress -and ((($_.MacAddress) -replace '[:-]','') -ne $shared)\r\n"
+        " }\r\n"
+        " if($want){$a=$candidates | Where-Object {(($_.MacAddress) -replace '[:-]','') -eq $want} | Select-Object -First 1}\r\n"
+        " else{\r\n"
+        "  $a=$candidates | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1\r\n"
+        "  if(-not $a){$a=$candidates | Where-Object {$_.Status -ne 'Disabled'} | Select-Object -First 1}\r\n"
+        "  if(-not $a){$a=$candidates | Select-Object -First 1}\r\n"
+        " }\r\n"
         " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
         "}\r\n"
-        "if(-not $a){Write-Output 'normal NAT adapter not found';exit 1168}\r\n"
-        "Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 10 -ErrorAction Stop\r\n"
-        "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
-        "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NAT_IP -PrefixLength ([int]$env:ASB_NAT_PREFIX) -DefaultGateway $env:ASB_NAT_GATEWAY -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
-        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($env:ASB_NAT_GATEWAY,'8.8.8.8') -ErrorAction Stop\r\n"
-        "for($i=0;$i -lt 20;$i++){\r\n"
-        " $ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NAT_IP}\r\n"
-        " $route=Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {$_.NextHop -eq $env:ASB_NAT_GATEWAY}\r\n"
-        " if($ip -and $route){Write-Output ('configured adapter=' + $a.Name + ' if=' + $a.ifIndex);exit 0}\r\n"
-        " Start-Sleep -Milliseconds 250\r\n"
-        "}\r\n"
-        "Write-Output ('NAT IP or gateway route not present on adapter=' + $a.Name + ' if=' + $a.ifIndex)\r\n"
-        "exit 1168\r\n";
+        "if(-not $a){if($want){Write-Output ('NAT adapter with MAC ' + $want + ' not found')}else{Write-Output 'normal NAT adapter not found'};exit 1168}\r\n"
+        "Write-Output ('selected adapter=' + $a.Name + ' mac=' + $a.MacAddress + ' status=' + $a.Status + ' if=' + $a.ifIndex)\r\n"
+        "try{\r\n"
+        " if($a.Status -eq 'Disabled'){Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop;Start-Sleep -Milliseconds 500}\r\n"
+        " Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 10 -ErrorAction Stop\r\n"
+        " Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+        " New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NAT_IP -PrefixLength ([int]$env:ASB_NAT_PREFIX) -DefaultGateway $env:ASB_NAT_GATEWAY -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
+        " Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($env:ASB_NAT_GATEWAY,'8.8.8.8') -ErrorAction Stop\r\n"
+        " for($i=0;$i -lt 20;$i++){\r\n"
+        "  $ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NAT_IP}\r\n"
+        "  $route=Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {$_.NextHop -eq $env:ASB_NAT_GATEWAY}\r\n"
+        "  if($ip -and $route){Write-Output ('configured adapter=' + $a.Name + ' if=' + $a.ifIndex);exit 0}\r\n"
+        "  Start-Sleep -Milliseconds 250\r\n"
+        " }\r\n"
+        " Write-Output ('NAT IP or gateway route not present on adapter=' + $a.Name + ' if=' + $a.ifIndex)\r\n"
+        " exit 1168\r\n"
+        "}catch{\r\n"
+        " $code=([int]$_.Exception.HResult -band 0xffff);if($code -eq 0){$code=1}\r\n"
+        " Write-Output ('NAT configuration failed adapter=' + $a.Name + ' if=' + $a.ifIndex + ' code=' + $code + ': ' + $_.Exception.Message)\r\n"
+        " exit $code\r\n"
+        "}\r\n";
     const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\nat-net.ps1";
-    wchar_t ip[64], prefix[16], gateway[64];
+    wchar_t ip[64], prefix[16], gateway[64], mac[64];
     char out[2048];
     int ec;
 
     if (!ip_a || !prefix_a || !gateway_a ||
         !MultiByteToWideChar(CP_UTF8, 0, ip_a, -1, ip, _countof(ip)) ||
         !MultiByteToWideChar(CP_UTF8, 0, prefix_a, -1, prefix, _countof(prefix)) ||
-        !MultiByteToWideChar(CP_UTF8, 0, gateway_a, -1, gateway, _countof(gateway)))
+        !MultiByteToWideChar(CP_UTF8, 0, gateway_a, -1, gateway, _countof(gateway)) ||
+        !MultiByteToWideChar(CP_UTF8, 0, mac_a ? mac_a : "", -1, mac, _countof(mac)))
         return ERROR_INVALID_PARAMETER;
     ec = write_agent_script(path, script); if (ec) return ec;
     SetEnvironmentVariableA("ASB_SHARED_NIC_MAC", g_shared_nic_mac);
     SetEnvironmentVariableW(L"ASB_NAT_IP", ip);
     SetEnvironmentVariableW(L"ASB_NAT_PREFIX", prefix);
     SetEnvironmentVariableW(L"ASB_NAT_GATEWAY", gateway);
+    SetEnvironmentVariableW(L"ASB_NAT_NIC_MAC", mac);
     ec = run_agent_powershell_out(path, 120000, out, sizeof(out));
     if (out[0]) {
         char *line = out, *nl;
         while (line && *line) {
             nl = strpbrk(line, "\r\n");
             if (nl) *nl = '\0';
-            if (*line) agent_log("nat_net: %s", line);
+            if (*line) {
+                agent_log("nat_net: %s", line);
+                agent_log_to_host("nat_net: %s", line);
+            }
             if (!nl) break;
             line = nl + 1;
             while (*line == '\r' || *line == '\n') line++;
@@ -2014,6 +2034,7 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
     SetEnvironmentVariableW(L"ASB_NAT_IP", NULL);
     SetEnvironmentVariableW(L"ASB_NAT_PREFIX", NULL);
     SetEnvironmentVariableW(L"ASB_NAT_GATEWAY", NULL);
+    SetEnvironmentVariableW(L"ASB_NAT_NIC_MAC", NULL);
     return ec;
 }
 
@@ -2700,25 +2721,30 @@ static void handle_client(AsbConn *client)
         }
         else if (strncmp(cmd, "set_ip:", 7) == 0) {
             /* set_ip:172.20.0.X/PREFIX:GATEWAY */
-            char ip[32] = {0}, prefix[8] = {0}, gateway[32] = {0};
-            char *slash, *colon2;
+            char ip[32] = {0}, prefix[8] = {0}, gateway[32] = {0}, nat_mac[64] = {0};
+            char *slash, *colon2, *colon3;
             char *arg = cmd + 7;
 
             /* Parse IP/prefix:gateway */
             slash = strchr(arg, '/');
             colon2 = slash ? strchr(slash, ':') : NULL;
             if (slash && colon2) {
+                colon3 = strchr(colon2 + 1, ':');
                 int ip_len = (int)(slash - arg);
                 int pfx_len = (int)(colon2 - slash - 1);
+                int gateway_len = colon3 ? (int)(colon3 - colon2 - 1) : (int)strlen(colon2 + 1);
                 if (ip_len > 0 && ip_len < (int)sizeof(ip))
                     strncpy_s(ip, sizeof(ip), arg, ip_len);
                 if (pfx_len > 0 && pfx_len < (int)sizeof(prefix))
                     strncpy_s(prefix, sizeof(prefix), slash + 1, pfx_len);
-                strncpy_s(gateway, sizeof(gateway), colon2 + 1, sizeof(gateway) - 1);
+                if (gateway_len > 0 && gateway_len < (int)sizeof(gateway))
+                    strncpy_s(gateway, sizeof(gateway), colon2 + 1, gateway_len);
+                if (colon3)
+                    strncpy_s(nat_mac, sizeof(nat_mac), colon3 + 1, sizeof(nat_mac) - 1);
             }
 
             if (ip[0] && prefix[0] && gateway[0]) {
-                int exit_code = configure_nat_nic(ip, prefix, gateway);
+                int exit_code = configure_nat_nic(ip, prefix, gateway, nat_mac);
                 if (exit_code == 0) REPLY("ok");
                 else REPLY("error:nat_net_failed");
             } else {

@@ -558,9 +558,22 @@ shared_mapping_done:
         /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
            subnet's .1; prefix length is always /24 for our NAT. */
         if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
-            char ip_cmd[64];
-            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
-                       vm->nat_ip, hcn_nat_subnet_base());
+            char ip_cmd[160], nat_mac[32] = "";
+            HRESULT mac_hr = hcn_get_endpoint_mac(&vm->endpoint_id,
+                                                   nat_mac, sizeof(nat_mac));
+            if (SUCCEEDED(mac_hr) && nat_mac[0]) {
+                sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1:%s",
+                           vm->nat_ip, hcn_nat_subnet_base(), nat_mac);
+                ui_log(L"NAT endpoint MAC for \"%s\": %S", vm->name, nat_mac);
+            } else {
+                /* Older HCN builds may omit MacAddress from the endpoint
+                   query. Keep the adapter-name-independent fallback, but
+                   make the degraded path visible in the log. */
+                sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
+                           vm->nat_ip, hcn_nat_subnet_base());
+                ui_log(L"Could not read NAT endpoint MAC for \"%s\" (0x%08X); using guest adapter discovery.",
+                       vm->name, mac_hr);
+            }
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf), 60000);
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);

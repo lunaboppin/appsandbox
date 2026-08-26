@@ -2,6 +2,7 @@
 #include "vm_agent.h"
 #include "ui.h"
 #include "disk_util.h"   /* ASB_IS_ARM64 */
+#include "hcn_network.h"
 #include <stdio.h>
 #include <sddl.h>
 #include <aclapi.h>
@@ -955,7 +956,17 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     if (!config->is_template &&
         ((endpoint_guid && endpoint_guid[0] != L'\0') ||
          (share_endpoint_guid && share_endpoint_guid[0] != L'\0'))) {
+        wchar_t default_mac_field[64] = L"";
         wchar_t share_mac_field[64] = L"";
+        char default_mac[32] = "";
+        GUID default_endpoint_id;
+        if (endpoint_guid && endpoint_guid[0] != L'\0' &&
+            SUCCEEDED(CLSIDFromString(endpoint_guid, &default_endpoint_id)) &&
+            SUCCEEDED(hcn_get_endpoint_mac(&default_endpoint_id,
+                                           default_mac, sizeof(default_mac))) &&
+            default_mac[0])
+            swprintf_s(default_mac_field, _countof(default_mac_field),
+                       L",\"MacAddress\":\"%S\"", default_mac);
         if (share_endpoint_guid && share_endpoint_guid[0] != L'\0' &&
             share_mac && share_mac[0])
             swprintf_s(share_mac_field, _countof(share_mac_field),
@@ -964,13 +975,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             share_endpoint_guid && share_endpoint_guid[0] != L'\0') {
             swprintf_s(net_section, _countof(net_section),
                 L",\"NetworkAdapters\":{"
-                L"\"Default\":{\"EndpointId\":\"%s\"},"
+                L"\"Default\":{\"EndpointId\":\"%s\"%s},"
                 L"\"SharedResources\":{\"EndpointId\":\"%s\"%s}}",
-                endpoint_guid, share_endpoint_guid, share_mac_field);
+                endpoint_guid, default_mac_field,
+                share_endpoint_guid, share_mac_field);
         } else if (endpoint_guid && endpoint_guid[0] != L'\0') {
             swprintf_s(net_section, _countof(net_section),
-                L",\"NetworkAdapters\":{\"Default\":{\"EndpointId\":\"%s\"}}",
-                endpoint_guid);
+                L",\"NetworkAdapters\":{\"Default\":{\"EndpointId\":\"%s\"%s}}",
+                endpoint_guid, default_mac_field);
         } else {
             swprintf_s(net_section, _countof(net_section),
                 L",\"NetworkAdapters\":{\"SharedResources\":{\"EndpointId\":\"%s\"%s}}",

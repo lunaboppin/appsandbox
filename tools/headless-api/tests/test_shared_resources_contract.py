@@ -63,8 +63,20 @@ def main():
           "NAT configuration does not hard-code the guest adapter name")
     check("configure_nat_nic" in agent and
           "ASB_SHARED_NIC_MAC" in agent and
-          "Get-NetRoute" in agent,
+          "Status -ne 'Disabled'" in agent and
+          "Get-NetRoute" in agent and
+          "NAT configuration failed adapter=" in agent,
           "NAT configuration selects the non-share adapter and verifies its route")
+    check('agent_log_to_host("nat_net: %s", line)' in agent,
+          "NAT configuration diagnostics are forwarded to the host log")
+    check("hcn_get_endpoint_mac" in host_agent and
+          "ASB_NAT_NIC_MAC" in agent and
+          "NAT adapter with MAC" in agent,
+          "NAT configuration targets the HCN endpoint MAC rather than guessing")
+    check("hcn_get_endpoint_mac" in hcs and
+          "default_mac_field" in hcs and
+          r'L"\"Default\":{\"EndpointId\":\"%s\"%s}' in hcs,
+          "HCS binds the guest NAT adapter to the HCN endpoint MAC")
     check("shared_appliance_get_smb_credentials" in host_agent,
           "client mappings do not use appliance DPAPI credentials")
     check("strrchr(arg, ':')" in agent,
