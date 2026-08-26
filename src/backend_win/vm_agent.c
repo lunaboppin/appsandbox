@@ -393,9 +393,42 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
             return (int)strlen(rsp);
         }
 
-        /* Untagged = async message, process inline */
-        process_async_message(vm, s, rsp);
+        /* Untagged = async message, process inline. A shutdown or service
+           stop invalidates the in-flight command; do not continue startup
+           configuration against a guest that is going away. */
+        if (process_async_message(vm, s, rsp) != 0) return -1;
     }
+}
+
+static BOOL configure_guest_nat(SOCKET s, VmInstance *vm, AgentConn *conn,
+                                char *response, int response_max)
+{
+    char ip_cmd[160], nat_mac[32] = "";
+    HRESULT mac_hr;
+    int n;
+
+    if (!vm || !conn || !response || response_max <= 0 ||
+        vm->network_mode != NET_NAT || vm->nat_ip[0] == '\0')
+        return TRUE;
+
+    mac_hr = hcn_get_endpoint_mac(&vm->endpoint_id, nat_mac, sizeof(nat_mac));
+    if (SUCCEEDED(mac_hr) && nat_mac[0]) {
+        sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1:%s",
+                  vm->nat_ip, hcn_nat_subnet_base(), nat_mac);
+        ui_log(L"NAT endpoint MAC for \"%s\": %S", vm->name, nat_mac);
+    } else {
+        /* Older HCN builds may omit MacAddress from the endpoint query. */
+        sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
+                  vm->nat_ip, hcn_nat_subnet_base());
+        ui_log(L"Could not read NAT endpoint MAC for \"%s\" (0x%08X); using guest adapter discovery.",
+               vm->name, mac_hr);
+    }
+
+    n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd,
+                        response, response_max, 60000);
+    if (n <= 0) return FALSE;
+    ui_log(L"NAT IP config for \"%s\": %S", vm->name, response);
+    return TRUE;
 }
 
 /* ---- Persistent connection thread ---- */
@@ -412,6 +445,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
     while (!conn->stop && (vm = asb_find_vm_by_id(conn->vm_id)) != NULL) {
         char buf[256];
         int n;
+        BOOL nat_configured = FALSE;
         SOCKET s;
 
         /* Try to connect */
@@ -434,6 +468,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             continue;
         }
 
+        vm->agent_initializing = TRUE;
         vm->agent_online = TRUE;
         vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
         vm->shutdown_requested = FALSE;
@@ -500,6 +535,15 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 notify_agent_status(vm);
                 goto shared_mapping_done;
             }
+
+            /* Configure NAT immediately after the private adapter is ready.
+               Mapping an appliance share may wait for SMB startup; it must not
+               delay internet configuration or leave NAT running during a later
+               guest shutdown. */
+            if (!configure_guest_nat(s, vm, conn, buf, sizeof(buf)))
+                goto disconnected;
+            nat_configured = TRUE;
+
             cred_hr = shared_appliance_get_smb_credentials(
                 user_w, _countof(user_w), password_w, _countof(password_w))
                 ? S_OK : HRESULT_FROM_WIN32(ERROR_LOGON_FAILURE);
@@ -555,29 +599,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         }
 shared_mapping_done:
 
-        /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
-           subnet's .1; prefix length is always /24 for our NAT. */
-        if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
-            char ip_cmd[160], nat_mac[32] = "";
-            HRESULT mac_hr = hcn_get_endpoint_mac(&vm->endpoint_id,
-                                                   nat_mac, sizeof(nat_mac));
-            if (SUCCEEDED(mac_hr) && nat_mac[0]) {
-                sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1:%s",
-                           vm->nat_ip, hcn_nat_subnet_base(), nat_mac);
-                ui_log(L"NAT endpoint MAC for \"%s\": %S", vm->name, nat_mac);
-            } else {
-                /* Older HCN builds may omit MacAddress from the endpoint
-                   query. Keep the adapter-name-independent fallback, but
-                   make the degraded path visible in the log. */
-                sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
-                           vm->nat_ip, hcn_nat_subnet_base());
-                ui_log(L"Could not read NAT endpoint MAC for \"%s\" (0x%08X); using guest adapter discovery.",
-                       vm->name, mac_hr);
-            }
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf), 60000);
-            if (n <= 0) goto disconnected;
-            ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
-        }
+        /* NAT-only VMs do not enter the appliance block above. */
+        if (!nat_configured && !configure_guest_nat(s, vm, conn, buf, sizeof(buf)))
+            goto disconnected;
 
         /* Send GPU share info to agent (if GPU-PV is assigned).
            Fire-and-forget - no response expected, so no tagging needed. */
@@ -626,6 +650,11 @@ shared_mapping_done:
                 ui_log(L"SSH install failed for \"%s\".", vm->name);
             }
         }
+
+        /* Startup commands are complete. Let the background synchronizer
+           retry any resource whose appliance/share was not ready yet. */
+        vm->agent_initializing = FALSE;
+        asb_request_shared_resource_sync();
 
         /* Notify UI - agent online + SSH state are all set now */
         notify_agent_status(vm);
@@ -695,6 +724,7 @@ shared_mapping_done:
         disconnected:
         /* Connection lost */
         vm->agent_online = FALSE;
+        vm->agent_initializing = FALSE;
         vm->idd_ready = FALSE;
         /* Atomically claim the socket so we never double-close a handle that
            vm_agent_stop() may have already closed (and whose value could have
@@ -772,6 +802,7 @@ void vm_agent_stop(VmInstance *instance)
     }
 
     instance->agent_online = FALSE;
+    instance->agent_initializing = FALSE;
     instance->idd_ready = FALSE;
     free_conn(conn);
     notify_agent_status(instance);

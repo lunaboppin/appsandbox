@@ -281,6 +281,9 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
+
+/* Internal: retry appliance-backed mappings after a guest agent reaches steady state. */
+void asb_request_shared_resource_sync(void);
 ASB_API HRESULT asb_shared_appliance_open_terminal(void);
 /* Copy the stopped appliance's own agent/setup logs into the host log. */
 ASB_API void asb_shared_appliance_collect_guest_log(void);

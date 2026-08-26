@@ -1809,10 +1809,20 @@ static int run_powershell_capture(const wchar_t *script, DWORD timeout_ms,
     return (int)ec;
 }
 
+static void get_agent_powershell_directory(wchar_t *directory, size_t directory_count)
+{
+    DWORD length;
+    if (!directory || directory_count < 2) return;
+    length = GetSystemDirectoryW(directory, (UINT)directory_count);
+    if (!length || length >= directory_count)
+        wcscpy_s(directory, directory_count, L"C:\\Windows\\System32");
+}
+
 static int run_agent_powershell_out(const wchar_t *script_path, DWORD timeout_ms,
                                     char *output, int output_size)
 {
-    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024]; DWORD ec, bytes;
+    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024];
+    wchar_t system_directory[MAX_PATH]; DWORD ec, bytes;
     SECURITY_ATTRIBUTES sa;
     HANDLE read_end = NULL, write_end = NULL;
     int pos = 0;
@@ -1829,11 +1839,12 @@ static int run_agent_powershell_out(const wchar_t *script_path, DWORD timeout_ms
     si.hStdOutput = write_end;
     si.hStdError = write_end;
     si.hStdInput = NULL;
+    get_agent_powershell_directory(system_directory, _countof(system_directory));
     swprintf_s(cmd, _countof(cmd),
         L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
         script_path);
     if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
+                        NULL, system_directory, &si, &pi)) {
         ec = GetLastError();
         CloseHandle(read_end); CloseHandle(write_end);
         return (int)ec;
@@ -1860,13 +1871,15 @@ static int run_agent_powershell_out(const wchar_t *script_path, DWORD timeout_ms
 
 static int run_agent_powershell(const wchar_t *script_path, DWORD timeout_ms)
 {
-    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024]; DWORD ec;
+    STARTUPINFOW si; PROCESS_INFORMATION pi; wchar_t cmd[1024];
+    wchar_t system_directory[MAX_PATH]; DWORD ec;
     ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+    get_agent_powershell_directory(system_directory, _countof(system_directory));
     swprintf_s(cmd, _countof(cmd),
         L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
         script_path);
     if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi))
+                        NULL, system_directory, &si, &pi))
         return (int)GetLastError();
     if (WaitForSingleObject(pi.hProcess, timeout_ms) != WAIT_OBJECT_0) {
         TerminateProcess(pi.hProcess, ERROR_TIMEOUT); ec = ERROR_TIMEOUT;
@@ -1878,6 +1891,7 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
 {
     static const char script[] =
         "$ErrorActionPreference='Stop'\r\n"
+        "Set-Location -LiteralPath ([Environment]::SystemDirectory)\r\n"
         "$m=$env:ASB_NET_MAC -replace '[:-]',''\r\n"
         "$a=$null\r\n"
         "for($i=0;$i -lt 60 -and -not $a;$i++){\r\n"
@@ -1962,13 +1976,17 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
 {
     static const char script[] =
         "$ErrorActionPreference='Stop'\r\n"
+        "Set-Location -LiteralPath ([Environment]::SystemDirectory)\r\n"
         "$shared=$env:ASB_SHARED_NIC_MAC -replace '[:-]',''\r\n"
         "$want=$env:ASB_NAT_NIC_MAC -replace '[:-]',''\r\n"
         "$a=$null\r\n"
+        "$last=''\r\n"
         "for($i=0;$i -lt 60 -and -not $a;$i++){\r\n"
-        " $candidates=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {\r\n"
-        "  $_.MacAddress -and ((($_.MacAddress) -replace '[:-]','') -ne $shared)\r\n"
-        " }\r\n"
+        " try{\r\n"
+        "  $candidates=@(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {\r\n"
+        "   $_.MacAddress -and ((($_.MacAddress) -replace '[:-]','') -ne $shared)\r\n"
+        "  })\r\n"
+        " }catch{$last=$_.Exception.Message;$candidates=@()}\r\n"
         " if($want){$a=$candidates | Where-Object {(($_.MacAddress) -replace '[:-]','') -eq $want} | Select-Object -First 1}\r\n"
         " else{\r\n"
         "  $a=$candidates | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1\r\n"
@@ -1977,7 +1995,7 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
         " }\r\n"
         " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
         "}\r\n"
-        "if(-not $a){if($want){Write-Output ('NAT adapter with MAC ' + $want + ' not found')}else{Write-Output 'normal NAT adapter not found'};exit 1168}\r\n"
+        "if(-not $a){if($want){Write-Output ('NAT adapter with MAC ' + $want + ' not found')}else{Write-Output 'normal NAT adapter not found'};if($last){Write-Output ('adapter query unavailable: ' + $last)};exit 1168}\r\n"
         "Write-Output ('selected adapter=' + $a.Name + ' mac=' + $a.MacAddress + ' status=' + $a.Status + ' if=' + $a.ifIndex)\r\n"
         "try{\r\n"
         " if($a.Status -eq 'Disabled'){Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop;Start-Sleep -Milliseconds 500}\r\n"
@@ -2047,6 +2065,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
 {
     static const char script[] =
         "$ErrorActionPreference='Stop'\r\n"
+        "Set-Location -LiteralPath ([Environment]::SystemDirectory)\r\n"
         "$local=$env:ASB_SMB_LOCAL\r\n"
         "$remote=$env:ASB_SMB_REMOTE\r\n"
         "$root=$local+'\\'\r\n"
@@ -2055,7 +2074,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         "$secure=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force\r\n"
         "$cred=[System.Management.Automation.PSCredential]::new(($h+'\\'+$env:ASB_SMB_USER),$secure)\r\n"
         "$code=1\r\n"
-        "for($attempt=0;$attempt -lt 5;$attempt++){\r\n"
+        "for($attempt=0;$attempt -lt 8;$attempt++){\r\n"
         " try{\r\n"
         "  $existing=Get-SmbGlobalMapping -LocalPath $local -ErrorAction SilentlyContinue\r\n"
         "  if($existing){\r\n"
@@ -2076,7 +2095,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         "  $code=([int]$_.Exception.HResult -band 0xffff);if($code -eq 0){$code=1};$last=$_.Exception.Message\r\n"
         "  Remove-SmbGlobalMapping -LocalPath $local -Force -ErrorAction SilentlyContinue\r\n"
         " }\r\n"
-        " if($attempt -lt 4){Start-Sleep -Milliseconds 750}\r\n"
+        " if($attempt -lt 7){Start-Sleep -Milliseconds 1000}\r\n"
         "}\r\n"
         "if(-not $last){$last='mapped drive was not readable'}\r\n"
         "Write-Output ('map failed user=' + $h + '\\' + $env:ASB_SMB_USER + ' target=' + $remote + ': ' + $last)\r\n"

@@ -4716,7 +4716,8 @@ static void sync_vm_shared_resources(VmInstance *inst)
     int want, prev, i, j;
     BOOL synced = TRUE;
 
-    if (!inst || !inst->running || !inst->agent_online) return;
+    if (!inst || !inst->running || !inst->agent_online ||
+        inst->agent_initializing) return;
     if (_wcsicmp(inst->shared_resource_transport, L"appliance") != 0 ||
         inst->share_host_ip[0] == '\0') return;
 
@@ -4756,9 +4757,20 @@ static void sync_vm_shared_resources(VmInstance *inst)
     inst->shared_resource_pending = !synced;
 }
 
+static BOOL shared_resource_retry_eligible(const VmInstance *inst)
+{
+    return inst && inst->shared_resource_pending && inst->running &&
+           inst->agent_online && !inst->agent_initializing &&
+           _wcsicmp(inst->shared_resource_transport, L"appliance") == 0 &&
+           inst->share_host_ip[0] != '\0';
+}
+
 /* 0 = idle, 1 = a pass is running, 2 = a pass is running and the resource set
    changed again since it started. */
 static volatile LONG g_share_sync_state;
+
+#define SHARED_RESOURCE_RETRY_DELAY_MS 2000
+#define SHARED_RESOURCE_RETRY_PASSES   30
 
 static DWORD WINAPI share_sync_thread(LPVOID parameter)
 {
@@ -4767,6 +4779,7 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
         SharedApplianceStatus appliance;
         HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_READY);
         int attempt, i;
+        BOOL retry_pending;
         /* Publish the definitions on the appliance before any guest tries to
            mount them. A stopped appliance has nothing to publish to and
            republishes the whole set when it next boots; one that is mid-start
@@ -4786,8 +4799,38 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
             asb_log(L"Shared resources will be published when the shared appliance is ready.");
         else if (FAILED(hr))
             asb_log(L"Error: Failed to publish shared resources on the appliance (0x%08X)", hr);
-        for (i = 0; i < g_vm_count; i++) sync_vm_shared_resources(&g_vms[i]);
+        retry_pending = FALSE;
+        for (i = 0; i < g_vm_count; i++) {
+            sync_vm_shared_resources(&g_vms[i]);
+            if (shared_resource_retry_eligible(&g_vms[i]))
+                retry_pending = TRUE;
+        }
         save_vm_list();
+
+        /* A guest can be online before Windows has finished creating its
+           network adapters, and the appliance can be reachable before the
+           per-resource share is readable. Keep failed mappings pending and
+           retry them in this background thread instead of requiring a second
+           user action. */
+        for (attempt = 0;
+             retry_pending && attempt < SHARED_RESOURCE_RETRY_PASSES;
+             ++attempt) {
+            if ((attempt % 5) == 0)
+                asb_log(L"Waiting for shared-resource mappings to become ready (attempt %d/%d).",
+                        attempt + 1, SHARED_RESOURCE_RETRY_PASSES);
+            Sleep(SHARED_RESOURCE_RETRY_DELAY_MS);
+            retry_pending = FALSE;
+            for (i = 0; i < g_vm_count; i++) {
+                if (!shared_resource_retry_eligible(&g_vms[i])) continue;
+                sync_vm_shared_resources(&g_vms[i]);
+                if (shared_resource_retry_eligible(&g_vms[i]))
+                    retry_pending = TRUE;
+            }
+            save_vm_list();
+        }
+        if (retry_pending)
+            asb_log(L"Shared-resource mappings remain pending; they will be retried when the guest agent reconnects.");
+
         if (InterlockedCompareExchange(&g_share_sync_state, 0, 1) == 1) break;
         InterlockedExchange(&g_share_sync_state, 1);
     }
@@ -4798,7 +4841,7 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
    PowerShell and can take seconds, and the callers are the GUI/API request
    loops. Guest-visible completion is reported through the agent-status
    notification each mapping raises. */
-static void request_shared_resource_sync(void)
+void asb_request_shared_resource_sync(void)
 {
     HANDLE thread;
     if (InterlockedCompareExchange(&g_share_sync_state, 1, 0) != 0) {
@@ -4818,7 +4861,7 @@ ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,
                                            wchar_t *created_id, size_t created_id_chars)
 {
     HRESULT hr=shared_resources_create(info,confirm_permissions,created_id,created_id_chars);
-    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();request_shared_resource_sync();}
+    if(SUCCEEDED(hr)){int i;for(i=0;i<g_vm_count;i++)g_vms[i].shared_resource_pending=TRUE;save_vm_list();asb_request_shared_resource_sync();}
     return hr;
 }
 
@@ -4831,7 +4874,7 @@ ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
         int i;
         for (i = 0; i < g_vm_count; i++) g_vms[i].shared_resource_pending = TRUE;
         save_vm_list();
-        request_shared_resource_sync();
+        asb_request_shared_resource_sync();
     }
     return hr;
 }
@@ -4849,7 +4892,7 @@ ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id)
             g_vms[i].shared_resource_pending = TRUE;
         }
         save_vm_list();
-        request_shared_resource_sync();
+        asb_request_shared_resource_sync();
     }
     return hr;
 }
@@ -4877,7 +4920,7 @@ ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
     if (SUCCEEDED(hr)) {
         inst->shared_resource_pending = TRUE;
         save_vm_list();
-        request_shared_resource_sync();
+        asb_request_shared_resource_sync();
     }
     return hr;
 }

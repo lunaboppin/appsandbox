@@ -51,9 +51,13 @@ def main():
     check("New-SmbGlobalMapping" in agent and "-RequireIntegrity $true" in agent,
           "guest does not create a signed global SMB mapping")
     check("Get-Item -LiteralPath $root -Force -ErrorAction Stop" in agent and
-          "for($attempt=0;$attempt -lt 5;$attempt++)" in agent and
+          "for($attempt=0;$attempt -lt 8;$attempt++)" in agent and
           "Remove-SmbGlobalMapping -LocalPath $local -Force" in agent,
           "guest can report an SMB drive mapped before its root is readable")
+    check("Set-Location -LiteralPath ([Environment]::SystemDirectory)" in agent and
+          "GetSystemDirectoryW" in agent and
+          "system_directory" in agent,
+          "PowerShell helpers escape mapped-drive working directories")
     check("Enable-NetAdapter -Name $a.Name" in agent and
           "Status -eq 'Up'" in agent and
           "Get-NetIPAddress -InterfaceIndex $a.ifIndex" in agent,
@@ -73,6 +77,13 @@ def main():
           "ASB_NAT_NIC_MAC" in agent and
           "NAT adapter with MAC" in agent,
           "NAT configuration targets the HCN endpoint MAC rather than guessing")
+    check("agent_initializing" in host_agent and
+          "process_async_message(vm, s, rsp) != 0" in host_agent and
+          "asb_request_shared_resource_sync();" in host_agent,
+          "guest startup does not race shared mapping and retries after readiness")
+    check(host_agent.index("if (!configure_guest_nat") <
+          host_agent.index("sprintf_s(map_cmd"),
+          "NAT configuration is sent before slow appliance SMB mapping")
     check("hcn_get_endpoint_mac" in hcs and
           "default_mac_field" in hcs and
           r'L"\"Default\":{\"EndpointId\":\"%s\"%s}' in hcs,

@@ -92,6 +92,7 @@ typedef struct {
     BOOL        running;
     BOOL        network_cleaned;  /* TRUE after network teardown (idempotent guard) */
     BOOL        agent_online;     /* TRUE when persistent agent connection is active */
+    volatile BOOL agent_initializing; /* TRUE while the connection startup commands run */
     BOOL        idd_ready;        /* TRUE once the agent reports the display driver is up (idd_status:ok) */
     BOOL        is_template;     /* TRUE = template VM (sysprep after install) */
     BOOL        is_appliance;    /* TRUE = hidden shared-storage appliance */
