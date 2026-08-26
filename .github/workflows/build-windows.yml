@@ -1,0 +1,145 @@
+name: Build Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Release x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Verify Windows driver build tools
+        shell: pwsh
+        run: |
+          $kitRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $umdfProps = Get-ChildItem -LiteralPath (Join-Path $kitRoot 'build') -Recurse -Filter 'WindowsDriver.UserMode.UMDF.props' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          $inf2cat = Get-ChildItem -LiteralPath (Join-Path $kitRoot 'bin') -Recurse -Filter 'Inf2Cat.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $umdfProps -or -not $inf2cat) {
+            throw "The GitHub runner does not contain the WDK/UMDF build tools."
+          }
+
+          Write-Host "UMDF build props: $($umdfProps.FullName)"
+          Write-Host "Inf2Cat: $($inf2cat.FullName)"
+
+      - name: Build Release solution
+        shell: pwsh
+        run: |
+          # The hosted runner may expose both PATH and Path. MSBuild's native
+          # tool launcher rejects that duplicate environment key on Windows.
+          $pathValue = [Environment]::GetEnvironmentVariable('Path', 'Process')
+          Remove-Item Env:\PATH -ErrorAction SilentlyContinue
+          Remove-Item Env:\Path -ErrorAction SilentlyContinue
+          $env:Path = $pathValue
+
+          # Driver post-build events invoke Windows PowerShell. Keep the
+          # system module path ahead of any PowerShell 7 modules on the runner.
+          $env:PSModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:WINDIR\System32\WindowsPowerShell\v1.0\Modules"
+          $env:ASB_SKIP_PACKAGE_PROJECT = '1'
+
+          $msbuild = (Get-Command msbuild.exe -ErrorAction Stop).Source
+          & $msbuild '.\AppSandbox.sln' `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SignMode=Off `
+            /m:1 `
+            /nr:false `
+            /v:minimal `
+            /nologo
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Verify Release artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            'bin\Release\AppSandbox.exe',
+            'bin\Release\appsandbox_core.dll',
+            'bin\Release\iso-patch.exe',
+            'bin\Release\WebView2Loader.dll',
+            'bin\Release\resources\appsandbox-agent.exe',
+            'bin\Release\drivers\AppSandboxVDD.dll',
+            'bin\Release\drivers\AppSandboxVDD.inf',
+            'bin\Release\drivers\AppSandboxVDD.cat',
+            'bin\Release\drivers\AppSandboxVAD.sys',
+            'bin\Release\drivers\AppSandboxVAD.inf',
+            'bin\Release\drivers\AppSandboxVAD.cat',
+            'bin\Release\drivers\AppSandboxSHM.sys',
+            'bin\Release\drivers\AppSandboxSHM.inf',
+            'bin\Release\drivers\AppSandboxSHM.cat',
+            'bin\Release\drivers\devcon.exe',
+            'bin\Release\web\index.html'
+          )
+
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
+          if ($missing.Count -gt 0) {
+            throw "Missing Release artifacts:`n$($missing -join "`n")"
+          }
+
+          Write-Host 'Driver artifacts:'
+          Get-ChildItem -LiteralPath 'bin\Release\drivers' -File | Sort-Object Name | ForEach-Object {
+            Write-Host ("  {0} ({1} bytes)" -f $_.Name, $_.Length)
+          }
+
+      - name: Create Windows package
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'bin\Release'
+          $stage = Join-Path $env:RUNNER_TEMP 'AppSandbox-package'
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'AppSandbox-windows-x64.zip'
+
+          if (Test-Path -LiteralPath $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          foreach ($file in @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll')) {
+            Copy-Item -LiteralPath (Join-Path $bin $file) -Destination (Join-Path $stage $file) -Force
+          }
+
+          foreach ($folder in @('drivers', 'resources', 'web')) {
+            Copy-Item -LiteralPath (Join-Path $bin $folder) -Destination (Join-Path $stage $folder) -Recurse -Force
+          }
+
+          $sdk = Join-Path $env:GITHUB_WORKSPACE 'tools\headless-api'
+          New-Item -ItemType Directory -Path (Join-Path $stage 'headless-api') -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $sdk 'asb.py') -Destination (Join-Path $stage 'headless-api\asb.py') -Force
+          Copy-Item -LiteralPath (Join-Path $sdk 'README.md') -Destination (Join-Path $stage 'headless-api\README.md') -Force
+
+          Get-ChildItem -LiteralPath $stage -Recurse -File |
+            Where-Object { $_.Extension -in @('.pdb', '.lib', '.exp', '.ilk', '.iobj', '.ipdb', '.map', '.cer', '.log') } |
+            Remove-Item -Force
+
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          Write-Host "Created $zip"
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppSandbox-windows-x64
+          path: AppSandbox-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
