@@ -1396,8 +1396,16 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         if (FAILED(hr)) {
             asb_log(L"Shared appliance unavailable for \"%s\" (0x%08X).", vm->name, hr);
             asb_alert(L"The shared-storage appliance is unavailable. Retry or start without shared resources.");
-            HeapFree(GetProcessHeap(), 0, args);
-            return 0;
+            asb_vm_cleanup_network(vm);
+            InterlockedExchange(&vm->management_busy, 0);
+            if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
+            free(args);
+            return 1;
+        }
+        if (args->config.shared_resource_count > 0 &&
+            !args->config.allow_missing_shared_resources) {
+            ui_log(L"VM \"%s\": shared-storage appliance is ready; continuing startup.",
+                   vm->name);
         }
     }
 
@@ -3681,8 +3689,9 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         shared_resources_build_attachments(inst->os_type,
             inst->shared_resource_exclusions, inst->shared_resources,
             ASB_MAX_SHARED_RESOURCES) > 0) {
-        HRESULT dependency_hr = shared_appliance_start(TRUE, 120000);
-        if (FAILED(dependency_hr)) {
+        SharedApplianceStatus dependency_status;
+        shared_appliance_get_status(&dependency_status);
+        if (!dependency_status.configured) {
             InterlockedExchange(&inst->management_busy, 0);
             return HRESULT_FROM_WIN32(ERROR_NOT_READY);
         }
@@ -3743,6 +3752,11 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
             inst->os_type, inst->shared_resource_exclusions,
             args->config.shared_resources, ASB_MAX_SHARED_RESOURCES);
         args->config.allow_missing_shared_resources = allow_missing_shared_resources;
+        if (args->config.shared_resource_count > 0 &&
+            !allow_missing_shared_resources) {
+            ui_log(L"VM \"%s\": waiting for the shared-storage appliance to become ready; "
+                   L"the application remains responsive.", inst->name);
+        }
         memcpy(inst->shared_resources, args->config.shared_resources,
                sizeof(inst->shared_resources));
         inst->shared_resource_count = args->config.shared_resource_count;

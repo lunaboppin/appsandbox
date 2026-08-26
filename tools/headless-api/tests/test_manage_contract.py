@@ -59,6 +59,17 @@ def main() -> int:
     check("InterlockedCompareExchange(&inst->management_busy" in start_body and
           "InterlockedExchange(&inst->management_busy, 0)" in start_body,
           "VM start does not serialize against management operations")
+    start_ex = core[core.index("ASB_API HRESULT asb_vm_start_ex"):core.index("/* ---- VM Shutdown")]
+    pre_worker = start_ex[:start_ex.index("/* Switch to snapshot/base branch")]
+    check("shared_appliance_start(" not in pre_worker and
+          "shared_appliance_get_status" in pre_worker,
+          "shared-resource VM start still starts or waits for the appliance on the UI thread")
+    check("waiting for the shared-storage appliance" in core,
+          "shared-resource VM start does not report that it is waiting for the appliance")
+    prepare_failure = core[core.index("hr = prepare_shared_transport"):core.index("/* ---- Background VHDX creation thread ----")]
+    check("InterlockedExchange(&vm->management_busy, 0)" in prepare_failure and
+          "g_state_cb" in prepare_failure,
+          "shared-resource preparation failure leaves the VM lifecycle busy")
     check("ERROR_DIR_NOT_EMPTY" in core and "branch_count > 0" in core,
           "core checkpoint deletion is not branch-first")
     check("instance->running" in snapshot and "ERROR_DIR_NOT_EMPTY" in snapshot,
