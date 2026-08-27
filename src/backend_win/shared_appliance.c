@@ -31,6 +31,8 @@
 #define APPLIANCE_SERVICE_USER L"AppSandboxShare"
 #define APPLIANCE_IDLE_MS (5ull * 60ull * 1000ull)
 #define APPLIANCE_SETUP_TIMEOUT_MS (30ul * 60ul * 1000ul)
+#define HOST_MAPPING_ALREADY_PRESENT 100ul
+#define HOST_MAPPING_NOT_PRESENT 101ul
 
 #if defined(_M_ARM64)
 #define UBUNTU_IMAGE_NAME L"noble-server-cloudimg-arm64.img"
@@ -69,6 +71,7 @@ typedef struct {
     volatile LONG readiness_wait_active;
     LONG idle_generation;
     LONG restart_attempts;
+    volatile LONG host_mount_mask;
 } SharedApplianceGlobal;
 
 typedef struct {
@@ -1387,6 +1390,7 @@ void shared_appliance_cleanup(void)
         if (resource && resource->host_drive_letter)
             host_mapping_command(resource, FALSE);
     }
+    InterlockedExchange(&g_appliance.host_mount_mask, 0);
     g_appliance.status.host_mounts = 0;
     shared_appliance_stop(FALSE);
     cleanup_runtime_network();
@@ -1775,9 +1779,18 @@ HRESULT shared_appliance_rebuild(const SharedApplianceConfig *replacement,
     return S_OK;
 }
 
+static DWORD host_mount_bit(const AsbSharedResourceInfo *resource)
+{
+    int offset;
+    if (!resource || !resource->host_drive_letter) return 0;
+    offset = towupper(resource->host_drive_letter) - L'D';
+    return offset >= 0 && offset < 26 ? (DWORD)1u << offset : 0;
+}
+
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount)
 {
-    wchar_t admin[256], password[256], command[4096], share[64], target[256];
+    wchar_t admin[256] = {0}, password[256] = {0};
+    wchar_t command[4096], share[64], target[256];
     DWORD exit_code;
     HRESULT hr;
     if (!resource || !resource->host_drive_letter) return E_INVALIDARG;
@@ -1795,20 +1808,38 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     if (mount) {
         swprintf_s(command, _countof(command),
           L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+          L"$ErrorActionPreference='Stop';$l='%c:';$r='%s';"
+          L"for($a=0;$a -lt 8;$a++){"
+          L"try{$m=Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue;"
+          L"if($m){if($m.RemotePath -ieq $r){"
+          L"try{$null=Get-Item -LiteralPath ($l+'\\') -Force -ErrorAction Stop;exit 100}catch{}"
+          L"};exit 85};"
           L"$p=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force;"
           L"$c=[pscredential]::new($env:ASB_SMB_USER,$p);"
-          L"New-SmbGlobalMapping -LocalPath '%c:' -RemotePath '%s' -Credential $c "
-          L"-Persistent $false -RequireIntegrity $true -ErrorAction Stop|Out-Null\"",
+          L"New-SmbGlobalMapping -LocalPath $l -RemotePath $r -Credential $c "
+          L"-Persistent $false -RequireIntegrity $true -ErrorAction Stop|Out-Null;"
+          L"for($i=0;$i -lt 20;$i++){"
+          L"try{$null=Get-Item -LiteralPath ($l+'\\') -Force -ErrorAction Stop;exit 0}catch{}"
+          L"Start-Sleep -Milliseconds 250};"
+          L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction SilentlyContinue"
+          L"}catch{if($a -eq 7){exit 1}};Start-Sleep -Milliseconds 500};exit 1\"",
           resource->host_drive_letter, target);
     } else {
         swprintf_s(command, _countof(command),
           L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
-          L"Remove-SmbGlobalMapping -LocalPath '%c:' -Force -ErrorAction SilentlyContinue\"",
+          L"$ErrorActionPreference='SilentlyContinue';$l='%c:';"
+          L"if(-not (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue)){exit 101};"
+          L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction SilentlyContinue;"
+          L"for($i=0;$i -lt 20 -and (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue);$i++){"
+          L"Start-Sleep -Milliseconds 250};"
+          L"if(Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue){exit 1};exit 0\"",
           resource->host_drive_letter);
     }
     hr = run_hidden_process(command, 60000);
     exit_code = HRESULT_CODE(hr);
-    (void)exit_code;
+    if ((mount && exit_code == HOST_MAPPING_ALREADY_PRESENT) ||
+        (!mount && exit_code == HOST_MAPPING_NOT_PRESENT))
+        hr = S_FALSE;
     SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", NULL);
     SetEnvironmentVariableW(L"ASB_SMB_USER", NULL);
     SecureZeroMemory(password, sizeof(password));
@@ -1819,22 +1850,37 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
 HRESULT shared_appliance_mount_host_resource(const wchar_t *resource_id)
 {
     const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
+    DWORD bit;
+    LONG previous;
     HRESULT hr;
     if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    bit = host_mount_bit(resource);
     hr = shared_appliance_start(TRUE, 120000); if (FAILED(hr)) return hr;
     hr = host_mapping_command(resource, TRUE);
-    if (SUCCEEDED(hr)) InterlockedIncrement(&g_appliance.status.host_mounts);
+    if (hr == S_FALSE) hr = S_OK;
+    if (SUCCEEDED(hr) && bit) {
+        previous = InterlockedOr(&g_appliance.host_mount_mask, (LONG)bit);
+        if (!(previous & (LONG)bit))
+            InterlockedIncrement(&g_appliance.status.host_mounts);
+    }
     return hr;
 }
 
 HRESULT shared_appliance_unmount_host_resource(const wchar_t *resource_id)
 {
     const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
+    DWORD bit;
+    LONG previous;
     HRESULT hr;
     if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    bit = host_mount_bit(resource);
     hr = host_mapping_command(resource, FALSE);
-    if (SUCCEEDED(hr) && g_appliance.status.host_mounts > 0)
-        InterlockedDecrement(&g_appliance.status.host_mounts);
+    if (hr == S_FALSE) hr = S_OK;
+    if (SUCCEEDED(hr) && bit) {
+        previous = InterlockedAnd(&g_appliance.host_mount_mask, ~(LONG)bit);
+        if ((previous & (LONG)bit) && g_appliance.status.host_mounts > 0)
+            InterlockedDecrement(&g_appliance.status.host_mounts);
+    }
     InterlockedIncrement(&g_appliance.idle_generation);
     return hr;
 }

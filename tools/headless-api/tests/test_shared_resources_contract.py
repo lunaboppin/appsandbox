@@ -52,6 +52,24 @@ def main():
 
     check("New-SmbGlobalMapping" in agent and "-RequireIntegrity $true" in agent,
           "guest does not create a signed global SMB mapping")
+    appliance = read("src/backend_win/shared_appliance.c")
+    host_mapper = appliance[appliance.index("static HRESULT host_mapping_command"):
+                            appliance.index("HRESULT shared_appliance_mount_host_resource")]
+    check("Get-SmbGlobalMapping" in host_mapper and
+          "RemotePath" in host_mapper and
+          "Get-Item -LiteralPath" in host_mapper,
+          "host SMB mapping does not reconcile an existing readable mapping")
+    check("HOST_MAPPING_ALREADY_PRESENT" in host_mapper and
+          "HOST_MAPPING_NOT_PRESENT" in host_mapper and
+          "host_mapping_command(resource, TRUE)" in appliance and
+          "if (hr == S_FALSE) hr = S_OK;" in appliance and
+          "if (SUCCEEDED(hr) && bit)" in appliance and
+          "InterlockedOr(&g_appliance.host_mount_mask" in appliance,
+          "host mount accounting is not idempotent")
+    check("host_mount_mask" in appliance and
+          "InterlockedOr" in appliance and
+          "InterlockedAnd" in appliance,
+          "host mount accounting does not track unique mapped drives")
     check("Get-Item -LiteralPath $root -Force -ErrorAction Stop" in agent and
           "for($attempt=0;$attempt -lt 8;$attempt++)" in agent and
           "Remove-SmbGlobalMapping -LocalPath $local -Force" in agent,
