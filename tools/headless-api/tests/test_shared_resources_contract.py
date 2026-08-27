@@ -17,6 +17,7 @@ def main():
     agent = read("tools/agent/agent.c")
     host_agent = read("src/backend_win/vm_agent.c")
     idd = read("src/backend_win/vm_display_idd.c")
+    input_agent = read("tools/agent/appsandbox-input.c")
     headless = read("src/app_win/headless.c")
     sdk = read("tools/headless-api/asb.py")
     html = read("web/index.html")
@@ -102,6 +103,13 @@ def main():
           "IDD helper startup can collide with the agent initialization command slot")
     check("return inst->agent_online && !inst->agent_initializing && inst->idd_ready;" in core,
           "display readiness is exposed before guest initialization is complete")
+    check("MOUSE_MOVE_MIN_INTERVAL_MS" in idd and
+          "pending_mouse" in idd and
+          "SetTimer(hwnd, IDT_INPUT" in idd,
+          "IDD mouse forwarding lacks coalescing and a UI-safe rate limit")
+    input_loop = input_agent[input_agent.index("static void handle_conn"):]
+    check("switch_to_input_desktop();" in input_loop,
+          "guest input helper switches desktops once per mouse packet")
     style = read("web/style.css")
     check("input:not([type])" in style and
           "settings-resource-actions" in style and

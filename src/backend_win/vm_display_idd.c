@@ -139,6 +139,8 @@ typedef struct InputPacket {
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
+#define IDT_INPUT       2002
+#define MOUSE_MOVE_MIN_INTERVAL_MS 8
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -237,6 +239,11 @@ struct VmDisplayIdd {
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
+    BOOL           pending_mouse;   /* latest move waiting for the rate-limit timer */
+    UINT           pending_mouse_x;
+    UINT           pending_mouse_y;
+    DWORD          last_mouse_move_tick;
+    BOOL           have_last_mouse_move_tick;
 
     /* Keyboard hotkey handling */
     wchar_t        vhdx_path[MAX_PATH]; /* copy of vm->vhdx_path for settings file */
@@ -534,6 +541,26 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
         const wchar_t *name = type < 4 ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
+}
+
+/* Mouse messages can arrive much faster than the guest display refreshes.
+   Keep only the latest position and send it at a bounded rate so the window
+   thread and the guest input helper cannot be flooded by cursor movement. */
+static void flush_pending_mouse(VmDisplayIdd *d)
+{
+    DWORD now;
+
+    if (!d || !d->pending_mouse || !d->mouse_in)
+        return;
+    now = GetTickCount();
+    if (d->have_last_mouse_move_tick &&
+        (DWORD)(now - d->last_mouse_move_tick) < MOUSE_MOVE_MIN_INTERVAL_MS)
+        return;
+    send_input(d, INPUT_MOUSE_MOVE, d->pending_mouse_x, d->pending_mouse_y, 0);
+    d->pending_mouse = FALSE;
+    d->last_mouse_move_tick = now;
+    d->have_last_mouse_move_tick = TRUE;
+    KillTimer(d->hwnd, IDT_INPUT);
 }
 
 /* ==================================================================
@@ -2155,6 +2182,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_INPUT);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
@@ -2202,6 +2230,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_TIMER:
+        if (wp == IDT_INPUT && d) {
+            flush_pending_mouse(d);
+            if (d->pending_mouse)
+                SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
+            return 0;
+        }
         if (wp == IDT_PRESENT && d) {
             if (d->frame_dirty)
                 d3d_render_frame(d);
@@ -2282,7 +2316,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
                                     d->frame_width, d->frame_height, &vx, &vy);
-                send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
+                d->pending_mouse_x = vx;
+                d->pending_mouse_y = vy;
+                d->pending_mouse = TRUE;
+                flush_pending_mouse(d);
+                if (d->pending_mouse)
+                    SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
             }
         }
         return 0;
@@ -2291,6 +2330,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->mouse_in = FALSE;
             d->tracking = FALSE;
+            d->pending_mouse = FALSE;
+            KillTimer(hwnd, IDT_INPUT);
         }
         return 0;
 

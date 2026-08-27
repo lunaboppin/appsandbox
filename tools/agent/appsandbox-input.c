@@ -78,7 +78,6 @@ static void inject_input(const InputPacket *pkt)
     INPUT inp;
     UINT result;
     ZeroMemory(&inp, sizeof(inp));
-    switch_to_input_desktop();
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
@@ -169,6 +168,7 @@ static void handle_conn(AsbConn *c)
         input_log("Failed to send ready signal.");
         return;
     }
+    switch_to_input_desktop();
     input_log("Sent ready signal to host. Entering recv loop.");
 
     for (;;) {
