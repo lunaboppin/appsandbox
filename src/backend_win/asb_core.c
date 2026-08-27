@@ -308,7 +308,9 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
         closesocket(s);
 
         vm = asb_find_vm_by_id(vm_id);
-        if (vm && !vm->idd_probe_stop && vm->running && vm->auto_open_display) {
+        if (vm && !vm->idd_probe_stop && vm->running &&
+            vm->agent_online && !vm->agent_initializing && vm->idd_ready &&
+            vm->auto_open_display) {
             asb_log(L"IDD probe: VDD ready for \"%s\", opening display", vm->name);
             /* Pass the stable ID, not a VmInstance*: the UI thread looks
                it up freshly with asb_find_vm_by_id before acting. */
@@ -3988,7 +3990,7 @@ ASB_API BOOL asb_vm_idd_ready(AsbVm vm)
        agent's idd_status report (the display driver is "running"). Connecting to
        the frame service to "check" would itself become the single consumer and
        blank the display, so readiness is a passive read of these latched flags. */
-    return inst->agent_online && inst->idd_ready;
+    return inst->agent_online && !inst->agent_initializing && inst->idd_ready;
 }
 
 ASB_API BOOL asb_vm_is_building(AsbVm vm)

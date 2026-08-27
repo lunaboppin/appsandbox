@@ -22,6 +22,7 @@
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <wtsapi32.h>
+#include <shlobj.h>
 #include <userenv.h>
 #include <ntsecapi.h>
 #include <stdio.h>
@@ -35,6 +36,7 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "userenv.lib")
 
 /* GUID_DEVCLASS_DISPLAY = {4D36E968-E325-11CE-BFC1-08002BE10318} */
@@ -764,6 +766,94 @@ static BOOL enable_privilege(LPCWSTR priv_name)
     AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
     CloseHandle(token);
     return GetLastError() == ERROR_SUCCESS;
+}
+
+/* Tell Explorer in an interactive user session that a global SMB drive was
+   added. The mapping itself is deliberately still created by the service as a
+   global mapping; this helper only refreshes the shell that was already open
+   when the mapping arrived. */
+static BOOL spawn_shell_refresh_in_session(DWORD session_id, char drive_letter)
+{
+    HANDLE user_token = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t exe_path[MAX_PATH];
+    wchar_t command_line[MAX_PATH + 64];
+    wchar_t *slash;
+    LPVOID env = NULL;
+    BOOL ok;
+
+    if (!WTSQueryUserToken(session_id, &user_token)) {
+        agent_log("Shell refresh: WTSQueryUserToken(session=%lu) failed (%lu).",
+                  session_id, GetLastError());
+        return FALSE;
+    }
+
+    if (!GetModuleFileNameW(NULL, exe_path, _countof(exe_path))) {
+        agent_log("Shell refresh: GetModuleFileNameW failed (%lu).", GetLastError());
+        CloseHandle(user_token);
+        return FALSE;
+    }
+    slash = wcsrchr(exe_path, L'\\');
+    if (!slash) {
+        CloseHandle(user_token);
+        return FALSE;
+    }
+    swprintf_s(command_line, _countof(command_line), L"\"%ls\" --refresh-drive %c",
+               exe_path, towupper((wchar_t)drive_letter));
+
+    if (!CreateEnvironmentBlock(&env, user_token, FALSE))
+        env = NULL; /* the helper does not require an environment block */
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    ok = CreateProcessAsUserW(user_token, NULL, command_line, NULL, NULL, FALSE,
+                              CREATE_NO_WINDOW |
+                                  (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                              env, NULL, &si, &pi);
+    if (!ok) {
+        agent_log("Shell refresh: CreateProcessAsUserW failed (%lu).", GetLastError());
+    } else {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(user_token);
+    return ok;
+}
+
+static void notify_shell_drive_added(const char *letter_a)
+{
+    DWORD session_id;
+
+    if (!letter_a || strlen(letter_a) != 1 ||
+        !isalpha((unsigned char)letter_a[0]))
+        return;
+    session_id = WTSGetActiveConsoleSessionId();
+    if (session_id == 0xFFFFFFFF)
+        return;
+    if (!spawn_shell_refresh_in_session(
+            session_id, (char)towupper((wchar_t)(unsigned char)letter_a[0])))
+        agent_log("Shell refresh: could not notify session %lu for drive %c:.",
+                  session_id, towupper((wchar_t)(unsigned char)letter_a[0]));
+}
+
+static int refresh_drive_shell(const char *letter_a)
+{
+    wchar_t root[8];
+
+    if (!letter_a || strlen(letter_a) != 1 ||
+        !isalpha((unsigned char)letter_a[0]))
+        return ERROR_INVALID_PARAMETER;
+    swprintf_s(root, _countof(root), L"%c:\\",
+               towupper((wchar_t)(unsigned char)letter_a[0]));
+    SHChangeNotify(SHCNE_DRIVEADD, SHCNF_PATHW, root, NULL);
+    SHChangeNotify(SHCNE_DRIVEADDGUI, SHCNF_PATHW, root, NULL);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, root, NULL);
+    return ERROR_SUCCESS;
 }
 
 /* ---- Input helper process (spawned into console session as SYSTEM) ---- */
@@ -1981,25 +2071,37 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
         "$want=$env:ASB_NAT_NIC_MAC -replace '[:-]',''\r\n"
         "$a=$null\r\n"
         "$last=''\r\n"
+        "$last_candidates=@()\r\n"
+        "$fallback=$false\r\n"
         "for($i=0;$i -lt 60 -and -not $a;$i++){\r\n"
         " try{\r\n"
         "  $candidates=@(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {\r\n"
         "   $_.MacAddress -and ((($_.MacAddress) -replace '[:-]','') -ne $shared)\r\n"
         "  })\r\n"
         " }catch{$last=$_.Exception.Message;$candidates=@()}\r\n"
+        " if($candidates.Count -gt 0){$last_candidates=$candidates}\r\n"
         " if($want){$a=$candidates | Where-Object {(($_.MacAddress) -replace '[:-]','') -eq $want} | Select-Object -First 1}\r\n"
         " else{\r\n"
         "  $a=$candidates | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1\r\n"
         "  if(-not $a){$a=$candidates | Where-Object {$_.Status -ne 'Disabled'} | Select-Object -First 1}\r\n"
         "  if(-not $a){$a=$candidates | Select-Object -First 1}\r\n"
         " }\r\n"
+        " if(-not $a -and $want -and $candidates.Count -eq 1 -and $candidates[0].Status -eq 'Up' -and $i -ge 10){$a=$candidates[0];$fallback=$true}\r\n"
         " if(-not $a){Start-Sleep -Milliseconds 500}\r\n"
         "}\r\n"
+        "if(-not $a -and $want){\r\n"
+        " $fallbacks=@($last_candidates | Where-Object {$_.Status -ne 'Disabled'})\r\n"
+        " $up=@($fallbacks | Where-Object {$_.Status -eq 'Up'})\r\n"
+        " if($up.Count -eq 1){$a=$up[0];$fallback=$true}\r\n"
+        " elseif($up.Count -eq 0 -and $fallbacks.Count -eq 1){$a=$fallbacks[0];$fallback=$true}\r\n"
+        "}\r\n"
         "if(-not $a){if($want){Write-Output ('NAT adapter with MAC ' + $want + ' not found')}else{Write-Output 'normal NAT adapter not found'};if($last){Write-Output ('adapter query unavailable: ' + $last)};exit 1168}\r\n"
+        "if($fallback){Write-Output ('requested NAT adapter MAC ' + $want + ' not present; using only non-shared adapter')}\r\n"
         "Write-Output ('selected adapter=' + $a.Name + ' mac=' + $a.MacAddress + ' status=' + $a.Status + ' if=' + $a.ifIndex)\r\n"
         "try{\r\n"
         " if($a.Status -eq 'Disabled'){Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop;Start-Sleep -Milliseconds 500}\r\n"
         " Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 10 -ErrorAction Stop\r\n"
+        " Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         " Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         " New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NAT_IP -PrefixLength ([int]$env:ASB_NAT_PREFIX) -DefaultGateway $env:ASB_NAT_GATEWAY -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
         " Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($env:ASB_NAT_GATEWAY,'8.8.8.8') -ErrorAction Stop\r\n"
@@ -2144,6 +2246,8 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
     SetEnvironmentVariableW(L"ASB_SMB_USER", NULL);
     SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", NULL);
 done:
+    if (ec == ERROR_SUCCESS)
+        notify_shell_drive_added(letter_a);
     SecureZeroMemory(password, sizeof(password));
     SecureZeroMemory(user, sizeof(user));
     return ec;
@@ -3379,7 +3483,9 @@ int main(int argc, char *argv[])
             return install_service();
         if (strcmp(argv[1], "--remove") == 0)
             return remove_service();
-        printf("Usage: appsandbox-agent.exe [--install | --remove]\n");
+        if (strcmp(argv[1], "--refresh-drive") == 0 && argc == 3)
+            return refresh_drive_shell(argv[2]);
+        printf("Usage: appsandbox-agent.exe [--install | --remove | --refresh-drive X]\n");
         return 1;
     }
 

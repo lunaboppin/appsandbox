@@ -85,7 +85,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;shell32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -101,7 +101,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;shell32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -121,11 +121,11 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;shell32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>if not exist "$(SolutionDir)release\resources\" mkdir "$(SolutionDir)release\resources\"
-xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
+      <Command>if not exist "$(ProjectDir)..\..\release\resources\" mkdir "$(ProjectDir)..\..\release\resources\"
+xcopy /Y "$(TargetPath)" "$(ProjectDir)..\..\release\resources\"</Command>
       <Message>Copying appsandbox-agent.exe to release\resources\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -146,11 +146,11 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;advapi32.lib;setupapi.lib;cfgmgr32.lib;wtsapi32.lib;shell32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>if not exist "$(SolutionDir)release\resources\" mkdir "$(SolutionDir)release\resources\"
-xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
+      <Command>if not exist "$(ProjectDir)..\..\release\resources\" mkdir "$(ProjectDir)..\..\release\resources\"
+xcopy /Y "$(TargetPath)" "$(ProjectDir)..\..\release\resources\"</Command>
       <Message>Copying appsandbox-agent.exe to release\resources\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>

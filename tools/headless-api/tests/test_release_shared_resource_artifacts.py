@@ -51,6 +51,10 @@ def main() -> int:
             failures.append("bundled guest agent is missing appliance NIC configuration")
         if not contains(agent, "Start-Sleep -Milliseconds 500"):
             failures.append("bundled guest agent is missing the NIC discovery retry delay")
+        if not contains(agent, "--refresh-drive"):
+            failures.append("bundled guest agent is missing interactive shell drive refresh")
+        if not contains(agent, "using only non-shared adapter"):
+            failures.append("bundled guest agent is missing NAT MAC-mismatch fallback")
         if contains(agent, "shared_map:"):
             failures.append("bundled guest agent still contains the obsolete VSMB mapper")
 

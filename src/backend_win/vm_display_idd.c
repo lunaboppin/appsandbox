@@ -1530,10 +1530,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         return 1;
     }
 
-    /* Tell the agent to respawn input helper in console session */
-    if (!d->stop && d->vm && d->vm->agent_online) {
+    /* The agent connection has one synchronous command slot.  Startup uses it
+       for network and shared-resource configuration, so wait for that sequence
+       to finish before asking the agent to respawn the console-session helper. */
+    while (!d->stop && d->vm && d->vm->agent_online &&
+           d->vm->agent_initializing) {
+        Sleep(100);
+    }
+
+    /* Tell the agent to respawn input helper in console session. */
+    if (!d->stop && d->vm && d->vm->agent_online &&
+        !d->vm->agent_initializing) {
         idd_log(d, L"Sending idd_connect to agent...");
-        vm_agent_send(d->vm, "idd_connect", NULL, 0, 5000);
+        vm_agent_send(d->vm, "idd_connect", NULL, 0, 30000);
     }
 
     /* Input socket lives independently of the frame channel — survives

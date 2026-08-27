@@ -16,6 +16,7 @@ def main():
     hcs = read("src/backend_win/hcs_vm.c")
     agent = read("tools/agent/agent.c")
     host_agent = read("src/backend_win/vm_agent.c")
+    idd = read("src/backend_win/vm_display_idd.c")
     headless = read("src/app_win/headless.c")
     sdk = read("tools/headless-api/asb.py")
     html = read("web/index.html")
@@ -54,6 +55,13 @@ def main():
           "for($attempt=0;$attempt -lt 8;$attempt++)" in agent and
           "Remove-SmbGlobalMapping -LocalPath $local -Force" in agent,
           "guest can report an SMB drive mapped before its root is readable")
+    check("#include <shlobj.h>" in agent and
+          '#pragma comment(lib, "shell32.lib")' in agent and
+          "SHChangeNotify" in agent and
+          "SHCNE_DRIVEADDGUI" in agent and
+          "--refresh-drive" in agent and
+          "notify_shell_drive_added(letter_a)" in agent,
+          "late global SMB mappings do not refresh the interactive Explorer shell")
     check("Set-Location -LiteralPath ([Environment]::SystemDirectory)" in agent and
           "GetSystemDirectoryW" in agent and
           "system_directory" in agent,
@@ -69,8 +77,13 @@ def main():
           "ASB_SHARED_NIC_MAC" in agent and
           "Status -ne 'Disabled'" in agent and
           "Get-NetRoute" in agent and
+          "only non-shared adapter" in agent and
           "NAT configuration failed adapter=" in agent,
-          "NAT configuration selects the non-share adapter and verifies its route")
+           "NAT configuration selects the non-share adapter and verifies its route")
+    nat = agent[agent.index("static int configure_nat_nic"):]
+    check("Remove-NetRoute -Confirm:$false" in nat and
+          nat.index("Remove-NetRoute -Confirm:$false") < nat.index("New-NetIPAddress"),
+          "NAT configuration clears an existing default route before assigning the gateway")
     check('agent_log_to_host("nat_net: %s", line)' in agent,
           "NAT configuration diagnostics are forwarded to the host log")
     check("hcn_get_endpoint_mac" in host_agent and
@@ -84,6 +97,11 @@ def main():
     check(host_agent.index("if (!configure_guest_nat") <
           host_agent.index("sprintf_s(map_cmd"),
           "NAT configuration is sent before slow appliance SMB mapping")
+    check("!d->vm->agent_initializing" in idd and
+          idd.index("!d->vm->agent_initializing") < idd.index('vm_agent_send(d->vm, "idd_connect"'),
+          "IDD helper startup can collide with the agent initialization command slot")
+    check("return inst->agent_online && !inst->agent_initializing && inst->idd_ready;" in core,
+          "display readiness is exposed before guest initialization is complete")
     style = read("web/style.css")
     check("input:not([type])" in style and
           "settings-resource-actions" in style and
