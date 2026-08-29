@@ -24,6 +24,7 @@
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_MOUSE_MOVE_REL 4          /* param1/param2 = INT32 dx/dy */
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
 #define INPUT_BTN_MIDDLE    2
@@ -92,6 +93,24 @@ static void inject_input(const InputPacket *pkt)
         result = SendInput(1, &inp, sizeof(INPUT));
         if (result == 0)
             input_log("SendInput(MOUSE_MOVE) failed: %lu", GetLastError());
+        break;
+    }
+    case INPUT_MOUSE_MOVE_REL: {
+        /* Relative motion, used while the host display has the mouse captured.
+           MOUSEEVENTF_ABSOLUTE is deliberately absent: Windows reports absolute
+           injected moves to Raw Input as MOUSE_MOVE_ABSOLUTE with lLastX/lLastY
+           holding the 0..65535 normalised *position*, and game engines read
+           those fields as a frame delta. That mismatch is what makes the view
+           spin. Without the flag the same events arrive as MOUSE_MOVE_RELATIVE
+           carrying the real delta, which is what engines expect. */
+        inp.type = INPUT_MOUSE;
+        inp.mi.dx = (LONG)(INT32)pkt->param1;
+        inp.mi.dy = (LONG)(INT32)pkt->param2;
+        inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+        result = SendInput(1, &inp, sizeof(INPUT));
+        if (result == 0)
+            input_log("SendInput(MOUSE_MOVE_REL dx=%d dy=%d) failed: %lu",
+                       (INT32)pkt->param1, (INT32)pkt->param2, GetLastError());
         break;
     }
     case INPUT_MOUSE_BUTTON: {

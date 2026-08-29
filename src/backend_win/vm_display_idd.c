@@ -112,6 +112,10 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+/* Relative motion (param1/param2 = INT32 dx/dy), sent instead of MOUSE_MOVE
+   while the mouse is captured. Guests that predate this type ignore it, so an
+   older guest agent simply behaves as if capture were unavailable. */
+#define INPUT_MOUSE_MOVE_REL 4
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
@@ -141,6 +145,11 @@ typedef struct InputPacket {
 #define PRESENT_MS      16   /* ~60 fps */
 #define IDT_INPUT       2002
 #define MOUSE_MOVE_MIN_INTERVAL_MS 8
+#define IDT_INPUT_REL   2003
+/* Captured motion can be coalesced harder than absolute motion because deltas
+   accumulate rather than replace each other — nothing is lost between flushes,
+   so this is purely a cap on packet rate. 4 ms = 250 Hz. */
+#define MOUSE_REL_MIN_INTERVAL_MS 4
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -245,6 +254,27 @@ struct VmDisplayIdd {
     DWORD          last_mouse_move_tick;
     BOOL           have_last_mouse_move_tick;
 
+    /* Mouse capture ("game mode"). While captured we stop sending absolute
+       positions and feed the guest raw relative deltas instead, which is what
+       Raw Input-based games need. mouse_capture is what the user asked for and
+       is persisted; capture_active is whether it is currently applied (it is
+       dropped while the window is not the active one so the host stays usable). */
+    volatile BOOL  mouse_capture;
+    BOOL           capture_active;
+    BOOL           raw_registered;   /* RegisterRawInputDevices currently in effect */
+    BOOL           clip_active;      /* ClipCursor currently in effect */
+    BOOL           capture_chord_held; /* swallowing the Ctrl+Alt+G that toggled us */
+    INT32          pending_rel_dx;   /* raw deltas accumulated since the last flush */
+    INT32          pending_rel_dy;
+    BOOL           pending_rel;
+    DWORD          last_rel_tick;
+    BOOL           have_last_rel_tick;
+    /* Some pointers (tablets, RDP, a few KVMs) report through Raw Input as
+       absolute rather than relative; we difference them ourselves. */
+    LONG           last_raw_abs_x;
+    LONG           last_raw_abs_y;
+    BOOL           have_last_raw_abs;
+
     /* Keyboard hotkey handling */
     wchar_t        vhdx_path[MAX_PATH]; /* copy of vm->vhdx_path for settings file */
     volatile BOOL  transmit_hotkeys; /* TRUE = capture host hotkeys + send to guest */
@@ -296,6 +326,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_MOUSE_CAPTURE  0x1030
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -581,40 +612,208 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
     swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
 }
 
-static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
+                                      BOOL capture_mouse)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"captureMouse\":%d}\n",
+            transmit_hotkeys ? 1 : 0, capture_mouse ? 1 : 0);
     fclose(f);
 }
 
-/* Read the persisted setting; if the file is absent, create it with the
-   default (off) and return FALSE. Returns the transmit-hotkeys value. */
-static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
+/* Read the persisted settings; if the file is absent, create it with the
+   defaults (both off). Files written by an older build have no captureMouse
+   key, which reads as off — the desired default. */
+static void idd_display_settings_load_or_create(const wchar_t *vhdx_path,
+                                                BOOL *transmit_hotkeys,
+                                                BOOL *capture_mouse)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     char buf[256];
-    BOOL transmit = FALSE;
 
-    if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
+    *transmit_hotkeys = FALSE;
+    *capture_mouse    = FALSE;
+
+    if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE);
-        return FALSE;
+        idd_display_settings_save(vhdx_path, FALSE, FALSE);
+        return;
     }
     if (fgets(buf, sizeof(buf), f)) {
         if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
-            transmit = TRUE;
+            *transmit_hotkeys = TRUE;
+        if (strstr(buf, "\"captureMouse\":1"))
+            *capture_mouse = TRUE;
     }
     fclose(f);
-    return transmit;
+}
+
+/* ==================================================================
+ * Mouse capture ("game mode")
+ *
+ * Normally the display forwards WM_MOUSEMOVE as an absolute position and the
+ * guest injects it with MOUSEEVENTF_ABSOLUTE. That is correct for desktop use
+ * and wrong for games: Windows surfaces absolute injected moves to Raw Input
+ * as MOUSE_MOVE_ABSOLUTE with lLastX/lLastY holding the 0..65535 normalised
+ * position, and engines read those fields as a per-frame delta. The result is
+ * five-digit "deltas" every frame — the view spins. Absolute positioning also
+ * caps how far you can turn at the width of the window.
+ *
+ * While captured we instead read the physical mouse through Raw Input, which
+ * gives true relative deltas at full device resolution with no pointer
+ * ballistics applied, and send those as INPUT_MOUSE_MOVE_REL. ClipCursor keeps
+ * the pointer inside the render area so it cannot wander onto the host, and
+ * the cursor is hidden because the guest draws its own.
+ *
+ * Buttons, wheel and keyboard keep their existing paths — only motion changes.
+ * ================================================================== */
+
+static void idd_clip_cursor_to_render(VmDisplayIdd *d)
+{
+    RECT r;
+
+    if (!d || !d->render_hwnd || !IsWindow(d->render_hwnd))
+        return;
+    if (!GetWindowRect(d->render_hwnd, &r))
+        return;
+    if (r.right <= r.left || r.bottom <= r.top)
+        return;
+    ClipCursor(&r);
+    d->clip_active = TRUE;
+}
+
+static BOOL idd_register_raw_mouse(VmDisplayIdd *d, BOOL on)
+{
+    RAWINPUTDEVICE rid;
+
+    rid.usUsagePage = 0x01;   /* Generic Desktop Controls */
+    rid.usUsage     = 0x02;   /* Mouse */
+    rid.dwFlags     = on ? 0 : RIDEV_REMOVE;
+    rid.hwndTarget  = on ? d->hwnd : NULL;
+
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        if (on)
+            idd_log(d, L"RegisterRawInputDevices failed (err %lu).", GetLastError());
+        return FALSE;
+    }
+    d->raw_registered = on;
+    return TRUE;
+}
+
+/* Deltas accumulate between flushes, so rate limiting here caps packets without
+   losing motion — unlike the absolute path, where coalescing discards positions. */
+static void flush_pending_rel(VmDisplayIdd *d)
+{
+    DWORD now;
+
+    if (!d || !d->pending_rel)
+        return;
+    now = GetTickCount();
+    if (d->have_last_rel_tick &&
+        (DWORD)(now - d->last_rel_tick) < MOUSE_REL_MIN_INTERVAL_MS)
+        return;
+    send_input(d, INPUT_MOUSE_MOVE_REL,
+               (UINT32)d->pending_rel_dx, (UINT32)d->pending_rel_dy, 0);
+    d->pending_rel_dx = 0;
+    d->pending_rel_dy = 0;
+    d->pending_rel = FALSE;
+    d->last_rel_tick = now;
+    d->have_last_rel_tick = TRUE;
+    KillTimer(d->hwnd, IDT_INPUT_REL);
+}
+
+/* Apply or undo the OS-level half of capture. Does not touch d->mouse_capture,
+   so the user's choice survives alt-tabbing away and back. */
+static void idd_apply_mouse_capture(VmDisplayIdd *d, BOOL on)
+{
+    if (!d || !d->hwnd || on == d->capture_active)
+        return;
+
+    if (on) {
+        if (!idd_register_raw_mouse(d, TRUE))
+            return;   /* no raw input, no capture — stay on the absolute path */
+        d->pending_rel        = FALSE;
+        d->pending_rel_dx     = 0;
+        d->pending_rel_dy     = 0;
+        d->have_last_rel_tick = FALSE;
+        d->have_last_raw_abs  = FALSE;
+        /* Drop any half-built absolute move so it cannot land after the switch. */
+        d->pending_mouse = FALSE;
+        KillTimer(d->hwnd, IDT_INPUT);
+        /* The pointer is confined to the render area from here, so buttons are
+           always meant for the guest even if WM_MOUSELEAVE slipped through. */
+        d->mouse_in = TRUE;
+        d->capture_active = TRUE;
+        idd_clip_cursor_to_render(d);
+        SetCursor(NULL);
+    } else {
+        d->capture_active = FALSE;
+        KillTimer(d->hwnd, IDT_INPUT_REL);
+        d->pending_rel = FALSE;
+        if (d->raw_registered)
+            idd_register_raw_mouse(d, FALSE);
+        if (d->clip_active) {
+            ClipCursor(NULL);
+            d->clip_active = FALSE;
+        }
+    }
+}
+
+/* User-level toggle: records the choice, applies it if we are focused, keeps the
+   system menu in sync and persists it for this VM. */
+static void idd_set_mouse_capture(VmDisplayIdd *d, BOOL on)
+{
+    HMENU sysmenu;
+
+    if (!d || d->mouse_capture == on)
+        return;
+    d->mouse_capture = on;
+    idd_apply_mouse_capture(d, on && d->input_focused);
+
+    sysmenu = d->hwnd ? GetSystemMenu(d->hwnd, FALSE) : NULL;
+    if (sysmenu)
+        CheckMenuItem(sysmenu, IDM_MOUSE_CAPTURE,
+                      MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED));
+
+    idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->mouse_capture);
+    idd_log(d, on ? L"Mouse capture: ON (relative input; Ctrl+Alt+G releases)."
+                  : L"Mouse capture: OFF (absolute pointer).");
+}
+
+/* Ctrl+Alt+G toggles capture. It is consumed before any forwarding so the guest
+   never sees it, and it is checked inside the low-level keyboard hook too —
+   otherwise Transmit Hotkeys mode would send it straight to the guest and leave
+   no way to get the pointer back. Returns TRUE when the event was consumed. */
+static BOOL idd_handle_capture_chord(VmDisplayIdd *d, DWORD vk, BOOL up)
+{
+    if (!d || vk != 'G')
+        return FALSE;
+
+    if (up) {
+        if (!d->capture_chord_held)
+            return FALSE;
+        d->capture_chord_held = FALSE;
+        return TRUE;   /* swallow the up that matches the down we ate */
+    }
+
+    if (d->capture_chord_held)
+        return TRUE;   /* auto-repeat while still held: eat, do not re-toggle */
+
+    if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000) ||
+        !(GetAsyncKeyState(VK_MENU)    & 0x8000))
+        return FALSE;
+
+    d->capture_chord_held = TRUE;
+    idd_set_mouse_capture(d, !d->mouse_capture);
+    return TRUE;
 }
 
 /* ==================================================================
@@ -697,6 +896,11 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
         BOOL up  = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
         BOOL alt = (k->flags & LLKHF_ALTDOWN) != 0;
+        /* Checked first: in this mode every other key goes to the guest, so the
+           capture chord has to be intercepted here or there is no way out. The
+           hook runs on the window thread, so calling in is safe. */
+        if (idd_handle_capture_chord(d, k->vkCode, up))
+            return 1;
         if (idd_is_reserved_hotkey(k->vkCode, alt)) {
             idd_forward_key(d, k->vkCode, k->scanCode,
                             (k->flags & LLKHF_EXTENDED) != 0, up);
@@ -1944,9 +2148,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING, IDM_MOUSE_CAPTURE,
+                        L"Capture Mouse (Game Mode)\tCtrl+Alt+G");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(sysmenu, IDM_MOUSE_CAPTURE,
+                          MF_BYCOMMAND | (d->mouse_capture ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -2095,10 +2303,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 /* Release anything the guest may be holding from this mode. */
                 idd_flush_held_keys(d);
             }
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
+                                      d->mouse_capture);
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
                         : L"Transmit Keyboard Hotkeys: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_MOUSE_CAPTURE) {
+            idd_set_mouse_capture(d, !d->mouse_capture);
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
@@ -2123,8 +2336,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             RemoveClipboardFormatListener(hwnd);
 
-            /* Remove the hotkey hook and release any keys still held in the
-               guest before tearing the window down. */
+            /* Release the pointer, remove the hotkey hook and release any keys
+               still held in the guest before tearing the window down. */
+            idd_apply_mouse_capture(d, FALSE);
             idd_remove_kbd_hook(d);
             idd_flush_held_keys(d);
 
@@ -2183,6 +2397,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
         KillTimer(hwnd, IDT_INPUT);
+        KillTimer(hwnd, IDT_INPUT_REL);
+        /* Must run before the window goes away: a leftover ClipCursor would trap
+           the host pointer inside a rectangle that no longer has a window in it. */
+        if (d) idd_apply_mouse_capture(d, FALSE);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
@@ -2217,8 +2435,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            if (d->capture_active)
+                idd_clip_cursor_to_render(d);   /* clip rect is in screen coords */
         }
         return 0;
+
+    case WM_MOVE:
+        if (d && d->capture_active)
+            idd_clip_cursor_to_render(d);
+        break;
 
     case WM_PAINT:
     {
@@ -2234,6 +2459,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             flush_pending_mouse(d);
             if (d->pending_mouse)
                 SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
+            return 0;
+        }
+        if (wp == IDT_INPUT_REL && d) {
+            flush_pending_rel(d);
+            if (d->pending_rel)
+                SetTimer(hwnd, IDT_INPUT_REL, MOUSE_REL_MIN_INTERVAL_MS, NULL);
             return 0;
         }
         if (wp == IDT_PRESENT && d) {
@@ -2288,16 +2519,64 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (!d->input_focused)
+            if (!d->input_focused) {
                 idd_flush_held_keys(d);
+                /* Hand the pointer back to the host while we are not the active
+                   window; d->mouse_capture remembers the user's choice so it
+                   comes straight back when they return. */
+                idd_apply_mouse_capture(d, FALSE);
+                d->capture_chord_held = FALSE;
+            } else if (d->mouse_capture) {
+                idd_apply_mouse_capture(d, TRUE);
+            }
         }
         break;
 
     case WM_ERASEBKGND:
         return 1;  /* We handle all painting via D3D11 */
 
+    /* ---- Captured mouse: raw relative motion straight from the device ---- */
+    case WM_INPUT:
+        if (d && d->capture_active) {
+            RAWINPUT ri;
+            UINT size = sizeof(ri);
+            if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size,
+                                sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+                ri.header.dwType == RIM_TYPEMOUSE) {
+                LONG dx = 0, dy = 0;
+                if (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) {
+                    /* Tablet/RDP-style pointer: difference successive positions
+                       ourselves so capture still produces relative motion. */
+                    if (d->have_last_raw_abs) {
+                        dx = ri.data.mouse.lLastX - d->last_raw_abs_x;
+                        dy = ri.data.mouse.lLastY - d->last_raw_abs_y;
+                    }
+                    d->last_raw_abs_x    = ri.data.mouse.lLastX;
+                    d->last_raw_abs_y    = ri.data.mouse.lLastY;
+                    d->have_last_raw_abs = TRUE;
+                } else {
+                    dx = ri.data.mouse.lLastX;
+                    dy = ri.data.mouse.lLastY;
+                }
+                if (dx || dy) {
+                    d->pending_rel_dx += dx;
+                    d->pending_rel_dy += dy;
+                    d->pending_rel = TRUE;
+                    flush_pending_rel(d);
+                    if (d->pending_rel)
+                        SetTimer(hwnd, IDT_INPUT_REL, MOUSE_REL_MIN_INTERVAL_MS, NULL);
+                }
+            }
+        }
+        break;   /* WM_INPUT must reach DefWindowProc so the system can clean up */
+
     /* ---- Mouse tracking (events forwarded from render child) ---- */
     case WM_MOUSEMOVE:
+        /* Captured: WM_INPUT drives motion and the pointer is clipped inside the
+           render area, so the legacy position is redundant and must not be sent
+           (mixing absolute and relative would fight the guest cursor). */
+        if (d && d->capture_active)
+            return 0;
         if (d) {
             if (!d->tracking && d->render_hwnd) {
                 TRACKMOUSEEVENT tme;
@@ -2327,6 +2606,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_MOUSELEAVE:
+        if (d && d->capture_active)
+            return 0;   /* clipped inside; a stray leave must not disarm buttons */
         if (d) {
             d->mouse_in = FALSE;
             d->tracking = FALSE;
@@ -2337,7 +2618,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && d->guest_cursor)
+            if (d && d->capture_active)
+                SetCursor(NULL);   /* the guest draws its own pointer */
+            else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -2391,6 +2674,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
+        /* Ctrl+Alt+G never reaches the guest — it is how you get the pointer
+           back. In Transmit mode the hook has already eaten it. */
+        if (idd_handle_capture_chord(d, (DWORD)wp, up))
+            return 0;
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
@@ -2432,10 +2719,16 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->audio_socket       = INVALID_SOCKET;
     d->clipboard          = NULL;
 
-    /* Load the per-VM display setting, creating display_settings.json with
-       the default (off) if this VM doesn't have one yet. The hook itself is
-       installed later, on the window thread, once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    /* Load the per-VM display settings, creating display_settings.json with
+       the defaults (off) if this VM doesn't have one yet. The keyboard hook is
+       installed later, on the window thread, once the window exists; mouse
+       capture is applied by the first WM_ACTIVATE for the same reason. */
+    {
+        BOOL transmit = FALSE, capture = FALSE;
+        idd_display_settings_load_or_create(vm->vhdx_path, &transmit, &capture);
+        d->transmit_hotkeys = transmit;
+        d->mouse_capture    = capture;
+    }
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

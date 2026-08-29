@@ -19,6 +19,9 @@
  *   type=2 MOUSE_WHEEL  : p1=delta (signed int32, ~120/notch)
  *   type=3 KEY          : p1=Windows VK, p2=scancode,
  *                          p3 bit0=extended, bit1=keyup (clear=keydown)
+ *   type=4 MOUSE_MOVE_REL : p1=dx, p2=dy (signed int32) — sent instead of
+ *                          MOUSE_MOVE while the host display has the mouse
+ *                          captured, so games get true relative motion
  *
  * Build:  gcc -O2 -Wall -o appsandbox-input appsandbox-input.c
  */
@@ -47,6 +50,7 @@
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_MOUSE_MOVE_REL 4          /* p1/p2 = int32 dx/dy */
 
 #define BTN_ID_LEFT         0
 #define BTN_ID_RIGHT        1
@@ -212,6 +216,48 @@ static int uinput_open(void)
     return fd;
 }
 
+/* Relative motion lives on its own uinput device, created on demand the first
+ * time the host sends INPUT_MOUSE_MOVE_REL (i.e. when the display window has
+ * the mouse captured). It is deliberately NOT folded into the device above:
+ * that one advertises ABS_X/ABS_Y plus BTN_TOUCH so libinput classifies it as
+ * an absolute pointer, and adding REL_X/REL_Y would muddy that classification
+ * and risk the desktop path that already works. */
+static int uinput_open_relative(void)
+{
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        in_log("open /dev/uinput (relative): %s", strerror(errno));
+        return -1;
+    }
+
+    ioctl(fd, UI_SET_EVBIT, EV_REL);
+    ioctl(fd, UI_SET_RELBIT, REL_X);
+    ioctl(fd, UI_SET_RELBIT, REL_Y);
+    /* libinput only treats a device as a mouse if it has at least one button. */
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+
+    struct uinput_setup usetup = {0};
+    strncpy(usetup.name, "AppSandbox Virtual Mouse (relative)",
+            UINPUT_MAX_NAME_SIZE - 1);
+    usetup.id.bustype = BUS_VIRTUAL;
+    usetup.id.vendor  = 0xA53B;
+    usetup.id.product = 0x0002;
+    usetup.id.version = 1;
+    if (ioctl(fd, UI_DEV_SETUP, &usetup) < 0) {
+        in_log("UI_DEV_SETUP (relative): %s", strerror(errno));
+        close(fd); return -1;
+    }
+    if (ioctl(fd, UI_DEV_CREATE) < 0) {
+        in_log("UI_DEV_CREATE (relative): %s", strerror(errno));
+        close(fd); return -1;
+    }
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
+    nanosleep(&ts, NULL);
+    in_log("relative pointer device created");
+    return fd;
+}
+
 static void uinput_close(int fd)
 {
     if (fd >= 0) {
@@ -244,6 +290,22 @@ static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y)
     emit(ui_fd, EV_ABS, ABS_X, ax);
     emit(ui_fd, EV_ABS, ABS_Y, ay);
     emit_syn(ui_fd);
+}
+
+/* Relative motion from a captured host pointer. The device is opened lazily so
+ * guests that never enter game mode never grow a second input device; if it
+ * cannot be created we drop the motion rather than fail the connection. */
+static int g_rel_fd = -1;
+
+static void do_mouse_move_rel(int32_t dx, int32_t dy)
+{
+    if (g_rel_fd < 0) {
+        g_rel_fd = uinput_open_relative();
+        if (g_rel_fd < 0) return;
+    }
+    if (dx) emit(g_rel_fd, EV_REL, REL_X, dx);
+    if (dy) emit(g_rel_fd, EV_REL, REL_Y, dy);
+    emit_syn(g_rel_fd);
 }
 
 static void do_mouse_button(int ui_fd, uint32_t btn_id, uint32_t down)
@@ -337,6 +399,8 @@ static void serve(int client_fd, int ui_fd)
         case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.p1, pkt.p2); break;
         case INPUT_MOUSE_WHEEL:  do_mouse_wheel(ui_fd, (int32_t)pkt.p1); break;
         case INPUT_KEY:          do_key(ui_fd, pkt.p1, pkt.p2, pkt.p3); break;
+        case INPUT_MOUSE_MOVE_REL:
+            do_mouse_move_rel((int32_t)pkt.p1, (int32_t)pkt.p2); break;
         default: break;
         }
     }
@@ -383,5 +447,6 @@ int main(void)
 
     close(srv);
     uinput_close(ui);
+    uinput_close(g_rel_fd);
     return 0;
 }
