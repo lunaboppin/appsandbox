@@ -280,6 +280,7 @@ struct VmDisplayIdd {
     UINT           capture_vk;         /* key that toggles capture */
     UINT           capture_mods;       /* CAPTURE_MOD_* required with it */
     wchar_t        capture_bind[64];   /* canonical text, for the menu and the file */
+    HWND           capture_badge;      /* on-screen "captured" caption, NULL when off */
     BOOL           hotkeys_chord_held; /* same, for the Ctrl+Alt+K that toggled hotkeys */
     BOOL           hotkeys_forced;     /* capture switched Transmit Hotkeys on for us */
     INT32          pending_rel_dx;   /* raw deltas accumulated since the last flush */
@@ -883,6 +884,146 @@ static void flush_pending_rel(VmDisplayIdd *d)
 
 /* Apply or undo the OS-level half of capture. Does not touch d->mouse_capture,
    so the user's choice survives alt-tabbing away and back. */
+/* ---- Capture indicator -----------------------------------------------------
+ * A small caption floated over the render area while the pointer is captured.
+ * Without it there is nothing on screen saying the mouse belongs to the guest,
+ * which matters most in the case capture exists for: a full-screen game, where
+ * the cursor is hidden and the window title is not visible.
+ *
+ * A layered popup rather than a child window: the swap chain blits straight to
+ * the render child, and a sibling over it fights the Present for those pixels.
+ * An owned popup is composited by the window manager instead, so it neither
+ * flickers nor costs anything per frame. It is click-through and never
+ * activates, so it cannot take focus away from the display.
+ */
+
+#define BADGE_ALPHA      215
+#define BADGE_MARGIN_Y   18
+#define BADGE_PAD_X      14
+#define BADGE_PAD_Y      7
+
+static const wchar_t *k_badge_class = L"AppSandboxCaptureBadge";
+
+static LRESULT CALLBACK idd_badge_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT: {
+        VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        HBRUSH bg;
+        HFONT font, old_font;
+        wchar_t text[128];
+
+        GetClientRect(hwnd, &rc);
+        bg = CreateSolidBrush(RGB(24, 24, 24));
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+        FrameRect(hdc, &rc, (HBRUSH)GetStockObject(GRAY_BRUSH));
+
+        swprintf_s(text, 128, L"Mouse captured  -  %s to release",
+                   (d && d->capture_bind[0]) ? d->capture_bind : L"Pause");
+
+        font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        old_font = (HFONT)SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(235, 235, 235));
+        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, old_font);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void idd_ensure_badge_class(HINSTANCE inst)
+{
+    static BOOL registered = FALSE;
+    WNDCLASSEXW wc;
+    if (registered) return;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = idd_badge_proc;
+    wc.hInstance     = inst;
+    wc.hCursor       = NULL;
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = k_badge_class;
+    RegisterClassExW(&wc);
+    registered = TRUE;
+}
+
+/* Centre the caption near the top of the render area, in screen coordinates. */
+static void idd_position_capture_badge(VmDisplayIdd *d)
+{
+    RECT area;
+    SIZE ext;
+    HDC hdc;
+    HFONT old_font;
+    wchar_t text[128];
+    int w, h, x, y;
+
+    if (!d || !d->capture_badge || !d->render_hwnd || !IsWindow(d->render_hwnd))
+        return;
+    if (!GetWindowRect(d->render_hwnd, &area))
+        return;
+
+    swprintf_s(text, 128, L"Mouse captured  -  %s to release",
+               d->capture_bind[0] ? d->capture_bind : L"Pause");
+
+    hdc = GetDC(d->capture_badge);
+    if (!hdc) return;
+    old_font = (HFONT)SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    if (!GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &ext)) {
+        ext.cx = 240;
+        ext.cy = 16;
+    }
+    SelectObject(hdc, old_font);
+    ReleaseDC(d->capture_badge, hdc);
+
+    w = ext.cx + BADGE_PAD_X * 2;
+    h = ext.cy + BADGE_PAD_Y * 2;
+    x = area.left + ((area.right - area.left) - w) / 2;
+    y = area.top + BADGE_MARGIN_Y;
+
+    SetWindowPos(d->capture_badge, HWND_TOPMOST, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    InvalidateRect(d->capture_badge, NULL, TRUE);
+}
+
+static void idd_show_capture_badge(VmDisplayIdd *d, BOOL on)
+{
+    if (!d) return;
+
+    if (!on) {
+        if (d->capture_badge) {
+            DestroyWindow(d->capture_badge);
+            d->capture_badge = NULL;
+        }
+        return;
+    }
+
+    if (!d->capture_badge) {
+        idd_ensure_badge_class(d->hInstance);
+        d->capture_badge = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            k_badge_class, L"", WS_POPUP,
+            0, 0, 10, 10, d->hwnd, NULL, d->hInstance, NULL);
+        if (!d->capture_badge)
+            return;   /* cosmetic only: capture still works without it */
+        SetWindowLongPtrW(d->capture_badge, GWLP_USERDATA, (LONG_PTR)d);
+        SetLayeredWindowAttributes(d->capture_badge, 0, BADGE_ALPHA, LWA_ALPHA);
+    }
+
+    idd_position_capture_badge(d);
+    ShowWindow(d->capture_badge, SW_SHOWNOACTIVATE);
+}
+
 static void idd_sync_cursor_to_guest(VmDisplayIdd *d);
 static void idd_set_transmit_hotkeys(VmDisplayIdd *d, BOOL on, BOOL persist);
 
@@ -918,8 +1059,10 @@ static void idd_apply_mouse_capture(VmDisplayIdd *d, BOOL on)
            it happened to be until the guest next reports a cursor position. */
         idd_sync_cursor_to_guest(d);
         SetCursor(d->cursor_visible && d->guest_cursor ? d->guest_cursor : NULL);
+        idd_show_capture_badge(d, TRUE);
     } else {
         d->capture_active = FALSE;
+        idd_show_capture_badge(d, FALSE);
         if (d->hotkeys_forced) {
             d->hotkeys_forced = FALSE;
             idd_set_transmit_hotkeys(d, FALSE, FALSE);
@@ -2724,14 +2867,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
-            if (d->capture_active)
+            if (d->capture_active) {
                 idd_clip_cursor_to_render(d);   /* clip rect is in screen coords */
+                idd_position_capture_badge(d);  /* ...and so is the caption */
+            }
         }
         return 0;
 
     case WM_MOVE:
-        if (d && d->capture_active)
+        if (d && d->capture_active) {
             idd_clip_cursor_to_render(d);
+            idd_position_capture_badge(d);
+        }
         break;
 
     case WM_PAINT:
