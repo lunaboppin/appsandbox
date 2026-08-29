@@ -3277,7 +3277,7 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
         }
         if (event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK) {
             DWORD sid = sn ? sn->dwSessionId : WTSGetActiveConsoleSessionId();
-            agent_log("Session %s detected (session %lu), respawning clipboard helpers.",
+            agent_log("Session %s detected (session %lu), respawning helpers.",
                        event_type == WTS_SESSION_LOGON ? "logon" : "unlock", sid);
             kill_clipboard_helper();
             if (sid != 0xFFFFFFFF)
@@ -3285,6 +3285,20 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
             kill_clipboard_reader();
             if (sid != 0xFFFFFFFF)
                 spawn_clipboard_reader_in_session(sid);
+            /* The input helper binds WinSta0\Default when it is created, so one
+               spawned before anybody logged on stays attached to the pre-logon
+               desktop: alive, holding the input channel, but with every
+               SendInput failing ERROR_ACCESS_DENIED. The monitor cannot notice
+               -- the process has not died and the console session id has not
+               changed -- so the guest is left with no working mouse until the
+               service is restarted by hand. Drop it here and let the monitor
+               respawn it against the desktop that now exists.
+
+               Killed rather than respawned inline on purpose: spawning stays in
+               the monitor thread alone, so the two threads cannot both create a
+               helper and leave the loser failing asb_listen() on a channel the
+               winner already bound. */
+            kill_input_helper();
         }
         return NO_ERROR;
     }
