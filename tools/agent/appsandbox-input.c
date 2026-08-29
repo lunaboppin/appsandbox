@@ -63,13 +63,87 @@ static void input_log(const char *fmt, ...)
 
 /* ---- Desktop switching ---- */
 
-static void switch_to_input_desktop(void)
+/* Minimum gap between rebind attempts, so a desktop that genuinely refuses
+   injection (the secure desktop behind Ctrl+Alt+Del) cannot spin. */
+#define DESKTOP_REBIND_MIN_MS 250
+
+static HDESK g_input_desk = NULL;
+
+/* Bind this thread to whatever desktop currently owns input.
+ *
+ * Called once at startup and again whenever injection is refused. A thread
+ * stays attached to the desktop it bound to, so after a switch -- lock,
+ * unlock, logon, fast user switch -- every SendInput into the new desktop
+ * fails with ERROR_ACCESS_DENIED, permanently. Binding once was why a guest
+ * that had been locked came back with a mouse that moved nothing.
+ */
+static BOOL switch_to_input_desktop(void)
 {
     HDESK desk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (desk) {
-        SetThreadDesktop(desk);
+    HDESK prev;
+
+    if (!desk)
+        return FALSE;
+    if (!SetThreadDesktop(desk)) {
         CloseDesktop(desk);
+        return FALSE;
     }
+
+    /* Only safe to close the old one once it is no longer this thread's. */
+    prev = g_input_desk;
+    g_input_desk = desk;
+    if (prev)
+        CloseDesktop(prev);
+    return TRUE;
+}
+
+/* Inject one event, rebinding to the current input desktop if it is refused.
+ *
+ * All failure logging lives here and is rate limited on purpose: a captured
+ * mouse produces these hundreds of times a second, and writing every one to
+ * disk was itself enough to stutter the guest.
+ */
+static void send_input_retry(INPUT *inp, const char *what)
+{
+    static DWORD last_rebind = 0;
+    static DWORD last_fail_log = 0;
+    DWORD now, err;
+
+    if (SendInput(1, inp, sizeof(INPUT)) != 0)
+        return;
+
+    err = GetLastError();
+    now = GetTickCount();
+
+    if (err != ERROR_ACCESS_DENIED) {
+        if (!last_fail_log || (DWORD)(now - last_fail_log) >= 1000) {
+            last_fail_log = now;
+            input_log("SendInput(%s) failed: %lu", what, err);
+        }
+        return;
+    }
+
+    /* Refused: the input desktop has almost certainly moved out from under us. */
+    if (last_rebind && (DWORD)(now - last_rebind) < DESKTOP_REBIND_MIN_MS) {
+        if (!last_fail_log || (DWORD)(now - last_fail_log) >= 1000) {
+            last_fail_log = now;
+            input_log("SendInput(%s) refused; input desktop not reachable.", what);
+        }
+        return;
+    }
+    last_rebind = now;
+
+    if (!switch_to_input_desktop()) {
+        if (!last_fail_log || (DWORD)(now - last_fail_log) >= 1000) {
+            last_fail_log = now;
+            input_log("SendInput(%s) refused; OpenInputDesktop failed: %lu",
+                      what, GetLastError());
+        }
+        return;
+    }
+
+    if (SendInput(1, inp, sizeof(INPUT)) != 0)
+        input_log("Input desktop changed; rebound and resumed at %s.", what);
 }
 
 /* ---- Input injection ---- */
@@ -77,7 +151,6 @@ static void switch_to_input_desktop(void)
 static void inject_input(const InputPacket *pkt)
 {
     INPUT inp;
-    UINT result;
     ZeroMemory(&inp, sizeof(inp));
 
     switch (pkt->type) {
@@ -90,9 +163,7 @@ static void inject_input(const InputPacket *pkt)
         inp.mi.dx = (LONG)(pkt->param1 * 65535 / (UINT32)(screen_w - 1));
         inp.mi.dy = (LONG)(pkt->param2 * 65535 / (UINT32)(screen_h - 1));
         inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-        result = SendInput(1, &inp, sizeof(INPUT));
-        if (result == 0)
-            input_log("SendInput(MOUSE_MOVE) failed: %lu", GetLastError());
+        send_input_retry(&inp, "MOUSE_MOVE");
         break;
     }
     case INPUT_MOUSE_MOVE_REL: {
@@ -107,10 +178,7 @@ static void inject_input(const InputPacket *pkt)
         inp.mi.dx = (LONG)(INT32)pkt->param1;
         inp.mi.dy = (LONG)(INT32)pkt->param2;
         inp.mi.dwFlags = MOUSEEVENTF_MOVE;
-        result = SendInput(1, &inp, sizeof(INPUT));
-        if (result == 0)
-            input_log("SendInput(MOUSE_MOVE_REL dx=%d dy=%d) failed: %lu",
-                       (INT32)pkt->param1, (INT32)pkt->param2, GetLastError());
+        send_input_retry(&inp, "MOUSE_MOVE_REL");
         break;
     }
     case INPUT_MOUSE_BUTTON: {
@@ -128,20 +196,14 @@ static void inject_input(const InputPacket *pkt)
         default:
             return;
         }
-        result = SendInput(1, &inp, sizeof(INPUT));
-        if (result == 0)
-            input_log("SendInput(MOUSE_BUTTON btn=%u down=%u) failed: %lu",
-                       pkt->param1, pkt->param2, GetLastError());
+        send_input_retry(&inp, "MOUSE_BUTTON");
         break;
     }
     case INPUT_MOUSE_WHEEL: {
         inp.type = INPUT_MOUSE;
         inp.mi.dwFlags = MOUSEEVENTF_WHEEL;
         inp.mi.mouseData = (DWORD)(INT32)pkt->param1;
-        result = SendInput(1, &inp, sizeof(INPUT));
-        if (result == 0)
-            input_log("SendInput(MOUSE_WHEEL delta=%d) failed: %lu",
-                       (INT32)pkt->param1, GetLastError());
+        send_input_retry(&inp, "MOUSE_WHEEL");
         break;
     }
     case INPUT_KEY: {
@@ -151,10 +213,7 @@ static void inject_input(const InputPacket *pkt)
         inp.ki.dwFlags = 0;
         if (pkt->param3 & 1) inp.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
         if (pkt->param3 & 2) inp.ki.dwFlags |= KEYEVENTF_KEYUP;
-        result = SendInput(1, &inp, sizeof(INPUT));
-        if (result == 0)
-            input_log("SendInput(KEY vk=0x%X scan=0x%X flags=0x%X) failed: %lu",
-                       pkt->param1, pkt->param2, pkt->param3, GetLastError());
+        send_input_retry(&inp, "KEY");
         break;
     }
     }
