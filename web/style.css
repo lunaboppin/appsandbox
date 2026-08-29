@@ -583,5 +583,25 @@ td.editing select {
     text-align: center;
 }
 
-.hint { font-size: 12px; opacity: 0.75; margin: 8px 0 0; line-height: 1.45; }
-.hint code { font-size: 11px; padding: 1px 4px; border-radius: 3px; background: rgba(127,127,127,0.18); }
+/* Global settings panel */
+.setting-row { display: flex; align-items: center; gap: 10px; margin: 4px 0 0; }
+.setting-row label { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+.keybind-input {
+    flex: 1;
+    min-width: 0;
+    text-align: center;
+    cursor: pointer;
+    caret-color: transparent;
+}
+.keybind-input.listening {
+    border-color: var(--accent);
+    background: var(--ctrl-bg);
+}
+.hint { font-size: 12px; color: var(--text-dim); margin: 10px 0 0; line-height: 1.45; }
+.hint code {
+    font-size: 11px;
+    padding: 1px 4px;
+    border-radius: var(--radius);
+    background: var(--ctrl-bg);
+    border: 1px solid var(--ctrl-border);
+}

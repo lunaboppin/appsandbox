@@ -1258,19 +1258,109 @@ function renderManageSharedResources(vm) {
     if(vm.sharedResourceError){var err=document.createElement('span');err.className='field-warn';err.textContent=vm.sharedResourceError;box.appendChild(err);}
 }
 
-/* Global settings (not per-VM). The capture key is validated host-side when a
-   display opens; anything unparseable falls back to the default there. */
-function openAppSettingsModal(){
-    document.getElementById('app-capture-hotkey').value = appSettings.captureHotkey || 'Pause';
+/* Global settings (not per-VM).
+ *
+ * The capture key is picked by pressing it rather than typing its name: the
+ * host parser accepts a small vocabulary, and asking someone to spell
+ * "ScrollLock" correctly is a worse experience than listening for the key.
+ * Names produced here match what idd_parse_bind accepts.
+ */
+var captureBindListening = false;
+
+var KEYBIND_NAMED = {
+    Pause: 'Pause', ScrollLock: 'ScrollLock', NumLock: 'NumLock',
+    Insert: 'Insert', Delete: 'Delete', Home: 'Home', End: 'End',
+    PageUp: 'PageUp', PageDown: 'PageDown', Space: 'Space', Tab: 'Tab',
+    Backspace: 'Backspace', CapsLock: 'CapsLock', ContextMenu: 'Apps'
+};
+
+/* Map a KeyboardEvent.code to a name the host understands, or null. */
+function keybindNameFor(code) {
+    if (Object.prototype.hasOwnProperty.call(KEYBIND_NAMED, code)) return KEYBIND_NAMED[code];
+    if (code.length > 1 && code.charAt(0) === 'F') {
+        var n = parseInt(code.substring(1), 10);
+        if (n >= 1 && n <= 24 && String(n) === code.substring(1)) return code;
+    }
+    if (code.length === 4 && code.substring(0, 3) === 'Key') return code.charAt(3);
+    if (code.length === 6 && code.substring(0, 5) === 'Digit') return code.charAt(5);
+    return null;
+}
+
+function beginCaptureBind() {
+    var el = document.getElementById('app-capture-hotkey');
+    if (!el || captureBindListening) return;
+    captureBindListening = true;
+    el.dataset.previous = el.value;
+    el.value = '';
+    el.placeholder = 'Press a key...';
+    el.classList.add('listening');
+}
+
+function cancelCaptureBind() {
+    var el = document.getElementById('app-capture-hotkey');
+    if (!el || !captureBindListening) return;
+    captureBindListening = false;
+    el.value = el.dataset.previous || '';
+    el.placeholder = 'Click, then press a key';
+    el.classList.remove('listening');
+}
+
+function onCaptureBindKey(e) {
+    if (!captureBindListening) return;
+    var el = document.getElementById('app-capture-hotkey');
+    if (!el) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    /* Esc backs out. Binding it would be hostile: it is the one key a stuck
+       user reaches for, and every dialog here treats it as "get me out". */
+    if (e.code === 'Escape') { cancelCaptureBind(); el.blur(); return; }
+
+    /* A modifier on its own is the user still assembling the combination. */
+    if (e.code === 'ControlLeft' || e.code === 'ControlRight' ||
+        e.code === 'AltLeft' || e.code === 'AltRight' ||
+        e.code === 'ShiftLeft' || e.code === 'ShiftRight' ||
+        e.code === 'MetaLeft' || e.code === 'MetaRight') return;
+
+    var name = keybindNameFor(e.code);
+    if (!name) return;   /* not in the host vocabulary: keep listening */
+
+    var text = (e.ctrlKey ? 'Ctrl+' : '') + (e.altKey ? 'Alt+' : '') +
+               (e.shiftKey ? 'Shift+' : '') + name;
+
+    captureBindListening = false;
+    el.value = text;
+    el.dataset.previous = text;
+    el.placeholder = 'Click, then press a key';
+    el.classList.remove('listening');
+    el.blur();
+}
+
+document.addEventListener('keydown', onCaptureBindKey, true);
+
+function openAppSettingsModal() {
+    var el = document.getElementById('app-capture-hotkey');
+    captureBindListening = false;
+    el.classList.remove('listening');
+    el.value = appSettings.captureHotkey || 'Pause';
+    el.dataset.previous = el.value;
+    el.placeholder = 'Click, then press a key';
     document.getElementById('app-settings-overlay').classList.add('active');
 }
-function closeAppSettingsModal(){document.getElementById('app-settings-overlay').classList.remove('active');}
-function saveAppSettings(){
+
+function closeAppSettingsModal() {
+    captureBindListening = false;
+    document.getElementById('app-settings-overlay').classList.remove('active');
+}
+
+function saveAppSettings() {
     var v = (document.getElementById('app-capture-hotkey').value || '').trim();
-    if(!v){ showModal('Settings','Enter a capture key, for example Pause.','OK'); return; }
+    if (!v) { showModal('Settings', 'Click the box and press the key you want to use.', 'OK'); return; }
     sendCmd('saveAppSettings', { captureHotkey: v });
     closeAppSettingsModal();
 }
+
 function openSettingsModal(){if(hostBridge.isMac)return;populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
 function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}

@@ -257,14 +257,14 @@
 <div class="modal-overlay win-host-only" id="app-settings-overlay">
     <div class="modal">
         <h3>Settings</h3>
-        <fieldset>
-            <legend>Display</legend>
-            <div class="form-grid resource-editor">
-                <label for="app-capture-hotkey">Capture key:</label>
-                <input type="text" id="app-capture-hotkey" placeholder="Pause" title="Key that toggles mouse capture on an IDD display.">
-            </div>
-            <p class="hint">Toggles mouse and keyboard capture on a sandbox display. Accepts a single key such as <code>Pause</code>, <code>F9</code> or <code>ScrollLock</code>, optionally with <code>Ctrl+</code>, <code>Alt+</code> or <code>Shift+</code> &mdash; for example <code>Ctrl+Alt+G</code>. Takes effect the next time a display is opened.</p>
-        </fieldset>
+        <div class="setting-row">
+            <label for="app-capture-hotkey">Capture key</label>
+            <input type="text" id="app-capture-hotkey" class="keybind-input" readonly
+                   placeholder="Click, then press a key"
+                   onclick="beginCaptureBind()" onblur="cancelCaptureBind()"
+                   title="Click, then press the key that should toggle capture.">
+        </div>
+        <p class="hint">Toggles mouse and keyboard capture on a sandbox display. Click the box and press the key you want, optionally holding Ctrl, Alt or Shift. Esc cancels without changing it. Takes effect the next time a display is opened.</p>
         <div class="modal-buttons"><button type="button" onclick="closeAppSettingsModal()" title="Close settings without saving.">Cancel</button><button type="button" class="primary" onclick="saveAppSettings()" title="Save global settings.">Save</button></div>
     </div>
 </div>
