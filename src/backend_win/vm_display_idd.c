@@ -144,6 +144,15 @@ typedef struct InputPacket {
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
+#define TITLE_UPDATE_MIN_INTERVAL_MS 500
+
+/* Capture toggle binding. Pause/Break by default: a single key, nothing in a
+   game uses it, and it cannot collide with a chord the guest wants. Overridable
+   per VM through "captureHotkey" in display_settings.json. */
+#define CAPTURE_MOD_CTRL    0x1
+#define CAPTURE_MOD_ALT     0x2
+#define CAPTURE_MOD_SHIFT   0x4
+#define DEFAULT_CAPTURE_BIND L"Pause"
 #define IDT_INPUT       2002
 #define MOUSE_MOVE_MIN_INTERVAL_MS 8
 #define IDT_INPUT_REL   2003
@@ -243,6 +252,8 @@ struct VmDisplayIdd {
     volatile BOOL  frame_dirty;
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
+    DWORD          last_title_tick;  /* rate limit for the caption text */
+    BOOL           have_last_title_tick;
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
 
     /* Input forwarding */
@@ -264,7 +275,10 @@ struct VmDisplayIdd {
     BOOL           capture_active;
     BOOL           raw_registered;   /* RegisterRawInputDevices currently in effect */
     BOOL           clip_active;      /* ClipCursor currently in effect */
-    BOOL           capture_chord_held; /* swallowing the Ctrl+Alt+G that toggled us */
+    BOOL           capture_chord_held; /* swallowing the capture key that toggled us */
+    UINT           capture_vk;         /* key that toggles capture */
+    UINT           capture_mods;       /* CAPTURE_MOD_* required with it */
+    wchar_t        capture_bind[64];   /* canonical text, for the menu and the file */
     BOOL           hotkeys_chord_held; /* same, for the Ctrl+Alt+K that toggled hotkeys */
     BOOL           hotkeys_forced;     /* capture switched Transmit Hotkeys on for us */
     INT32          pending_rel_dx;   /* raw deltas accumulated since the last flush */
@@ -569,12 +583,16 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
 
     g_input_send_count++;
 
-    /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
+    /* Log non-move events only (moves are too noisy). Relative moves must be
+       excluded as well as absolute ones: idd_log does a synchronous LB_ADDSTRING
+       plus an UpdateWindow, and while captured these arrive as often as every
+       MOUSE_REL_MIN_INTERVAL_MS -- enough repainting on the window thread to
+       visibly stutter whatever the guest is running. */
+    if (type != INPUT_MOUSE_MOVE && type != INPUT_MOUSE_MOVE_REL) {
         static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
+            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY", L"MOUSE_MOVE_REL"
         };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
+        const wchar_t *name = type < 5 ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
 }
@@ -607,6 +625,99 @@ static void flush_pending_mouse(VmDisplayIdd *d)
  * display opens, so both new and pre-existing VMs get one on demand.
  * ================================================================== */
 
+/* ---- Capture toggle binding ----------------------------------------------
+ * Accepts "Pause", "F9", "Ctrl+Alt+G", "Shift+Insert": optional Ctrl/Alt/Shift
+ * prefixes in any order, then one key. Anything unrecognised leaves the default
+ * in place rather than binding something unpredictable -- being unable to
+ * release the pointer is a bad way to fail. */
+
+static const struct { const wchar_t *name; UINT vk; } k_bind_keys[] = {
+    { L"Pause", VK_PAUSE }, { L"Break", VK_PAUSE }, { L"ScrollLock", VK_SCROLL },
+    { L"Insert", VK_INSERT }, { L"Delete", VK_DELETE }, { L"Home", VK_HOME },
+    { L"End", VK_END }, { L"PageUp", VK_PRIOR }, { L"PageDown", VK_NEXT },
+    { L"Space", VK_SPACE }, { L"Tab", VK_TAB }, { L"Escape", VK_ESCAPE },
+    { L"Esc", VK_ESCAPE }, { L"Backspace", VK_BACK }, { L"NumLock", VK_NUMLOCK },
+    { L"Apps", VK_APPS }, { L"CapsLock", VK_CAPITAL },
+};
+
+static void idd_format_bind(UINT vk, UINT mods, wchar_t *out, size_t out_chars)
+{
+    wchar_t key[32];
+    size_t i;
+
+    key[0] = 0;
+    for (i = 0; i < sizeof(k_bind_keys) / sizeof(k_bind_keys[0]); i++) {
+        if (k_bind_keys[i].vk == vk) {
+            wcscpy_s(key, 32, k_bind_keys[i].name);
+            break;
+        }
+    }
+    if (!key[0]) {
+        if (vk >= VK_F1 && vk <= VK_F24)
+            swprintf_s(key, 32, L"F%u", vk - VK_F1 + 1);
+        else if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+            swprintf_s(key, 32, L"%c", (wchar_t)vk);
+        else
+            swprintf_s(key, 32, L"0x%02X", vk);
+    }
+
+    swprintf_s(out, out_chars, L"%s%s%s%s",
+               (mods & CAPTURE_MOD_CTRL)  ? L"Ctrl+"  : L"",
+               (mods & CAPTURE_MOD_ALT)   ? L"Alt+"   : L"",
+               (mods & CAPTURE_MOD_SHIFT) ? L"Shift+" : L"",
+               key);
+}
+
+static BOOL idd_parse_bind(const wchar_t *text, UINT *out_vk, UINT *out_mods)
+{
+    wchar_t work[64];
+    wchar_t *tok, *ctx = NULL;
+    UINT mods = 0, vk = 0;
+    size_t i;
+
+    if (!text || !text[0]) return FALSE;
+    wcscpy_s(work, 64, text);
+
+    for (tok = wcstok_s(work, L"+", &ctx); tok; tok = wcstok_s(NULL, L"+", &ctx)) {
+        if (_wcsicmp(tok, L"Ctrl") == 0 || _wcsicmp(tok, L"Control") == 0) {
+            mods |= CAPTURE_MOD_CTRL;  continue;
+        }
+        if (_wcsicmp(tok, L"Alt") == 0)   { mods |= CAPTURE_MOD_ALT;   continue; }
+        if (_wcsicmp(tok, L"Shift") == 0) { mods |= CAPTURE_MOD_SHIFT; continue; }
+
+        if (vk) return FALSE;   /* two non-modifier keys is not a binding we grasp */
+
+        for (i = 0; i < sizeof(k_bind_keys) / sizeof(k_bind_keys[0]); i++) {
+            if (_wcsicmp(tok, k_bind_keys[i].name) == 0) {
+                vk = k_bind_keys[i].vk;
+                break;
+            }
+        }
+        if (vk) continue;
+
+        if ((tok[0] == L'F' || tok[0] == L'f') && tok[1]) {
+            int n = _wtoi(tok + 1);
+            if (n >= 1 && n <= 24 && !tok[(n < 10) ? 2 : 3]) {
+                vk = (UINT)VK_F1 + (UINT)(n - 1);
+                continue;
+            }
+        }
+        if (!tok[1]) {
+            wchar_t c = towupper(tok[0]);
+            if ((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')) {
+                vk = (UINT)c;
+                continue;
+            }
+        }
+        return FALSE;
+    }
+
+    if (!vk) return FALSE;
+    *out_vk = vk;
+    *out_mods = mods;
+    return TRUE;
+}
+
 static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, size_t out_chars)
 {
     wchar_t dir[MAX_PATH];
@@ -618,15 +729,17 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
 }
 
 static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
-                                      BOOL capture_mouse)
+                                      BOOL capture_mouse, const wchar_t *capture_bind)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"captureMouse\":%d}\n",
-            transmit_hotkeys ? 1 : 0, capture_mouse ? 1 : 0);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"captureMouse\":%d,"
+               "\"captureHotkey\":\"%ls\"}\n",
+            transmit_hotkeys ? 1 : 0, capture_mouse ? 1 : 0,
+            (capture_bind && capture_bind[0]) ? capture_bind : DEFAULT_CAPTURE_BIND);
     fclose(f);
 }
 
@@ -635,7 +748,11 @@ static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_ho
    key, which reads as off — the desired default. */
 static void idd_display_settings_load_or_create(const wchar_t *vhdx_path,
                                                 BOOL *transmit_hotkeys,
-                                                BOOL *capture_mouse)
+                                                BOOL *capture_mouse,
+                                                UINT *capture_vk,
+                                                UINT *capture_mods,
+                                                wchar_t *capture_bind,
+                                                size_t bind_chars)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
@@ -643,13 +760,15 @@ static void idd_display_settings_load_or_create(const wchar_t *vhdx_path,
 
     *transmit_hotkeys = FALSE;
     *capture_mouse    = FALSE;
+    idd_parse_bind(DEFAULT_CAPTURE_BIND, capture_vk, capture_mods);
+    wcscpy_s(capture_bind, bind_chars, DEFAULT_CAPTURE_BIND);
 
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE, FALSE);
+        idd_display_settings_save(vhdx_path, FALSE, FALSE, capture_bind);
         return;
     }
     if (fgets(buf, sizeof(buf), f)) {
@@ -657,6 +776,29 @@ static void idd_display_settings_load_or_create(const wchar_t *vhdx_path,
             *transmit_hotkeys = TRUE;
         if (strstr(buf, "\"captureMouse\":1"))
             *capture_mouse = TRUE;
+
+        /* "captureHotkey":"<text>". Absent from files written by an older build,
+           which simply keeps the default. An unparseable value keeps it too. */
+        {
+            const char *k = strstr(buf, "\"captureHotkey\"");
+            const char *v = k ? strchr(k + 15, '"') : NULL;
+            const char *end = v ? strchr(v + 1, '"') : NULL;
+            if (v && end && end > v + 1 && (end - v - 1) < 48) {
+                char raw[64];
+                wchar_t text[64];
+                size_t len = (size_t)(end - v - 1);
+                memcpy(raw, v + 1, len);
+                raw[len] = 0;
+                if (MultiByteToWideChar(CP_UTF8, 0, raw, -1, text, 64) > 0) {
+                    UINT vk = 0, mods = 0;
+                    if (idd_parse_bind(text, &vk, &mods)) {
+                        *capture_vk   = vk;
+                        *capture_mods = mods;
+                        idd_format_bind(vk, mods, capture_bind, bind_chars);
+                    }
+                }
+            }
+        }
     }
     fclose(f);
 }
@@ -805,27 +947,36 @@ static void idd_set_mouse_capture(VmDisplayIdd *d, BOOL on)
         CheckMenuItem(sysmenu, IDM_MOUSE_CAPTURE,
                       MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED));
 
-    idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->mouse_capture);
-    idd_log(d, on ? L"Mouse capture: ON (relative input; Ctrl+Alt+G releases)."
-                  : L"Mouse capture: OFF (absolute pointer).");
+    idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->mouse_capture,
+                              d->capture_bind);
+    if (on)
+        idd_log(d, L"Mouse capture: ON (relative input; %s releases).",
+                d->capture_bind);
+    else
+        idd_log(d, L"Mouse capture: OFF (absolute pointer).");
 }
 
-/* Ctrl+Alt+G toggles capture. It is consumed before any forwarding so the guest
+/* The capture key toggles capture. It is consumed before any forwarding so the guest
    never sees it, and it is checked inside the low-level keyboard hook too —
    otherwise Transmit Hotkeys mode would send it straight to the guest and leave
    no way to get the pointer back. Returns TRUE when the event was consumed. */
 static BOOL idd_handle_capture_chord(VmDisplayIdd *d, DWORD vk, BOOL up)
 {
     BOOL *held;
+    BOOL is_capture;
+    UINT need;
 
     if (!d)
         return FALSE;
-    if (vk == 'G')
+    if (d->capture_vk && vk == d->capture_vk) {
+        is_capture = TRUE;
         held = &d->capture_chord_held;
-    else if (vk == 'K')
+    } else if (vk == 'K') {
+        is_capture = FALSE;
         held = &d->hotkeys_chord_held;
-    else
+    } else {
         return FALSE;
+    }
 
     if (up) {
         if (!*held)
@@ -837,12 +988,18 @@ static BOOL idd_handle_capture_chord(VmDisplayIdd *d, DWORD vk, BOOL up)
     if (*held)
         return TRUE;   /* auto-repeat while still held: eat, do not re-toggle */
 
-    if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000) ||
-        !(GetAsyncKeyState(VK_MENU)    & 0x8000))
+    /* The capture key carries whatever modifiers it was bound with (none, for
+       the Pause default); the hotkeys toggle is always Ctrl+Alt+K. */
+    need = is_capture ? d->capture_mods : (CAPTURE_MOD_CTRL | CAPTURE_MOD_ALT);
+    if (((need & CAPTURE_MOD_CTRL)  != 0) != ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0))
+        return FALSE;
+    if (((need & CAPTURE_MOD_ALT)   != 0) != ((GetAsyncKeyState(VK_MENU)    & 0x8000) != 0))
+        return FALSE;
+    if (((need & CAPTURE_MOD_SHIFT) != 0) != ((GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0))
         return FALSE;
 
     *held = TRUE;
-    if (vk == 'G') {
+    if (is_capture) {
         idd_set_mouse_capture(d, !d->mouse_capture);
     } else {
         /* An explicit toggle is the user's own choice, so capture must not undo
@@ -996,7 +1153,7 @@ static void idd_set_transmit_hotkeys(VmDisplayIdd *d, BOOL on, BOOL persist)
 
     if (persist)
         idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
-                                  d->mouse_capture);
+                                  d->mouse_capture, d->capture_bind);
     idd_log(d, on ? L"Transmit Keyboard Hotkeys: ON."
                   : L"Transmit Keyboard Hotkeys: OFF.");
 }
@@ -1621,13 +1778,21 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    /* Refresh the title once per uploaded frame (~frame rate). */
+    /* Refresh the caption at about 2 Hz. SetWindowTextW is a synchronous
+       WM_SETTEXT that repaints the non-client area, so doing it once per
+       uploaded frame put a caption redraw in front of every single frame. */
     if (frame_uploaded && d->hwnd) {
-        wchar_t title[256];
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
-                   d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
-        SetWindowTextW(d->hwnd, title);
+        DWORD now = GetTickCount();
+        if (!d->have_last_title_tick ||
+            (DWORD)(now - d->last_title_tick) >= TITLE_UPDATE_MIN_INTERVAL_MS) {
+            wchar_t title[256];
+            swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
+                       d->audio_muted ? L"\U0001F507 " : L"",
+                       d->vm_name, d->frame_width, d->frame_height, d->recv_count);
+            SetWindowTextW(d->hwnd, title);
+            d->last_title_tick = now;
+            d->have_last_title_tick = TRUE;
+        }
     }
     d->render_count++;
 
@@ -2279,8 +2444,12 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS,
                         L"Transmit Keyboard Hotkeys	Ctrl+Alt+K");
-            AppendMenuW(sysmenu, MF_STRING, IDM_MOUSE_CAPTURE,
-                        L"Capture Mouse (Game Mode)\tCtrl+Alt+G");
+            {
+                wchar_t item[96];
+                swprintf_s(item, 96, L"Capture Mouse (Game Mode)\t%s",
+                           d->capture_bind);
+                AppendMenuW(sysmenu, MF_STRING, IDM_MOUSE_CAPTURE, item);
+            }
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
@@ -2799,7 +2968,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
-        /* Ctrl+Alt+G never reaches the guest — it is how you get the pointer
+        /* The capture key never reaches the guest — it is how you get the pointer
            back. In Transmit mode the hook has already eaten it. */
         if (idd_handle_capture_chord(d, (DWORD)wp, up))
             return 0;
@@ -2850,9 +3019,14 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        capture is applied by the first WM_ACTIVATE for the same reason. */
     {
         BOOL transmit = FALSE, capture = FALSE;
-        idd_display_settings_load_or_create(vm->vhdx_path, &transmit, &capture);
+        UINT vk = 0, mods = 0;
+        idd_display_settings_load_or_create(vm->vhdx_path, &transmit, &capture,
+                                            &vk, &mods, d->capture_bind,
+                                            sizeof(d->capture_bind) / sizeof(wchar_t));
         d->transmit_hotkeys = transmit;
         d->mouse_capture    = capture;
+        d->capture_vk       = vk;
+        d->capture_mods     = mods;
     }
 
     /* Initialize frame buffer at default resolution */
