@@ -582,3 +582,6 @@ td.editing select {
     color: #888;
     text-align: center;
 }
+
+.hint { font-size: 12px; opacity: 0.75; margin: 8px 0 0; line-height: 1.45; }
+.hint code { font-size: 11px; padding: 1px 4px; border-radius: 3px; background: rgba(127,127,127,0.18); }

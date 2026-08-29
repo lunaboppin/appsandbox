@@ -265,6 +265,19 @@ ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
                                            const AsbSharedResourceInfo *info,
                                            BOOL confirm_permissions);
 ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id);
+
+/* ---- Application settings (global, %ProgramData%\AppSandbox\app-settings.cfg) ----
+   Settings that are not per-VM. The capture hotkey is the key that toggles
+   mouse capture on an IDD display; a VM may still override it privately via
+   "captureHotkey" in its own display_settings.json. */
+
+/* Writes the configured capture hotkey (e.g. L"Pause") into out. Falls back to
+   the built-in default when unset or unreadable, so out is always valid. */
+ASB_API void    asb_app_get_capture_hotkey(wchar_t *out, size_t out_chars);
+
+/* Persists the capture hotkey. Text is stored as given; the display validates
+   it when loading and ignores anything it cannot parse. */
+ASB_API HRESULT asb_app_set_capture_hotkey(const wchar_t *text);
 ASB_API BOOL asb_vm_shared_resource_enabled(AsbVm vm, const wchar_t *id);
 ASB_API HRESULT asb_vm_set_shared_resource_enabled(AsbVm vm,
                                                    const wchar_t *id, BOOL enabled);

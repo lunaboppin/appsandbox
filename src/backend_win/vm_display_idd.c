@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#include "asb_core.h"
 #include "vm_display_idd.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
@@ -729,17 +730,15 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
 }
 
 static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
-                                      BOOL capture_mouse, const wchar_t *capture_bind)
+                                      BOOL capture_mouse)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"captureMouse\":%d,"
-               "\"captureHotkey\":\"%ls\"}\n",
-            transmit_hotkeys ? 1 : 0, capture_mouse ? 1 : 0,
-            (capture_bind && capture_bind[0]) ? capture_bind : DEFAULT_CAPTURE_BIND);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"captureMouse\":%d}\n",
+            transmit_hotkeys ? 1 : 0, capture_mouse ? 1 : 0);
     fclose(f);
 }
 
@@ -760,15 +759,20 @@ static void idd_display_settings_load_or_create(const wchar_t *vhdx_path,
 
     *transmit_hotkeys = FALSE;
     *capture_mouse    = FALSE;
-    idd_parse_bind(DEFAULT_CAPTURE_BIND, capture_vk, capture_mods);
-    wcscpy_s(capture_bind, bind_chars, DEFAULT_CAPTURE_BIND);
+    /* The binding is a global setting; a VM may still override it privately by
+       carrying "captureHotkey" in its own file, which is read below. */
+    asb_app_get_capture_hotkey(capture_bind, bind_chars);
+    if (!idd_parse_bind(capture_bind, capture_vk, capture_mods)) {
+        idd_parse_bind(DEFAULT_CAPTURE_BIND, capture_vk, capture_mods);
+        wcscpy_s(capture_bind, bind_chars, DEFAULT_CAPTURE_BIND);
+    }
 
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE, FALSE, capture_bind);
+        idd_display_settings_save(vhdx_path, FALSE, FALSE);
         return;
     }
     if (fgets(buf, sizeof(buf), f)) {
@@ -947,8 +951,7 @@ static void idd_set_mouse_capture(VmDisplayIdd *d, BOOL on)
         CheckMenuItem(sysmenu, IDM_MOUSE_CAPTURE,
                       MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED));
 
-    idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->mouse_capture,
-                              d->capture_bind);
+    idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->mouse_capture);
     if (on)
         idd_log(d, L"Mouse capture: ON (relative input; %s releases).",
                 d->capture_bind);
@@ -1153,7 +1156,7 @@ static void idd_set_transmit_hotkeys(VmDisplayIdd *d, BOOL on, BOOL persist)
 
     if (persist)
         idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
-                                  d->mouse_capture, d->capture_bind);
+                                  d->mouse_capture);
     idd_log(d, on ? L"Transmit Keyboard Hotkeys: ON."
                   : L"Transmit Keyboard Hotkeys: OFF.");
 }

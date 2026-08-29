@@ -587,6 +587,17 @@ static void send_full_state(void)
     }
 
     {
+        /* Global application settings (not per-VM). */
+        wchar_t hotkey[64];
+        asb_app_get_capture_hotkey(hotkey, 64);
+        if (jb.count > 0) jb_append(&jb, L",");
+        jb_append(&jb, L"\"appSettings\":");
+        jb_object_begin(&jb);
+        jb_string(&jb, L"captureHotkey", hotkey);
+        jb_object_end(&jb);
+    }
+
+    {
         SharedApplianceStatus s;
         asb_shared_appliance_get_status(&s);
         if (jb.count > 0) jb_append(&jb, L",");
@@ -1306,6 +1317,14 @@ static void on_webview2_message(const wchar_t *json)
             else if (wcscmp(field, L"gpuMode") == 0) asb_vm_set_gpu(vm, _wtoi(value));
             else if (wcscmp(field, L"networkMode") == 0) asb_vm_set_network(vm, _wtoi(value));
             asb_save();
+            send_vm_list();
+        }
+    } else if (wcscmp(action, L"saveAppSettings") == 0) {
+        wchar_t hotkey[64] = { 0 };
+        if (json_get_string(json, L"captureHotkey", hotkey, 64) && hotkey[0]) {
+            asb_app_set_capture_hotkey(hotkey);
+            /* Displays read the binding when they open, so an already-open
+               display keeps the one it started with. */
             send_vm_list();
         }
     } else if (wcscmp(action, L"selectVm") == 0) {

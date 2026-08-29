@@ -17,6 +17,7 @@
         <h2>Sandboxes</h2>
         <div class="header-actions">
             <button class="win-host-only" onclick="openSettingsModal()" title="Open the shared appliance and shared resource settings.">Shared Resources</button>
+            <button class="win-host-only" onclick="openAppSettingsModal()" title="Open global AppSandbox settings.">Settings</button>
             <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
         </div>
     </div>
@@ -249,6 +250,22 @@
         <div class="modal-buttons">
             <button onclick="closeManageVm()">Close</button>
         </div>
+    </div>
+</div>
+
+<!-- Global application settings -->
+<div class="modal-overlay win-host-only" id="app-settings-overlay">
+    <div class="modal">
+        <h3>Settings</h3>
+        <fieldset>
+            <legend>Display</legend>
+            <div class="form-grid resource-editor">
+                <label for="app-capture-hotkey">Capture key:</label>
+                <input type="text" id="app-capture-hotkey" placeholder="Pause" title="Key that toggles mouse capture on an IDD display.">
+            </div>
+            <p class="hint">Toggles mouse and keyboard capture on a sandbox display. Accepts a single key such as <code>Pause</code>, <code>F9</code> or <code>ScrollLock</code>, optionally with <code>Ctrl+</code>, <code>Alt+</code> or <code>Shift+</code> &mdash; for example <code>Ctrl+Alt+G</code>. Takes effect the next time a display is opened.</p>
+        </fieldset>
+        <div class="modal-buttons"><button type="button" onclick="closeAppSettingsModal()" title="Close settings without saving.">Cancel</button><button type="button" class="primary" onclick="saveAppSettings()" title="Save global settings.">Save</button></div>
     </div>
 </div>
 

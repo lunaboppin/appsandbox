@@ -4987,3 +4987,68 @@ static HINSTANCE g_hInstance_core = NULL;
 ASB_API HINSTANCE ui_get_instance(void) { return g_hInstance_core; }
 
 ASB_API void asb_set_hinstance(HINSTANCE hInst) { g_hInstance_core = hInst; }
+
+/* ==================================================================
+ * Application settings (global, not per-VM)
+ *
+ * A tiny KEY=VALUE file beside the other configuration in
+ * %ProgramData%\AppSandbox. Only the IDD capture hotkey lives here today, so
+ * the format is deliberately the simplest thing that will extend: one key per
+ * line, first '=' separates, unknown keys are preserved on write.
+ * ================================================================== */
+
+#define ASB_DEFAULT_CAPTURE_HOTKEY L"Pause"
+
+static void asb_app_settings_path(wchar_t *out, size_t out_chars)
+{
+    wchar_t base[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(out, out_chars, L"%s\\AppSandbox\\app-settings.cfg", base);
+}
+
+ASB_API void asb_app_get_capture_hotkey(wchar_t *out, size_t out_chars)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    wchar_t line[256];
+
+    if (!out || out_chars == 0) return;
+    wcscpy_s(out, out_chars, ASB_DEFAULT_CAPTURE_HOTKEY);
+
+    asb_app_settings_path(path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f)
+        return;
+
+    while (fgetws(line, 256, f)) {
+        wchar_t *eq = wcschr(line, L'=');
+        if (!eq) continue;
+        *eq = 0;
+        if (_wcsicmp(line, L"CaptureHotkey") == 0) {
+            wchar_t *v = eq + 1;
+            size_t n = wcslen(v);
+            while (n && (v[n - 1] == L'\n' || v[n - 1] == L'\r' || v[n - 1] == L' '))
+                v[--n] = 0;
+            if (n)
+                wcscpy_s(out, out_chars, v);
+            break;
+        }
+    }
+    fclose(f);
+}
+
+ASB_API HRESULT asb_app_set_capture_hotkey(const wchar_t *text)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+
+    if (!text || !text[0]) return E_INVALIDARG;
+
+    asb_app_settings_path(path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f)
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    fwprintf(f, L"CaptureHotkey=%s\n", text);
+    fclose(f);
+    return S_OK;
+}

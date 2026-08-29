@@ -16,6 +16,7 @@ let manageVmIndex = -1;
 let managePending = false;
 let sharedResources = [];
 let sharedAppliance = {};
+let appSettings = {};
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -184,6 +185,7 @@ function onFullState(msg) {
     lastStorageParent = msg.lastStorageParent || lastStorageParent;
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
+    appSettings = msg.appSettings || {};
     renderSharedAppliance();
     renderSettingsResources();
     renderCreateSharedResources();
@@ -1256,6 +1258,19 @@ function renderManageSharedResources(vm) {
     if(vm.sharedResourceError){var err=document.createElement('span');err.className='field-warn';err.textContent=vm.sharedResourceError;box.appendChild(err);}
 }
 
+/* Global settings (not per-VM). The capture key is validated host-side when a
+   display opens; anything unparseable falls back to the default there. */
+function openAppSettingsModal(){
+    document.getElementById('app-capture-hotkey').value = appSettings.captureHotkey || 'Pause';
+    document.getElementById('app-settings-overlay').classList.add('active');
+}
+function closeAppSettingsModal(){document.getElementById('app-settings-overlay').classList.remove('active');}
+function saveAppSettings(){
+    var v = (document.getElementById('app-capture-hotkey').value || '').trim();
+    if(!v){ showModal('Settings','Enter a capture key, for example Pause.','OK'); return; }
+    sendCmd('saveAppSettings', { captureHotkey: v });
+    closeAppSettingsModal();
+}
 function openSettingsModal(){if(hostBridge.isMac)return;populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
 function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}
