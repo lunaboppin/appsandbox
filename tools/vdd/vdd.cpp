@@ -914,14 +914,14 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
     adapterCaps.Size = sizeof(adapterCaps);
     VddLog("InitAdapter: IDDCX_ADAPTER_CAPS.Size=%u", (unsigned)adapterCaps.Size);
 
-    /* Set FP16 processing flag when supported */
-#pragma warning(suppress: 4127)
-    if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
-        adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
-        VddLog("InitAdapter: FP16 flag set");
-    } else {
-        VddLog("InitAdapter: FP16 not available");
-    }
+    /* Do NOT set IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16.  This driver is SDR-only
+       (BGRA8 staging texture, no-op HDR metadata).  Advertising FP16 makes DWM
+       compose this display's desktop in R16G16B16A16_FLOAT, which breaks
+       third-party Desktop Duplication capture (Parsec etc.): DuplicateOutput1
+       fails with DXGI_ERROR_UNSUPPORTED and the fallback path double-applies
+       sRGB gamma, giving a washed-out image. */
+    adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_NONE;
+    VddLog("InitAdapter: SDR only (FP16 not advertised)");
 
     adapterCaps.MaxMonitorsSupported = 1;
 
