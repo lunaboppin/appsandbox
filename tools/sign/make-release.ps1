@@ -280,8 +280,9 @@ $signtool = Find-SignTool
 # cert are skipped (re-signing a driver binary would change its bytes and break the MS catalog
 # hash on a reuse / cache-hit run). drivers-signed/_attest/_package are excluded; WebView2Loader.dll
 # is left as Microsoft shipped it.
-# WebView2Loader.dll and devcon.exe are Microsoft's binaries - never re-sign them with our cert.
-$msBinaries = @('WebView2Loader.dll', 'devcon.exe')
+# WebView2Loader.dll and devcon.exe are Microsoft's binaries, and ViGEmBus_Setup.exe is
+# Nefarius' signed installer - never re-sign them with our cert.
+$msBinaries = @('WebView2Loader.dll', 'devcon.exe', 'ViGEmBus_Setup.exe')
 $toSign = @(Get-ChildItem $bin -Recurse -Include *.exe, *.dll, *.sys | Where-Object {
     ($_.Name -notin $msBinaries) -and
     ($_.FullName -notmatch '\\(drivers-signed|_attest|_package)\\') -and

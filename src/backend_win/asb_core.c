@@ -886,7 +886,8 @@ static void remember_storage_parent(const wchar_t *root)
    result is the one the shared-resource path depends on. */
 static const wchar_t *const k_guest_bins[] = {
     L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe",
-    L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe"
+    L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe",
+    L"ViGEmBus_Setup.exe"   /* game controller bus; the agent installs it */
 };
 
 /* Replace one guest file if its hash differs from the host copy. */

@@ -30,6 +30,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <Xinput.h>
 
 #include "vm_display_idd.h"
 #include "vm_clipboard.h"
@@ -45,6 +46,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "xinput.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -145,8 +147,11 @@ typedef struct FileDropResult {
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired guest refresh rate (Hz) */
 #define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = refresh (Hz) */
+#define INPUT_GAMEPAD       0x30        /* + slot 0..3: p1 = buttons|LT<<16|RT<<24, p2 = LX|LY<<16, p3 = RX|RY<<16 */
+#define INPUT_GAMEPAD_REMOVE 0x34       /* p1 = slot */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host after IRDY: p1 = caps, p2 = version */
 #define INPUT_GUEST_CURSOR  0x81        /* guest -> host: p1 = 1 if the guest cursor is hidden */
+#define INPUT_GUEST_RUMBLE  0x82        /* guest -> host: p1 = slot, p2 = large, p3 = small motor (0-255) */
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
@@ -163,6 +168,7 @@ typedef struct FileDropResult {
 #define INPUT_CAP_REFRESH   0x08
 #define INPUT_CAP_CURSOR_REPORT 0x10
 #define INPUT_CAP_SET_MODE  0x20
+#define INPUT_CAP_GAMEPAD   0x40
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 #define INPUT_QUEUE_MAX     512
@@ -294,6 +300,8 @@ struct VmDisplayIdd {
     volatile BOOL  input_connected;
     volatile LONG  guest_caps;      /* INPUT_CAP_* of the connected helper */
     volatile LONG  guest_helper_hidden; /* INPUT_GUEST_CURSOR from the helper */
+    volatile LONG  input_gen;       /* bumped on every input (re)connect */
+    HANDLE         gamepad_thread;  /* XInput poller (see idd_gamepad_thread_proc) */
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -631,6 +639,12 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
         } else if (last && type == INPUT_MOUSE_MOVE_REL && last->type == INPUT_MOUSE_MOVE_REL) {
             last->param1 = (UINT32)((INT32)last->param1 + (INT32)p1);
             last->param2 = (UINT32)((INT32)last->param2 + (INT32)p2);
+        } else if (last && type >= INPUT_GAMEPAD && type < INPUT_GAMEPAD + XUSER_MAX_COUNT &&
+                   last->type == type) {
+            /* Newer controller state replaces an unsent older one. */
+            last->param1 = p1;
+            last->param2 = p2;
+            last->param3 = p3;
         } else if (d->input_q_len < INPUT_QUEUE_MAX) {
             InputPacket *pkt = &d->input_q[d->input_q_len++];
             pkt->magic  = INPUT_MAGIC;
@@ -747,6 +761,7 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
         LeaveCriticalSection(&d->input_cs);
         InterlockedExchange(&d->guest_caps, guest_caps);
         InterlockedExchange(&d->guest_helper_hidden, 0);
+        InterlockedIncrement(&d->input_gen);
         d->input_connected = TRUE;
         idd_log(d, L"Input connected (guest caps 0x%X).", (UINT)guest_caps);
         if (d->hwnd)
@@ -789,6 +804,12 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
                         if (InterlockedExchange(&d->guest_helper_hidden, hidden) != hidden &&
                             d->hwnd)
                             PostMessageW(d->hwnd, WM_IDD_CURSOR_STATE, 0, 0);
+                    } else if (gp.type == INPUT_GUEST_RUMBLE && gp.param1 < XUSER_MAX_COUNT &&
+                               d->input_focused) {
+                        XINPUT_VIBRATION vib;
+                        vib.wLeftMotorSpeed  = (WORD)((gp.param2 & 0xFF) * 257);
+                        vib.wRightMotorSpeed = (WORD)((gp.param3 & 0xFF) * 257);
+                        XInputSetState(gp.param1, &vib);
                     }
                     /* Other guest packet types are ignored. */
                 }
@@ -1705,6 +1726,115 @@ session_cleanup:
 
 
 /* ==================================================================
+ * Game controllers — host XInput pads become virtual pads in the guest
+ * ================================================================== */
+
+#define GAMEPAD_POLL_MS     4       /* ~250 Hz, like a wired controller */
+#define GAMEPAD_PROBE_MS    1000    /* empty slots: XInputGetState is slow on them */
+
+static void idd_send_pad_state(VmDisplayIdd *d, DWORD slot, const XINPUT_GAMEPAD *g)
+{
+    send_input(d, INPUT_GAMEPAD + slot,
+               (UINT32)g->wButtons | ((UINT32)g->bLeftTrigger << 16) |
+                   ((UINT32)g->bRightTrigger << 24),
+               (UINT32)(UINT16)g->sThumbLX | ((UINT32)(UINT16)g->sThumbLY << 16),
+               (UINT32)(UINT16)g->sThumbRX | ((UINT32)(UINT16)g->sThumbRY << 16));
+}
+
+/* Polls the host's XInput controllers while this window is the active one
+   and the guest helper supports pads. State is sent on change; losing focus
+   sends a neutral state (the pad stays plugged in so games don't pause) and
+   stops rumble. A pad unplugged on the host is unplugged in the guest. */
+static DWORD WINAPI idd_gamepad_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    DWORD last_packet[XUSER_MAX_COUNT] = { 0 };
+    DWORD last_probe[XUSER_MAX_COUNT] = { 0 };
+    BOOL  present[XUSER_MAX_COUNT] = { 0 };
+    BOOL  sent[XUSER_MAX_COUNT] = { 0 };    /* the guest has a pad in this slot */
+    BOOL  was_active = FALSE;
+    LONG  gen = -1;
+    HANDLE timer;
+    DWORD i;
+
+    /* Sleep() only has ~15.6 ms resolution; a high-resolution waitable timer
+       gives the 4 ms poll interval without raising the system timer rate. */
+    timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                   TIMER_ALL_ACCESS);
+
+    while (!d->stop) {
+        BOOL active = d->input_connected && (d->guest_caps & INPUT_CAP_GAMEPAD) &&
+                      d->input_focused && d->hwnd && GetForegroundWindow() == d->hwnd;
+        DWORD now = GetTickCount();
+
+        if (gen != d->input_gen) {
+            /* New helper connection: it has no pads yet. */
+            gen = d->input_gen;
+            ZeroMemory(sent, sizeof(sent));
+        }
+
+        for (i = 0; i < XUSER_MAX_COUNT; i++) {
+            XINPUT_STATE st;
+            if (!present[i] && last_probe[i] && (DWORD)(now - last_probe[i]) < GAMEPAD_PROBE_MS)
+                continue;
+            last_probe[i] = now;
+            if (XInputGetState(i, &st) != ERROR_SUCCESS) {
+                if (present[i]) {
+                    present[i] = FALSE;
+                    idd_log(d, L"Gamepad %lu disconnected on the host.", i);
+                    if (sent[i] && d->input_connected)
+                        send_input(d, INPUT_GAMEPAD_REMOVE, i, 0, 0);
+                    sent[i] = FALSE;
+                }
+                continue;
+            }
+            if (!present[i]) {
+                present[i] = TRUE;
+                idd_log(d, L"Gamepad %lu found on the host.", i);
+            }
+            if (active) {
+                if (!sent[i] || !was_active || st.dwPacketNumber != last_packet[i]) {
+                    idd_send_pad_state(d, i, &st.Gamepad);
+                    last_packet[i] = st.dwPacketNumber;
+                    sent[i] = TRUE;
+                }
+            } else if (was_active && sent[i]) {
+                XINPUT_GAMEPAD neutral;
+                XINPUT_VIBRATION off = { 0, 0 };
+                ZeroMemory(&neutral, sizeof(neutral));
+                idd_send_pad_state(d, i, &neutral);
+                XInputSetState(i, &off);
+            }
+        }
+        was_active = active;
+
+        if (timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)GAMEPAD_POLL_MS * 10000;
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(timer, GAMEPAD_POLL_MS * 4);
+            else
+                Sleep(GAMEPAD_POLL_MS);
+        } else {
+            Sleep(GAMEPAD_POLL_MS);
+        }
+    }
+
+    /* Unplug our pads in the guest and stop any rumble on the host. */
+    for (i = 0; i < XUSER_MAX_COUNT; i++) {
+        if (present[i]) {
+            XINPUT_VIBRATION off = { 0, 0 };
+            XInputSetState(i, &off);
+        }
+        if (sent[i] && d->input_connected)
+            send_input(d, INPUT_GAMEPAD_REMOVE, i, 0, 0);
+    }
+    if (timer)
+        CloseHandle(timer);
+    return 0;
+}
+
+/* ==================================================================
  * File drop — files dragged onto the window go to the guest Desktop
  * ================================================================== */
 
@@ -2506,6 +2636,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
        helper rather than the one being replaced. */
     if (!d->stop && !d->input_thread)
         d->input_thread = CreateThread(NULL, 0, idd_input_thread_proc, d, 0, NULL);
+    if (!d->stop && !d->gamepad_thread)
+        d->gamepad_thread = CreateThread(NULL, 0, idd_gamepad_thread_proc, d, 0, NULL);
 
     while (!d->stop) {
         SOCKET s;
@@ -3133,6 +3265,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d->recv_thread = NULL;
             }
 
+            /* Gamepad thread: one poll interval; its final unplug packets are
+               queued before the input thread's last drain. */
+            if (d->gamepad_thread) {
+                WaitForSingleObject(d->gamepad_thread, 1000);
+                CloseHandle(d->gamepad_thread);
+                d->gamepad_thread = NULL;
+            }
+
             /* Input thread: at most a connect (1s) or send (2s) in flight. */
             if (d->input_thread) {
                 WaitForSingleObject(d->input_thread, 3000);
@@ -3570,6 +3710,12 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->recv_thread) {
         WaitForSingleObject(display->recv_thread, 3000);
         CloseHandle(display->recv_thread);
+    }
+
+    /* gamepad_thread likewise */
+    if (display->gamepad_thread) {
+        WaitForSingleObject(display->gamepad_thread, 1000);
+        CloseHandle(display->gamepad_thread);
     }
 
     /* input_thread likewise (it may have been started after WM_CLOSE ran) */

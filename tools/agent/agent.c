@@ -1588,6 +1588,96 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
     return TRUE;
 }
 
+/* ---- ViGEmBus (virtual game controllers for appsandbox-input) ----
+ *
+ * The host copies ViGEmBus_Setup.exe (Nefarius' signed installer) next to
+ * the agent. If the bus driver is not installed yet, install it silently in
+ * the background. A failed attempt is recorded with the installer's size so
+ * it is not retried on every boot; a new installer is tried again. */
+
+static DWORD WINAPI vigembus_install_thread(LPVOID param)
+{
+    wchar_t dir[MAX_PATH], setup[MAX_PATH], marker[MAX_PATH], cmd[MAX_PATH * 2];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    SC_HANDLE scm, svc;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD code = 1;
+    wchar_t *slash;
+    FILE *f;
+    (void)param;
+
+    scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (scm) {
+        svc = OpenServiceW(scm, L"ViGEmBus", SERVICE_QUERY_STATUS);
+        if (svc) {
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return 0;   /* already installed */
+        }
+        CloseServiceHandle(scm);
+    }
+
+    GetModuleFileNameW(NULL, dir, MAX_PATH);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(setup, MAX_PATH, L"%s\\ViGEmBus_Setup.exe", dir);
+    swprintf_s(marker, MAX_PATH, L"%s\\vigembus-install.txt", dir);
+    if (!GetFileAttributesExW(setup, GetFileExInfoStandard, &fa))
+        return 0;   /* no installer shipped to this VM */
+
+    if (_wfopen_s(&f, marker, L"r") == 0 && f) {
+        unsigned long long size = 0;
+        unsigned long prev = 0;
+        int n = fscanf_s(f, "%llu %lu", &size, &prev);
+        fclose(f);
+        if (n == 2 && size == (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow)) {
+            agent_log("ViGEmBus: install of this installer failed before (exit %lu); not retrying. "
+                      "Delete %ls to retry.", prev, marker);
+            return 0;
+        }
+    }
+
+    /* Advanced Installer bootstrapper: /exenoui hides the EXE UI, /qn the MSI UI. */
+    swprintf_s(cmd, MAX_PATH * 2, L"\"%s\" /exenoui /qn /norestart", setup);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    agent_log("ViGEmBus: installing (virtual game controllers)...");
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) {
+        agent_log("ViGEmBus: could not start the installer (%lu).", GetLastError());
+        return 0;
+    }
+    if (WaitForSingleObject(pi.hProcess, 5 * 60 * 1000) == WAIT_TIMEOUT) {
+        agent_log("ViGEmBus: installer timed out, terminating it.");
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    /* 3010 / 1641: installed, reboot requested (the bus works without one). */
+    if (code == 0 || code == 3010 || code == 1641) {
+        agent_log("ViGEmBus: installed (exit %lu).", code);
+        DeleteFileW(marker);
+    } else {
+        agent_log("ViGEmBus: install failed (exit %lu).", code);
+        if (_wfopen_s(&f, marker, L"w") == 0 && f) {
+            fprintf(f, "%llu %lu\n",
+                    ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow, code);
+            fclose(f);
+        }
+    }
+    return 0;
+}
+
+static void start_vigembus_install(void)
+{
+    HANDLE t = CreateThread(NULL, 0, vigembus_install_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
 /* ---- VDD device check: restart if not running ---- */
 
 static void ensure_vdd_running(void)
@@ -3341,6 +3431,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
     ensure_hyperv_video_disabled(NULL);
+
+    /* Game controller bus for appsandbox-input (background, once) */
+    start_vigembus_install();
 
     /* Wait until stop is signaled */
     WaitForSingleObject(g_stop_event, INFINITE);

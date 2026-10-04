@@ -64,6 +64,21 @@ governs that file.
   (redistributable tool).
 - **Copyright:** Copyright (c) Microsoft Corporation.
 
+## vendor/vigem/ViGEmClient/ — ViGEm client library (virtual game controllers)
+
+- **License:** MIT (`SPDX: MIT`). License text:
+  [`vendor/vigem/ViGEmClient/LICENSE`](vendor/vigem/ViGEmClient/LICENSE).
+- **Copyright:** Copyright (c) Nefarius Software Solutions e.U. and contributors.
+- Source compiled into `appsandbox-input.exe` (guest), unmodified.
+
+## vendor/vigem/ViGEmBus/ViGEmBus_Setup.exe — ViGEmBus driver installer
+
+- **License:** BSD 3-Clause (`SPDX: BSD-3-Clause`). License text:
+  [`vendor/vigem/ViGEmBus/LICENSE`](vendor/vigem/ViGEmBus/LICENSE).
+- **Copyright:** Copyright (c) 2016-2020, Nefarius Software Solutions e.U.
+- Nefarius' signed v1.22.0 installer, redistributed unmodified (renamed) and
+  installed into Windows guests by the agent.
+
 ## vendor/qemu-ivshmem/ — QEMU + its runtime dependencies (bundled macOS VMM)
 
 - **License:** QEMU — GNU General Public License, version 2 (`SPDX: GPL-2.0`);

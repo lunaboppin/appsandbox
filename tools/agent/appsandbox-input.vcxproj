@@ -157,6 +157,15 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
   <ItemGroup>
     <ClCompile Include="appsandbox-input.c" />
     <ClCompile Include="input-filedrop.c" />
+    <ClCompile Include="input-gamepad.c">
+      <AdditionalIncludeDirectories>..\..\vendor\vigem\ViGEmClient\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <ClCompile Include="..\..\vendor\vigem\ViGEmClient\src\ViGEmClient.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <WarningLevel>Level3</WarningLevel>
+      <AdditionalIncludeDirectories>..\..\vendor\vigem\ViGEmClient\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="..\transport\asb_transport.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

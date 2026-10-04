@@ -1939,7 +1939,7 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
 
     /* 2. Agent + input helper executables */
     {
-        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe" };
+        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe", L"ViGEmBus_Setup.exe" };
         int bi;
         for (bi = 0; bi < (int)(sizeof(bins) / sizeof(bins[0])); bi++) {
             BOOL found = FALSE;

@@ -39,8 +39,11 @@
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired refresh rate in Hz */
 #define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = refresh Hz */
+#define INPUT_GAMEPAD       0x30        /* + slot 0..3: XINPUT_GAMEPAD state, see input-gamepad.c */
+#define INPUT_GAMEPAD_REMOVE 0x34       /* p1 = slot */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host: p1 = caps, p2 = version */
 #define INPUT_GUEST_CURSOR  0x81        /* guest -> host: p1 = 1 if the cursor is hidden */
+#define INPUT_GUEST_RUMBLE  0x82        /* guest -> host: p1 = slot, p2 = large, p3 = small motor */
 
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
@@ -55,7 +58,8 @@
 #define INPUT_CAP_REFRESH   0x08
 #define INPUT_CAP_CURSOR_REPORT 0x10
 #define INPUT_CAP_SET_MODE  0x20
-#define INPUT_PROTO_VERSION 4
+#define INPUT_CAP_GAMEPAD   0x40
+#define INPUT_PROTO_VERSION 5
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 
@@ -70,6 +74,10 @@ typedef struct {
 #pragma pack(pop)
 
 void filedrop_start(void);   /* input-filedrop.c */
+void gamepad_init(void);     /* input-gamepad.c */
+void gamepad_update(const void *owner, UINT32 index, UINT32 p1, UINT32 p2, UINT32 p3);
+void gamepad_remove(UINT32 index);
+void gamepad_release_owner(const void *owner);
 
 /* ---- Logging (rate limited where it can be hot) ---- */
 
@@ -446,6 +454,15 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
         ensure_input_desktop(FALSE);
         apply_mode(pkt->param1, pkt->param2, pkt->param3);
         break;
+    case INPUT_GAMEPAD + 0:
+    case INPUT_GAMEPAD + 1:
+    case INPUT_GAMEPAD + 2:
+    case INPUT_GAMEPAD + 3:
+        gamepad_update(h, pkt->type - INPUT_GAMEPAD, pkt->param1, pkt->param2, pkt->param3);
+        break;
+    case INPUT_GAMEPAD_REMOVE:
+        gamepad_remove(pkt->param1);
+        break;
     default:
         break;   /* unknown types from newer hosts are ignored */
     }
@@ -475,6 +492,22 @@ static void send_cursor_locked(AsbConn *c, BOOL hidden)
     pkt.param1 = hidden ? 1 : 0;
     if (asb_send(c, &pkt, sizeof(pkt)) != (int)sizeof(pkt))
         input_log("Failed to send cursor state.");
+}
+
+/* Rumble from a virtual pad (ViGEm notification thread) back to the host. */
+void gamepad_send_rumble(UINT32 index, UINT32 large_motor, UINT32 small_motor)
+{
+    InputPacket pkt;
+    ZeroMemory(&pkt, sizeof(pkt));
+    pkt.magic  = INPUT_MAGIC;
+    pkt.type   = INPUT_GUEST_RUMBLE;
+    pkt.param1 = index;
+    pkt.param2 = large_motor;
+    pkt.param3 = small_motor;
+    EnterCriticalSection(&g_send_cs);
+    if (g_report_conn && asb_send(g_report_conn, &pkt, sizeof(pkt)) != (int)sizeof(pkt))
+        input_log("Failed to send rumble.");
+    LeaveCriticalSection(&g_send_cs);
 }
 
 static DWORD WINAPI cursor_watch_thread(LPVOID param)
@@ -548,7 +581,7 @@ static void handle_conn(AsbConn *c)
     pkt.type   = INPUT_GUEST_CAPS;
     pkt.param1 = INPUT_CAP_REL_MOUSE | INPUT_CAP_XBUTTONS |
                  INPUT_CAP_HWHEEL | INPUT_CAP_REFRESH | INPUT_CAP_SET_MODE |
-                 (report ? INPUT_CAP_CURSOR_REPORT : 0);
+                 (report ? INPUT_CAP_CURSOR_REPORT | INPUT_CAP_GAMEPAD : 0);
     pkt.param2 = INPUT_PROTO_VERSION;
     EnterCriticalSection(&g_send_cs);
     sent = asb_send(c, &ready, sizeof(ready)) == (int)sizeof(ready) &&
@@ -590,6 +623,7 @@ static void handle_conn(AsbConn *c)
     LeaveCriticalSection(&g_send_cs);
 
     release_held(&held);
+    gamepad_release_owner(&held);
 }
 
 /* ==================================================================
@@ -642,6 +676,7 @@ int main(void)
     InitializeCriticalSection(&g_inject_cs);
     InitializeCriticalSection(&g_conn_cs);
     InitializeCriticalSection(&g_send_cs);
+    gamepad_init();
 
     input_log("Starting (PID=%lu, session=%lu).",
               GetCurrentProcessId(),
