@@ -1678,6 +1678,178 @@ static void start_vigembus_install(void)
     if (t) CloseHandle(t);
 }
 
+/* ---- Staged driver updates (display + audio) ----
+ *
+ * When the host starts the VM it refreshes drivers\AppSandboxVDD.* and
+ * drivers\AppSandboxVAD.* next to the agent. Existing VMs keep whatever driver
+ * they were provisioned with, so install a staged package that differs from
+ * the one last applied. These builds are test-signed: only do it in Test
+ * Mode (otherwise the driver would not load and the VM could lose its
+ * display). The package is forced onto the device with devcon update, as at
+ * provisioning, because an installed Microsoft-signed driver of the same
+ * version would otherwise outrank it. Each package is attempted once. */
+
+static BOOL test_signing_on(void)
+{
+    wchar_t opts[512];
+    DWORD size = sizeof(opts);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control",
+                     L"SystemStartOptions", RRF_RT_REG_SZ, NULL, opts, &size) != ERROR_SUCCESS)
+        return FALSE;
+    _wcsupr_s(opts, _countof(opts));
+    return wcsstr(opts, L"TESTSIGNING") != NULL;
+}
+
+/* FNV-1a 64 of a file: identifies a staged package (its catalog). */
+static BOOL file_fingerprint(const wchar_t *path, unsigned long long *out)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    unsigned long long h = 1469598103934665603ULL;
+    BYTE buf[8192];
+    DWORD got;
+    if (f == INVALID_HANDLE_VALUE)
+        return FALSE;
+    while (ReadFile(f, buf, sizeof(buf), &got, NULL) && got) {
+        DWORD i;
+        for (i = 0; i < got; i++) { h ^= buf[i]; h *= 1099511628211ULL; }
+    }
+    CloseHandle(f);
+    *out = h;
+    return TRUE;
+}
+
+/* Run a command line, wait (up to timeout), return its exit code (or -1). */
+static DWORD run_wait(const wchar_t *cmdline, const wchar_t *cwd, DWORD timeout_ms)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[MAX_PATH * 3];
+    DWORD code = (DWORD)-1;
+    wcscpy_s(cmd, _countof(cmd), cmdline);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, cwd, &si, &pi))
+        return (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return code;
+}
+
+static void apply_staged_driver(const wchar_t *ddir, const wchar_t *name, const wchar_t *hwid)
+{
+    wchar_t inf[MAX_PATH], cat[MAX_PATH], cer[MAX_PATH], marker[MAX_PATH], cmd[MAX_PATH * 3];
+    unsigned long long fp = 0, done = 0;
+    DWORD rc;
+    FILE *f;
+
+    swprintf_s(inf, MAX_PATH, L"%s\\%s.inf", ddir, name);
+    swprintf_s(cat, MAX_PATH, L"%s\\%s.cat", ddir, name);
+    swprintf_s(cer, MAX_PATH, L"%s\\%s.cer", ddir, name);
+    swprintf_s(marker, MAX_PATH, L"%s\\%s.applied", ddir, name);
+    if (GetFileAttributesW(inf) == INVALID_FILE_ATTRIBUTES || !file_fingerprint(cat, &fp))
+        return;
+    if (_wfopen_s(&f, marker, L"r") == 0 && f) {
+        if (fscanf_s(f, "%llx", &done) != 1)
+            done = 0;
+        fclose(f);
+    }
+    if (done == fp)
+        return;   /* this package was already applied (or attempted) */
+
+    if (!test_signing_on()) {
+        agent_log("Drivers: a newer %ls is staged but Test Mode is off; not installing it "
+                  "(turn on Test Mode in the VM to use it).", name);
+        return;   /* not marked: retried once Test Mode is on */
+    }
+
+    agent_log("Drivers: installing the staged %ls...", name);
+    if (GetFileAttributesW(cer) != INVALID_FILE_ATTRIBUTES) {
+        swprintf_s(cmd, _countof(cmd), L"certutil.exe -addstore Root \"%s\"", cer);
+        run_wait(cmd, ddir, 30000);
+        swprintf_s(cmd, _countof(cmd), L"certutil.exe -f -addstore TrustedPublisher \"%s\"", cer);
+        run_wait(cmd, ddir, 30000);
+    }
+    swprintf_s(cmd, _countof(cmd), L"pnputil.exe /add-driver \"%s\"", inf);
+    rc = run_wait(cmd, ddir, 120000);
+    agent_log("Drivers: pnputil /add-driver %ls exit %lu.", name, rc);
+    swprintf_s(cmd, _countof(cmd), L"\"%s\\devcon.exe\" update \"%s\" %s", ddir, inf, hwid);
+    rc = run_wait(cmd, ddir, 120000);
+    /* devcon: 0 = done, 1 = done but a reboot is needed. */
+    agent_log("Drivers: %ls %s (devcon exit %lu).", name,
+              rc == 0 ? "updated" : rc == 1 ? "updated; takes effect after a VM restart" : "update FAILED", rc);
+
+    if (_wfopen_s(&f, marker, L"w") == 0 && f) {
+        fprintf(f, "%llx\n", fp);   /* attempt once per package, success or not */
+        fclose(f);
+    }
+}
+
+static BOOL secure_boot_on(void)
+{
+    DWORD v = 0, size = sizeof(v);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+                     L"UEFISecureBootEnabled", RRF_RT_REG_DWORD, NULL, &v, &size) != ERROR_SUCCESS)
+        return FALSE;
+    return v != 0;
+}
+
+/* The host turned Test Mode on for this VM (testmode.request, written while
+   the disk was offline). Secure Boot is then off; turn test signing on and
+   restart once. Returns TRUE if a restart was started. */
+static BOOL handle_test_mode_request(const wchar_t *dir)
+{
+    wchar_t req[MAX_PATH];
+    DWORD rc;
+
+    swprintf_s(req, MAX_PATH, L"%s\\testmode.request", dir);
+    if (GetFileAttributesW(req) == INVALID_FILE_ATTRIBUTES)
+        return FALSE;
+    if (test_signing_on()) {
+        DeleteFileW(req);
+        return FALSE;
+    }
+    if (secure_boot_on()) {
+        agent_log("Test Mode: requested, but Secure Boot is still on; start the VM from "
+                  "App Sandbox (not a restart inside Windows) to apply it.");
+        return FALSE;
+    }
+    rc = run_wait(L"bcdedit.exe /set testsigning on", dir, 30000);
+    agent_log("Test Mode: bcdedit /set testsigning on exit %lu.", rc);
+    if (rc != 0)
+        return FALSE;
+    DeleteFileW(req);
+    agent_log("Test Mode: on. Restarting the VM once to apply it.");
+    run_wait(L"shutdown.exe /r /t 15 /c \"App Sandbox: restarting once to turn on Test Mode\"", dir, 10000);
+    return TRUE;
+}
+
+static DWORD WINAPI staged_drivers_thread(LPVOID param)
+{
+    wchar_t ddir[MAX_PATH], *slash;
+    (void)param;
+    GetModuleFileNameW(NULL, ddir, MAX_PATH);
+    slash = wcsrchr(ddir, L'\\');
+    if (slash) *slash = L'\0';
+    if (handle_test_mode_request(ddir))
+        return 0;   /* drivers install after the restart */
+    wcscat_s(ddir, MAX_PATH, L"\\drivers");
+    apply_staged_driver(ddir, L"AppSandboxVDD", L"Root\\AppSandboxVDD");
+    apply_staged_driver(ddir, L"AppSandboxVAD", L"Root\\AppSandboxVAD");
+    return 0;
+}
+
+static void start_staged_drivers(void)
+{
+    HANDLE t = CreateThread(NULL, 0, staged_drivers_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
 /* ---- VDD device check: restart if not running ---- */
 
 static void ensure_vdd_running(void)
@@ -3434,6 +3606,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Game controller bus for appsandbox-input (background, once) */
     start_vigembus_install();
+
+    /* Display/audio driver updates the host staged (background, Test Mode only) */
+    start_staged_drivers();
 
     /* Wait until stop is signaled */
     WaitForSingleObject(g_stop_event, INFINITE);

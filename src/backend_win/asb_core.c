@@ -890,6 +890,14 @@ static const wchar_t *const k_guest_bins[] = {
     L"ViGEmBus_Setup.exe"   /* game controller bus; the agent installs it */
 };
 
+/* Display and audio driver packages, refreshed into
+   C:\Windows\AppSandbox\drivers (where provisioning put them). The agent
+   installs a changed package at boot when the guest runs in Test Mode. */
+static const wchar_t *const k_guest_driver_files[] = {
+    L"AppSandboxVDD.dll", L"AppSandboxVDD.inf", L"AppSandboxVDD.cat", L"AppSandboxVDD.cer",
+    L"AppSandboxVAD.sys", L"AppSandboxVAD.inf", L"AppSandboxVAD.cat", L"AppSandboxVAD.cer"
+};
+
 /* Replace one guest file if its hash differs from the host copy. */
 static HRESULT upgrade_guest_file_offline(const wchar_t *source, const wchar_t *dest)
 {
@@ -913,7 +921,7 @@ static HRESULT upgrade_guest_file_offline(const wchar_t *source, const wchar_t *
    other helpers are best-effort and only logged). *any_failed, if given,
    reports a failure of any file. */
 static HRESULT upgrade_windows_guest_offline(const wchar_t *vhdx_path, int bin_count,
-                                             BOOL *any_failed)
+                                             BOOL *any_failed, BOOL request_test_mode)
 {
     VIRTUAL_STORAGE_TYPE st;
     OPEN_VIRTUAL_DISK_PARAMETERS op;
@@ -963,6 +971,33 @@ static HRESULT upgrade_windows_guest_offline(const wchar_t *vhdx_path, int bin_c
             if(i==0)hr=SUCCEEDED(fhr)?S_OK:fhr;
             if(FAILED(fhr)&&any_failed)*any_failed=TRUE;
         }
+        /* Full refresh only (not the agent-only appliance path): driver
+           packages too, best-effort. */
+        if(bin_count==(int)_countof(k_guest_bins)){
+            wchar_t ddir[MAX_PATH];
+            swprintf_s(ddir,MAX_PATH,L"%c:\\Windows\\AppSandbox\\drivers",L'A'+bit);
+            CreateDirectoryW(ddir,NULL);
+            for(i=0;i<(int)_countof(k_guest_driver_files);i++){
+                HRESULT fhr;
+                swprintf_s(source,MAX_PATH,L"%s\\drivers\\%s",module,k_guest_driver_files[i]);
+                if(GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES)continue;
+                swprintf_s(dest,MAX_PATH,L"%s\\%s",ddir,k_guest_driver_files[i]);
+                fhr=upgrade_guest_file_offline(source,dest);
+                if(fhr==S_OK){updated++;asb_log(L"Guest binary refresh: updated drivers\\%s.",k_guest_driver_files[i]);}
+                if(FAILED(fhr)&&any_failed)*any_failed=TRUE;
+            }
+            /* Test Mode VM: ask the agent to make sure test signing is on. */
+            {
+                wchar_t req[MAX_PATH];
+                swprintf_s(req,MAX_PATH,L"%c:\\Windows\\AppSandbox\\testmode.request",L'A'+bit);
+                if(request_test_mode){
+                    HANDLE rf=CreateFileW(req,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+                    if(rf!=INVALID_HANDLE_VALUE)CloseHandle(rf);
+                }else{
+                    DeleteFileW(req);
+                }
+            }
+        }
         break;
     }
     if(!after)hr=HRESULT_FROM_WIN32(ERROR_NOT_READY);
@@ -977,7 +1012,7 @@ static HRESULT upgrade_windows_guest_offline(const wchar_t *vhdx_path, int bin_c
 /* Agent only: used by shared_appliance.c for the appliance VM. */
 static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
 {
-    return upgrade_windows_guest_offline(vhdx_path, 1, NULL);
+    return upgrade_windows_guest_offline(vhdx_path, 1, NULL, FALSE);
 }
 
 HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path)
@@ -1432,7 +1467,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     if (vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
         BOOL any_failed = FALSE;
         hr = upgrade_windows_guest_offline(vm->vhdx_path,
-                                           (int)_countof(k_guest_bins), &any_failed);
+                                           (int)_countof(k_guest_bins), &any_failed,
+                                           vm->test_mode);
         if (any_failed)
             asb_log(L"Guest binary refresh incomplete for \"%s\" (agent 0x%08X); booting with the existing files.", vm->name, hr);
         if (args->config.shared_resource_count > 0) {
@@ -5022,6 +5058,19 @@ ASB_API BOOL asb_get_suppress_tray_warn(void)
 /* ---- Internal access (for UI layer) ---- */
 
 ASB_API VmInstance *asb_vm_instance(AsbVm vm) { return vm_inst(vm); }
+
+ASB_API HRESULT asb_vm_enable_test_mode(VmInstance *vm)
+{
+    if (!vm || _wcsicmp(vm->os_type, L"Windows") != 0)
+        return E_INVALIDARG;
+    if (vm->test_mode)
+        return S_FALSE;
+    vm->test_mode = TRUE;
+    if (!save_vm_list())
+        return E_FAIL;
+    asb_log(L"Test Mode enabled for \"%s\"; it takes effect when the VM next starts.", vm->name);
+    return S_OK;
+}
 
 ASB_API SnapshotTree *asb_vm_snap_tree(AsbVm vm)
 {

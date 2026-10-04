@@ -314,6 +314,11 @@ HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path);
 
 ASB_API VmInstance   *asb_vm_instance(AsbVm vm);
 
+/* Turn on Test Mode for an existing Windows VM: from its next start Secure
+   Boot is off, and the guest agent enables test signing (restarting the VM
+   once), so the test-signed AppSandbox drivers can load. */
+ASB_API HRESULT       asb_vm_enable_test_mode(VmInstance *vm);
+
 /* Look up a VmInstance by its stable unique_id. Returns NULL if no VM
    with that id exists (e.g. the VM was deleted). Long-lived background
    threads cache the id rather than a VmInstance* so they survive

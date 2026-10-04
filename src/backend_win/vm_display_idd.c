@@ -20,6 +20,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <ksmedia.h>
+#include <functiondiscoverykeys_devpkey.h>
 
 #pragma warning(push)
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
@@ -36,6 +37,7 @@
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
+#include "asb_core.h"
 #include "ui.h"
 #include "resource.h"
 
@@ -208,6 +210,7 @@ typedef struct InputPacket {
 /* Displays: the primary window plus up to three extra ones, each fed by its
    own frame channel (port 2 for display 0, IDD_EXTRA_PORT_BASE + n for n). */
 #define IDD_MAX_DISPLAYS        4
+#define MICSRC_MAX              16       /* "Microphone source" entries */
 #define IDD_EXTRA_PORT_BASE     20
 
 /* Timer for Present cadence when no frames arrive */
@@ -392,6 +395,12 @@ struct VmDisplayIdd {
     /* Microphone (:0009 — host→guest). Off unless the user shares it; the
        host microphone is only opened while the guest is recording. */
     volatile BOOL    mic_share;
+    /* Host recording device to share (endpoint ID); empty = Windows default.
+       Written on the window thread; the mic thread copies it under sock_cs. */
+    wchar_t          mic_device_id[256];
+    volatile BOOL    mic_restart;       /* source changed: reopen the device */
+    HMENU            mic_src_menu;      /* "Microphone source" submenu */
+    wchar_t          mic_src_ids[MICSRC_MAX][256];  /* [0] unused (default) */
     HANDLE           mic_thread;
     volatile SOCKET  mic_socket;
     /* Guards mic_socket/drop_socket between their worker (which clears and
@@ -431,6 +440,8 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_FULLSCREEN     0x1030
 #define IDM_SHARE_MIC      0x1040
 #define IDM_DISPLAYS_BASE  0x1300   /* + 0x10 * (count - 1) */
+#define IDM_MICSRC_BASE    0x1400   /* + 0x10 * index; 0 = Windows default */
+#define IDM_TEST_MODE      0x1050
 #define IDM_REFRESH_BASE   0x1100   /* + 0x10 * index into g_refresh_choices */
 #define IDM_RES_BASE       0x1200   /* + 0x10 * index into g_res_choices */
 
@@ -932,9 +943,10 @@ static void idd_display_settings_save(const VmDisplayIdd *d)
        user's Immersive mode choice. */
     fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"refreshRate\":%u,"
                "\"resolutionWidth\":%u,\"resolutionHeight\":%u,\"shareMicrophone\":%d,"
-               "\"displayCount\":%u}\n",
+               "\"displayCount\":%u,\"micDevice\":\"%ls\"}\n",
             d->transmit_hotkeys ? 1 : 0, d->refresh_pref,
-            d->res_pref_w, d->res_pref_h, d->mic_share ? 1 : 0, d->display_count);
+            d->res_pref_w, d->res_pref_h, d->mic_share ? 1 : 0, d->display_count,
+            d->mic_device_id);
     fclose(f);
 }
 
@@ -944,7 +956,7 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
-    char buf[256];
+    char buf[1024];
 
     d->transmit_hotkeys = FALSE;
     d->refresh_pref = 0;
@@ -970,6 +982,18 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
             unsigned v = 0;
             if (dc && sscanf_s(dc + 15, "%u", &v) == 1 && v >= 1 && v <= IDD_MAX_DISPLAYS)
                 d->display_count = v;
+        }
+        {
+            /* Endpoint IDs are plain ASCII ({0.0.1.00000000}.{guid}). */
+            const char *md = strstr(buf, "\"micDevice\":\"");
+            d->mic_device_id[0] = L'\0';
+            if (md) {
+                const char *p = md + 13;
+                size_t n = 0;
+                while (*p && *p != '"' && n + 1 < _countof(d->mic_device_id))
+                    d->mic_device_id[n++] = (wchar_t)(unsigned char)*p++;
+                d->mic_device_id[n] = L'\0';
+            }
         }
         r = strstr(buf, "\"refreshRate\":");
         if (r) {
@@ -2176,12 +2200,24 @@ static BOOL mic_capture_start(VmDisplayIdd *d, MicCapture *m)
 {
     WAVEFORMATEX wfx;
     HRESULT hr;
+    wchar_t id[256];
+
+    EnterCriticalSection(&d->sock_cs);
+    wcscpy_s(id, _countof(id), d->mic_device_id);
+    LeaveCriticalSection(&d->sock_cs);
 
     ZeroMemory(m, sizeof(*m));
     hr = CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
                           &AUDIO_IID_IMMDeviceEnumerator, (void **)&m->en);
-    if (SUCCEEDED(hr))
-        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(m->en, eCapture, eConsole, &m->dev);
+    if (SUCCEEDED(hr) && id[0]) {
+        hr = IMMDeviceEnumerator_GetDevice(m->en, id, &m->dev);
+        if (FAILED(hr)) {
+            idd_log(d, L"Microphone: the chosen source is not available (0x%08lX); using the Windows default.", hr);
+            m->dev = NULL;
+        }
+    }
+    if (SUCCEEDED(hr) || m->en)
+        hr = m->dev ? S_OK : IMMDeviceEnumerator_GetDefaultAudioEndpoint(m->en, eCapture, eConsole, &m->dev);
     if (SUCCEEDED(hr))
         hr = IMMDevice_Activate(m->dev, &AUDIO_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&m->ac);
     if (SUCCEEDED(hr)) {
@@ -2293,6 +2329,13 @@ static DWORD WINAPI idd_mic_thread_proc(LPVOID param)
                 idd_log(d, L"Microphone: the VM stopped recording; host microphone closed.");
             }
 
+            if (capturing && d->mic_restart) {
+                d->mic_restart = FALSE;
+                mic_capture_stop(&cap);
+                capturing = mic_capture_start(d, &cap);
+                idd_log(d, capturing ? L"Microphone: switched source."
+                                     : L"Microphone: could not open the new source.");
+            }
             if (capturing && !mic_capture_pump(&cap, s, frame))
                 break;
             Sleep(10);
@@ -2948,8 +2991,14 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
         if (s == INVALID_SOCKET) {
             int wait;
-            if (connect_failures++ == 0)
-                idd_log(d, L"Connection failed, retrying every second.");
+            if (connect_failures++ == 0) {
+                if (d->primary)
+                    idd_log(d->primary, L"Display %u: waiting for the VM to add it. This needs the updated "
+                                        L"display driver, which installs at VM start when the VM is in Test Mode.",
+                            d->display_index + 1);
+                else
+                    idd_log(d, L"Connection failed, retrying every second.");
+            }
             for (wait = 0; wait < 1000 && !d->stop; wait += 250)
                 Sleep(250);
             continue;
@@ -3255,6 +3304,58 @@ static void idd_sync_extras_mode(VmDisplayIdd *d)
     }
 }
 
+/* Window thread: list the host's recording devices in the "Microphone
+   source" submenu (rebuilt each time the system menu opens). */
+static void idd_fill_mic_menu(VmDisplayIdd *d)
+{
+    IMMDeviceEnumerator *en = NULL;
+    IMMDeviceCollection *col = NULL;
+    UINT n = 0, i, count = 0;
+    BOOL checked_any = FALSE;
+
+    if (!d->mic_src_menu)
+        return;
+    while (GetMenuItemCount(d->mic_src_menu) > 0)
+        DeleteMenu(d->mic_src_menu, 0, MF_BYPOSITION);
+    AppendMenuW(d->mic_src_menu, MF_STRING, IDM_MICSRC_BASE, L"Windows default");
+    n = 1;
+
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                   &AUDIO_IID_IMMDeviceEnumerator, (void **)&en)) &&
+        SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(en, eCapture, DEVICE_STATE_ACTIVE, &col)) &&
+        SUCCEEDED(IMMDeviceCollection_GetCount(col, &count))) {
+        AppendMenuW(d->mic_src_menu, MF_SEPARATOR, 0, NULL);
+        for (i = 0; i < count && n < MICSRC_MAX; i++) {
+            IMMDevice *dev = NULL;
+            IPropertyStore *ps = NULL;
+            LPWSTR id = NULL;
+            PROPVARIANT name;
+            PropVariantInit(&name);
+            if (SUCCEEDED(IMMDeviceCollection_Item(col, i, &dev)) &&
+                SUCCEEDED(IMMDevice_GetId(dev, &id)) &&
+                SUCCEEDED(IMMDevice_OpenPropertyStore(dev, STGM_READ, &ps)) &&
+                SUCCEEDED(IPropertyStore_GetValue(ps, &PKEY_Device_FriendlyName, &name)) &&
+                name.vt == VT_LPWSTR) {
+                BOOL sel = _wcsicmp(id, d->mic_device_id) == 0;
+                wcscpy_s(d->mic_src_ids[n], 256, id);
+                AppendMenuW(d->mic_src_menu, MF_STRING | (sel ? MF_CHECKED : 0),
+                            IDM_MICSRC_BASE + 0x10 * n, name.pwszVal);
+                checked_any |= sel;
+                n++;
+            }
+            PropVariantClear(&name);
+            if (id) CoTaskMemFree(id);
+            if (ps) IPropertyStore_Release(ps);
+            if (dev) IMMDevice_Release(dev);
+        }
+    }
+    if (col) IMMDeviceCollection_Release(col);
+    if (en) IMMDeviceEnumerator_Release(en);
+    CheckMenuItem(d->mic_src_menu, IDM_MICSRC_BASE,
+                  MF_BYCOMMAND | (!d->mic_device_id[0] || !checked_any ? MF_CHECKED : MF_UNCHECKED));
+}
+
 /* Forward a state message from the primary to its extra windows. */
 static void idd_notify_extras(VmDisplayIdd *d, UINT msg, WPARAM wp)
 {
@@ -3325,6 +3426,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_MIC, L"Share microphone with the VM");
+            d->mic_src_menu = CreatePopupMenu();
+            if (d->mic_src_menu) {
+                AppendMenuW(d->mic_src_menu, MF_STRING, IDM_MICSRC_BASE, L"Windows default");
+                AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)d->mic_src_menu, L"Microphone source");
+            }
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS,
                         L"Immersive mode (send Alt+Tab, Win key, etc. to the VM)");
             AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Fullscreen\tCtrl+Alt+Enter");
@@ -3360,6 +3466,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                 }
                 AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)disp_menu, L"VM displays");
             }
+            AppendMenuW(sysmenu, MF_STRING, IDM_TEST_MODE,
+                        L"Test Mode (allow App Sandbox's test-signed drivers)...");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
@@ -3570,6 +3678,41 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_display_settings_save(d);
             idd_log(d, L"VM displays: %u.", d->display_count);
             idd_apply_display_count(d);
+            return 0;
+        }
+        if (d && !d->primary && (wp & 0xFFF0) >= IDM_MICSRC_BASE &&
+            (wp & 0xFFF0) < IDM_MICSRC_BASE + 0x10 * MICSRC_MAX) {
+            UINT idx = (UINT)(((wp & 0xFFF0) - IDM_MICSRC_BASE) / 0x10);
+            EnterCriticalSection(&d->sock_cs);
+            if (idx == 0)
+                d->mic_device_id[0] = L'\0';
+            else
+                wcscpy_s(d->mic_device_id, _countof(d->mic_device_id), d->mic_src_ids[idx]);
+            LeaveCriticalSection(&d->sock_cs);
+            d->mic_restart = TRUE;
+            idd_display_settings_save(d);
+            idd_log(d, idx == 0 ? L"Microphone source: Windows default."
+                                : L"Microphone source changed.");
+            return 0;
+        }
+        if (d && !d->primary && (wp & 0xFFF0) == IDM_TEST_MODE) {
+            if (d->vm && !d->vm->test_mode &&
+                MessageBoxW(hwnd,
+                    L"Test Mode lets this VM load App Sandbox's test-signed display and audio "
+                    L"drivers, which the extra displays, resolution matching, high refresh rates "
+                    L"and the microphone need.\n\n"
+                    L"It turns off Secure Boot for this VM and allows test-signed drivers in it. "
+                    L"That lowers the VM's protection against tampered boot files and drivers, and "
+                    L"it can't be turned back off from here (the display would stop working).\n\n"
+                    L"After you shut the VM down and start it again, it turns test signing on, "
+                    L"restarts itself once, and then installs the updated drivers.\n\n"
+                    L"Turn on Test Mode for this VM?",
+                    L"Test Mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                HRESULT thr = asb_vm_enable_test_mode(d->vm);
+                idd_log(d, SUCCEEDED(thr)
+                            ? L"Test Mode: on. Shut the VM down and start it again to apply it."
+                            : L"Test Mode: could not be turned on (0x%08X).", thr);
+            }
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHARE_MIC) {
@@ -3899,6 +4042,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_ERASEBKGND:
         return 1;  /* We handle all painting via D3D11 */
+
+    case WM_INITMENUPOPUP:
+        if (d && HIWORD(lp)) {   /* the system menu is opening */
+            BOOL on = d->vm && d->vm->test_mode;
+            idd_fill_mic_menu(d);
+            CheckMenuItem((HMENU)wp, IDM_TEST_MODE, MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED));
+            EnableMenuItem((HMENU)wp, IDM_TEST_MODE, MF_BYCOMMAND | (on ? MF_GRAYED : MF_ENABLED));
+        }
+        break;
 
     case WM_DROPFILES:
         if (d) idd_handle_drop(d, (HDROP)wp);

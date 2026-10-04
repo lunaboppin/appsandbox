@@ -382,6 +382,49 @@ static void refresh_vdd_layout(BOOL force)
     }
 }
 
+/* AppSandbox monitors that are part of the desktop right now. */
+static UINT count_attached_vdd_monitors(void)
+{
+    DISPLAY_DEVICEW ad;
+    DWORD ai;
+    UINT n = 0;
+    ZeroMemory(&ad, sizeof(ad));
+    ad.cb = sizeof(ad);
+    for (ai = 0; EnumDisplayDevicesW(NULL, ai, &ad, 0); ai++, ad.cb = sizeof(ad)) {
+        DISPLAY_DEVICEW mon;
+        if (!(ad.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+            continue;
+        ZeroMemory(&mon, sizeof(mon));
+        mon.cb = sizeof(mon);
+        if (EnumDisplayDevicesW(ad.DeviceName, 0, &mon, EDD_GET_DEVICE_INTERFACE_NAME) &&
+            vdd_monitor_index(mon.DeviceID) >= 0)
+            n++;
+    }
+    return n;
+}
+
+/* New monitors normally extend the desktop, but if Windows leaves one off
+   (or duplicates it), nothing is ever drawn to it and the host window stays
+   black. Give the driver time to add them, then ask for Extend. */
+static DWORD WINAPI extend_displays_thread(LPVOID param)
+{
+    UINT want = (UINT)(UINT_PTR)param, have = 0;
+    int tries;
+    ensure_input_desktop(TRUE);
+    for (tries = 0; tries < 8; tries++) {
+        Sleep(1000);
+        have = count_attached_vdd_monitors();
+        if (have >= want)
+            return 0;
+    }
+    {
+        LONG rc = SetDisplayConfig(0, NULL, 0, NULL, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+        input_log("Displays: %u of %u in use; switched to Extend (%ld), now %u.",
+                  have, want, rc, count_attached_vdd_monitors());
+    }
+    return 0;
+}
+
 /* The host's number of displays -> the display driver (it polls this). */
 static void apply_display_count(UINT32 count)
 {
@@ -394,6 +437,10 @@ static void apply_display_count(UINT32 count)
     input_log("Displays: %lu requested (%s, %ld).", v,
               rc == ERROR_SUCCESS ? "ok" : "failed", (long)rc);
     g_vdd_layout_tick = 0;   /* re-read the layout on the next move */
+    if (v > 1) {
+        HANDLE t = CreateThread(NULL, 0, extend_displays_thread, (LPVOID)(UINT_PTR)v, 0, NULL);
+        if (t) CloseHandle(t);
+    }
 }
 
 /* ==================================================================
