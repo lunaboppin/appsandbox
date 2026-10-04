@@ -39,6 +39,7 @@
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired refresh rate in Hz */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host: p1 = caps, p2 = version */
+#define INPUT_GUEST_CURSOR  0x81        /* guest -> host: p1 = 1 if the cursor is hidden */
 
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
@@ -51,7 +52,8 @@
 #define INPUT_CAP_XBUTTONS  0x02
 #define INPUT_CAP_HWHEEL    0x04
 #define INPUT_CAP_REFRESH   0x08
-#define INPUT_PROTO_VERSION 2
+#define INPUT_CAP_CURSOR_REPORT 0x10
+#define INPUT_PROTO_VERSION 3
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 
@@ -187,6 +189,9 @@ static void inject(INPUT *inp, const char *what)
     }
     LeaveCriticalSection(&g_inject_cs);
 }
+
+/* Guest cursor visibility from the cursor watcher: -1 = not known yet. */
+static volatile LONG g_cursor_hidden = -1;
 
 /* ==================================================================
  * Per-connection state: what this host still holds down
@@ -388,6 +393,70 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
     }
 }
 
+/* ==================================================================
+ * Guest cursor visibility reporting
+ *
+ * The host switches to relative mouse mode when the guest hides its cursor.
+ * The display driver's hardware-cursor packet is one signal; this is a second
+ * one that does not depend on the driver: poll GetCursorInfo on the input
+ * desktop and report changes to the host.
+ * ================================================================== */
+
+#define CURSOR_POLL_MS 16
+
+/* Guards g_report_conn and every send on it (the recv loop never sends). */
+static CRITICAL_SECTION g_send_cs;
+static AsbConn *g_report_conn = NULL;
+
+static void send_cursor_locked(AsbConn *c, BOOL hidden)
+{
+    InputPacket pkt;
+    ZeroMemory(&pkt, sizeof(pkt));
+    pkt.magic  = INPUT_MAGIC;
+    pkt.type   = INPUT_GUEST_CURSOR;
+    pkt.param1 = hidden ? 1 : 0;
+    if (asb_send(c, &pkt, sizeof(pkt)) != (int)sizeof(pkt))
+        input_log("Failed to send cursor state.");
+}
+
+static DWORD WINAPI cursor_watch_thread(LPVOID param)
+{
+    (void)param;
+    for (;;) {
+        CURSORINFO ci;
+        LONG hidden;
+
+        Sleep(CURSOR_POLL_MS);
+        /* Per-thread attachment, like the injector: GetCursorInfo reports the
+           cursor of the desktop this thread is on. */
+        ensure_input_desktop(FALSE);
+        ZeroMemory(&ci, sizeof(ci));
+        ci.cbSize = sizeof(ci);
+        if (!GetCursorInfo(&ci))
+            continue;
+        /* hCursor == NULL: SetCursor(NULL), which games also use to hide it. */
+        hidden = (!(ci.flags & CURSOR_SHOWING) ||
+                  (ci.flags & CURSOR_SUPPRESSED) ||
+                  ci.hCursor == NULL) ? 1 : 0;
+        if (hidden == g_cursor_hidden)
+            continue;
+
+        EnterCriticalSection(&g_send_cs);
+        InterlockedExchange(&g_cursor_hidden, hidden);
+        if (g_report_conn)
+            send_cursor_locked(g_report_conn, hidden != 0);
+        LeaveCriticalSection(&g_send_cs);
+        {
+            static DWORD last_log = 0;
+            DWORD now = GetTickCount();
+            if (!last_log || (DWORD)(now - last_log) >= 1000) {
+                last_log = now;
+                input_log("Guest cursor %s (flags 0x%lX).", hidden ? "hidden" : "shown", ci.flags);
+            }
+        }
+    }
+}
+
 /* Receive exactly len bytes (transport may deliver partial reads). */
 static int recv_full(AsbConn *c, void *buf, int len)
 {
@@ -407,25 +476,39 @@ static void handle_conn(AsbConn *c)
     HeldState held;
     UINT pkt_count = 0;
     UINT32 ready = INPUT_READY_MAGIC;
+    BOOL report = asb_conn_socket_u64(c) != ~0ull;
+    BOOL sent;
 
     ZeroMemory(&held, sizeof(held));
 
     /* Ready first (all hosts wait for exactly this), then our capabilities.
        Hosts that predate the caps packet never read past the ready magic,
-       so the extra bytes are harmless to them. */
+       so the extra bytes are harmless to them. Cursor reports are only sent
+       on socket connections (ivshmem hosts never read past the ready magic). */
     ZeroMemory(&pkt, sizeof(pkt));
     pkt.magic  = INPUT_MAGIC;
     pkt.type   = INPUT_GUEST_CAPS;
     pkt.param1 = INPUT_CAP_REL_MOUSE | INPUT_CAP_XBUTTONS |
-                 INPUT_CAP_HWHEEL | INPUT_CAP_REFRESH;
+                 INPUT_CAP_HWHEEL | INPUT_CAP_REFRESH |
+                 (report ? INPUT_CAP_CURSOR_REPORT : 0);
     pkt.param2 = INPUT_PROTO_VERSION;
-    if (asb_send(c, &ready, sizeof(ready)) != (int)sizeof(ready) ||
-        asb_send(c, &pkt, sizeof(pkt)) != (int)sizeof(pkt)) {
+    EnterCriticalSection(&g_send_cs);
+    sent = asb_send(c, &ready, sizeof(ready)) == (int)sizeof(ready) &&
+           asb_send(c, &pkt, sizeof(pkt)) == (int)sizeof(pkt);
+    if (sent && report) {
+        /* From here on the cursor thread may report on this connection.
+           Send the current state at once so the host starts in sync. */
+        g_report_conn = c;
+        if (g_cursor_hidden >= 0)
+            send_cursor_locked(c, g_cursor_hidden != 0);
+    }
+    LeaveCriticalSection(&g_send_cs);
+    if (!sent) {
         input_log("Failed to send ready/caps.");
         return;
     }
     ensure_input_desktop(TRUE);
-    input_log("Sent ready + caps. Entering recv loop.");
+    input_log("Sent ready + caps (0x%02X). Entering recv loop.", pkt.param1);
 
     for (;;) {
         int n = recv_full(c, &pkt, (int)sizeof(pkt));
@@ -441,6 +524,12 @@ static void handle_conn(AsbConn *c)
         pkt_count++;
         handle_packet(&pkt, &held);
     }
+
+    /* Stop cursor reports before the caller closes the connection. */
+    EnterCriticalSection(&g_send_cs);
+    if (g_report_conn == c)
+        g_report_conn = NULL;
+    LeaveCriticalSection(&g_send_cs);
 
     release_held(&held);
 }
@@ -494,6 +583,7 @@ int main(void)
 
     InitializeCriticalSection(&g_inject_cs);
     InitializeCriticalSection(&g_conn_cs);
+    InitializeCriticalSection(&g_send_cs);
 
     input_log("Starting (PID=%lu, session=%lu).",
               GetCurrentProcessId(),
@@ -501,6 +591,8 @@ int main(void)
 
     {
         HANDLE w = CreateThread(NULL, 0, desktop_switch_watcher, NULL, 0, NULL);
+        if (w) CloseHandle(w);
+        w = CreateThread(NULL, 0, cursor_watch_thread, NULL, 0, NULL);
         if (w) CloseHandle(w);
     }
 

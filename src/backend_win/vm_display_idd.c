@@ -116,6 +116,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired guest refresh rate (Hz) */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host after IRDY: p1 = caps, p2 = version */
+#define INPUT_GUEST_CURSOR  0x81        /* guest -> host: p1 = 1 if the guest cursor is hidden */
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
@@ -130,6 +131,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_CAP_XBUTTONS  0x02
 #define INPUT_CAP_HWHEEL    0x04
 #define INPUT_CAP_REFRESH   0x08
+#define INPUT_CAP_CURSOR_REPORT 0x10
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 #define INPUT_QUEUE_MAX     512
@@ -259,6 +261,7 @@ struct VmDisplayIdd {
     UINT           input_q_len;
     volatile BOOL  input_connected;
     volatile LONG  guest_caps;      /* INPUT_CAP_* of the connected helper */
+    volatile LONG  guest_helper_hidden; /* INPUT_GUEST_CURSOR from the helper */
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -645,6 +648,8 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
         UINT32 ready_magic = 0;
         InputPacket caps;
         LONG guest_caps = 0;
+        BYTE rx[sizeof(InputPacket) * 16];
+        int rx_len;
 
         hcs_service_guid(d->os_type, 3, &svc);
         s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
@@ -678,27 +683,60 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
         d->input_q_len = 0;   /* anything queued before the link existed is stale */
         LeaveCriticalSection(&d->input_cs);
         InterlockedExchange(&d->guest_caps, guest_caps);
+        InterlockedExchange(&d->guest_helper_hidden, 0);
         d->input_connected = TRUE;
         idd_log(d, L"Input connected (guest caps 0x%X).", (UINT)guest_caps);
         if (d->hwnd)
             PostMessageW(d->hwnd, WM_IDD_INPUT_STATE, 1, 0);
 
+        rx_len = 0;
         for (;;) {
             UINT n;
             BOOL stopping = d->stop;
+            BOOL link_lost = FALSE;
 
+            /* 50 ms: guest cursor reports are picked up promptly even while
+               no host input is flowing. */
             if (!stopping)
-                WaitForSingleObject(d->input_evt, 250);
+                WaitForSingleObject(d->input_evt, 50);
 
-            /* The guest only writes during the handshake, so readability
-               now means it closed the connection (helper respawned). */
-            if (wait_readable(s, 0)) {
-                char scratch[64];
-                if (recv(s, scratch, sizeof(scratch), 0) <= 0) {
+            /* Guest -> host packets after the handshake (cursor reports).
+               recv <= 0 means the guest closed the connection (helper
+               respawned) and we reconnect. */
+            while (wait_readable(s, 0)) {
+                int got = recv(s, (char *)rx + rx_len, (int)sizeof(rx) - rx_len, 0);
+                int off = 0;
+                if (got <= 0) {
                     idd_log(d, L"Input: guest closed the connection, reconnecting.");
+                    link_lost = TRUE;
                     break;
                 }
+                rx_len += got;
+                while (rx_len - off >= (int)sizeof(InputPacket)) {
+                    InputPacket gp;
+                    memcpy(&gp, rx + off, sizeof(gp));
+                    off += (int)sizeof(gp);
+                    if (gp.magic != INPUT_MAGIC) {
+                        idd_log(d, L"Input: bad packet from guest (magic 0x%08X), reconnecting.", gp.magic);
+                        link_lost = TRUE;
+                        break;
+                    }
+                    if (gp.type == INPUT_GUEST_CURSOR) {
+                        LONG hidden = gp.param1 ? 1 : 0;
+                        if (InterlockedExchange(&d->guest_helper_hidden, hidden) != hidden &&
+                            d->hwnd)
+                            PostMessageW(d->hwnd, WM_IDD_CURSOR_STATE, 0, 0);
+                    }
+                    /* Other guest packet types are ignored. */
+                }
+                if (link_lost)
+                    break;
+                rx_len -= off;
+                if (rx_len)
+                    memmove(rx, rx + off, (size_t)rx_len);
             }
+            if (link_lost)
+                break;
 
             EnterCriticalSection(&d->input_cs);
             n = d->input_q_len;
@@ -717,6 +755,7 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
 
         d->input_connected = FALSE;
         InterlockedExchange(&d->guest_caps, 0);
+        InterlockedExchange(&d->guest_helper_hidden, 0);
         shutdown(s, SD_BOTH);
         closesocket(s);
         if (d->hwnd && !d->stop)
@@ -1087,12 +1126,24 @@ static void idd_exit_rel_mode(VmDisplayIdd *d, BOOL place_pointer)
     idd_log(d, L"Mouse: absolute.");
 }
 
+/* The guest cursor counts as hidden when either source says so: the display
+   driver's hardware-cursor packet or the input helper's GetCursorInfo report. */
+static BOOL idd_guest_cursor_hidden(VmDisplayIdd *d)
+{
+    return !d->cursor_visible || d->guest_helper_hidden;
+}
+
+static BOOL idd_rel_capable(VmDisplayIdd *d)
+{
+    return (d->guest_caps & INPUT_CAP_REL_MOUSE) && d->input_connected;
+}
+
 /* Re-evaluate which mode we should be in. Called whenever one of the inputs
    changes: guest cursor visibility, activation, input link, clicks. */
 static void idd_update_mouse_mode(VmDisplayIdd *d)
 {
-    BOOL guest_hidden = !d->cursor_visible;
-    BOOL capable = (d->guest_caps & INPUT_CAP_REL_MOUSE) && d->input_connected;
+    BOOL guest_hidden = idd_guest_cursor_hidden(d);
+    BOOL capable = idd_rel_capable(d);
     BOOL active = d->input_focused && GetForegroundWindow() == d->hwnd;
 
     if (d->rel_mode) {
@@ -2777,7 +2828,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->rel_mode)
                 return 0;
 
-            {
+            /* Safety net: while the guest cursor is hidden (a game in
+               mouse-look) absolute positions are what make games spin, so
+               none are sent until relative mode takes over. Helpers without
+               relative support keep getting absolute moves (their only mode). */
+            if (!(idd_guest_cursor_hidden(d) && idd_rel_capable(d))) {
                 UINT vx, vy;
                 /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
@@ -2788,7 +2843,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Pointer arrived over the picture while a game has the guest
                cursor hidden and this window is active: hand it the mouse. */
-            if (!d->cursor_visible)
+            if (idd_guest_cursor_hidden(d))
                 idd_update_mouse_mode(d);
         }
         return 0;
@@ -2846,7 +2901,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ReleaseCapture();
 
         if (d->mouse_in || d->rel_mode || !down) {
-            if (down && !d->rel_mode && !d->cursor_visible)
+            if (down && !d->rel_mode && idd_guest_cursor_hidden(d))
                 idd_update_mouse_mode(d);
             if (btn <= INPUT_BTN_MIDDLE || (d->guest_caps & INPUT_CAP_XBUTTONS))
                 send_input(d, INPUT_MOUSE_BUTTON, btn, down ? 1 : 0, 0);
