@@ -13,6 +13,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <shellapi.h>
 
 #define COBJMACROS
 #include <initguid.h>
@@ -43,6 +44,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -92,6 +94,32 @@ typedef struct AudioHeader {
 typedef struct AudioFrameHeader {
     UINT32 bytes;
 } AudioFrameHeader;
+#pragma pack(pop)
+
+/* ---- File drop wire protocol (mirror of tools/agent/input-filedrop.c) ---- */
+
+#define FILEDROP_PORT       11
+#define FILEDROP_MAGIC      0x44465341  /* "ASFD" little-endian */
+#define FILEDROP_FILE       1
+#define FILEDROP_DIR        2
+#define FILEDROP_END        3
+#define FILEDROP_CHUNK      (1024 * 1024)
+#define FILEDROP_MAX_DEPTH  32
+
+#pragma pack(push, 1)
+typedef struct FileDropHeader {
+    UINT32 magic;
+    UINT32 type;
+    UINT32 name_bytes;      /* UTF-16 bytes, no terminator */
+    UINT32 reserved;
+    UINT64 size;
+} FileDropHeader;
+
+typedef struct FileDropResult {
+    UINT32 magic;
+    UINT32 files_ok;
+    UINT32 errors;
+} FileDropResult;
 #pragma pack(pop)
 
 /* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
@@ -322,6 +350,10 @@ struct VmDisplayIdd {
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
 
+    /* File drop (:0011 — host→guest). One transfer at a time. */
+    HANDLE           drop_thread;
+    volatile SOCKET  drop_socket;
+
     /* Audio playback channel (:0004 — guest→host render) */
     volatile SOCKET  audio_socket;
     HANDLE           audio_recv_thread;
@@ -492,6 +524,7 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     case WM_KEYDOWN: case WM_KEYUP:
     case WM_SYSKEYDOWN: case WM_SYSKEYUP:
     case WM_SETCURSOR:
+    case WM_DROPFILES:
         return SendMessageW(GetParent(hwnd), msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1672,6 +1705,221 @@ session_cleanup:
 
 
 /* ==================================================================
+ * File drop — files dragged onto the window go to the guest Desktop
+ * ================================================================== */
+
+typedef struct DropJob {
+    VmDisplayIdd *d;
+    UINT          count;
+    wchar_t     **paths;
+    UINT          files;
+    UINT64        bytes;
+    BOOL          failed;
+} DropJob;
+
+static BOOL drop_send_header(SOCKET s, UINT32 type, const wchar_t *name, UINT64 size)
+{
+    FileDropHeader h;
+    h.magic = FILEDROP_MAGIC;
+    h.type = type;
+    h.name_bytes = name ? (UINT32)(wcslen(name) * sizeof(wchar_t)) : 0;
+    h.reserved = 0;
+    h.size = size;
+    return send_all(s, (const char *)&h, sizeof(h)) &&
+           (!h.name_bytes || send_all(s, (const char *)name, (int)h.name_bytes));
+}
+
+static BOOL drop_send_file(DropJob *job, SOCKET s, const wchar_t *path,
+                           const wchar_t *rel, BYTE *buf)
+{
+    LARGE_INTEGER size;
+    UINT64 left;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE || !GetFileSizeEx(f, &size)) {
+        idd_log(job->d, L"File drop: cannot read %s (%lu); skipped.", path, GetLastError());
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        return TRUE;   /* skip it, keep going */
+    }
+    if (!drop_send_header(s, FILEDROP_FILE, rel, (UINT64)size.QuadPart)) {
+        CloseHandle(f);
+        return FALSE;
+    }
+    /* The size is promised in the header: if the file shrinks while we read
+       it, pad with zeros so the stream stays aligned. */
+    for (left = (UINT64)size.QuadPart; left > 0 && !job->d->stop; ) {
+        DWORD want = left > FILEDROP_CHUNK ? FILEDROP_CHUNK : (DWORD)left, got = 0;
+        if (!ReadFile(f, buf, want, &got, NULL) || got == 0) {
+            ZeroMemory(buf, want);
+            got = want;
+        }
+        if (!send_all(s, (const char *)buf, (int)got)) {
+            CloseHandle(f);
+            return FALSE;
+        }
+        left -= got;
+    }
+    CloseHandle(f);
+    if (job->d->stop)
+        return FALSE;
+    job->files++;
+    job->bytes += (UINT64)size.QuadPart;
+    return TRUE;
+}
+
+static BOOL drop_send_tree(DropJob *job, SOCKET s, const wchar_t *path,
+                           const wchar_t *rel, BYTE *buf, int depth)
+{
+    DWORD attrs = GetFileAttributesW(path);
+    WIN32_FIND_DATAW fd;
+    wchar_t pattern[1024];
+    HANDLE h;
+
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+        return TRUE;
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return drop_send_file(job, s, path, rel, buf);
+
+    if (!drop_send_header(s, FILEDROP_DIR, rel, 0))
+        return FALSE;
+    /* Don't follow junctions/symlinks (loops) or go absurdly deep. */
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) || depth >= FILEDROP_MAX_DEPTH)
+        return TRUE;
+
+    if (swprintf_s(pattern, 1024, L"%s\\*", path) < 0)
+        return TRUE;
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return TRUE;
+    do {
+        wchar_t child[1024], child_rel[1024];
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+            continue;
+        if (swprintf_s(child, 1024, L"%s\\%s", path, fd.cFileName) < 0 ||
+            swprintf_s(child_rel, 1024, L"%s\\%s", rel, fd.cFileName) < 0) {
+            idd_log(job->d, L"File drop: path too long under %s; skipped.", path);
+            continue;
+        }
+        if (!drop_send_tree(job, s, child, child_rel, buf, depth + 1)) {
+            FindClose(h);
+            return FALSE;
+        }
+    } while (!job->d->stop && FindNextFileW(h, &fd));
+    FindClose(h);
+    return !job->d->stop;
+}
+
+static DWORD WINAPI drop_thread_proc(LPVOID param)
+{
+    DropJob *job = (DropJob *)param;
+    VmDisplayIdd *d = job->d;
+    WSADATA wsa;
+    GUID svc;
+    SOCKET s;
+    BYTE *buf;
+    UINT i;
+    DWORD start = GetTickCount();
+    BOOL ok = TRUE;
+
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, FILEDROP_CHUNK);
+    hcs_service_guid(d->os_type, FILEDROP_PORT, &svc);
+    s = buf ? connect_to_hv_service(&d->runtime_id, &svc, 2000) : INVALID_SOCKET;
+    if (s == INVALID_SOCKET) {
+        idd_log(d, L"File drop: the VM is not accepting files (restart the VM to update its helpers).");
+        goto out;
+    }
+    {
+        DWORD timeout = 30000;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+    }
+    d->drop_socket = s;
+    idd_log(d, L"File drop: sending %u item(s) to the VM Desktop...", job->count);
+
+    for (i = 0; i < job->count && ok && !d->stop; i++) {
+        const wchar_t *name = wcsrchr(job->paths[i], L'\\');
+        name = name ? name + 1 : job->paths[i];
+        if (!name[0]) {
+            idd_log(d, L"File drop: %s has no name (a drive root?); skipped.", job->paths[i]);
+            continue;
+        }
+        ok = drop_send_tree(job, s, job->paths[i], name, buf, 0);
+    }
+    if (ok && !d->stop && drop_send_header(s, FILEDROP_END, NULL, 0)) {
+        FileDropResult r;
+        if (recv_exact(s, &r, sizeof(r)) && r.magic == FILEDROP_MAGIC) {
+            idd_log(d, L"File drop: %u file(s), %.1f MB copied to the VM Desktop in %.1f s%s.",
+                    r.files_ok, (double)job->bytes / (1024.0 * 1024.0),
+                    (GetTickCount() - start) / 1000.0,
+                    r.errors ? L" (some items failed; see the guest input.log)" : L"");
+        } else {
+            idd_log(d, L"File drop: sent %u file(s); the VM did not confirm.", job->files);
+        }
+    } else if (!d->stop) {
+        idd_log(d, L"File drop: transfer failed after %u file(s) (%d).", job->files, WSAGetLastError());
+    }
+
+    d->drop_socket = INVALID_SOCKET;
+    closesocket(s);
+out:
+    for (i = 0; i < job->count; i++)
+        HeapFree(GetProcessHeap(), 0, job->paths[i]);
+    HeapFree(GetProcessHeap(), 0, job->paths);
+    HeapFree(GetProcessHeap(), 0, job);
+    if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    WSACleanup();
+    return 0;
+}
+
+/* WM_DROPFILES: copy the paths and hand them to a worker thread. */
+static void idd_handle_drop(VmDisplayIdd *d, HDROP drop)
+{
+    UINT count = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0), i, n = 0;
+    DropJob *job;
+
+    if (d->drop_thread) {
+        if (WaitForSingleObject(d->drop_thread, 0) != WAIT_OBJECT_0) {
+            idd_log(d, L"File drop: a transfer is still running; drop again when it finishes.");
+            DragFinish(drop);
+            return;
+        }
+        CloseHandle(d->drop_thread);
+        d->drop_thread = NULL;
+    }
+
+    job = (DropJob *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(DropJob));
+    if (job && count)
+        job->paths = (wchar_t **)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                           count * sizeof(wchar_t *));
+    if (!job || !job->paths) {
+        if (job) HeapFree(GetProcessHeap(), 0, job);
+        DragFinish(drop);
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        UINT len = DragQueryFileW(drop, i, NULL, 0);
+        wchar_t *p = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, (len + 1) * sizeof(wchar_t));
+        if (p && DragQueryFileW(drop, i, p, len + 1))
+            job->paths[n++] = p;
+        else if (p)
+            HeapFree(GetProcessHeap(), 0, p);
+    }
+    DragFinish(drop);
+    job->d = d;
+    job->count = n;
+
+    d->drop_thread = CreateThread(NULL, 0, drop_thread_proc, job, 0, NULL);
+    if (!d->drop_thread) {
+        for (i = 0; i < n; i++)
+            HeapFree(GetProcessHeap(), 0, job->paths[i]);
+        HeapFree(GetProcessHeap(), 0, job->paths);
+        HeapFree(GetProcessHeap(), 0, job);
+    }
+}
+
+/* ==================================================================
  * D3D11 initialization and teardown
  * ================================================================== */
 
@@ -2642,6 +2890,23 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             d->hwnd, NULL, d->hInstance, NULL);
     }
 
+    /* Accept files dragged from Explorer. App Sandbox runs elevated, so the
+       messages a drop uses must be let through UIPI from the (normal
+       integrity) shell, or drops are silently refused. */
+    {
+        HWND targets[2];
+        int ti;
+        targets[0] = d->hwnd;
+        targets[1] = d->render_hwnd;
+        for (ti = 0; ti < 2; ti++) {
+            if (!targets[ti]) continue;
+            ChangeWindowMessageFilterEx(targets[ti], WM_DROPFILES, MSGFLT_ALLOW, NULL);
+            ChangeWindowMessageFilterEx(targets[ti], WM_COPYDATA, MSGFLT_ALLOW, NULL);
+            ChangeWindowMessageFilterEx(targets[ti], 0x0049 /* WM_COPYGLOBALDATA */, MSGFLT_ALLOW, NULL);
+            DragAcceptFiles(targets[ti], TRUE);
+        }
+    }
+
     /* Separate top-level log window */
     {
         wchar_t log_title[300];
@@ -2838,6 +3103,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->clipboard) {
                 vm_clipboard_destroy(d->clipboard);
                 d->clipboard = NULL;
+            }
+
+            /* Abort a running file drop (the worker sees d->stop). */
+            if (d->drop_thread) {
+                SOCKET ds = d->drop_socket;
+                if (ds != INVALID_SOCKET)
+                    shutdown(ds, SD_BOTH);
+                WaitForSingleObject(d->drop_thread, 3000);
+                CloseHandle(d->drop_thread);
+                d->drop_thread = NULL;
             }
 
             /* Wait for audio recv thread (:0004) */
@@ -3038,6 +3313,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND:
         return 1;  /* We handle all painting via D3D11 */
 
+    case WM_DROPFILES:
+        if (d) idd_handle_drop(d, (HDROP)wp);
+        else DragFinish((HDROP)wp);
+        return 0;
+
     /* ---- Mouse tracking (events forwarded from render child) ---- */
     case WM_MOUSEMOVE:
         if (d) {
@@ -3211,6 +3491,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->open         = TRUE;
     d->stop         = FALSE;
     d->audio_socket       = INVALID_SOCKET;
+    d->drop_socket        = INVALID_SOCKET;
     d->cursor_visible     = 1;   /* until the guest says otherwise */
     d->clipboard          = NULL;
 
@@ -3303,6 +3584,12 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
         display->clipboard = NULL;
+    }
+
+    /* drop_thread guard (WM_CLOSE normally waited for it) */
+    if (display->drop_thread) {
+        WaitForSingleObject(display->drop_thread, 3000);
+        CloseHandle(display->drop_thread);
     }
 
     /* audio_recv_thread guard */

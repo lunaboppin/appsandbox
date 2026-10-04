@@ -69,9 +69,11 @@ typedef struct {
 } InputPacket;
 #pragma pack(pop)
 
+void filedrop_start(void);   /* input-filedrop.c */
+
 /* ---- Logging (rate limited where it can be hot) ---- */
 
-static void input_log(const char *fmt, ...)
+void input_log(const char *fmt, ...)
 {
     FILE *f;
     va_list ap;
@@ -656,6 +658,9 @@ int main(void)
         input_log("asb_transport_init failed.");
         return 1;
     }
+
+    /* Files dragged onto the host display window (own channel and threads). */
+    filedrop_start();
 
     l = asb_listen(ASB_CH_INPUT);
     if (!l) {

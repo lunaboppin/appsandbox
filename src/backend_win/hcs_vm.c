@@ -912,7 +912,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t video_section[2048];
     wchar_t comports_section[512];
     wchar_t plan9_section[5120];
-    wchar_t service_table[2048];
+    wchar_t service_table[4096];
     wchar_t vmgs_path[MAX_PATH];
     wchar_t vmrs_path[MAX_PATH];
     wchar_t dir[MAX_PATH];
@@ -1200,22 +1200,24 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        bind(AF_VSOCK, port=N) ends up registered as the corresponding
        <N>-FACB-... GUID on the host side. Same security descriptors
        for both. Ports 1–6 cover agent + frame + input + audio + the
-       two clipboard channels. */
+       two clipboard channels; 9 is the host microphone, 11 file drop and
+       21–23 the frame channels of extra displays. */
     {
+        static const unsigned ports[] = { 1, 2, 3, 4, 5, 6, 9, 11, 21, 22, 23 };
         wchar_t entry[256];
         wchar_t guid_str[64];
-        unsigned port;
+        unsigned i;
         service_table[0] = L'\0';
-        for (port = 1; port <= 6; port++) {
-            hcs_service_guid_str(config->os_type, port, guid_str, 64);
+        for (i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
+            hcs_service_guid_str(config->os_type, ports[i], guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"
                     L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
                     L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
                     L"\"AllowWildcardBinds\":true"
                 L"}",
-                (port > 1) ? L"," : L"", guid_str);
-            wcscat_s(service_table, 2048, entry);
+                i ? L"," : L"", guid_str);
+            wcscat_s(service_table, _countof(service_table), entry);
         }
     }
 

@@ -29,6 +29,9 @@ extern "C" {
 #define ASB_CH_CLIPBOARD        5
 #define ASB_CH_CLIPBOARD_READER 6
 #define ASB_CH_SSH              7
+#define ASB_CH_MIC              9      /* host microphone -> guest (Windows host only) */
+#define ASB_CH_FILEDROP         11     /* files dropped on the display -> guest  */
+#define ASB_CH_DISPLAY_EXTRA    20     /* + n: frame channel of extra display n (1..3) */
 #define ASB_CH_9P               50001
 
 /* ================================================================================
