@@ -83,7 +83,10 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
 #pragma pack(pop)
 
 /* ============================================================================
- *  Supported resolutions and refresh rates (single mode for this driver)
+ *  Supported resolution and refresh rates. One resolution; several refresh
+ *  rates so a game is not capped at 60 fps when the host monitor is faster.
+ *  Index 0 (60 Hz) is the preferred mode, so first boot is unchanged; the
+ *  host asks the guest input helper to switch to the rate it wants.
  * ============================================================================ */
 struct ResolutionEntry {
     UINT width;
@@ -103,6 +106,11 @@ struct RefreshRateEntry {
 
 static const RefreshRateEntry g_SupportedRefreshRates[] = {
     { 60, 1 },
+    { 75, 1 },
+    { 120, 1 },
+    { 144, 1 },
+    { 165, 1 },
+    { 240, 1 },
 };
 
 static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
@@ -111,7 +119,7 @@ static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
  *  EDID - 128-byte block
  *
  *  Manufacturer: "ASB" (AppSandBox)
- *  Descriptor:   1920x1080 @ 60 Hz, 8-bit
+ *  Descriptor:   1920x1080 @ 60 Hz preferred, 8-bit; range limits 24-240 Hz
  *  Checksum byte 127 is a placeholder - patched at runtime.
  * ============================================================================ */
 static const BYTE VDD_EDID[] = {
@@ -159,9 +167,12 @@ static const BYTE VDD_EDID[] = {
     0x00, 0x00, 0x00, 0xFC, 0x00,
     'A', 'p', 'p', 'S', 'a', 'n', 'd', 'b', 'o', 'x', 'V', 'D', 'D',
 
-    /* Descriptor #3: Monitor range limits */
-    0x00, 0x00, 0x00, 0xFD, 0x00,
-    0x38, 0x4C, 0x1E, 0x51, 0x11, 0x00, 0x0A,
+    /* Descriptor #3: Monitor range limits.
+       Byte 4 = 0x08: max horizontal rate is offset by +255 kHz (EDID 1.4).
+       V 24-240 Hz, H 30-(5+255)=260 kHz, max pixel clock 500 MHz -- wide
+       enough for every mode in g_SupportedRefreshRates. */
+    0x00, 0x00, 0x00, 0xFD, 0x08,
+    0x18, 0xF0, 0x1E, 0x05, 0x32, 0x00, 0x0A,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 
     /* Descriptor #4: Dummy (zero) */
@@ -208,6 +219,10 @@ typedef struct _VDD_SWAP_PROC {
     PBYTE               pCursorShapeBuffer; /* buffer for cursor bitmap */
     UINT                cursorBufSize;      /* size of pCursorShapeBuffer (2x for MASKED_COLOR) */
     DWORD               lastShapeId;        /* last received shape ID */
+
+    /* Contiguous send buffer (VDD_PIXEL_BYTES) so a frame goes out in one
+       transport send instead of one send per row. */
+    PBYTE               pSendBuf;
 } VDD_SWAP_PROC;
 
 /* ============================================================================
@@ -227,7 +242,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
     LUID                cachedDeviceLuid;
 
     /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* modes[0] = preferred 1920x1080@60 */
     UINT                modeCount;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,

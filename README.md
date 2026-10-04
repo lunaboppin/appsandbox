@@ -109,7 +109,9 @@ DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa
 apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
 
 # Tips:
-[Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
+[Windows] Games: the mouse switches to raw relative input automatically whenever the game hides its cursor, and back when it shows one (no capture hotkey). Alt+Tab or clicking another window always releases it.  
+
+[Windows] Immersive mode (sends Alt+Tab, the Windows key, etc. to the VM), the VM refresh rate (matches your monitor by default), and audio mute: right-click the connection title bar  
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 

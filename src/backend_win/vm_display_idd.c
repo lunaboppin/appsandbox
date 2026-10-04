@@ -23,7 +23,7 @@
 #pragma warning(push)
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #pragma warning(pop)
 
@@ -112,13 +112,27 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_MOUSE_MOVE_REL 4          /* p1/p2 = INT32 dx/dy */
+#define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
+#define INPUT_SET_REFRESH   0x20        /* p1 = desired guest refresh rate (Hz) */
+#define INPUT_GUEST_CAPS    0x80        /* guest -> host after IRDY: p1 = caps, p2 = version */
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
 #define INPUT_BTN_MIDDLE    2
+#define INPUT_BTN_X1        3
+#define INPUT_BTN_X2        4
+
+/* Guest helper capabilities (INPUT_GUEST_CAPS p1). Helpers that predate the
+   caps packet (and the Linux helper) report none, and get absolute-only. */
+#define INPUT_CAP_REL_MOUSE 0x01
+#define INPUT_CAP_XBUTTONS  0x02
+#define INPUT_CAP_HWHEEL    0x04
+#define INPUT_CAP_REFRESH   0x08
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
+#define INPUT_QUEUE_MAX     512
 
 #pragma pack(push, 1)
 typedef struct InputPacket {
@@ -135,12 +149,13 @@ typedef struct InputPacket {
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
+#define WM_IDD_CURSOR_STATE     (WM_USER + 102)  /* guest cursor shown/hidden */
+#define WM_IDD_INPUT_STATE      (WM_USER + 103)  /* input link (dis)connected */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
-#define IDT_INPUT       2002
-#define MOUSE_MOVE_MIN_INTERVAL_MS 8
+#define TITLE_UPDATE_MS 500
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -235,15 +250,30 @@ struct VmDisplayIdd {
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
 
-    /* Input forwarding */
-    volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
+    /* Input forwarding. The input thread owns the :0003 connection; every
+       other thread only appends to input_q (ordered, moves coalesced). */
+    HANDLE         input_thread;
+    HANDLE         input_evt;       /* auto-reset: queue has data / stop */
+    CRITICAL_SECTION input_cs;
+    InputPacket    input_q[INPUT_QUEUE_MAX];
+    UINT           input_q_len;
+    volatile BOOL  input_connected;
+    volatile LONG  guest_caps;      /* INPUT_CAP_* of the connected helper */
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
-    BOOL           pending_mouse;   /* latest move waiting for the rate-limit timer */
-    UINT           pending_mouse_x;
-    UINT           pending_mouse_y;
-    DWORD          last_mouse_move_tick;
-    BOOL           have_last_mouse_move_tick;
+
+    /* Automatic relative mouse mode (window thread only). Entered while the
+       guest hides its cursor (games in mouse-look), left when it shows it. */
+    BOOL           rel_mode;
+    BOOL           raw_abs_have;    /* last absolute raw sample valid */
+    LONG           raw_abs_x, raw_abs_y;
+
+    /* Guest refresh rate: 0 = match the host monitor. */
+    UINT           refresh_pref;
+    UINT           refresh_sent;
+
+    DWORD          last_title_tick;
+    BOOL           tearing;         /* swap chain created with ALLOW_TEARING */
 
     /* Keyboard hotkey handling */
     wchar_t        vhdx_path[MAX_PATH]; /* copy of vm->vhdx_path for settings file */
@@ -260,7 +290,11 @@ struct VmDisplayIdd {
     /* Guest cursor */
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
     UINT32         cursor_shape_id; /* tracks which shape is current */
-    BOOL           cursor_visible;  /* guest cursor visibility */
+    volatile LONG  cursor_visible;  /* guest cursor visibility (starts TRUE) */
+    volatile LONG  cursor_x;        /* guest pointer hotspot, guest pixels */
+    volatile LONG  cursor_y;
+    UINT32         cursor_xhot;     /* hotspot of the current shape */
+    UINT32         cursor_yhot;
 
     /* Debug log window (separate top-level window) */
     HWND           log_hwnd;        /* top-level log window */
@@ -296,6 +330,18 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_REFRESH_BASE   0x1100   /* + 0x10 * index into g_refresh_choices */
+
+/* Guest refresh-rate choices offered in the system menu; 0 = match host. */
+static const UINT g_refresh_choices[] = { 0, 60, 120, 144, 165, 240 };
+#define REFRESH_CHOICE_COUNT (sizeof(g_refresh_choices) / sizeof(g_refresh_choices[0]))
+
+/* Raw Input registrations are per process, and every display window lives
+   in this process. Only the display currently in relative mode owns the
+   mouse registration, so one display leaving relative mode can never
+   unregister another's. */
+static volatile HWND g_raw_owner;
+
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -406,7 +452,9 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     case WM_LBUTTONDOWN: case WM_LBUTTONUP:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
     case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
     case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
     case WM_MOUSELEAVE:
     case WM_KEYDOWN: case WM_KEYUP:
     case WM_SYSKEYDOWN: case WM_SYSKEYUP:
@@ -488,79 +536,197 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     UpdateWindow(d->log_list_hwnd);
 }
 
-/* ---- Send input packet to guest ---- */
+static BOOL   recv_exact(SOCKET s, void *buf, int len);
+static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *service_guid, int timeout_ms);
 
-static UINT g_input_send_count = 0;
-
+/* ---- Queue an input packet for the guest ----
+ *
+ * Callable from any thread; never blocks on the network. Packets stay in
+ * order so a click can never overtake the move before it. Consecutive moves
+ * are merged here instead of throttled: absolute positions replace each
+ * other and relative deltas add up, so a fast mouse cannot flood the guest
+ * and no motion is lost. Discrete events (buttons, keys) are never dropped
+ * while connected -- a dropped key-up is a stuck key.
+ */
 static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
-    InputPacket pkt;
-    SOCKET s;
-    int ret;
+    BOOL queued = TRUE;
 
-    s = d->input_socket;
-    if (s == INVALID_SOCKET) return;
+    if (!d->input_connected)
+        return;   /* nothing to deliver to; the guest releases held input itself */
 
-    pkt.magic  = INPUT_MAGIC;
-    pkt.type   = type;
-    pkt.param1 = p1;
-    pkt.param2 = p2;
-    pkt.param3 = p3;
+    EnterCriticalSection(&d->input_cs);
+    {
+        InputPacket *last = d->input_q_len ? &d->input_q[d->input_q_len - 1] : NULL;
 
-    /* Non-blocking send — drop packet if buffer full rather than stall the UI */
-    ret = send(s, (const char *)&pkt, (int)sizeof(pkt), 0);
-    if (ret == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK) {
-            /* Send buffer full: drop this packet (as the comment intends)
-               without tearing down the socket. */
-            return;
+        if (last && type == INPUT_MOUSE_MOVE && last->type == INPUT_MOUSE_MOVE) {
+            last->param1 = p1;
+            last->param2 = p2;
+        } else if (last && type == INPUT_MOUSE_MOVE_REL && last->type == INPUT_MOUSE_MOVE_REL) {
+            last->param1 = (UINT32)((INT32)last->param1 + (INT32)p1);
+            last->param2 = (UINT32)((INT32)last->param2 + (INT32)p2);
+        } else if (d->input_q_len < INPUT_QUEUE_MAX) {
+            InputPacket *pkt = &d->input_q[d->input_q_len++];
+            pkt->magic  = INPUT_MAGIC;
+            pkt->type   = type;
+            pkt->param1 = p1;
+            pkt->param2 = p2;
+            pkt->param3 = p3;
+        } else {
+            /* Only reachable if the guest stopped reading for a long time;
+               the input thread will tear the link down shortly. */
+            queued = FALSE;
         }
-        idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
-        /* Mark dead — recv thread owns the socket and will close + reconnect */
-        d->input_socket = INVALID_SOCKET;
-        return;
     }
-    if (ret != (int)sizeof(pkt)) {
-        /* Partial send on a stream socket: the guest reads fixed-size 20-byte
-           InputPackets, so a truncated packet permanently misaligns the wire.
-           Flag for reconnect so the channel resynchronises. */
-        idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
-                ret, (int)sizeof(pkt));
-        d->input_socket = INVALID_SOCKET;
-        return;
-    }
+    LeaveCriticalSection(&d->input_cs);
 
-    g_input_send_count++;
-
-    /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
-        static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
-        };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
-        idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
-    }
+    if (queued)
+        SetEvent(d->input_evt);
 }
 
-/* Mouse messages can arrive much faster than the guest display refreshes.
-   Keep only the latest position and send it at a bounded rate so the window
-   thread and the guest input helper cannot be flooded by cursor movement. */
-static void flush_pending_mouse(VmDisplayIdd *d)
+/* Wait until s is readable or timeout_ms passes. Used instead of
+   SO_RCVTIMEO, which leaves a socket in an indeterminate state on expiry. */
+static BOOL wait_readable(SOCKET s, int timeout_ms)
 {
-    DWORD now;
+    fd_set rf;
+    struct timeval tv;
+    FD_ZERO(&rf);
+    FD_SET(s, &rf);
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    return select(0, &rf, NULL, NULL, &tv) == 1;
+}
 
-    if (!d || !d->pending_mouse || !d->mouse_in)
-        return;
-    now = GetTickCount();
-    if (d->have_last_mouse_move_tick &&
-        (DWORD)(now - d->last_mouse_move_tick) < MOUSE_MOVE_MIN_INTERVAL_MS)
-        return;
-    send_input(d, INPUT_MOUSE_MOVE, d->pending_mouse_x, d->pending_mouse_y, 0);
-    d->pending_mouse = FALSE;
-    d->last_mouse_move_tick = now;
-    d->have_last_mouse_move_tick = TRUE;
-    KillTimer(d->hwnd, IDT_INPUT);
+static BOOL send_all(SOCKET s, const char *buf, int len)
+{
+    while (len > 0) {
+        int n = send(s, buf, len, 0);
+        if (n == SOCKET_ERROR || n == 0)
+            return FALSE;
+        buf += n;
+        len -= n;
+    }
+    return TRUE;
+}
+
+static void idd_input_wait(VmDisplayIdd *d, int ms)
+{
+    int waited;
+    for (waited = 0; waited < ms && !d->stop; waited += 50)
+        Sleep(50);
+}
+
+/* ---- Input thread: owns the :0003 connection ----
+ *
+ * Previously the frame receive loop reconnected input as a side effect of
+ * receiving frames, and nothing noticed when the guest helper was replaced
+ * (the agent respawns it on idd_connect and logon), so input could stay
+ * dead until the display was reopened. This thread keeps the link up on
+ * its own: it watches the socket for the guest closing it and reconnects
+ * within a few hundred milliseconds.
+ */
+static DWORD WINAPI idd_input_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    WSADATA wsa;
+    InputPacket *batch;
+
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    batch = (InputPacket *)HeapAlloc(GetProcessHeap(), 0,
+                                     sizeof(InputPacket) * INPUT_QUEUE_MAX);
+    if (!batch) {
+        WSACleanup();
+        return 1;
+    }
+
+    while (!d->stop) {
+        GUID svc;
+        SOCKET s;
+        UINT32 ready_magic = 0;
+        InputPacket caps;
+        LONG guest_caps = 0;
+
+        hcs_service_guid(d->os_type, 3, &svc);
+        s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
+        if (s == INVALID_SOCKET) {
+            idd_input_wait(d, 500);
+            continue;
+        }
+
+        if (!wait_readable(s, 5000) ||
+            !recv_exact(s, &ready_magic, sizeof(ready_magic)) ||
+            ready_magic != INPUT_READY_MAGIC) {
+            idd_log(d, L"Input handshake failed - retrying.");
+            closesocket(s);
+            idd_input_wait(d, 500);
+            continue;
+        }
+
+        /* A current helper follows IRDY with its capabilities straight away;
+           an older one sends nothing more. */
+        if (wait_readable(s, 500) &&
+            recv_exact(s, &caps, sizeof(caps)) &&
+            caps.magic == INPUT_MAGIC && caps.type == INPUT_GUEST_CAPS)
+            guest_caps = (LONG)caps.param1;
+
+        {
+            DWORD send_timeout = 2000;
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&send_timeout, sizeof(send_timeout));
+        }
+
+        EnterCriticalSection(&d->input_cs);
+        d->input_q_len = 0;   /* anything queued before the link existed is stale */
+        LeaveCriticalSection(&d->input_cs);
+        InterlockedExchange(&d->guest_caps, guest_caps);
+        d->input_connected = TRUE;
+        idd_log(d, L"Input connected (guest caps 0x%X).", (UINT)guest_caps);
+        if (d->hwnd)
+            PostMessageW(d->hwnd, WM_IDD_INPUT_STATE, 1, 0);
+
+        for (;;) {
+            UINT n;
+            BOOL stopping = d->stop;
+
+            if (!stopping)
+                WaitForSingleObject(d->input_evt, 250);
+
+            /* The guest only writes during the handshake, so readability
+               now means it closed the connection (helper respawned). */
+            if (wait_readable(s, 0)) {
+                char scratch[64];
+                if (recv(s, scratch, sizeof(scratch), 0) <= 0) {
+                    idd_log(d, L"Input: guest closed the connection, reconnecting.");
+                    break;
+                }
+            }
+
+            EnterCriticalSection(&d->input_cs);
+            n = d->input_q_len;
+            if (n)
+                memcpy(batch, d->input_q, n * sizeof(InputPacket));
+            d->input_q_len = 0;
+            LeaveCriticalSection(&d->input_cs);
+
+            if (n && !send_all(s, (const char *)batch, (int)(n * sizeof(InputPacket)))) {
+                idd_log(d, L"Input send failed (%d), reconnecting.", WSAGetLastError());
+                break;
+            }
+            if (stopping || d->stop)
+                break;   /* final drain (e.g. key releases on close) is sent */
+        }
+
+        d->input_connected = FALSE;
+        InterlockedExchange(&d->guest_caps, 0);
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+        if (d->hwnd && !d->stop)
+            PostMessageW(d->hwnd, WM_IDD_INPUT_STATE, 0, 0);
+        idd_input_wait(d, 250);
+    }
+
+    HeapFree(GetProcessHeap(), 0, batch);
+    WSACleanup();
+    return 0;
 }
 
 /* ==================================================================
@@ -581,40 +747,50 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
     swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
 }
 
-static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+static void idd_display_settings_save(const VmDisplayIdd *d)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
-    if (!vhdx_path || vhdx_path[0] == L'\0') return;
-    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    if (d->vhdx_path[0] == L'\0') return;
+    idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
+    /* transmitKeyboardHotkeys keeps its name so existing files keep the
+       user's Immersive mode choice. */
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"refreshRate\":%u}\n",
+            d->transmit_hotkeys ? 1 : 0, d->refresh_pref);
     fclose(f);
 }
 
-/* Read the persisted setting; if the file is absent, create it with the
-   default (off) and return FALSE. Returns the transmit-hotkeys value. */
-static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
+/* Read the persisted settings into d; if the file is absent, create it with
+   the defaults (Immersive off, refresh matches the host). */
+static void idd_display_settings_load_or_create(VmDisplayIdd *d)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     char buf[256];
-    BOOL transmit = FALSE;
 
-    if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
-    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    d->transmit_hotkeys = FALSE;
+    d->refresh_pref = 0;
+    if (d->vhdx_path[0] == L'\0') return;
+    idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE);
-        return FALSE;
+        idd_display_settings_save(d);
+        return;
     }
     if (fgets(buf, sizeof(buf), f)) {
+        const char *r;
         if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
-            transmit = TRUE;
+            d->transmit_hotkeys = TRUE;
+        r = strstr(buf, "\"refreshRate\":");
+        if (r) {
+            unsigned v = 0;
+            if (sscanf_s(r + 14, "%u", &v) == 1 && v <= 1000)
+                d->refresh_pref = v;
+        }
     }
     fclose(f);
-    return transmit;
 }
 
 /* ==================================================================
@@ -776,6 +952,248 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     *vy = (UINT)local_y;
     if (*vx >= vm_w) *vx = vm_w - 1;
     if (*vy >= vm_h) *vy = vm_h - 1;
+}
+
+/* ==================================================================
+ * Automatic relative mouse mode (Parsec-style)
+ *
+ * While the guest shows a cursor, the host pointer is free: it moves in and
+ * out of the window and its position is sent as an absolute coordinate.
+ * When the guest hides its cursor -- which is what a game does when it takes
+ * the mouse for camera control -- and the host pointer is over the VM
+ * picture, the display switches to relative motion: physical mouse deltas
+ * from Raw Input, host pointer hidden and kept inside the picture. As soon
+ * as the guest shows a cursor again (menu, pause, Alt+Tab inside the guest)
+ * the display switches back and puts the host pointer exactly where the
+ * guest pointer is, so the hand-off has no visible jump.
+ *
+ * Nothing needs a hotkey: losing activation (Alt+Tab or Win on the host,
+ * clicking another window, Ctrl+Alt+Del) always releases the pointer, and
+ * clicking back into the picture resumes.
+ *
+ * All of this runs on the window thread.
+ * ================================================================== */
+
+static BOOL idd_render_rect_screen(VmDisplayIdd *d, RECT *out)
+{
+    POINT tl = { 0, 0 }, br;
+    RECT rc;
+    if (!d->render_hwnd || !GetClientRect(d->render_hwnd, &rc) ||
+        rc.right <= 0 || rc.bottom <= 0)
+        return FALSE;
+    br.x = rc.right;
+    br.y = rc.bottom;
+    ClientToScreen(d->render_hwnd, &tl);
+    ClientToScreen(d->render_hwnd, &br);
+    SetRect(out, tl.x, tl.y, br.x, br.y);
+    return TRUE;
+}
+
+/* Rectangle (screen coords) actually covered by the guest picture, i.e. the
+   render area minus letterbox bars. */
+static BOOL idd_picture_rect_screen(VmDisplayIdd *d, RECT *out)
+{
+    RECT r;
+    float vx, vy, vw, vh;
+    if (!idd_render_rect_screen(d, &r))
+        return FALSE;
+    compute_letterbox((UINT)(r.right - r.left), (UINT)(r.bottom - r.top),
+                      d->frame_width, d->frame_height, &vx, &vy, &vw, &vh);
+    if (vw < 1.0f || vh < 1.0f)
+        return FALSE;
+    out->left   = r.left + (LONG)vx;
+    out->top    = r.top + (LONG)vy;
+    out->right  = out->left + (LONG)vw;
+    out->bottom = out->top + (LONG)vh;
+    return TRUE;
+}
+
+static BOOL idd_pointer_over_picture(VmDisplayIdd *d)
+{
+    POINT pt;
+    RECT pic;
+    if (!GetCursorPos(&pt) || !idd_picture_rect_screen(d, &pic))
+        return FALSE;
+    return PtInRect(&pic, pt) && WindowFromPoint(pt) == d->render_hwnd;
+}
+
+static void idd_set_raw_mouse(VmDisplayIdd *d, BOOL on)
+{
+    RAWINPUTDEVICE rid;
+    rid.usUsagePage = 0x01;   /* generic desktop */
+    rid.usUsage     = 0x02;   /* mouse */
+    if (on) {
+        /* Foreground-only (no INPUTSINK), legacy messages kept so clicks
+           and the wheel still arrive through the normal handlers. */
+        rid.dwFlags    = 0;
+        rid.hwndTarget = d->hwnd;
+        if (RegisterRawInputDevices(&rid, 1, sizeof(rid)))
+            g_raw_owner = d->hwnd;
+        else
+            idd_log(d, L"RegisterRawInputDevices failed (%lu).", GetLastError());
+    } else if (g_raw_owner == d->hwnd) {
+        rid.dwFlags    = RIDEV_REMOVE;
+        rid.hwndTarget = NULL;
+        RegisterRawInputDevices(&rid, 1, sizeof(rid));
+        g_raw_owner = NULL;
+    }
+}
+
+static void idd_apply_clip(VmDisplayIdd *d)
+{
+    RECT pic;
+    if (d->rel_mode && idd_picture_rect_screen(d, &pic))
+        ClipCursor(&pic);
+}
+
+static void idd_enter_rel_mode(VmDisplayIdd *d)
+{
+    if (d->rel_mode)
+        return;
+    d->rel_mode = TRUE;
+    d->raw_abs_have = FALSE;
+    idd_set_raw_mouse(d, TRUE);
+    idd_apply_clip(d);
+    SetCursor(NULL);
+    idd_log(d, L"Mouse: relative (guest hid its cursor).");
+}
+
+/* place_pointer: move the host pointer to where the guest pointer is, so
+   switching back to absolute does not make the guest pointer jump. Only
+   wanted when the guest showed its cursor; not when focus left us. */
+static void idd_exit_rel_mode(VmDisplayIdd *d, BOOL place_pointer)
+{
+    if (!d->rel_mode)
+        return;
+    d->rel_mode = FALSE;
+    ClipCursor(NULL);
+    idd_set_raw_mouse(d, FALSE);
+
+    if (place_pointer && d->frame_width && d->frame_height) {
+        RECT pic;
+        if (idd_picture_rect_screen(d, &pic)) {
+            LONG gx = d->cursor_x, gy = d->cursor_y;
+            int sx, sy;
+            if (gx < 0) gx = 0;
+            if (gy < 0) gy = 0;
+            if (gx >= (LONG)d->frame_width)  gx = (LONG)d->frame_width - 1;
+            if (gy >= (LONG)d->frame_height) gy = (LONG)d->frame_height - 1;
+            sx = pic.left + MulDiv(gx, pic.right - pic.left, (int)d->frame_width);
+            sy = pic.top  + MulDiv(gy, pic.bottom - pic.top, (int)d->frame_height);
+            SetCursorPos(sx, sy);
+        }
+    }
+    SetCursor(d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
+    idd_log(d, L"Mouse: absolute.");
+}
+
+/* Re-evaluate which mode we should be in. Called whenever one of the inputs
+   changes: guest cursor visibility, activation, input link, clicks. */
+static void idd_update_mouse_mode(VmDisplayIdd *d)
+{
+    BOOL guest_hidden = !d->cursor_visible;
+    BOOL capable = (d->guest_caps & INPUT_CAP_REL_MOUSE) && d->input_connected;
+    BOOL active = d->input_focused && GetForegroundWindow() == d->hwnd;
+
+    if (d->rel_mode) {
+        if (!active || !capable)
+            idd_exit_rel_mode(d, FALSE);
+        else if (!guest_hidden)
+            idd_exit_rel_mode(d, TRUE);
+        return;
+    }
+    if (guest_hidden && capable && active && idd_pointer_over_picture(d))
+        idd_enter_rel_mode(d);
+}
+
+static void idd_handle_raw_input(VmDisplayIdd *d, HRAWINPUT hri)
+{
+    RAWINPUT ri;
+    UINT size = sizeof(ri);
+    LONG dx, dy;
+
+    if (GetRawInputData(hri, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1 ||
+        ri.header.dwType != RIM_TYPEMOUSE)
+        return;
+
+    if (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) {
+        /* Tablets, some touchpads, remote-desktop pointers: difference the
+           normalised positions to recover motion in screen pixels. */
+        BOOL virt = (ri.data.mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+        int w = GetSystemMetrics(virt ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+        int h = GetSystemMetrics(virt ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+        LONG ax = MulDiv(ri.data.mouse.lLastX, w, 65535);
+        LONG ay = MulDiv(ri.data.mouse.lLastY, h, 65535);
+        if (!d->raw_abs_have) {
+            d->raw_abs_have = TRUE;
+            d->raw_abs_x = ax;
+            d->raw_abs_y = ay;
+            return;
+        }
+        dx = ax - d->raw_abs_x;
+        dy = ay - d->raw_abs_y;
+        d->raw_abs_x = ax;
+        d->raw_abs_y = ay;
+    } else {
+        dx = ri.data.mouse.lLastX;
+        dy = ri.data.mouse.lLastY;
+    }
+
+    if (dx || dy)
+        send_input(d, INPUT_MOUSE_MOVE_REL, (UINT32)dx, (UINT32)dy, 0);
+}
+
+/* ==================================================================
+ * Guest refresh rate
+ *
+ * The guest renders at its display's refresh rate, so a game can never
+ * present faster than that. Match the guest to the monitor the display
+ * window is on (or the user's fixed choice). The guest helper picks the
+ * highest mode its display offers that does not exceed the request.
+ * ================================================================== */
+
+static UINT idd_host_monitor_refresh(VmDisplayIdd *d)
+{
+    MONITORINFOEXW mi;
+    DEVMODEW dm;
+    HMONITOR mon = MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST);
+
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!mon || !GetMonitorInfoW(mon, (MONITORINFO *)&mi))
+        return 60;
+    ZeroMemory(&dm, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ||
+        dm.dmDisplayFrequency < 24)
+        return 60;
+    /* 59/119/143/239 Hz panels: the guest matches within 1 Hz. */
+    return dm.dmDisplayFrequency;
+}
+
+static void idd_send_refresh(VmDisplayIdd *d, BOOL force)
+{
+    UINT hz;
+    if (!d->input_connected || !(d->guest_caps & INPUT_CAP_REFRESH))
+        return;
+    hz = d->refresh_pref ? d->refresh_pref : idd_host_monitor_refresh(d);
+    if (!force && hz == d->refresh_sent)
+        return;
+    d->refresh_sent = hz;
+    send_input(d, INPUT_SET_REFRESH, hz, 0, 0);
+    idd_log(d, L"Guest refresh rate requested: %u Hz%s.", hz,
+            d->refresh_pref ? L"" : L" (matching host monitor)");
+}
+
+static void idd_update_refresh_menu(VmDisplayIdd *d)
+{
+    HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
+    UINT i;
+    if (!sysmenu) return;
+    for (i = 0; i < REFRESH_CHOICE_COUNT; i++)
+        CheckMenuItem(sysmenu, IDM_REFRESH_BASE + 0x10 * i,
+                      MF_BYCOMMAND | (g_refresh_choices[i] == d->refresh_pref
+                                      ? MF_CHECKED : MF_UNCHECKED));
 }
 
 /* ---- Reliable recv: read exactly `len` bytes ---- */
@@ -1073,6 +1491,19 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+static BOOL idd_tearing_supported(void)
+{
+    IDXGIFactory5 *f5 = NULL;
+    BOOL allow = FALSE;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory5, (void **)&f5)) || !f5)
+        return FALSE;
+    if (FAILED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                 &allow, sizeof(allow))))
+        allow = FALSE;
+    IDXGIFactory5_Release(f5);
+    return allow;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
@@ -1084,24 +1515,40 @@ static BOOL d3d_init(VmDisplayIdd *d)
     ID3DBlob *ps_blob = NULL;
     HRESULT hr;
 
-    /* Create device and swap chain */
+    /* Flip-model swap chain: no extra DWM copy, and with tearing allowed a
+       Present never waits for the host's vblank, so guest frames are shown
+       the moment they arrive whatever rate the guest runs at. */
+    d->tearing = idd_tearing_supported();
+
     ZeroMemory(&scd, sizeof(scd));
-    scd.BufferCount                        = 1;
+    scd.BufferCount                        = 2;
     scd.BufferDesc.Width                   = DEFAULT_WIDTH;
     scd.BufferDesc.Height                  = DEFAULT_HEIGHT;
     scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator   = 60;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
     scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow                       = d->render_hwnd;
     scd.SampleDesc.Count                   = 1;
     scd.Windowed                           = TRUE;
-    scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    scd.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scd.Flags                              = d->tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     hr = D3D11CreateDeviceAndSwapChain(
         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
         NULL, 0, D3D11_SDK_VERSION,
         &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+
+    if (FAILED(hr)) {
+        /* Fall back to the original blt-model swap chain. */
+        ui_log(L"IDD: flip-model swap chain failed (0x%08X), using blt model.", hr);
+        d->tearing = FALSE;
+        scd.BufferCount = 1;
+        scd.SwapEffect  = DXGI_SWAP_EFFECT_DISCARD;
+        scd.Flags       = 0;
+        hr = D3D11CreateDeviceAndSwapChain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+            NULL, 0, D3D11_SDK_VERSION,
+            &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+    }
 
     if (FAILED(hr)) {
         ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
@@ -1224,7 +1671,8 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
 
     hr = d->swap_chain->lpVtbl->ResizeBuffers(d->swap_chain, 0,
             (UINT)rc.right, (UINT)rc.bottom,
-            DXGI_FORMAT_UNKNOWN, 0);
+            DXGI_FORMAT_UNKNOWN,
+            d->tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (FAILED(hr)) {
         ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
         return;
@@ -1293,9 +1741,13 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    /* Refresh the title once per uploaded frame (~frame rate). */
-    if (frame_uploaded && d->hwnd) {
+    /* Refresh the title at a low fixed rate. SetWindowTextW is a synchronous
+       non-client repaint; doing it per frame stalls the window thread at
+       exactly the frame rates we want to reach. */
+    if (frame_uploaded && d->hwnd &&
+        (DWORD)(GetTickCount() - d->last_title_tick) >= TITLE_UPDATE_MS) {
         wchar_t title[256];
+        d->last_title_tick = GetTickCount();
         swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
                    d->audio_muted ? L"\U0001F507 " : L"",
                    d->vm_name, d->frame_width, d->frame_height, d->recv_count);
@@ -1319,7 +1771,8 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
 
-    d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    d->swap_chain->lpVtbl->Present(d->swap_chain, 0,
+                                   d->tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
@@ -1572,38 +2025,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         vm_agent_send(d->vm, "idd_connect", NULL, 0, 30000);
     }
 
-    /* Input socket lives independently of the frame channel — survives
-       frame disconnections so the user can still send input to wake
-       the VM screen if the display path goes inactive. */
-    {
-        SOCKET input_s = INVALID_SOCKET;
+    /* Input runs on its own thread, independent of the frame channel, so
+       the user can still wake the VM screen if the display path is idle.
+       Started after idd_connect so its first connection reaches the fresh
+       helper rather than the one being replaced. */
+    if (!d->stop && !d->input_thread)
+        d->input_thread = CreateThread(NULL, 0, idd_input_thread_proc, d, 0, NULL);
 
     while (!d->stop) {
         SOCKET s;
         FrameHeader hdr;
-
-        /* Ensure input channel is connected (independent of frame channel) */
-        if (input_s == INVALID_SOCKET) {
-            GUID svc; hcs_service_guid(d->os_type, 3, &svc);
-            input_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-            if (input_s != INVALID_SOCKET) {
-                UINT32 ready_magic = 0;
-                if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == INPUT_READY_MAGIC) {
-                    DWORD zero_timeout = 0;
-                    u_long nb = 1;
-                    setsockopt(input_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-                    ioctlsocket(input_s, FIONBIO, &nb);
-                    d->input_socket = input_s;
-                    g_input_send_count = 0;
-                    idd_log(d, L"Input connected + ready (GUID :0003).");
-                } else {
-                    idd_log(d, L"Input handshake failed - closing.");
-                    closesocket(input_s);
-                    input_s = INVALID_SOCKET;
-                }
-            }
-        }
 
         /* Clipboard module (handles :0005 + :0006 internally) */
         if (!d->clipboard) {
@@ -1656,7 +2087,18 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                                 sizeof(CursorHeader) - sizeof(UINT32)))
                     break;
 
-                d->cursor_visible = chdr.visible;
+                if (chdr.shape_updated && chdr.shape_data_size > 0) {
+                    d->cursor_xhot = chdr.xhot;
+                    d->cursor_yhot = chdr.yhot;
+                }
+                /* IddCx reports the shape's top-left; the pointer is at the hotspot. */
+                InterlockedExchange(&d->cursor_x, chdr.x + (INT32)d->cursor_xhot);
+                InterlockedExchange(&d->cursor_y, chdr.y + (INT32)d->cursor_yhot);
+                if ((LONG)(chdr.visible != 0) != d->cursor_visible) {
+                    InterlockedExchange(&d->cursor_visible, chdr.visible ? 1 : 0);
+                    if (d->hwnd)
+                        PostMessageW(d->hwnd, WM_IDD_CURSOR_STATE, 0, 0);
+                }
 
                 if (chdr.shape_updated && chdr.shape_data_size > 0) {
                     BYTE *cursor_buf;
@@ -1832,46 +2274,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Signal the window thread to repaint */
             if (d->hwnd && IsWindow(d->hwnd))
                 PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
-
-            /* Reconnect input socket if send_input flagged it dead */
-            if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
-                closesocket(input_s);
-                input_s = INVALID_SOCKET;
-                idd_log(d, L"Input socket closed, will reconnect...");
-            }
-            if (input_s == INVALID_SOCKET) {
-                GUID svc; hcs_service_guid(d->os_type, 3, &svc);
-                SOCKET new_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-                if (new_s != INVALID_SOCKET) {
-                    UINT32 ready_magic = 0;
-                    if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
-                        ready_magic == INPUT_READY_MAGIC) {
-                        DWORD zero_timeout = 0;
-                        u_long nb = 1;
-                        setsockopt(new_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-                        ioctlsocket(new_s, FIONBIO, &nb);
-                        input_s = new_s;
-                        d->input_socket = new_s;
-                        g_input_send_count = 0;
-                        idd_log(d, L"Input reconnected + ready (GUID :0003).");
-                    } else {
-                        closesocket(new_s);
-                    }
-                }
-                /* If connect/handshake fails, will retry next frame */
-            }
         }
 
-        /* Frame channel lost — close it but keep input alive */
+        /* Frame channel lost — close it (input has its own thread) */
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
-
-        /* Check if input is still alive (send_input may have flagged it dead) */
-        if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
-            closesocket(input_s);
-            input_s = INVALID_SOCKET;
-            idd_log(d, L"Input socket flagged dead, will reconnect.");
-        }
 
         /* Wait before reconnecting frame channel */
         {
@@ -1880,15 +2287,6 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 Sleep(500);
         }
     }
-
-    /* Final cleanup — close input socket on thread exit */
-    d->input_socket = INVALID_SOCKET;
-    if (input_s != INVALID_SOCKET) {
-        closesocket(input_s);
-    }
-    idd_log(d, L"Input disconnected.");
-
-    } /* end input_s scope */
 
     if (recv_buf)
         HeapFree(GetProcessHeap(), 0, recv_buf);
@@ -1941,12 +2339,27 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     {
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
+            HMENU refresh_menu = CreatePopupMenu();
+            UINT i;
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
-            AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS,
+                        L"Immersive mode (send Alt+Tab, Win key, etc. to the VM)");
+            if (refresh_menu) {
+                for (i = 0; i < REFRESH_CHOICE_COUNT; i++) {
+                    wchar_t label[64];
+                    if (g_refresh_choices[i] == 0)
+                        wcscpy_s(label, 64, L"Match host monitor");
+                    else
+                        swprintf_s(label, 64, L"%u Hz", g_refresh_choices[i]);
+                    AppendMenuW(refresh_menu, MF_STRING, IDM_REFRESH_BASE + 0x10 * i, label);
+                }
+                AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)refresh_menu, L"VM refresh rate");
+            }
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            idd_update_refresh_menu(d);
         }
     }
 
@@ -2095,10 +2508,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 /* Release anything the guest may be holding from this mode. */
                 idd_flush_held_keys(d);
             }
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
+            idd_display_settings_save(d);
             idd_log(d, d->transmit_hotkeys
-                        ? L"Transmit Keyboard Hotkeys: ON."
-                        : L"Transmit Keyboard Hotkeys: OFF.");
+                        ? L"Immersive mode: ON."
+                        : L"Immersive mode: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) >= IDM_REFRESH_BASE &&
+            (wp & 0xFFF0) < IDM_REFRESH_BASE + 0x10 * REFRESH_CHOICE_COUNT) {
+            d->refresh_pref = g_refresh_choices[((wp & 0xFFF0) - IDM_REFRESH_BASE) / 0x10];
+            idd_update_refresh_menu(d);
+            idd_display_settings_save(d);
+            idd_send_refresh(d, TRUE);
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
@@ -2126,10 +2547,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Remove the hotkey hook and release any keys still held in the
                guest before tearing the window down. */
             idd_remove_kbd_hook(d);
+            idd_exit_rel_mode(d, FALSE);
             idd_flush_held_keys(d);
 
-            /* Stop recv threads */
+            /* Stop recv threads; the input thread sends what is queued
+               (the key releases above) before it closes the link. */
             d->stop = TRUE;
+            if (d->input_evt)
+                SetEvent(d->input_evt);
 
             /* Destroy clipboard module */
             if (d->clipboard) {
@@ -2153,6 +2578,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 WaitForSingleObject(d->recv_thread, 2000);
                 CloseHandle(d->recv_thread);
                 d->recv_thread = NULL;
+            }
+
+            /* Input thread: at most a connect (1s) or send (2s) in flight. */
+            if (d->input_thread) {
+                WaitForSingleObject(d->input_thread, 3000);
+                CloseHandle(d->input_thread);
+                d->input_thread = NULL;
             }
 
             d->open = FALSE;
@@ -2182,7 +2614,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
-        KillTimer(hwnd, IDT_INPUT);
+        if (d) idd_exit_rel_mode(d, FALSE);  /* never leave the host pointer clipped */
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
@@ -2217,8 +2649,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            idd_apply_clip(d);
         }
         return 0;
+
+    case WM_MOVE:
+        if (d) idd_apply_clip(d);
+        break;
+
+    /* The window may now be on a monitor with a different refresh rate. */
+    case WM_EXITSIZEMOVE:
+    case WM_DISPLAYCHANGE:
+        if (d) idd_send_refresh(d, FALSE);
+        break;
 
     case WM_PAINT:
     {
@@ -2230,12 +2673,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_TIMER:
-        if (wp == IDT_INPUT && d) {
-            flush_pending_mouse(d);
-            if (d->pending_mouse)
-                SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
-            return 0;
-        }
         if (wp == IDT_PRESENT && d) {
             if (d->frame_dirty)
                 d3d_render_frame(d);
@@ -2245,6 +2682,25 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_FRAME_READY:
         if (d) d3d_render_frame(d);
         return 0;
+
+    case WM_IDD_CURSOR_STATE:
+        if (d) idd_update_mouse_mode(d);
+        return 0;
+
+    case WM_IDD_INPUT_STATE:
+        if (d) {
+            if (wp) {
+                d->refresh_sent = 0;   /* a new helper knows nothing yet */
+                idd_send_refresh(d, TRUE);
+            }
+            idd_update_mouse_mode(d);
+        }
+        return 0;
+
+    case WM_INPUT:
+        if (d && d->rel_mode)
+            idd_handle_raw_input(d, (HRAWINPUT)lp);
+        break;   /* DefWindowProc must still see WM_INPUT */
 
     case WM_CLIPBOARDUPDATE:
         if (d && d->clipboard) {
@@ -2284,12 +2740,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
        (not WM_KILLFOCUS) is correct because focus moves between this window
        and its render child without losing activation. Losing activation —
        e.g. the user clicks another window or Alt+Tabs away with a key held —
-       flushes held keys so nothing sticks down in the guest. */
+       flushes held keys so nothing sticks down in the guest, and always
+       hands the pointer back to the host. */
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (!d->input_focused)
+            if (!d->input_focused) {
+                idd_exit_rel_mode(d, FALSE);
                 idd_flush_held_keys(d);
+            } else {
+                /* Re-evaluate once activation has fully settled. */
+                PostMessageW(hwnd, WM_IDD_CURSOR_STATE, 0, 0);
+            }
         }
         break;
 
@@ -2310,19 +2772,24 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             d->mouse_in = TRUE;
 
+            /* In relative mode motion comes from Raw Input; the host pointer
+               is parked and its messages carry nothing useful. */
+            if (d->rel_mode)
+                return 0;
+
             {
                 UINT vx, vy;
                 /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
                                     d->frame_width, d->frame_height, &vx, &vy);
-                d->pending_mouse_x = vx;
-                d->pending_mouse_y = vy;
-                d->pending_mouse = TRUE;
-                flush_pending_mouse(d);
-                if (d->pending_mouse)
-                    SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
+                send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
             }
+
+            /* Pointer arrived over the picture while a game has the guest
+               cursor hidden and this window is active: hand it the mouse. */
+            if (!d->cursor_visible)
+                idd_update_mouse_mode(d);
         }
         return 0;
 
@@ -2330,14 +2797,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->mouse_in = FALSE;
             d->tracking = FALSE;
-            d->pending_mouse = FALSE;
-            KillTimer(hwnd, IDT_INPUT);
         }
         return 0;
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && d->guest_cursor)
+            if (d && d->rel_mode)
+                SetCursor(NULL);
+            else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -2345,34 +2812,56 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
-    /* ---- Mouse button/wheel forwarding (only when cursor is in render area) ---- */
+    /* ---- Mouse button/wheel forwarding (only when cursor is in render area) ----
+       A button press over the picture is also the "click back in" that
+       resumes relative mode after the user left the window. */
     case WM_LBUTTONDOWN:
-        if (d && d->mouse_in) {
-            if (d->render_hwnd) SetCapture(d->render_hwnd);
-            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
-        }
-        return 0;
-    case WM_LBUTTONUP:
-        ReleaseCapture();
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
-        return 0;
-
     case WM_RBUTTONDOWN:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
-        return 0;
-    case WM_RBUTTONUP:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
-        return 0;
-
     case WM_MBUTTONDOWN:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
-        return 0;
+    case WM_XBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
     case WM_MBUTTONUP:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
-        return 0;
+    case WM_XBUTTONUP:
+    {
+        UINT32 btn;
+        BOOL down = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+                     msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN);
+        switch (msg) {
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: btn = INPUT_BTN_LEFT;   break;
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: btn = INPUT_BTN_RIGHT;  break;
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: btn = INPUT_BTN_MIDDLE; break;
+        default:
+            btn = GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? INPUT_BTN_X1 : INPUT_BTN_X2;
+            break;
+        }
+        if (!d)
+            return 0;
+
+        /* Keep receiving the release even if the pointer leaves mid-drag. */
+        if (down && d->render_hwnd)
+            SetCapture(d->render_hwnd);
+        else if (!down && !(wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON |
+                                  MK_XBUTTON1 | MK_XBUTTON2)))
+            ReleaseCapture();
+
+        if (d->mouse_in || d->rel_mode || !down) {
+            if (down && !d->rel_mode && !d->cursor_visible)
+                idd_update_mouse_mode(d);
+            if (btn <= INPUT_BTN_MIDDLE || (d->guest_caps & INPUT_CAP_XBUTTONS))
+                send_input(d, INPUT_MOUSE_BUTTON, btn, down ? 1 : 0, 0);
+        }
+        return (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) ? TRUE : 0;
+    }
 
     case WM_MOUSEWHEEL:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
+        if (d && (d->mouse_in || d->rel_mode))
+            send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
+        return 0;
+
+    case WM_MOUSEHWHEEL:
+        if (d && (d->mouse_in || d->rel_mode) && (d->guest_caps & INPUT_CAP_HWHEEL))
+            send_input(d, INPUT_MOUSE_HWHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
         return 0;
 
     /* ---- Keyboard input forwarding (gated on window activation) ----
@@ -2428,14 +2917,14 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->main_hwnd   = main_hwnd;
     d->open         = TRUE;
     d->stop         = FALSE;
-    d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
+    d->cursor_visible     = 1;   /* until the guest says otherwise */
     d->clipboard          = NULL;
 
-    /* Load the per-VM display setting, creating display_settings.json with
-       the default (off) if this VM doesn't have one yet. The hook itself is
+    /* Load the per-VM display settings, creating display_settings.json with
+       the defaults if this VM doesn't have one yet. The hook itself is
        installed later, on the window thread, once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    idd_display_settings_load_or_create(d);
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
@@ -2449,11 +2938,22 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     InitializeCriticalSection(&d->frame_cs);
+    InitializeCriticalSection(&d->input_cs);
+    d->input_evt = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!d->input_evt) {
+        DeleteCriticalSection(&d->input_cs);
+        DeleteCriticalSection(&d->frame_cs);
+        HeapFree(GetProcessHeap(), 0, d->frame_buf);
+        HeapFree(GetProcessHeap(), 0, d);
+        return NULL;
+    }
 
     /* Start the window thread (which will then start the recv thread) */
     d->window_thread = CreateThread(NULL, 0, idd_window_thread_proc, d, 0, NULL);
     if (!d->window_thread) {
         ui_log(L"IDD: Failed to create window thread.");
+        CloseHandle(d->input_evt);
+        DeleteCriticalSection(&d->input_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
@@ -2498,6 +2998,14 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         CloseHandle(display->recv_thread);
     }
 
+    /* input_thread likewise (it may have been started after WM_CLOSE ran) */
+    if (display->input_evt)
+        SetEvent(display->input_evt);
+    if (display->input_thread) {
+        WaitForSingleObject(display->input_thread, 3000);
+        CloseHandle(display->input_thread);
+    }
+
     /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
@@ -2515,6 +3023,9 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     }
 
     DeleteCriticalSection(&display->frame_cs);
+    DeleteCriticalSection(&display->input_cs);
+    if (display->input_evt)
+        CloseHandle(display->input_evt);
 
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
