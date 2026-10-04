@@ -38,6 +38,7 @@
 #define INPUT_MOUSE_MOVE_REL 4          /* p1/p2 = INT32 dx/dy */
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired refresh rate in Hz */
+#define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = refresh Hz */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host: p1 = caps, p2 = version */
 #define INPUT_GUEST_CURSOR  0x81        /* guest -> host: p1 = 1 if the cursor is hidden */
 
@@ -53,7 +54,8 @@
 #define INPUT_CAP_HWHEEL    0x04
 #define INPUT_CAP_REFRESH   0x08
 #define INPUT_CAP_CURSOR_REPORT 0x10
-#define INPUT_PROTO_VERSION 3
+#define INPUT_CAP_SET_MODE  0x20
+#define INPUT_PROTO_VERSION 4
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 
@@ -290,13 +292,14 @@ static void release_held(HeldState *h)
 }
 
 /* ==================================================================
- * Refresh rate
+ * Display mode (resolution + refresh rate)
  * ================================================================== */
 
-/* Switch every active display to the highest refresh rate it offers at its
-   current resolution that does not exceed hz (within 1 Hz). The only display in a VM is
-   the AppSandbox VDD (the GPU-PV adapter has no outputs). */
-static void apply_refresh(UINT32 hz)
+/* Switch every active display to width x height (0 = keep the current
+   resolution, or if the display does not offer it) at the highest refresh
+   rate it offers there that does not exceed hz (within 1 Hz). The only
+   display in a VM is the AppSandbox VDD (the GPU-PV adapter has no outputs). */
+static void apply_mode(UINT32 width, UINT32 height, UINT32 hz)
 {
     DISPLAY_DEVICEW dd;
     DWORD di;
@@ -320,32 +323,59 @@ static void apply_refresh(UINT32 hz)
         if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &cur))
             continue;
 
-        for (mi = 0;; mi++) {
-            ZeroMemory(&dm, sizeof(dm));
-            dm.dmSize = sizeof(dm);
-            if (!EnumDisplaySettingsW(dd.DeviceName, mi, &dm))
-                break;
-            if (dm.dmPelsWidth != cur.dmPelsWidth ||
-                dm.dmPelsHeight != cur.dmPelsHeight ||
-                dm.dmBitsPerPel != cur.dmBitsPerPel)
+        /* Target resolution: the requested one if this display offers it at
+           the current colour depth, otherwise the current one. */
+        {
+            DWORD tw = cur.dmPelsWidth, th = cur.dmPelsHeight;
+            if (width && height) {
+                for (mi = 0;; mi++) {
+                    ZeroMemory(&dm, sizeof(dm));
+                    dm.dmSize = sizeof(dm);
+                    if (!EnumDisplaySettingsW(dd.DeviceName, mi, &dm))
+                        break;
+                    if (dm.dmPelsWidth == width && dm.dmPelsHeight == height &&
+                        dm.dmBitsPerPel == cur.dmBitsPerPel) {
+                        tw = width;
+                        th = height;
+                        break;
+                    }
+                }
+                if (tw != width || th != height)
+                    input_log("Mode: %ls does not offer %ux%u; keeping %lux%lu.",
+                              dd.DeviceName, width, height, cur.dmPelsWidth, cur.dmPelsHeight);
+            }
+
+            for (mi = 0;; mi++) {
+                ZeroMemory(&dm, sizeof(dm));
+                dm.dmSize = sizeof(dm);
+                if (!EnumDisplaySettingsW(dd.DeviceName, mi, &dm))
+                    break;
+                if (dm.dmPelsWidth != tw ||
+                    dm.dmPelsHeight != th ||
+                    dm.dmBitsPerPel != cur.dmBitsPerPel)
+                    continue;
+                /* +1: hosts report 59/143/239 Hz for 60/144/240 Hz panels. */
+                if (dm.dmDisplayFrequency <= hz + 1 && dm.dmDisplayFrequency > best)
+                    best = dm.dmDisplayFrequency;
+            }
+
+            if (best == 0 ||
+                (best == cur.dmDisplayFrequency && tw == cur.dmPelsWidth && th == cur.dmPelsHeight)) {
+                input_log("Mode: %ls stays at %lux%lu @ %lu Hz (requested %ux%u @ %u).",
+                          dd.DeviceName, cur.dmPelsWidth, cur.dmPelsHeight,
+                          cur.dmDisplayFrequency, width, height, hz);
                 continue;
-            /* +1: hosts report 59/143/239 Hz for 60/144/240 Hz panels. */
-            if (dm.dmDisplayFrequency <= hz + 1 && dm.dmDisplayFrequency > best)
-                best = dm.dmDisplayFrequency;
-        }
+            }
 
-        if (best == 0 || best == cur.dmDisplayFrequency) {
-            input_log("Refresh: %ls stays at %lu Hz (requested %u).",
-                      dd.DeviceName, cur.dmDisplayFrequency, hz);
-            continue;
+            cur.dmPelsWidth = tw;
+            cur.dmPelsHeight = th;
+            cur.dmDisplayFrequency = best;
+            cur.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+            rc = ChangeDisplaySettingsExW(dd.DeviceName, &cur, NULL, CDS_UPDATEREGISTRY, NULL);
+            input_log("Mode: %ls -> %lux%lu @ %lu Hz (requested %ux%u @ %u): %s (%ld).",
+                      dd.DeviceName, tw, th, best, width, height, hz,
+                      rc == DISP_CHANGE_SUCCESSFUL ? "ok" : "failed", rc);
         }
-
-        cur.dmDisplayFrequency = best;
-        cur.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-        rc = ChangeDisplaySettingsExW(dd.DeviceName, &cur, NULL, CDS_UPDATEREGISTRY, NULL);
-        input_log("Refresh: %ls -> %lu Hz (requested %u): %s (%ld).",
-                  dd.DeviceName, best, hz,
-                  rc == DISP_CHANGE_SUCCESSFUL ? "ok" : "failed", rc);
     }
 }
 
@@ -408,7 +438,11 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
     }
     case INPUT_SET_REFRESH:
         ensure_input_desktop(FALSE);
-        apply_refresh(pkt->param1);
+        apply_mode(0, 0, pkt->param1);
+        break;
+    case INPUT_SET_MODE:
+        ensure_input_desktop(FALSE);
+        apply_mode(pkt->param1, pkt->param2, pkt->param3);
         break;
     default:
         break;   /* unknown types from newer hosts are ignored */
@@ -511,7 +545,7 @@ static void handle_conn(AsbConn *c)
     pkt.magic  = INPUT_MAGIC;
     pkt.type   = INPUT_GUEST_CAPS;
     pkt.param1 = INPUT_CAP_REL_MOUSE | INPUT_CAP_XBUTTONS |
-                 INPUT_CAP_HWHEEL | INPUT_CAP_REFRESH |
+                 INPUT_CAP_HWHEEL | INPUT_CAP_REFRESH | INPUT_CAP_SET_MODE |
                  (report ? INPUT_CAP_CURSOR_REPORT : 0);
     pkt.param2 = INPUT_PROTO_VERSION;
     EnterCriticalSection(&g_send_cs);

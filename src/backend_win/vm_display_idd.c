@@ -103,7 +103,8 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define MAX_FRAME_WIDTH     7680
+#define MAX_FRAME_HEIGHT    4320
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -115,6 +116,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_MOVE_REL 4          /* p1/p2 = INT32 dx/dy */
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired guest refresh rate (Hz) */
+#define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = refresh (Hz) */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host after IRDY: p1 = caps, p2 = version */
 #define INPUT_GUEST_CURSOR  0x81        /* guest -> host: p1 = 1 if the guest cursor is hidden */
 
@@ -132,6 +134,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_CAP_HWHEEL    0x04
 #define INPUT_CAP_REFRESH   0x08
 #define INPUT_CAP_CURSOR_REPORT 0x10
+#define INPUT_CAP_SET_MODE  0x20
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 #define INPUT_QUEUE_MAX     512
@@ -237,6 +240,7 @@ struct VmDisplayIdd {
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT                     tex_width, tex_height;   /* size of frame_tex */
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -278,6 +282,13 @@ struct VmDisplayIdd {
     /* Guest refresh rate: 0 = match the host monitor. */
     UINT           refresh_pref;
     UINT           refresh_sent;
+    /* Guest resolution: RES_KEEP, RES_MATCH or a fixed size. */
+    UINT           res_pref_w, res_pref_h;
+    UINT           mode_sent_w, mode_sent_h;
+
+    /* Borderless fullscreen on the window's monitor (Ctrl+Alt+Enter). */
+    BOOL           fullscreen;
+    WINDOWPLACEMENT saved_placement;
 
     DWORD          last_title_tick;
     BOOL           tearing;         /* swap chain created with ALLOW_TEARING */
@@ -337,11 +348,26 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_FULLSCREEN     0x1030
 #define IDM_REFRESH_BASE   0x1100   /* + 0x10 * index into g_refresh_choices */
+#define IDM_RES_BASE       0x1200   /* + 0x10 * index into g_res_choices */
 
 /* Guest refresh-rate choices offered in the system menu; 0 = match host. */
 static const UINT g_refresh_choices[] = { 0, 60, 120, 144, 165, 240 };
 #define REFRESH_CHOICE_COUNT (sizeof(g_refresh_choices) / sizeof(g_refresh_choices[0]))
+
+/* Guest resolution choices: {0,0} = keep whatever the guest uses (default),
+   {1,1} = match the host monitor the window is on. The rest must be modes
+   the display driver offers (tools/vdd/vdd.h). */
+typedef struct { UINT w, h; } IddResChoice;
+#define RES_KEEP  0
+#define RES_MATCH 1
+static const IddResChoice g_res_choices[] = {
+    { RES_KEEP, RES_KEEP }, { RES_MATCH, RES_MATCH },
+    { 1280, 720 }, { 1600, 900 }, { 1920, 1080 }, { 1920, 1200 },
+    { 2560, 1080 }, { 2560, 1440 }, { 3440, 1440 }, { 3840, 2160 }, { 5120, 1440 },
+};
+#define RES_CHOICE_COUNT (sizeof(g_res_choices) / sizeof(g_res_choices[0]))
 
 /* Raw Input registrations are per process, and every display window lives
    in this process. Only the display currently in relative mode owns the
@@ -799,8 +825,10 @@ static void idd_display_settings_save(const VmDisplayIdd *d)
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     /* transmitKeyboardHotkeys keeps its name so existing files keep the
        user's Immersive mode choice. */
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"refreshRate\":%u}\n",
-            d->transmit_hotkeys ? 1 : 0, d->refresh_pref);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"refreshRate\":%u,"
+               "\"resolutionWidth\":%u,\"resolutionHeight\":%u}\n",
+            d->transmit_hotkeys ? 1 : 0, d->refresh_pref,
+            d->res_pref_w, d->res_pref_h);
     fclose(f);
 }
 
@@ -814,6 +842,7 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
 
     d->transmit_hotkeys = FALSE;
     d->refresh_pref = 0;
+    d->res_pref_w = d->res_pref_h = RES_KEEP;
     if (d->vhdx_path[0] == L'\0') return;
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
@@ -831,6 +860,17 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
             unsigned v = 0;
             if (sscanf_s(r + 14, "%u", &v) == 1 && v <= 1000)
                 d->refresh_pref = v;
+        }
+        {
+            const char *rw = strstr(buf, "\"resolutionWidth\":");
+            const char *rh = strstr(buf, "\"resolutionHeight\":");
+            unsigned w = 0, h = 0;
+            if (rw && rh &&
+                sscanf_s(rw + 18, "%u", &w) == 1 && sscanf_s(rh + 19, "%u", &h) == 1 &&
+                w <= MAX_FRAME_WIDTH && h <= MAX_FRAME_HEIGHT) {
+                d->res_pref_w = w;
+                d->res_pref_h = h;
+            }
         }
     }
     fclose(f);
@@ -1246,18 +1286,62 @@ static UINT idd_host_monitor_refresh(VmDisplayIdd *d)
     return dm.dmDisplayFrequency;
 }
 
+static BOOL idd_host_monitor_size(VmDisplayIdd *d, UINT *w, UINT *h)
+{
+    MONITORINFOEXW mi;
+    DEVMODEW dm;
+    HMONITOR mon = MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST);
+
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!mon || !GetMonitorInfoW(mon, (MONITORINFO *)&mi))
+        return FALSE;
+    ZeroMemory(&dm, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ||
+        dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0)
+        return FALSE;
+    *w = dm.dmPelsWidth;
+    *h = dm.dmPelsHeight;
+    return TRUE;
+}
+
+/* Tell the guest helper which display mode to use: the refresh rate always,
+   the resolution unless the user keeps the guest's own setting. Helpers
+   without INPUT_CAP_SET_MODE only get the refresh rate. */
 static void idd_send_refresh(VmDisplayIdd *d, BOOL force)
 {
-    UINT hz;
-    if (!d->input_connected || !(d->guest_caps & INPUT_CAP_REFRESH))
+    UINT hz, w = 0, h = 0;
+    if (!d->input_connected)
         return;
     hz = d->refresh_pref ? d->refresh_pref : idd_host_monitor_refresh(d);
-    if (!force && hz == d->refresh_sent)
-        return;
+    if (d->res_pref_w == RES_MATCH) {
+        if (!idd_host_monitor_size(d, &w, &h))
+            w = h = 0;
+    } else if (d->res_pref_w != RES_KEEP) {
+        w = d->res_pref_w;
+        h = d->res_pref_h;
+    }
+
+    if (w && (d->guest_caps & INPUT_CAP_SET_MODE)) {
+        if (!force && hz == d->refresh_sent && w == d->mode_sent_w && h == d->mode_sent_h)
+            return;
+        send_input(d, INPUT_SET_MODE, w, h, hz);
+        idd_log(d, L"Guest display mode requested: %ux%u @ %u Hz%s.", w, h, hz,
+                d->res_pref_w == RES_MATCH ? L" (matching host monitor)" : L"");
+    } else {
+        if (!(d->guest_caps & INPUT_CAP_REFRESH))
+            return;
+        w = h = 0;
+        if (!force && hz == d->refresh_sent && d->mode_sent_w == 0)
+            return;
+        send_input(d, INPUT_SET_REFRESH, hz, 0, 0);
+        idd_log(d, L"Guest refresh rate requested: %u Hz%s.", hz,
+                d->refresh_pref ? L"" : L" (matching host monitor)");
+    }
     d->refresh_sent = hz;
-    send_input(d, INPUT_SET_REFRESH, hz, 0, 0);
-    idd_log(d, L"Guest refresh rate requested: %u Hz%s.", hz,
-            d->refresh_pref ? L"" : L" (matching host monitor)");
+    d->mode_sent_w = w;
+    d->mode_sent_h = h;
 }
 
 static void idd_update_refresh_menu(VmDisplayIdd *d)
@@ -1269,6 +1353,49 @@ static void idd_update_refresh_menu(VmDisplayIdd *d)
         CheckMenuItem(sysmenu, IDM_REFRESH_BASE + 0x10 * i,
                       MF_BYCOMMAND | (g_refresh_choices[i] == d->refresh_pref
                                       ? MF_CHECKED : MF_UNCHECKED));
+    for (i = 0; i < RES_CHOICE_COUNT; i++)
+        CheckMenuItem(sysmenu, IDM_RES_BASE + 0x10 * i,
+                      MF_BYCOMMAND | (g_res_choices[i].w == d->res_pref_w &&
+                                      g_res_choices[i].h == d->res_pref_h
+                                      ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sysmenu, IDM_FULLSCREEN,
+                  MF_BYCOMMAND | (d->fullscreen ? MF_CHECKED : MF_UNCHECKED));
+}
+
+/* Borderless fullscreen on the monitor the window is on, and back to the
+   saved window placement. Toggled from the system menu or Ctrl+Alt+Enter. */
+static void idd_set_fullscreen(VmDisplayIdd *d, BOOL on)
+{
+    HWND hwnd = d->hwnd;
+    LONG style;
+    if (!hwnd || on == d->fullscreen)
+        return;
+    style = GetWindowLongW(hwnd, GWL_STYLE);
+    if (on) {
+        MONITORINFO mi;
+        ZeroMemory(&mi, sizeof(mi));
+        mi.cbSize = sizeof(mi);
+        d->saved_placement.length = sizeof(d->saved_placement);
+        if (!GetWindowPlacement(hwnd, &d->saved_placement) ||
+            !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        d->fullscreen = TRUE;
+        SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    } else {
+        d->fullscreen = FALSE;
+        SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &d->saved_placement);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    idd_update_refresh_menu(d);
+    idd_send_refresh(d, FALSE);   /* the monitor may have changed */
+    idd_log(d, on ? L"Fullscreen: on (Ctrl+Alt+Enter to leave)." : L"Fullscreen: off.");
 }
 
 /* ---- Reliable recv: read exactly `len` bytes ---- */
@@ -1579,12 +1706,57 @@ static BOOL idd_tearing_supported(void)
     return allow;
 }
 
+/* (Re)create the CPU-writable frame texture and its view at w x h. */
+static BOOL d3d_create_frame_texture(VmDisplayIdd *d, UINT w, UINT h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    HRESULT hr;
+
+    if (d->frame_srv) { d->frame_srv->lpVtbl->Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL; }
+    d->tex_width = d->tex_height = 0;
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = w;
+    td.Height             = h;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D %ux%u failed (0x%08X)", w, h, hr);
+        return FALSE;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
+        d->frame_tex->lpVtbl->Release(d->frame_tex);
+        d->frame_tex = NULL;
+        return FALSE;
+    }
+    d->tex_width = w;
+    d->tex_height = h;
+    return TRUE;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
@@ -1648,37 +1820,9 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
-    ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
-    td.MipLevels          = 1;
-    td.ArraySize          = 1;
-    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
-    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
-
-    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateTexture2D failed (0x%08X)", hr);
+    /* Frame texture at the default size; recreated when the guest mode changes. */
+    if (!d3d_create_frame_texture(d, DEFAULT_WIDTH, DEFAULT_HEIGHT))
         return FALSE;
-    }
-
-    /* Shader resource view for the frame texture */
-    ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Texture2D.MipLevels       = 1;
-    srv_desc.Texture2D.MostDetailedMip = 0;
-
-    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
-            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
-        return FALSE;
-    }
 
     /* Compile and create vertex shader */
     if (!d3d_compile_shader(g_vs_hlsl, "main", "vs_4_0", &vs_blob))
@@ -1771,12 +1915,18 @@ static void d3d_render_frame(VmDisplayIdd *d)
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
 
-    if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
+    if (!d->device || !d->ctx || !d->swap_chain || !d->rtv || !d->frame_srv)
         return;
 
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
+        /* The guest changed mode: match the texture to the frame. */
+        if ((d->frame_width != d->tex_width || d->frame_height != d->tex_height) &&
+            !d3d_create_frame_texture(d, d->frame_width, d->frame_height)) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1788,7 +1938,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height && row < d->tex_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -2075,11 +2225,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    SIZE_T recv_cap = (SIZE_T)DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
+    UINT connect_failures = 0;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    /* Receive buffer for frame pixel data; grows if the guest mode is larger. */
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_cap);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -2126,19 +2278,24 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
         }
 
-        /* Try to connect frame channel (VDD driver, GUID :0002) */
-        idd_log(d, L"Connecting to frame service...");
+        /* Try to connect frame channel (VDD driver, GUID :0002). A guest mode
+           change restarts the driver's listener, so retry quickly and only
+           log the first failure of a run. */
+        if (connect_failures == 0)
+            idd_log(d, L"Connecting to frame service...");
         {
             GUID svc; hcs_service_guid(d->os_type, 2, &svc);
             s = connect_to_hv_service(&d->runtime_id, &svc, 3000);
         }
         if (s == INVALID_SOCKET) {
             int wait;
-            idd_log(d, L"Connection failed, retrying in 3s.");
-            for (wait = 0; wait < 3000 && !d->stop; wait += 500)
-                Sleep(500);
+            if (connect_failures++ == 0)
+                idd_log(d, L"Connection failed, retrying every second.");
+            for (wait = 0; wait < 1000 && !d->stop; wait += 250)
+                Sleep(250);
             continue;
         }
+        connect_failures = 0;
 
         idd_log(d, L"Frame channel connected.");
 
@@ -2228,8 +2385,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Sanity checks */
             if (hdr.width == 0 || hdr.height == 0 ||
-                hdr.width > 7680 || hdr.height > 4320 ||
-                hdr.stride < hdr.width * 4) {
+                hdr.width > MAX_FRAME_WIDTH || hdr.height > MAX_FRAME_HEIGHT ||
+                hdr.stride < hdr.width * 4 || hdr.stride > MAX_FRAME_WIDTH * 4) {
                 idd_log(d, L"Invalid frame dimensions %ux%u stride %u.",
                        hdr.width, hdr.height, hdr.stride);
                 break;
@@ -2251,9 +2408,23 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (!recv_exact(s, &data_size, 4))
                 break;
 
-            if (data_size > MAX_FRAME_DATA_SIZE) {
+            /* A full frame is at most stride*height bytes, a dirty update at
+               most width*height*4 (the guest falls back to a full frame
+               beyond that). */
+            if ((UINT64)data_size > (rect_count ? (UINT64)hdr.width * hdr.height * 4
+                                                : (UINT64)hdr.stride * hdr.height)) {
                 idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
                 break;
+            }
+            if (data_size > recv_cap) {
+                BYTE *nb = (BYTE *)HeapAlloc(GetProcessHeap(), 0, data_size);
+                if (!nb) {
+                    idd_log(d, L"Out of memory for a %u-byte frame, reconnecting.", data_size);
+                    break;
+                }
+                HeapFree(GetProcessHeap(), 0, recv_buf);
+                recv_buf = nb;
+                recv_cap = data_size;
             }
 
             /* Read pixel data */
@@ -2355,11 +2526,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
 
-        /* Wait before reconnecting frame channel */
+        /* Brief pause: a guest mode change re-creates the driver's listener
+           within a few hundred milliseconds. */
         {
             int wait;
-            for (wait = 0; wait < 3000 && !d->stop; wait += 500)
-                Sleep(500);
+            for (wait = 0; wait < 500 && !d->stop; wait += 250)
+                Sleep(250);
         }
     }
 
@@ -2415,11 +2587,26 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
             HMENU refresh_menu = CreatePopupMenu();
+            HMENU res_menu = CreatePopupMenu();
             UINT i;
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS,
                         L"Immersive mode (send Alt+Tab, Win key, etc. to the VM)");
+            AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Fullscreen\tCtrl+Alt+Enter");
+            if (res_menu) {
+                for (i = 0; i < RES_CHOICE_COUNT; i++) {
+                    wchar_t label[64];
+                    if (g_res_choices[i].w == RES_KEEP)
+                        wcscpy_s(label, 64, L"Keep guest setting");
+                    else if (g_res_choices[i].w == RES_MATCH)
+                        wcscpy_s(label, 64, L"Match host monitor");
+                    else
+                        swprintf_s(label, 64, L"%u x %u", g_res_choices[i].w, g_res_choices[i].h);
+                    AppendMenuW(res_menu, MF_STRING, IDM_RES_BASE + 0x10 * i, label);
+                }
+                AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)res_menu, L"VM resolution");
+            }
             if (refresh_menu) {
                 for (i = 0; i < REFRESH_CHOICE_COUNT; i++) {
                     wchar_t label[64];
@@ -2597,6 +2784,22 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_send_refresh(d, TRUE);
             return 0;
         }
+        if (d && (wp & 0xFFF0) >= IDM_RES_BASE &&
+            (wp & 0xFFF0) < IDM_RES_BASE + 0x10 * RES_CHOICE_COUNT) {
+            const IddResChoice *c = &g_res_choices[((wp & 0xFFF0) - IDM_RES_BASE) / 0x10];
+            d->res_pref_w = c->w;
+            d->res_pref_h = c->h;
+            idd_update_refresh_menu(d);
+            idd_display_settings_save(d);
+            if (c->w != RES_KEEP && !(d->guest_caps & INPUT_CAP_SET_MODE) && d->input_connected)
+                idd_log(d, L"The guest input helper can't change resolution yet; restart the VM to update it.");
+            idd_send_refresh(d, TRUE);
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_FULLSCREEN) {
+            idd_set_fullscreen(d, !d->fullscreen);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
             /* Reveal the log window (hidden by default). Closing it via its
                own [X] just hides it again (see idd_log_proc WM_CLOSE), so
@@ -2701,6 +2904,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
         DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
         RECT wr;
+        if (d && d->fullscreen)
+            break;   /* fullscreen covers the monitor whatever the frame size */
         /* Minimum: 320x180 client area */
         wr.left = 0; wr.top = 0; wr.right = 320; wr.bottom = 180;
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2959,6 +3164,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
+        /* Ctrl+Alt+Enter toggles fullscreen (as in VMware) and is not sent
+           to the VM. Ctrl and Alt themselves were forwarded and are
+           released normally. */
+        if (wp == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000) &&
+            (GetKeyState(VK_MENU) & 0x8000)) {
+            if (!up && !(lp & (1 << 30)))   /* ignore auto-repeat */
+                idd_set_fullscreen(d, !d->fullscreen);
+            return 0;
+        }
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */

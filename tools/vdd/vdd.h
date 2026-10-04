@@ -38,12 +38,16 @@ Environment:
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
-#define VDD_WIDTH            1920
+#define VDD_WIDTH            1920       /* preferred (first-boot) mode */
 #define VDD_HEIGHT           1080
 #define VDD_BPP              4          /* BGRA 8-bit */
-#define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
-#define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
+
+/* Mode limits. Every offered mode must fit inside the EDID range-limits
+   descriptor or the OS filters it out: 2550 MHz pixel clock, 510 kHz line
+   rate (totalSize == activeSize, see VddCreateMonitorMode). */
+#define VDD_MAX_PIXEL_RATE   2550000000ull
+#define VDD_MAX_HSYNC        510000u
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -83,10 +87,10 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
 #pragma pack(pop)
 
 /* ============================================================================
- *  Supported resolution and refresh rates. One resolution; several refresh
- *  rates so a game is not capped at 60 fps when the host monitor is faster.
- *  Index 0 (60 Hz) is the preferred mode, so first boot is unchanged; the
- *  host asks the guest input helper to switch to the rate it wants.
+ *  Supported resolutions and refresh rates. Every resolution is offered at
+ *  every refresh rate that fits the EDID range limits, so the VM can match
+ *  the host monitor (the host asks the guest input helper for a mode).
+ *  1920x1080 @ 60 Hz is the preferred mode, so first boot is unchanged.
  * ============================================================================ */
 struct ResolutionEntry {
     UINT width;
@@ -94,7 +98,19 @@ struct ResolutionEntry {
 };
 
 static const ResolutionEntry g_SupportedResolutions[] = {
-    { 1920, 1080 },
+    { 1920, 1080 },     /* preferred: keep first */
+    { 1280,  720 },
+    { 1366,  768 },
+    { 1600,  900 },
+    { 1680, 1050 },
+    { 1920, 1200 },
+    { 2560, 1080 },
+    { 2560, 1440 },
+    { 2560, 1600 },
+    { 3440, 1440 },
+    { 3840, 1600 },
+    { 3840, 2160 },
+    { 5120, 1440 },
 };
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
@@ -114,6 +130,18 @@ static const RefreshRateEntry g_SupportedRefreshRates[] = {
 };
 
 static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
+
+/* Largest frame any offered mode produces (3840x2160 x 4 bytes). */
+#define VDD_MAX_FRAME_BYTES  (3840u * 2160u * VDD_BPP)
+
+/* One offered mode; the full list is built once by VddBuildModeList(). */
+struct VddMode {
+    UINT width;
+    UINT height;
+    UINT refresh;
+};
+
+#define VDD_MAX_MODES (ARRAYSIZE(g_SupportedResolutions) * ARRAYSIZE(g_SupportedRefreshRates))
 
 /* ============================================================================
  *  EDID - 128-byte block
@@ -169,10 +197,10 @@ static const BYTE VDD_EDID[] = {
 
     /* Descriptor #3: Monitor range limits.
        Byte 4 = 0x08: max horizontal rate is offset by +255 kHz (EDID 1.4).
-       V 24-240 Hz, H 30-(5+255)=260 kHz, max pixel clock 500 MHz -- wide
-       enough for every mode in g_SupportedRefreshRates. */
+       V 24-240 Hz, H 30-(255+255)=510 kHz, max pixel clock 2550 MHz --
+       the VDD_MAX_HSYNC / VDD_MAX_PIXEL_RATE limits every offered mode fits. */
     0x00, 0x00, 0x00, 0xFD, 0x08,
-    0x18, 0xF0, 0x1E, 0x05, 0x32, 0x00, 0x0A,
+    0x18, 0xF0, 0x1E, 0xFF, 0xFF, 0x00, 0x0A,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 
     /* Descriptor #4: Dummy (zero) */
@@ -220,9 +248,15 @@ typedef struct _VDD_SWAP_PROC {
     UINT                cursorBufSize;      /* size of pCursorShapeBuffer (2x for MASKED_COLOR) */
     DWORD               lastShapeId;        /* last received shape ID */
 
-    /* Contiguous send buffer (VDD_PIXEL_BYTES) so a frame goes out in one
+    /* Current surface size (follows the committed mode). The staging texture
+       is (re)created to match the first frame of each size. */
+    UINT                width;
+    UINT                height;
+
+    /* Contiguous send buffer (width*height*4) so a frame goes out in one
        transport send instead of one send per row. */
     PBYTE               pSendBuf;
+    SIZE_T              sendBufSize;
 } VDD_SWAP_PROC;
 
 /* ============================================================================
@@ -241,9 +275,6 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
 
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* modes[0] = preferred 1920x1080@60 */
-    UINT                modeCount;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.
