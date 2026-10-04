@@ -6,9 +6,9 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - one monitor (1280x720 up to 5120x1440,
-    60-240 Hz) with direct HvSocket frame transport to the host (no agent
-    middleman).
+    AppSandbox Virtual Display Driver - up to four monitors (1280x720 up to
+    5120x1440, 60-240 Hz each) with direct HvSocket frame transport to the
+    host (no agent middleman).
 
     IddCx lifecycle:
     - DllMain
@@ -84,21 +84,19 @@ static void VddLog(const char* fmt, ...)
 /*  EDID with computed checksum                                              */
 /* ========================================================================= */
 
-static const BYTE* VddGetEdid()
+/* Monitor n gets product code 0x0001+n and serial n+1, so its PnP ID is
+   ASB000<n+1> -- monitor 0 keeps the original EDID byte for byte. */
+static void VddBuildEdid(BYTE edid[128], UINT index)
 {
-    static BYTE edid[128];
-    static BOOL computed = FALSE;
-
-    if (!computed)
-    {
-        memcpy(edid, VDD_EDID, 127);
-        BYTE sum = 0;
-        for (int i = 0; i < 127; i++)
-            sum += edid[i];
-        edid[127] = (BYTE)(256 - sum);
-        computed = TRUE;
-    }
-    return edid;
+    memcpy(edid, VDD_EDID, 127);
+    edid[10] = (BYTE)(0x01 + index);    /* product code, little-endian */
+    edid[11] = 0x00;
+    edid[12] = (BYTE)(0x01 + index);    /* serial number, little-endian */
+    edid[13] = edid[14] = edid[15] = 0x00;
+    BYTE sum = 0;
+    for (int i = 0; i < 127; i++)
+        sum += edid[i];
+    edid[127] = (BYTE)(256 - sum);
 }
 
 /* ========================================================================= */
@@ -207,17 +205,17 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
     while (!proc->bStopNetwork) {
         /* (Re)create the listener. PC: socket(AF_HYPERV)+bind(ch2 GUID, wildcard)+listen;
            Mac: bind the ivshmem ch2 slot. */
-        l = asb_listen(ASB_CH_DISPLAY);
+        l = asb_listen(proc->channel);
         if (!l) {
-            VddLog("Network: asb_listen(ch2) failed, retrying in 3s (transport=%s)",
-                   asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+            VddLog("Network: asb_listen(ch%d) failed, retrying in 3s (transport=%s)",
+                   proc->channel, asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
             for (int w = 0; w < 3000 && !proc->bStopNetwork; w += 500)
                 Sleep(500);
             continue;
         }
 
-        VddLog("Network: listening for host connections (transport=%s)",
-               asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+        VddLog("Network: listening for host connections on ch%d (transport=%s)",
+               proc->channel, asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
 
         /* Accept loop — 1s timeout so we re-check bStopNetwork between accepts. */
         while (!proc->bStopNetwork) {
@@ -971,21 +969,32 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->wdfDevice = device;
+    for (UINT i = 0; i < VDD_MAX_MONITORS; i++) {
+        ctx->monitors[i].ctx = ctx;
+        ctx->monitors[i].index = i;
+        VddBuildEdid(ctx->monitors[i].edid, i);
+    }
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
 {
     VddLog("Context cleanup starting");
 
-    /* Stop recovery timer (wait for any in-progress callback to finish) */
+    /* Stop the timers (wait for any in-progress callback to finish) */
     if (ctx->hRecoveryTimer) {
         WdfTimerStop(ctx->hRecoveryTimer, TRUE);
     }
+    if (ctx->hMonitorTimer) {
+        WdfTimerStop(ctx->hMonitorTimer, TRUE);
+    }
 
-    if (ctx->pSwapProc)
+    for (UINT i = 0; i < VDD_MAX_MONITORS; i++)
     {
-        VddDestroySwapProc(ctx->pSwapProc);
-        ctx->pSwapProc = nullptr;
+        if (ctx->monitors[i].pSwapProc)
+        {
+            VddDestroySwapProc(ctx->monitors[i].pSwapProc);
+            ctx->monitors[i].pSwapProc = nullptr;
+        }
     }
 
     /* Release cached D3D device (safe here — no IddCx teardown in progress) */
@@ -1023,7 +1032,7 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
     adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_NONE;
     VddLog("InitAdapter: SDR only (FP16 not advertised)");
 
-    adapterCaps.MaxMonitorsSupported = 1;
+    adapterCaps.MaxMonitorsSupported = VDD_MAX_MONITORS;
 
     adapterCaps.EndPointDiagnostics.Size = sizeof(adapterCaps.EndPointDiagnostics);
     adapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
@@ -1088,19 +1097,21 @@ static void VddFinishInit(VDD_DEVICE_CONTEXT* ctx)
 /*  CreateMonitor (called after adapter init finished)                       */
 /* ========================================================================= */
 
-static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx)
+static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx, UINT index)
 {
-    VddLog("CreateMonitor: entered (ctx=%p, adapter=%p)", (void*)ctx, (void*)ctx->hAdapter);
+    VDD_MONITOR* mon = &ctx->monitors[index];
+    VddLog("CreateMonitor: entered (ctx=%p, adapter=%p, index=%u)",
+           (void*)ctx, (void*)ctx->hAdapter, index);
 
     IDDCX_MONITOR_INFO monitorInfo = {};
     monitorInfo.Size = sizeof(monitorInfo);
     monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-    monitorInfo.ConnectorIndex = 0;
+    monitorInfo.ConnectorIndex = index;
 
     monitorInfo.MonitorDescription.Size     = sizeof(monitorInfo.MonitorDescription);
     monitorInfo.MonitorDescription.Type     = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
     monitorInfo.MonitorDescription.DataSize = 128;
-    monitorInfo.MonitorDescription.pData    = (void*)VddGetEdid();
+    monitorInfo.MonitorDescription.pData    = (void*)mon->edid;
 
     VddLog("CreateMonitor: EDID checksum byte=0x%02X, IDDCX_MONITOR_INFO.Size=%u",
            ((const BYTE*)monitorInfo.MonitorDescription.pData)[127],
@@ -1128,24 +1139,75 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx)
     }
     VddLog("CreateMonitor: IddCxMonitorCreate succeeded (monitor=%p)", (void*)createOut.MonitorObject);
 
-    ctx->hMonitor = createOut.MonitorObject;
+    mon->hMonitor = createOut.MonitorObject;
 
-    /* Store context on the monitor object */
+    /* Store the monitor on the monitor object */
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(createOut.MonitorObject);
-    pMonCtx->pContext = ctx;
+    pMonCtx->pMonitor = mon;
 
     VddLog("CreateMonitor: calling IddCxMonitorArrival...");
     IDARG_OUT_MONITORARRIVAL arrivalOut = {};
-    st = IddCxMonitorArrival(ctx->hMonitor, &arrivalOut);
+    st = IddCxMonitorArrival(mon->hMonitor, &arrivalOut);
     if (!NT_SUCCESS(st))
     {
         VddLog("CreateMonitor: IddCxMonitorArrival FAILED st=0x%08X", st);
+        WdfObjectDelete((WDFOBJECT)mon->hMonitor);
+        mon->hMonitor = NULL;
         return st;
     }
 
-    VddLog("CreateMonitor: monitor created and arrived successfully");
+    VddLog("CreateMonitor: monitor %u created and arrived successfully", index);
 
     return STATUS_SUCCESS;
+}
+
+/* ========================================================================= */
+/*  Extra monitors: follow HKLM\SOFTWARE\AppSandbox\VDD\MonitorCount         */
+/* ========================================================================= */
+
+static UINT VddDesiredMonitorCount(void)
+{
+    DWORD value = 1, size = sizeof(value);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, VDD_SETTINGS_KEY, VDD_MONITOR_COUNT,
+                     RRF_RT_REG_DWORD, NULL, &value, &size) != ERROR_SUCCESS)
+        return 1;
+    if (value < 1) value = 1;
+    if (value > VDD_MAX_MONITORS) value = VDD_MAX_MONITORS;
+    return (UINT)value;
+}
+
+static VOID VddMonitorTimerCallback(WDFTIMER Timer)
+{
+    MonitorTimerContext* timerCtx = WdfObjectGet_MonitorTimerContext(Timer);
+    VDD_DEVICE_CONTEXT* ctx = timerCtx->pContext;
+    UINT want = VddDesiredMonitorCount();
+
+    /* Monitor 0 is created by AdapterInitFinished and never departs. */
+    if (ctx->monitorCount == 0)
+        return;
+
+    while (ctx->monitorCount < want) {
+        UINT index = ctx->monitorCount;
+        if (!NT_SUCCESS(VddCreateMonitor(ctx, index))) {
+            VddLog("Monitors: adding monitor %u failed; retrying on the next tick", index);
+            return;
+        }
+        ctx->monitorCount++;
+        VddLog("Monitors: %u active", ctx->monitorCount);
+    }
+    while (ctx->monitorCount > want) {
+        VDD_MONITOR* mon = &ctx->monitors[ctx->monitorCount - 1];
+        if (mon->hMonitor) {
+            NTSTATUS st = IddCxMonitorDeparture(mon->hMonitor);
+            VddLog("Monitors: monitor %u departed (st=0x%08X)", mon->index, st);
+        }
+        /* The swap chain processor is torn down by the unassign callback
+           (or by the next assign if the monitor comes back), never here:
+           doing it here as well could race with that callback. */
+        mon->hMonitor = NULL;
+        ctx->monitorCount--;
+        VddLog("Monitors: %u active", ctx->monitorCount);
+    }
 }
 
 /* ========================================================================= */
@@ -1160,7 +1222,7 @@ static VOID VddRecoveryTimerCallback(WDFTIMER Timer)
     VDD_DEVICE_CONTEXT* ctx = timerCtx->pContext;
 
     /* If a swap chain was assigned in the meantime, nothing to do */
-    if (ctx->pSwapProc) {
+    if (ctx->monitors[0].pSwapProc) {
         VddLog("Recovery: swap chain already reassigned, skipping");
         return;
     }
@@ -1185,20 +1247,21 @@ NTSTATUS VddMonitorAssignSwapChain(
     VddLog("AssignSwapChain: entered (MonitorObject=%p)", (void*)MonitorObject);
 
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(MonitorObject);
-    VDD_DEVICE_CONTEXT* ctx = pMonCtx->pContext;
+    VDD_MONITOR* mon = pMonCtx->pMonitor;
+    VDD_DEVICE_CONTEXT* ctx = mon->ctx;
 
     /* Cancel any pending recovery timer — a new swap chain is being assigned */
-    if (ctx->hRecoveryTimer) {
+    if (mon->index == 0 && ctx->hRecoveryTimer) {
         WdfTimerStop(ctx->hRecoveryTimer, FALSE);
         VddLog("AssignSwapChain: recovery timer cancelled");
     }
 
     /* Destroy existing swap proc if any */
-    if (ctx->pSwapProc)
+    if (mon->pSwapProc)
     {
         VddLog("AssignSwapChain: destroying existing swap proc");
-        VddDestroySwapProc(ctx->pSwapProc);
-        ctx->pSwapProc = nullptr;
+        VddDestroySwapProc(mon->pSwapProc);
+        mon->pSwapProc = nullptr;
         VddLog("AssignSwapChain: existing swap proc destroyed");
     }
 
@@ -1214,6 +1277,7 @@ NTSTATUS VddMonitorAssignSwapChain(
 
     proc->hSwapChain      = pInArgs->hSwapChain;
     proc->hAvailableEvent = pInArgs->hNextSurfaceAvailable;
+    proc->channel         = mon->index ? ASB_CH_DISPLAY_EXTRA + (int)mon->index : ASB_CH_DISPLAY;
     proc->hTerminateEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     VddLog("AssignSwapChain: hSwapChain=%p hAvailableEvent=%p hTerminateEvent=%p",
            (void*)proc->hSwapChain, (void*)proc->hAvailableEvent, (void*)proc->hTerminateEvent);
@@ -1313,9 +1377,10 @@ NTSTATUS VddMonitorAssignSwapChain(
         VddLog("AssignSwapChain: network thread created (handle=%p)", (void*)proc->hNetworkThread);
     }
 
-    ctx->pSwapProc = proc;
+    mon->pSwapProc = proc;
 
-    VddLog("AssignSwapChain: COMPLETE — swap chain assigned, all threads started");
+    VddLog("AssignSwapChain: COMPLETE — monitor %u swap chain assigned (ch%d), all threads started",
+           mon->index, proc->channel);
     return STATUS_SUCCESS;
 }
 
@@ -1324,12 +1389,19 @@ NTSTATUS VddMonitorUnassignSwapChain(
     IDDCX_MONITOR MonitorObject)
 {
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(MonitorObject);
-    VDD_DEVICE_CONTEXT* ctx = pMonCtx->pContext;
+    VDD_MONITOR* mon = pMonCtx->pMonitor;
+    VDD_DEVICE_CONTEXT* ctx = mon->ctx;
 
-    if (ctx->pSwapProc)
+    if (mon->pSwapProc)
     {
-        VddDestroySwapProc(ctx->pSwapProc);
-        ctx->pSwapProc = nullptr;
+        VddDestroySwapProc(mon->pSwapProc);
+        mon->pSwapProc = nullptr;
+    }
+
+    if (mon->index != 0)
+    {
+        VddLog("SwapChain unassigned (monitor %u)", mon->index);
+        return STATUS_SUCCESS;
     }
 
     VddLog("SwapChain unassigned — starting recovery timer (5s)");
@@ -1615,9 +1687,16 @@ NTSTATUS VddAdapterInitFinished(
     if (NT_SUCCESS(pInArgs->AdapterInitStatus))
     {
         VddLog("AdapterInitFinished: adapter init succeeded, creating monitor...");
-        VddFinishInit(pWrapper->pContext);
-        NTSTATUS st = VddCreateMonitor(pWrapper->pContext);
+        VDD_DEVICE_CONTEXT* ctx = pWrapper->pContext;
+        VddFinishInit(ctx);
+        NTSTATUS st = VddCreateMonitor(ctx, 0);
         VddLog("AdapterInitFinished: VddCreateMonitor returned 0x%08X", st);
+        if (NT_SUCCESS(st)) {
+            ctx->monitorCount = 1;
+            /* Extra monitors follow MonitorCount from now on. */
+            if (ctx->hMonitorTimer)
+                WdfTimerStart(ctx->hMonitorTimer, WDF_REL_TIMEOUT_IN_MS(VDD_MONITOR_POLL_MS));
+        }
         return st;
     }
 
@@ -1795,6 +1874,27 @@ NTSTATUS VddDeviceAdd(
             VddLog("DeviceAdd: recovery timer created");
         } else {
             VddLog("DeviceAdd: WdfTimerCreate FAILED st=0x%08X (recovery disabled)", st);
+        }
+    }
+
+    /* Periodic timer for extra monitors (started once monitor 0 exists). */
+    {
+        WDF_TIMER_CONFIG timerConfig;
+        WDF_OBJECT_ATTRIBUTES timerAttrs;
+        WDFTIMER hTimer = NULL;
+
+        WDF_TIMER_CONFIG_INIT_PERIODIC(&timerConfig, VddMonitorTimerCallback, VDD_MONITOR_POLL_MS);
+        timerConfig.AutomaticSerialization = FALSE;
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&timerAttrs, MonitorTimerContext);
+        timerAttrs.ParentObject = hDevice;
+
+        st = WdfTimerCreate(&timerConfig, &timerAttrs, &hTimer);
+        if (NT_SUCCESS(st)) {
+            WdfObjectGet_MonitorTimerContext(hTimer)->pContext = ctx;
+            ctx->hMonitorTimer = hTimer;
+        } else {
+            VddLog("DeviceAdd: monitor timer create FAILED st=0x%08X (one monitor only)", st);
         }
     }
 

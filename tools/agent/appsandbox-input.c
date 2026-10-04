@@ -27,18 +27,20 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 /* ---- Input protocol (must match the host sender) ---- */
 
 #define INPUT_MAGIC         0x4E495341  /* "ASIN" little-endian */
-#define INPUT_MOUSE_MOVE    0           /* p1/p2 = absolute x/y in guest pixels */
+#define INPUT_MOUSE_MOVE    0           /* p1/p2 = absolute x/y in guest pixels, p3 = display */
 #define INPUT_MOUSE_BUTTON  1           /* p1 = button, p2 = down */
 #define INPUT_MOUSE_WHEEL   2           /* p1 = INT32 delta */
 #define INPUT_KEY           3           /* p1 = vk, p2 = scan, p3 = bit0 ext, bit1 up */
 #define INPUT_MOUSE_MOVE_REL 4          /* p1/p2 = INT32 dx/dy */
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired refresh rate in Hz */
-#define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = refresh Hz */
+#define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = Hz | (display+1) << 16 */
+#define INPUT_SET_DISPLAYS  0x22        /* p1 = number of AppSandbox displays (1..4) */
 #define INPUT_GAMEPAD       0x30        /* + slot 0..3: XINPUT_GAMEPAD state, see input-gamepad.c */
 #define INPUT_GAMEPAD_REMOVE 0x34       /* p1 = slot */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host: p1 = caps, p2 = version */
@@ -59,7 +61,8 @@
 #define INPUT_CAP_CURSOR_REPORT 0x10
 #define INPUT_CAP_SET_MODE  0x20
 #define INPUT_CAP_GAMEPAD   0x40
-#define INPUT_PROTO_VERSION 5
+#define INPUT_CAP_MULTIMON  0x80
+#define INPUT_PROTO_VERSION 6
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 
@@ -302,6 +305,98 @@ static void release_held(HeldState *h)
 }
 
 /* ==================================================================
+ * AppSandbox displays
+ *
+ * The display driver presents up to four monitors; monitor n has the PnP
+ * ID ASB000<n+1>. The host sends absolute mouse positions per display, so
+ * map display n to where Windows placed it on the virtual desktop. The
+ * layout is cached and re-read at most once a second.
+ * ================================================================== */
+
+#define VDD_MAX_DISPLAYS    4
+#define VDD_LAYOUT_TTL_MS   1000
+
+typedef struct {
+    BOOL    valid;
+    LONG    x, y;           /* top-left on the virtual desktop */
+    LONG    w, h;
+    wchar_t device[32];     /* \\.\DISPLAYn */
+} VddDisplay;
+
+static VddDisplay g_vdd_displays[VDD_MAX_DISPLAYS];
+static UINT       g_vdd_display_count;
+static DWORD      g_vdd_layout_tick;
+
+/* Index (0-based) of an AppSandbox monitor from its interface name, or -1. */
+static int vdd_monitor_index(const wchar_t *device_id)
+{
+    const wchar_t *p;
+    for (p = device_id; *p; p++) {
+        if ((p[0] == L'#') &&
+            (p[1] == L'A' || p[1] == L'a') && (p[2] == L'S' || p[2] == L's') &&
+            (p[3] == L'B' || p[3] == L'b') && p[4] == L'0' && p[5] == L'0' && p[6] == L'0' &&
+            p[7] >= L'1' && p[7] < L'1' + VDD_MAX_DISPLAYS)
+            return (int)(p[7] - L'1');
+    }
+    return -1;
+}
+
+static void refresh_vdd_layout(BOOL force)
+{
+    DISPLAY_DEVICEW ad;
+    DWORD ai, now = GetTickCount();
+
+    if (!force && g_vdd_layout_tick && (DWORD)(now - g_vdd_layout_tick) < VDD_LAYOUT_TTL_MS)
+        return;
+    g_vdd_layout_tick = now;
+    ZeroMemory(g_vdd_displays, sizeof(g_vdd_displays));
+    g_vdd_display_count = 0;
+
+    ZeroMemory(&ad, sizeof(ad));
+    ad.cb = sizeof(ad);
+    for (ai = 0; EnumDisplayDevicesW(NULL, ai, &ad, 0); ai++, ad.cb = sizeof(ad)) {
+        DISPLAY_DEVICEW mon;
+        DEVMODEW dm;
+        int idx;
+
+        if (!(ad.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+            continue;
+        ZeroMemory(&mon, sizeof(mon));
+        mon.cb = sizeof(mon);
+        if (!EnumDisplayDevicesW(ad.DeviceName, 0, &mon, EDD_GET_DEVICE_INTERFACE_NAME))
+            continue;
+        idx = vdd_monitor_index(mon.DeviceID);
+        if (idx < 0)
+            continue;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(ad.DeviceName, ENUM_CURRENT_SETTINGS, &dm))
+            continue;
+        g_vdd_displays[idx].valid = TRUE;
+        g_vdd_displays[idx].x = dm.dmPosition.x;
+        g_vdd_displays[idx].y = dm.dmPosition.y;
+        g_vdd_displays[idx].w = (LONG)dm.dmPelsWidth;
+        g_vdd_displays[idx].h = (LONG)dm.dmPelsHeight;
+        wcscpy_s(g_vdd_displays[idx].device, 32, ad.DeviceName);
+        g_vdd_display_count++;
+    }
+}
+
+/* The host's number of displays -> the display driver (it polls this). */
+static void apply_display_count(UINT32 count)
+{
+    DWORD v = count;
+    LSTATUS rc;
+    if (v < 1) v = 1;
+    if (v > VDD_MAX_DISPLAYS) v = VDD_MAX_DISPLAYS;
+    rc = RegSetKeyValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\AppSandbox\\VDD", L"MonitorCount",
+                         REG_DWORD, &v, sizeof(v));
+    input_log("Displays: %lu requested (%s, %ld).", v,
+              rc == ERROR_SUCCESS ? "ok" : "failed", (long)rc);
+    g_vdd_layout_tick = 0;   /* re-read the layout on the next move */
+}
+
+/* ==================================================================
  * Display mode (resolution + refresh rate)
  * ================================================================== */
 
@@ -309,13 +404,22 @@ static void release_held(HeldState *h)
    resolution, or if the display does not offer it) at the highest refresh
    rate it offers there that does not exceed hz (within 1 Hz). The only
    display in a VM is the AppSandbox VDD (the GPU-PV adapter has no outputs). */
-static void apply_mode(UINT32 width, UINT32 height, UINT32 hz)
+static void apply_mode(UINT32 width, UINT32 height, UINT32 hz, int only_display)
 {
     DISPLAY_DEVICEW dd;
     DWORD di;
+    const wchar_t *only_device = NULL;
 
     if (hz < 24 || hz > 1000)
         return;
+    if (only_display >= 0) {
+        refresh_vdd_layout(TRUE);
+        if (only_display >= VDD_MAX_DISPLAYS || !g_vdd_displays[only_display].valid) {
+            input_log("Mode: display %d is not present.", only_display);
+            return;
+        }
+        only_device = g_vdd_displays[only_display].device;
+    }
 
     ZeroMemory(&dd, sizeof(dd));
     dd.cb = sizeof(dd);
@@ -326,6 +430,8 @@ static void apply_mode(UINT32 width, UINT32 height, UINT32 hz)
 
         if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ||
             (dd.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER))
+            continue;
+        if (only_device && _wcsicmp(dd.DeviceName, only_device) != 0)
             continue;
 
         ZeroMemory(&cur, sizeof(cur));
@@ -400,14 +506,33 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
-        int screen_w = GetSystemMetrics(SM_CXSCREEN);
-        int screen_h = GetSystemMetrics(SM_CYSCREEN);
-        if (screen_w <= 1) screen_w = 1920;
-        if (screen_h <= 1) screen_h = 1080;
+        UINT32 disp = pkt->param3;
+        refresh_vdd_layout(FALSE);
         inp.type = INPUT_MOUSE;
-        inp.mi.dx = (LONG)((UINT64)pkt->param1 * 65535 / (UINT32)(screen_w - 1));
-        inp.mi.dy = (LONG)((UINT64)pkt->param2 * 65535 / (UINT32)(screen_h - 1));
-        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        if (disp < VDD_MAX_DISPLAYS && g_vdd_displays[disp].valid &&
+            (disp > 0 || g_vdd_display_count > 1)) {
+            /* Several displays: place the pointer on the right one. */
+            const VddDisplay *vd = &g_vdd_displays[disp];
+            LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            LONG vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            LONG vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            LONG vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            LONG gx = vd->x + (LONG)min(pkt->param1, (UINT32)(vd->w - 1));
+            LONG gy = vd->y + (LONG)min(pkt->param2, (UINT32)(vd->h - 1));
+            if (vw <= 1) vw = 2;
+            if (vh <= 1) vh = 2;
+            inp.mi.dx = (LONG)((INT64)(gx - vx) * 65535 / (vw - 1));
+            inp.mi.dy = (LONG)((INT64)(gy - vy) * 65535 / (vh - 1));
+            inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        } else {
+            int screen_w = GetSystemMetrics(SM_CXSCREEN);
+            int screen_h = GetSystemMetrics(SM_CYSCREEN);
+            if (screen_w <= 1) screen_w = 1920;
+            if (screen_h <= 1) screen_h = 1080;
+            inp.mi.dx = (LONG)((UINT64)pkt->param1 * 65535 / (UINT32)(screen_w - 1));
+            inp.mi.dy = (LONG)((UINT64)pkt->param2 * 65535 / (UINT32)(screen_h - 1));
+            inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        }
         inject(&inp, "MOUSE_MOVE");
         mouse_diag(FALSE, 0, 0);
         break;
@@ -448,11 +573,15 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
     }
     case INPUT_SET_REFRESH:
         ensure_input_desktop(FALSE);
-        apply_mode(0, 0, pkt->param1);
+        apply_mode(0, 0, pkt->param1, -1);
         break;
     case INPUT_SET_MODE:
         ensure_input_desktop(FALSE);
-        apply_mode(pkt->param1, pkt->param2, pkt->param3);
+        apply_mode(pkt->param1, pkt->param2, pkt->param3 & 0xFFFF,
+                   (int)(pkt->param3 >> 16) - 1);   /* 0 in the high half = all displays */
+        break;
+    case INPUT_SET_DISPLAYS:
+        apply_display_count(pkt->param1);
         break;
     case INPUT_GAMEPAD + 0:
     case INPUT_GAMEPAD + 1:
@@ -581,6 +710,7 @@ static void handle_conn(AsbConn *c)
     pkt.type   = INPUT_GUEST_CAPS;
     pkt.param1 = INPUT_CAP_REL_MOUSE | INPUT_CAP_XBUTTONS |
                  INPUT_CAP_HWHEEL | INPUT_CAP_REFRESH | INPUT_CAP_SET_MODE |
+                 INPUT_CAP_MULTIMON |
                  (report ? INPUT_CAP_CURSOR_REPORT | INPUT_CAP_GAMEPAD : 0);
     pkt.param2 = INPUT_PROTO_VERSION;
     EnterCriticalSection(&g_send_cs);
@@ -677,6 +807,10 @@ int main(void)
     InitializeCriticalSection(&g_conn_cs);
     InitializeCriticalSection(&g_send_cs);
     gamepad_init();
+
+    /* Physical pixels everywhere: the host sends positions in guest pixels,
+       and display scaling must not shrink the screen metrics we map them to. */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     input_log("Starting (PID=%lu, session=%lu).",
               GetCurrentProcessId(),

@@ -157,7 +157,8 @@ typedef struct FileDropResult {
 #define INPUT_MOUSE_MOVE_REL 4          /* p1/p2 = INT32 dx/dy */
 #define INPUT_MOUSE_HWHEEL  5           /* p1 = INT32 delta */
 #define INPUT_SET_REFRESH   0x20        /* p1 = desired guest refresh rate (Hz) */
-#define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = refresh (Hz) */
+#define INPUT_SET_MODE      0x21        /* p1 = width, p2 = height, p3 = Hz | (display+1) << 16 (0 = all) */
+#define INPUT_SET_DISPLAYS  0x22        /* p1 = number of displays (1..IDD_MAX_DISPLAYS) */
 #define INPUT_GAMEPAD       0x30        /* + slot 0..3: p1 = buttons|LT<<16|RT<<24, p2 = LX|LY<<16, p3 = RX|RY<<16 */
 #define INPUT_GAMEPAD_REMOVE 0x34       /* p1 = slot */
 #define INPUT_GUEST_CAPS    0x80        /* guest -> host after IRDY: p1 = caps, p2 = version */
@@ -180,6 +181,7 @@ typedef struct FileDropResult {
 #define INPUT_CAP_CURSOR_REPORT 0x10
 #define INPUT_CAP_SET_MODE  0x20
 #define INPUT_CAP_GAMEPAD   0x40
+#define INPUT_CAP_MULTIMON  0x80
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 #define INPUT_QUEUE_MAX     512
@@ -201,6 +203,12 @@ typedef struct InputPacket {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_CURSOR_STATE     (WM_USER + 102)  /* guest cursor shown/hidden */
 #define WM_IDD_INPUT_STATE      (WM_USER + 103)  /* input link (dis)connected */
+#define WM_IDD_EXTRA_CLOSED     (WM_USER + 104)  /* an extra display window was closed */
+
+/* Displays: the primary window plus up to three extra ones, each fed by its
+   own frame channel (port 2 for display 0, IDD_EXTRA_PORT_BASE + n for n). */
+#define IDD_MAX_DISPLAYS        4
+#define IDD_EXTRA_PORT_BASE     20
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -337,6 +345,17 @@ struct VmDisplayIdd {
     BOOL           fullscreen;
     WINDOWPLACEMENT saved_placement;
 
+    /* Several displays. The primary window (display 0) owns the input link
+       and every other channel; an extra display's window only receives its
+       own frames and sends input through the primary. */
+    struct VmDisplayIdd *primary;       /* NULL on the primary window */
+    UINT           display_index;       /* 0 = primary */
+    UINT           display_count;       /* primary: displays wanted (1..4) */
+    struct VmDisplayIdd *extras[IDD_MAX_DISPLAYS];  /* primary: [1..count-1] */
+    /* primary: the extra windows' HWNDs, set and cleared by their own window
+       threads, so other threads can test focus without touching extras[]. */
+    volatile HWND  extra_hwnd[IDD_MAX_DISPLAYS];
+
     DWORD          last_title_tick;
     BOOL           tearing;         /* swap chain created with ALLOW_TEARING */
 
@@ -407,6 +426,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_SHOW_LOG       0x1020
 #define IDM_FULLSCREEN     0x1030
 #define IDM_SHARE_MIC      0x1040
+#define IDM_DISPLAYS_BASE  0x1300   /* + 0x10 * (count - 1) */
 #define IDM_REFRESH_BASE   0x1100   /* + 0x10 * index into g_refresh_choices */
 #define IDM_RES_BASE       0x1200   /* + 0x10 * index into g_res_choices */
 
@@ -640,10 +660,18 @@ static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *servi
  * and no motion is lost. Discrete events (buttons, keys) are never dropped
  * while connected -- a dropped key-up is a stuck key.
  */
+/* The window whose input link a window uses: itself, or for an extra
+   display the primary window. */
+static VmDisplayIdd *idd_owner(VmDisplayIdd *d)
+{
+    return d->primary ? d->primary : d;
+}
+
 static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
     BOOL queued = TRUE;
 
+    d = idd_owner(d);
     if (!d->input_connected)
         return;   /* nothing to deliver to; the guest releases held input itself */
 
@@ -898,9 +926,10 @@ static void idd_display_settings_save(const VmDisplayIdd *d)
     /* transmitKeyboardHotkeys keeps its name so existing files keep the
        user's Immersive mode choice. */
     fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"refreshRate\":%u,"
-               "\"resolutionWidth\":%u,\"resolutionHeight\":%u,\"shareMicrophone\":%d}\n",
+               "\"resolutionWidth\":%u,\"resolutionHeight\":%u,\"shareMicrophone\":%d,"
+               "\"displayCount\":%u}\n",
             d->transmit_hotkeys ? 1 : 0, d->refresh_pref,
-            d->res_pref_w, d->res_pref_h, d->mic_share ? 1 : 0);
+            d->res_pref_w, d->res_pref_h, d->mic_share ? 1 : 0, d->display_count);
     fclose(f);
 }
 
@@ -916,6 +945,7 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
     d->refresh_pref = 0;
     d->res_pref_w = d->res_pref_h = RES_KEEP;
     d->mic_share = FALSE;
+    d->display_count = 1;
     if (d->vhdx_path[0] == L'\0') return;
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
@@ -930,6 +960,12 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
             d->transmit_hotkeys = TRUE;
         if (strstr(buf, "\"shareMicrophone\":1"))
             d->mic_share = TRUE;
+        {
+            const char *dc = strstr(buf, "\"displayCount\":");
+            unsigned v = 0;
+            if (dc && sscanf_s(dc + 15, "%u", &v) == 1 && v >= 1 && v <= IDD_MAX_DISPLAYS)
+                d->display_count = v;
+        }
         r = strstr(buf, "\"refreshRate\":");
         if (r) {
             unsigned v = 0;
@@ -1249,12 +1285,18 @@ static void idd_exit_rel_mode(VmDisplayIdd *d, BOOL place_pointer)
    driver's hardware-cursor packet or the input helper's GetCursorInfo report. */
 static BOOL idd_guest_cursor_hidden(VmDisplayIdd *d)
 {
-    return !d->cursor_visible || d->guest_helper_hidden;
+    VmDisplayIdd *o = idd_owner(d);
+    /* With several displays the driver reports the cursor hidden on every
+       display it is not on, so only the helper's (global) report counts. */
+    if (o->display_count > 1 && o->input_connected && (o->guest_caps & INPUT_CAP_CURSOR_REPORT))
+        return o->guest_helper_hidden != 0;
+    return !d->cursor_visible || o->guest_helper_hidden;
 }
 
 static BOOL idd_rel_capable(VmDisplayIdd *d)
 {
-    return (d->guest_caps & INPUT_CAP_REL_MOUSE) && d->input_connected;
+    VmDisplayIdd *o = idd_owner(d);
+    return (o->guest_caps & INPUT_CAP_REL_MOUSE) && o->input_connected;
 }
 
 /* Re-evaluate which mode we should be in. Called whenever one of the inputs
@@ -1387,7 +1429,10 @@ static BOOL idd_host_monitor_size(VmDisplayIdd *d, UINT *w, UINT *h)
 static void idd_send_refresh(VmDisplayIdd *d, BOOL force)
 {
     UINT hz, w = 0, h = 0;
-    if (!d->input_connected)
+    VmDisplayIdd *o = idd_owner(d);
+    BOOL multi = o->display_count > 1 && (o->guest_caps & INPUT_CAP_MULTIMON) &&
+                 (o->guest_caps & INPUT_CAP_SET_MODE);
+    if (!o->input_connected)
         return;
     hz = d->refresh_pref ? d->refresh_pref : idd_host_monitor_refresh(d);
     if (d->res_pref_w == RES_MATCH) {
@@ -1398,14 +1443,20 @@ static void idd_send_refresh(VmDisplayIdd *d, BOOL force)
         h = d->res_pref_h;
     }
 
-    if (w && (d->guest_caps & INPUT_CAP_SET_MODE)) {
+    if (multi) {
+        /* Each window sets its own display (w = 0 keeps its resolution). */
+        if (!force && hz == d->refresh_sent && w == d->mode_sent_w && h == d->mode_sent_h)
+            return;
+        send_input(d, INPUT_SET_MODE, w, h, hz | ((d->display_index + 1) << 16));
+        idd_log(d, L"Guest display %u mode requested: %ux%u @ %u Hz.", d->display_index + 1, w, h, hz);
+    } else if (w && (o->guest_caps & INPUT_CAP_SET_MODE)) {
         if (!force && hz == d->refresh_sent && w == d->mode_sent_w && h == d->mode_sent_h)
             return;
         send_input(d, INPUT_SET_MODE, w, h, hz);
         idd_log(d, L"Guest display mode requested: %ux%u @ %u Hz%s.", w, h, hz,
                 d->res_pref_w == RES_MATCH ? L" (matching host monitor)" : L"");
     } else {
-        if (!(d->guest_caps & INPUT_CAP_REFRESH))
+        if (!(o->guest_caps & INPUT_CAP_REFRESH))
             return;
         w = h = 0;
         if (!force && hz == d->refresh_sent && d->mode_sent_w == 0)
@@ -1435,6 +1486,9 @@ static void idd_update_refresh_menu(VmDisplayIdd *d)
                                       ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(sysmenu, IDM_FULLSCREEN,
                   MF_BYCOMMAND | (d->fullscreen ? MF_CHECKED : MF_UNCHECKED));
+    for (i = 1; i <= IDD_MAX_DISPLAYS; i++)
+        CheckMenuItem(sysmenu, IDM_DISPLAYS_BASE + 0x10 * (i - 1),
+                      MF_BYCOMMAND | (d->display_count == i ? MF_CHECKED : MF_UNCHECKED));
 }
 
 /* Borderless fullscreen on the monitor the window is on, and back to the
@@ -1753,6 +1807,22 @@ session_cleanup:
 #define GAMEPAD_POLL_MS     4       /* ~250 Hz, like a wired controller */
 #define GAMEPAD_PROBE_MS    1000    /* empty slots: XInputGetState is slow on them */
 
+/* Is the primary window, or one of its extra display windows, the active
+   foreground window? */
+static BOOL idd_any_window_active(VmDisplayIdd *p)
+{
+    HWND fg = GetForegroundWindow();
+    UINT i;
+    if (!fg)
+        return FALSE;
+    if (p->input_focused && fg == p->hwnd)
+        return TRUE;
+    for (i = 1; i < IDD_MAX_DISPLAYS; i++)
+        if (p->extra_hwnd[i] && fg == p->extra_hwnd[i])
+            return TRUE;
+    return FALSE;
+}
+
 static void idd_send_pad_state(VmDisplayIdd *d, DWORD slot, const XINPUT_GAMEPAD *g)
 {
     send_input(d, INPUT_GAMEPAD + slot,
@@ -1785,7 +1855,7 @@ static DWORD WINAPI idd_gamepad_thread_proc(LPVOID param)
 
     while (!d->stop) {
         BOOL active = d->input_connected && (d->guest_caps & INPUT_CAP_GAMEPAD) &&
-                      d->input_focused && d->hwnd && GetForegroundWindow() == d->hwnd;
+                      idd_any_window_active(d);
         DWORD now = GetTickCount();
 
         if (gen != d->input_gen) {
@@ -2816,8 +2886,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         Sleep(100);
     }
 
-    /* Tell the agent to respawn input helper in console session. */
-    if (!d->stop && d->vm && d->vm->agent_online &&
+    /* Tell the agent to respawn input helper in console session (the
+       primary window only: extra displays share its helper). */
+    if (!d->primary && !d->stop && d->vm && d->vm->agent_online &&
         !d->vm->agent_initializing) {
         idd_log(d, L"Sending idd_connect to agent...");
         vm_agent_send(d->vm, "idd_connect", NULL, 0, 30000);
@@ -2827,9 +2898,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
        the user can still wake the VM screen if the display path is idle.
        Started after idd_connect so its first connection reaches the fresh
        helper rather than the one being replaced. */
-    if (!d->stop && !d->input_thread)
+    if (!d->primary && !d->stop && !d->input_thread)
         d->input_thread = CreateThread(NULL, 0, idd_input_thread_proc, d, 0, NULL);
-    if (!d->stop && !d->gamepad_thread)
+    if (!d->primary && !d->stop && !d->gamepad_thread)
         d->gamepad_thread = CreateThread(NULL, 0, idd_gamepad_thread_proc, d, 0, NULL);
 
     while (!d->stop) {
@@ -2837,7 +2908,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         FrameHeader hdr;
 
         /* Clipboard module (handles :0005 + :0006 internally) */
-        if (!d->clipboard) {
+        if (!d->primary && !d->clipboard) {
             d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
                                                d->hwnd, clip_log_callback, d);
             if (d->clipboard)
@@ -2846,11 +2917,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Ensure audio recv thread is running (:0004, guest→host).
            The thread handles connecting on its own — the helper may not be up yet. */
-        if (!d->audio_recv_thread) {
+        if (!d->primary && !d->audio_recv_thread) {
             d->audio_recv_thread = CreateThread(NULL, 0, audio_recv_thread_proc, d, 0, NULL);
             idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
         }
-        if (!d->mic_thread)
+        if (!d->primary && !d->mic_thread)
             d->mic_thread = CreateThread(NULL, 0, idd_mic_thread_proc, d, 0, NULL);
 
         /* Try to connect frame channel (VDD driver, GUID :0002). A guest mode
@@ -2859,7 +2930,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         if (connect_failures == 0)
             idd_log(d, L"Connecting to frame service...");
         {
-            GUID svc; hcs_service_guid(d->os_type, 2, &svc);
+            GUID svc;
+            hcs_service_guid(d->os_type,
+                             d->display_index ? IDD_EXTRA_PORT_BASE + d->display_index : 2,
+                             &svc);
             s = connect_to_hv_service(&d->runtime_id, &svc, 3000);
         }
         if (s == INVALID_SOCKET) {
@@ -3118,6 +3192,65 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 }
 
 /* ==================================================================
+ * Extra display windows
+ * ================================================================== */
+
+static VmDisplayIdd *idd_alloc(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd,
+                               VmDisplayIdd *primary, UINT display_index);
+static void idd_sync_extras_mode(VmDisplayIdd *d);
+
+/* Primary window thread: create or close extra display windows so there
+   are display_count windows in all, and tell the guest how many displays
+   to present. */
+static void idd_apply_display_count(VmDisplayIdd *d)
+{
+    UINT i;
+    if (d->primary)
+        return;
+    for (i = IDD_MAX_DISPLAYS - 1; i >= 1; i--) {
+        if (i >= d->display_count && d->extras[i]) {
+            VmDisplayIdd *x = d->extras[i];
+            d->extras[i] = NULL;
+            vm_display_idd_destroy(x);
+        }
+    }
+    for (i = 1; i < d->display_count && i < IDD_MAX_DISPLAYS; i++) {
+        if (!d->extras[i] && !d->stop)
+            d->extras[i] = idd_alloc(d->vm, d->hInstance, NULL, d, i);
+    }
+    if (d->input_connected && (d->guest_caps & INPUT_CAP_MULTIMON))
+        send_input(d, INPUT_SET_DISPLAYS, d->display_count, 0, 0);
+    else if (d->display_count > 1 && d->input_connected)
+        idd_log(d, L"The guest input helper can't add displays yet; restart the VM to update it.");
+}
+
+/* Primary window thread: copy the refresh/resolution choice to the extra
+   displays and have each re-send its mode (WM_IDD_INPUT_STATE with wp = 1). */
+static void idd_sync_extras_mode(VmDisplayIdd *d)
+{
+    UINT i;
+    for (i = 1; i < IDD_MAX_DISPLAYS; i++) {
+        VmDisplayIdd *x = d->extras[i];
+        if (!x)
+            continue;
+        x->refresh_pref = d->refresh_pref;
+        x->res_pref_w = d->res_pref_w;
+        x->res_pref_h = d->res_pref_h;
+        if (x->hwnd)
+            PostMessageW(x->hwnd, WM_IDD_INPUT_STATE, 1, 0);
+    }
+}
+
+/* Forward a state message from the primary to its extra windows. */
+static void idd_notify_extras(VmDisplayIdd *d, UINT msg, WPARAM wp)
+{
+    UINT i;
+    for (i = 1; i < IDD_MAX_DISPLAYS; i++)
+        if (d->extras[i] && d->extras[i]->hwnd)
+            PostMessageW(d->extras[i]->hwnd, msg, wp, 0);
+}
+
+/* ==================================================================
  * Window thread — creates window, initializes D3D11, runs message pump
  * ================================================================== */
 
@@ -3129,7 +3262,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     ensure_idd_class(d->hInstance);
 
-    swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
+    if (d->display_index)
+        swprintf_s(title, 300, L"%s - Display %u", d->vm_name, d->display_index + 1);
+    else
+        swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
     /* Compute outer window size so the client area is exactly 1920x1080 */
     {
@@ -3150,6 +3286,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->open = FALSE;
         return 1;
     }
+    if (d->primary)
+        d->primary->extra_hwnd[d->display_index] = d->hwnd;
 
     /* Dark mode title bar to match AppSandbox main window */
     {
@@ -3160,9 +3298,15 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Add options to the system menu (right-click title bar) */
     {
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
-        if (sysmenu) {
+        if (sysmenu && d->primary) {
+            /* Extra display: its settings follow the primary window's. */
+            AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Fullscreen\tCtrl+Alt+Enter");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+        } else if (sysmenu) {
             HMENU refresh_menu = CreatePopupMenu();
             HMENU res_menu = CreatePopupMenu();
+            HMENU disp_menu = CreatePopupMenu();
             UINT i;
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
@@ -3193,6 +3337,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                     AppendMenuW(refresh_menu, MF_STRING, IDM_REFRESH_BASE + 0x10 * i, label);
                 }
                 AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)refresh_menu, L"VM refresh rate");
+            }
+            if (disp_menu) {
+                for (i = 1; i <= IDD_MAX_DISPLAYS; i++) {
+                    wchar_t label[64];
+                    swprintf_s(label, 64, i == 1 ? L"%u display" : L"%u displays", i);
+                    AppendMenuW(disp_menu, MF_STRING, IDM_DISPLAYS_BASE + 0x10 * (i - 1), label);
+                }
+                AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)disp_menu, L"VM displays");
             }
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
@@ -3302,6 +3454,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Start a present timer for steady rendering */
     SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
 
+    /* Reopen the extra display windows this VM was left with. */
+    if (!d->primary && d->display_count > 1)
+        idd_apply_display_count(d);
+
     /* Install the hotkey hook on this (message-pumping) thread if the
        persisted setting has Transmit mode enabled. */
     if (d->transmit_hotkeys)
@@ -3377,6 +3533,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_update_refresh_menu(d);
             idd_display_settings_save(d);
             idd_send_refresh(d, TRUE);
+            idd_sync_extras_mode(d);
             return 0;
         }
         if (d && (wp & 0xFFF0) >= IDM_RES_BASE &&
@@ -3389,6 +3546,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (c->w != RES_KEEP && !(d->guest_caps & INPUT_CAP_SET_MODE) && d->input_connected)
                 idd_log(d, L"The guest input helper can't change resolution yet; restart the VM to update it.");
             idd_send_refresh(d, TRUE);
+            idd_sync_extras_mode(d);
+            return 0;
+        }
+        if (d && !d->primary && (wp & 0xFFF0) >= IDM_DISPLAYS_BASE &&
+            (wp & 0xFFF0) < IDM_DISPLAYS_BASE + 0x10 * IDD_MAX_DISPLAYS) {
+            d->display_count = (UINT)(((wp & 0xFFF0) - IDM_DISPLAYS_BASE) / 0x10) + 1;
+            idd_update_refresh_menu(d);
+            idd_display_settings_save(d);
+            idd_log(d, L"VM displays: %u.", d->display_count);
+            idd_apply_display_count(d);
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHARE_MIC) {
@@ -3424,6 +3591,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:
         if (d) {
             BOOL user_initiated = d->open;
+            UINT xi;
+
+            /* The primary closes its extra display windows first: they send
+               input through it. An extra closed by the user lowers the
+               display count instead. */
+            for (xi = IDD_MAX_DISPLAYS - 1; xi >= 1; xi--) {
+                if (d->extras[xi]) {
+                    VmDisplayIdd *x = d->extras[xi];
+                    d->extras[xi] = NULL;
+                    vm_display_idd_destroy(x);
+                }
+            }
+            if (d->primary && user_initiated && d->primary->hwnd)
+                PostMessageW(d->primary->hwnd, WM_IDD_EXTRA_CLOSED, d->display_index, 0);
 
             RemoveClipboardFormatListener(hwnd);
 
@@ -3525,6 +3706,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        if (d && d->primary)
+            d->primary->extra_hwnd[d->display_index] = NULL;
         if (d) idd_exit_rel_mode(d, FALSE);  /* never leave the host pointer clipped */
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
@@ -3597,16 +3780,35 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_IDD_CURSOR_STATE:
-        if (d) idd_update_mouse_mode(d);
+        if (d) {
+            idd_update_mouse_mode(d);
+            if (!d->primary)
+                idd_notify_extras(d, WM_IDD_CURSOR_STATE, 0);
+        }
         return 0;
 
     case WM_IDD_INPUT_STATE:
         if (d) {
+            if (wp && !d->primary && (d->guest_caps & INPUT_CAP_MULTIMON))
+                send_input(d, INPUT_SET_DISPLAYS, d->display_count, 0, 0);
             if (wp) {
                 d->refresh_sent = 0;   /* a new helper knows nothing yet */
                 idd_send_refresh(d, TRUE);
             }
             idd_update_mouse_mode(d);
+            if (!d->primary)
+                idd_notify_extras(d, WM_IDD_INPUT_STATE, wp);
+        }
+        return 0;
+
+    case WM_IDD_EXTRA_CLOSED:
+        /* The user closed extra display wp: keep only the displays before it. */
+        if (d && !d->primary && wp >= 1 && wp < IDD_MAX_DISPLAYS && wp < d->display_count) {
+            d->display_count = (UINT)wp;
+            idd_update_refresh_menu(d);
+            idd_display_settings_save(d);
+            idd_log(d, L"VM displays: %u (a display window was closed).", d->display_count);
+            idd_apply_display_count(d);
         }
         return 0;
 
@@ -3705,7 +3907,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
                                     d->frame_width, d->frame_height, &vx, &vy);
-                send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
+                send_input(d, INPUT_MOUSE_MOVE, vx, vy, d->display_index);
             }
 
             /* Pointer arrived over the picture while a game has the guest
@@ -3770,7 +3972,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d->mouse_in || d->rel_mode || !down) {
             if (down && !d->rel_mode && idd_guest_cursor_hidden(d))
                 idd_update_mouse_mode(d);
-            if (btn <= INPUT_BTN_MIDDLE || (d->guest_caps & INPUT_CAP_XBUTTONS))
+            if (btn <= INPUT_BTN_MIDDLE || (idd_owner(d)->guest_caps & INPUT_CAP_XBUTTONS))
                 send_input(d, INPUT_MOUSE_BUTTON, btn, down ? 1 : 0, 0);
         }
         return (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) ? TRUE : 0;
@@ -3782,7 +3984,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_MOUSEHWHEEL:
-        if (d && (d->mouse_in || d->rel_mode) && (d->guest_caps & INPUT_CAP_HWHEEL))
+        if (d && (d->mouse_in || d->rel_mode) && (idd_owner(d)->guest_caps & INPUT_CAP_HWHEEL))
             send_input(d, INPUT_MOUSE_HWHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
         return 0;
 
@@ -3827,23 +4029,24 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * Public API
  * ================================================================== */
 
-VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+/* Allocate a display and start its window thread. display_index 0 is the
+   primary window; an extra display (primary != NULL) copies the primary's
+   settings and saves none of its own. */
+static VmDisplayIdd *idd_alloc(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd,
+                               VmDisplayIdd *primary, UINT display_index)
 {
     VmDisplayIdd *d;
-
-    if (!vm) return NULL;
-
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     d = (VmDisplayIdd *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                    sizeof(VmDisplayIdd));
     if (!d) return NULL;
 
     d->vm           = vm;
-    wcscpy_s(d->vm_name, 256, vm->name);
-    wcscpy_s(d->vhdx_path, MAX_PATH, vm->vhdx_path);
-    d->runtime_id   = vm->runtime_id;
-    wcscpy_s(d->os_type, 32, vm->os_type);
+    wcscpy_s(d->vm_name, 256, primary ? primary->vm_name : vm->name);
+    if (!primary)
+        wcscpy_s(d->vhdx_path, MAX_PATH, vm->vhdx_path);
+    d->runtime_id   = primary ? primary->runtime_id : vm->runtime_id;
+    wcscpy_s(d->os_type, 32, primary ? primary->os_type : vm->os_type);
     d->hInstance    = hInstance;
     d->main_hwnd   = main_hwnd;
     d->open         = TRUE;
@@ -3853,11 +4056,21 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->mic_socket         = INVALID_SOCKET;
     d->cursor_visible     = 1;   /* until the guest says otherwise */
     d->clipboard          = NULL;
+    d->primary            = primary;
+    d->display_index      = display_index;
 
-    /* Load the per-VM display settings, creating display_settings.json with
-       the defaults if this VM doesn't have one yet. The hook itself is
-       installed later, on the window thread, once the window exists. */
-    idd_display_settings_load_or_create(d);
+    if (primary) {
+        d->transmit_hotkeys = primary->transmit_hotkeys;
+        d->refresh_pref     = primary->refresh_pref;
+        d->res_pref_w       = primary->res_pref_w;
+        d->res_pref_h       = primary->res_pref_h;
+        d->display_count    = 1;
+    } else {
+        /* Load the per-VM display settings, creating display_settings.json
+           with the defaults if this VM doesn't have one yet. The hook itself
+           is installed later, on the window thread, once the window exists. */
+        idd_display_settings_load_or_create(d);
+    }
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
@@ -3894,6 +4107,15 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     return d;
+}
+
+VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+{
+    if (!vm) return NULL;
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    return idd_alloc(vm, hInstance, main_hwnd, NULL, 0);
 }
 
 void vm_display_idd_destroy(VmDisplayIdd *display)

@@ -49,6 +49,16 @@ Environment:
 #define VDD_MAX_PIXEL_RATE   2550000000ull
 #define VDD_MAX_HSYNC        510000u
 
+/* Monitors: monitor 0 always exists (as before); the guest input helper asks
+   for more by writing MonitorCount (1..VDD_MAX_MONITORS) under this key, and
+   a timer adds or removes monitors to match. Monitor n > 0 sends frames on
+   transport channel ASB_CH_DISPLAY_EXTRA + n; each has its own EDID product
+   code and serial (ASB0001..ASB0004) so the guest can tell them apart. */
+#define VDD_MAX_MONITORS     4
+#define VDD_SETTINGS_KEY     L"SOFTWARE\\AppSandbox\\VDD"
+#define VDD_MONITOR_COUNT    L"MonitorCount"
+#define VDD_MONITOR_POLL_MS  1000
+
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
  *  Must match FrameHeader in vm_display_idd.c
@@ -257,7 +267,23 @@ typedef struct _VDD_SWAP_PROC {
        transport send instead of one send per row. */
     PBYTE               pSendBuf;
     SIZE_T              sendBufSize;
+
+    /* Transport channel this monitor's frames go out on. */
+    int                 channel;
 } VDD_SWAP_PROC;
+
+struct _VDD_DEVICE_CONTEXT;
+
+/* ============================================================================
+ *  One virtual monitor
+ * ============================================================================ */
+typedef struct _VDD_MONITOR {
+    struct _VDD_DEVICE_CONTEXT* ctx;
+    UINT                index;              /* 0 .. VDD_MAX_MONITORS-1 */
+    IDDCX_MONITOR       hMonitor;           /* NULL when not arrived */
+    VDD_SWAP_PROC*      pSwapProc;          /* Active swap chain processor */
+    BYTE                edid[128];
+} VDD_MONITOR;
 
 /* ============================================================================
  *  Device context (heap-allocated, stored via IndirectDeviceContextWrapper)
@@ -265,8 +291,8 @@ typedef struct _VDD_SWAP_PROC {
 typedef struct _VDD_DEVICE_CONTEXT {
     WDFDEVICE           wdfDevice;
     IDDCX_ADAPTER       hAdapter;
-    IDDCX_MONITOR       hMonitor;
-    VDD_SWAP_PROC*      pSwapProc;          /* Active swap chain processor */
+    VDD_MONITOR         monitors[VDD_MAX_MONITORS];
+    UINT                monitorCount;       /* monitors 0..monitorCount-1 arrived */
 
     /* Cached D3D11 device — persists across swap chain transitions.
        Kept alive here so that WdfObjectDelete's IddCx teardown never triggers
@@ -281,6 +307,10 @@ typedef struct _VDD_DEVICE_CONTEXT {
        Uses a WDF timer so the callback runs on a proper WDF thread
        (IddCx APIs crash when called from raw CreateThread threads). */
     WDFTIMER            hRecoveryTimer;
+
+    /* Polls MonitorCount and adds/removes monitors (WDF thread, like the
+       recovery timer). */
+    WDFTIMER            hMonitorTimer;
 } VDD_DEVICE_CONTEXT;
 
 /* ============================================================================
@@ -296,7 +326,7 @@ WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 
 struct MonitorContextWrapper
 {
-    VDD_DEVICE_CONTEXT* pContext;
+    VDD_MONITOR* pMonitor;
 };
 
 WDF_DECLARE_CONTEXT_TYPE(MonitorContextWrapper);
@@ -307,6 +337,13 @@ struct RecoveryTimerContext
 };
 
 WDF_DECLARE_CONTEXT_TYPE(RecoveryTimerContext);
+
+struct MonitorTimerContext
+{
+    VDD_DEVICE_CONTEXT* pContext;
+};
+
+WDF_DECLARE_CONTEXT_TYPE(MonitorTimerContext);
 
 /* ============================================================================
  *  IddCx Callback declarations
