@@ -270,6 +270,10 @@ struct VmDisplayIdd {
     BOOL           rel_mode;
     BOOL           raw_abs_have;    /* last absolute raw sample valid */
     LONG           raw_abs_x, raw_abs_y;
+    /* Relative-motion diagnostics, logged at most once a second. */
+    DWORD          rel_log_tick;
+    UINT           rel_log_events;
+    LONG           rel_log_sum_x, rel_log_sum_y, rel_log_max;
 
     /* Guest refresh rate: 0 = match the host monitor. */
     UINT           refresh_pref;
@@ -1192,6 +1196,26 @@ static void idd_handle_raw_input(VmDisplayIdd *d, HRAWINPUT hri)
 
     if (dx || dy)
         send_input(d, INPUT_MOUSE_MOVE_REL, (UINT32)dx, (UINT32)dy, 0);
+
+    /* Diagnostics: one summary line per second of relative motion. */
+    {
+        DWORD now = GetTickCount();
+        LONG ad = labs(dx) > labs(dy) ? labs(dx) : labs(dy);
+        d->rel_log_events++;
+        d->rel_log_sum_x += dx;
+        d->rel_log_sum_y += dy;
+        if (ad > d->rel_log_max) d->rel_log_max = ad;
+        if ((DWORD)(now - d->rel_log_tick) >= 1000) {
+            if (d->rel_log_tick)
+                idd_log(d, L"Mouse rel: %u events, sum (%ld, %ld), max |d| %ld%s.",
+                        d->rel_log_events, d->rel_log_sum_x, d->rel_log_sum_y,
+                        d->rel_log_max,
+                        (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) ? L" (absolute device)" : L"");
+            d->rel_log_tick = now;
+            d->rel_log_events = 0;
+            d->rel_log_sum_x = d->rel_log_sum_y = d->rel_log_max = 0;
+        }
+    }
 }
 
 /* ==================================================================

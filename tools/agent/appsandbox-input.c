@@ -193,6 +193,26 @@ static void inject(INPUT *inp, const char *what)
 /* Guest cursor visibility from the cursor watcher: -1 = not known yet. */
 static volatile LONG g_cursor_hidden = -1;
 
+/* Diagnostics: one summary line per second of mouse motion. Absolute moves
+   while the cursor is hidden are what make games spin, so they are counted. */
+static void mouse_diag(BOOL rel, LONG dx, LONG dy)
+{
+    static DWORD tick;
+    static UINT rel_n, abs_hidden_n;
+    static LONG sum_x, sum_y;
+    DWORD now = GetTickCount();
+    if (rel) { rel_n++; sum_x += dx; sum_y += dy; }
+    else if (g_cursor_hidden == 1) abs_hidden_n++;
+    if ((DWORD)(now - tick) < 1000)
+        return;
+    if (tick && (rel_n || abs_hidden_n))
+        input_log("Mouse: %u relative (sum %ld, %ld), %u absolute while cursor hidden.",
+                  rel_n, sum_x, sum_y, abs_hidden_n);
+    tick = now;
+    rel_n = abs_hidden_n = 0;
+    sum_x = sum_y = 0;
+}
+
 /* ==================================================================
  * Per-connection state: what this host still holds down
  * ================================================================== */
@@ -349,6 +369,7 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
         inp.mi.dy = (LONG)((UINT64)pkt->param2 * 65535 / (UINT32)(screen_h - 1));
         inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
         inject(&inp, "MOUSE_MOVE");
+        mouse_diag(FALSE, 0, 0);
         break;
     }
     case INPUT_MOUSE_MOVE_REL:
@@ -360,6 +381,7 @@ static void handle_packet(const InputPacket *pkt, HeldState *h)
         inp.mi.dy = (LONG)(INT32)pkt->param2;
         inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
         inject(&inp, "MOUSE_MOVE_REL");
+        mouse_diag(TRUE, inp.mi.dx, inp.mi.dy);
         break;
     case INPUT_MOUSE_BUTTON:
         if (pkt->param1 < INPUT_BTN_COUNT) {
