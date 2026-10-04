@@ -259,7 +259,7 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
  *  teardown (which crashes WUDFHost.exe).                                    */
 /* ========================================================================= */
 
-static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid,
+static HRESULT VddGetOrCreateD3DDevice(VDD_MONITOR* ctx, LUID adapterLuid,
                                         ID3D11Device** ppDevice, ID3D11DeviceContext** ppCtx)
 {
     /* Check if cached device matches the requested LUID and is still healthy */
@@ -984,6 +984,7 @@ static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
     if (ctx->hRecoveryTimer) {
         WdfTimerStop(ctx->hRecoveryTimer, TRUE);
     }
+    ctx->stopping = TRUE;
     if (ctx->hMonitorTimer) {
         WdfTimerStop(ctx->hMonitorTimer, TRUE);
     }
@@ -997,15 +998,19 @@ static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
         }
     }
 
-    /* Release cached D3D device (safe here — no IddCx teardown in progress) */
-    if (ctx->pCachedCtx) {
-        ctx->pCachedCtx->Release();
-        ctx->pCachedCtx = nullptr;
+    /* Release the cached D3D devices (safe here — no IddCx teardown in progress) */
+    for (UINT m = 0; m < VDD_MAX_MONITORS; m++)
+    {
+    VDD_MONITOR* ctx_m = &ctx->monitors[m];
+    if (ctx_m->pCachedCtx) {
+        ctx_m->pCachedCtx->Release();
+        ctx_m->pCachedCtx = nullptr;
     }
-    if (ctx->pCachedDevice) {
-        VddLog("Context cleanup: releasing cached D3D device");
-        ctx->pCachedDevice->Release();
-        ctx->pCachedDevice = nullptr;
+    if (ctx_m->pCachedDevice) {
+        VddLog("Context cleanup: releasing cached D3D device (monitor %u)", m);
+        ctx_m->pCachedDevice->Release();
+        ctx_m->pCachedDevice = nullptr;
+    }
     }
 
     VddLog("Context cleanup done");
@@ -1183,14 +1188,21 @@ static VOID VddMonitorTimerCallback(WDFTIMER Timer)
     UINT want = VddDesiredMonitorCount();
 
     /* Monitor 0 is created by AdapterInitFinished and never departs. */
-    if (ctx->monitorCount == 0)
+    if (ctx->monitorCount == 0 || ctx->stopping)
         return;
 
     while (ctx->monitorCount < want) {
         UINT index = ctx->monitorCount;
+        VDD_MONITOR* mon = &ctx->monitors[index];
+        /* A previous monitor in this slot departed long ago (>= one tick); if
+           its unassign never arrived, its processor is still here. */
+        if (mon->pSwapProc) {
+            VddDestroySwapProc(mon->pSwapProc);
+            mon->pSwapProc = nullptr;
+        }
         if (!NT_SUCCESS(VddCreateMonitor(ctx, index))) {
             VddLog("Monitors: adding monitor %u failed; retrying on the next tick", index);
-            return;
+            break;
         }
         ctx->monitorCount++;
         VddLog("Monitors: %u active", ctx->monitorCount);
@@ -1208,6 +1220,9 @@ static VOID VddMonitorTimerCallback(WDFTIMER Timer)
         ctx->monitorCount--;
         VddLog("Monitors: %u active", ctx->monitorCount);
     }
+
+    if (!ctx->stopping)
+        WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(VDD_MONITOR_POLL_MS));
 }
 
 /* ========================================================================= */
@@ -1287,7 +1302,7 @@ NTSTATUS VddMonitorAssignSwapChain(
 
     /* Get or reuse cached D3D11 device (cached in ctx to survive swap chain
        transitions) */
-    HRESULT hr = VddGetOrCreateD3DDevice(ctx, pInArgs->RenderAdapterLuid,
+    HRESULT hr = VddGetOrCreateD3DDevice(mon, pInArgs->RenderAdapterLuid,
                                           &proc->pDevice, &proc->pDeviceContext);
     if (FAILED(hr))
     {
@@ -1391,6 +1406,14 @@ NTSTATUS VddMonitorUnassignSwapChain(
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(MonitorObject);
     VDD_MONITOR* mon = pMonCtx->pMonitor;
     VDD_DEVICE_CONTEXT* ctx = mon->ctx;
+
+    if (mon->index != 0 && mon->hMonitor != MonitorObject)
+    {
+        /* Late unassign for a monitor that departed; the slot may already
+           belong to a new monitor whose swap chain must be left alone. */
+        VddLog("SwapChain unassigned for a departed monitor %u (ignored)", mon->index);
+        return STATUS_SUCCESS;
+    }
 
     if (mon->pSwapProc)
     {
@@ -1883,7 +1906,9 @@ NTSTATUS VddDeviceAdd(
         WDF_OBJECT_ATTRIBUTES timerAttrs;
         WDFTIMER hTimer = NULL;
 
-        WDF_TIMER_CONFIG_INIT_PERIODIC(&timerConfig, VddMonitorTimerCallback, VDD_MONITOR_POLL_MS);
+        /* One-shot, re-armed at the end of each callback, so a slow monitor
+           arrival can never overlap the next tick. */
+        WDF_TIMER_CONFIG_INIT(&timerConfig, VddMonitorTimerCallback);
         timerConfig.AutomaticSerialization = FALSE;
 
         WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&timerAttrs, MonitorTimerContext);

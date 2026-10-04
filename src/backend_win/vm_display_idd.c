@@ -355,6 +355,7 @@ struct VmDisplayIdd {
     /* primary: the extra windows' HWNDs, set and cleared by their own window
        threads, so other threads can test focus without touching extras[]. */
     volatile HWND  extra_hwnd[IDD_MAX_DISPLAYS];
+    BOOL           closing;             /* WM_CLOSE in progress (window thread) */
 
     DWORD          last_title_tick;
     BOOL           tearing;         /* swap chain created with ALLOW_TEARING */
@@ -393,6 +394,9 @@ struct VmDisplayIdd {
     volatile BOOL    mic_share;
     HANDLE           mic_thread;
     volatile SOCKET  mic_socket;
+    /* Guards mic_socket/drop_socket between their worker (which clears and
+       closes them) and teardown (which shuts them down to unblock it). */
+    CRITICAL_SECTION sock_cs;
 
     /* File drop (:0011 — host→guest). One transfer at a time. */
     HANDLE           drop_thread;
@@ -679,7 +683,8 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     {
         InputPacket *last = d->input_q_len ? &d->input_q[d->input_q_len - 1] : NULL;
 
-        if (last && type == INPUT_MOUSE_MOVE && last->type == INPUT_MOUSE_MOVE) {
+        if (last && type == INPUT_MOUSE_MOVE && last->type == INPUT_MOUSE_MOVE &&
+            last->param3 == p3) {   /* p3 = display: never merge across displays */
             last->param1 = p1;
             last->param2 = p2;
         } else if (last && type == INPUT_MOUSE_MOVE_REL && last->type == INPUT_MOUSE_MOVE_REL) {
@@ -2082,7 +2087,9 @@ static DWORD WINAPI drop_thread_proc(LPVOID param)
         idd_log(d, L"File drop: transfer failed after %u file(s) (%d).", job->files, WSAGetLastError());
     }
 
+    EnterCriticalSection(&d->sock_cs);
     d->drop_socket = INVALID_SOCKET;
+    LeaveCriticalSection(&d->sock_cs);
     closesocket(s);
 out:
     for (i = 0; i < job->count; i++)
@@ -2242,6 +2249,7 @@ static DWORD WINAPI idd_mic_thread_proc(LPVOID param)
         UINT32 state = MIC_STATE_IDLE;
         MicCapture cap;
         BOOL capturing = FALSE, no_device = FALSE;
+        DWORD retry_at = 0;
 
         if (!d->mic_share) {
             Sleep(250);
@@ -2273,12 +2281,12 @@ static DWORD WINAPI idd_mic_thread_proc(LPVOID param)
             if (lost)
                 break;
 
-            if (state == MIC_STATE_RECORDING && !capturing) {
+            if (state == MIC_STATE_RECORDING && !capturing &&
+                (!retry_at || (LONG)(GetTickCount() - retry_at) >= 0)) {
                 capturing = mic_capture_start(d, &cap);
                 if (capturing)
                     idd_log(d, L"Microphone: the VM is recording; sending the host microphone.");
-                else
-                    state = MIC_STATE_IDLE;   /* don't retry every 10 ms */
+                retry_at = capturing ? 0 : GetTickCount() + 5000;   /* retry in 5 s */
             } else if (state != MIC_STATE_RECORDING && capturing) {
                 mic_capture_stop(&cap);
                 capturing = FALSE;
@@ -2292,7 +2300,9 @@ static DWORD WINAPI idd_mic_thread_proc(LPVOID param)
 
         if (capturing)
             mic_capture_stop(&cap);
+        EnterCriticalSection(&d->sock_cs);
         d->mic_socket = INVALID_SOCKET;
+        LeaveCriticalSection(&d->sock_cs);
         closesocket(s);
         if (no_device) {
             int w;
@@ -2947,6 +2957,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         connect_failures = 0;
 
         idd_log(d, L"Frame channel connected.");
+        /* An extra display's monitor only exists once the guest added it;
+           now that it does, (re)send this display's mode. */
+        if (d->primary && d->hwnd)
+            PostMessageW(d->hwnd, WM_IDD_INPUT_STATE, 1, 0);
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
         while (!d->stop) {
@@ -3205,7 +3219,7 @@ static void idd_sync_extras_mode(VmDisplayIdd *d);
 static void idd_apply_display_count(VmDisplayIdd *d)
 {
     UINT i;
-    if (d->primary)
+    if (d->primary || d->closing)
         return;
     for (i = IDD_MAX_DISPLAYS - 1; i >= 1; i--) {
         if (i >= d->display_count && d->extras[i]) {
@@ -3593,6 +3607,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             BOOL user_initiated = d->open;
             UINT xi;
 
+            if (d->closing)
+                return 0;   /* re-entered while extras were being destroyed */
+            d->closing = TRUE;
+
             /* The primary closes its extra display windows first: they send
                input through it. An extra closed by the user lowers the
                display count instead. */
@@ -3628,22 +3646,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Microphone thread: stops capturing and closes within ~10 ms. */
             if (d->mic_thread) {
-                SOCKET ms = d->mic_socket;
-                if (ms != INVALID_SOCKET)
-                    shutdown(ms, SD_BOTH);
-                WaitForSingleObject(d->mic_thread, 3000);
-                CloseHandle(d->mic_thread);
-                d->mic_thread = NULL;
+                EnterCriticalSection(&d->sock_cs);
+                if (d->mic_socket != INVALID_SOCKET)
+                    shutdown(d->mic_socket, SD_BOTH);
+                LeaveCriticalSection(&d->sock_cs);
+                if (WaitForSingleObject(d->mic_thread, 3000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->mic_thread);
+                    d->mic_thread = NULL;
+                }   /* else vm_display_idd_destroy waits for it before freeing d */
             }
 
             /* Abort a running file drop (the worker sees d->stop). */
             if (d->drop_thread) {
-                SOCKET ds = d->drop_socket;
-                if (ds != INVALID_SOCKET)
-                    shutdown(ds, SD_BOTH);
-                WaitForSingleObject(d->drop_thread, 3000);
-                CloseHandle(d->drop_thread);
-                d->drop_thread = NULL;
+                EnterCriticalSection(&d->sock_cs);
+                if (d->drop_socket != INVALID_SOCKET)
+                    shutdown(d->drop_socket, SD_BOTH);
+                LeaveCriticalSection(&d->sock_cs);
+                if (WaitForSingleObject(d->drop_thread, 3000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->drop_thread);
+                    d->drop_thread = NULL;
+                }   /* else vm_display_idd_destroy waits for it before freeing d */
             }
 
             /* Wait for audio recv thread (:0004) */
@@ -3652,31 +3674,35 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     closesocket(d->audio_socket);
                     d->audio_socket = INVALID_SOCKET;
                 }
-                WaitForSingleObject(d->audio_recv_thread, 2000);
-                CloseHandle(d->audio_recv_thread);
-                d->audio_recv_thread = NULL;
+                if (WaitForSingleObject(d->audio_recv_thread, 2000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->audio_recv_thread);
+                    d->audio_recv_thread = NULL;
+                }   /* else vm_display_idd_destroy waits for it before freeing d */
             }
 
             /* Wait briefly for recv thread to exit */
             if (d->recv_thread) {
-                WaitForSingleObject(d->recv_thread, 2000);
-                CloseHandle(d->recv_thread);
-                d->recv_thread = NULL;
+                if (WaitForSingleObject(d->recv_thread, 2000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->recv_thread);
+                    d->recv_thread = NULL;
+                }   /* else vm_display_idd_destroy waits for it before freeing d */
             }
 
             /* Gamepad thread: one poll interval; its final unplug packets are
                queued before the input thread's last drain. */
             if (d->gamepad_thread) {
-                WaitForSingleObject(d->gamepad_thread, 1000);
-                CloseHandle(d->gamepad_thread);
-                d->gamepad_thread = NULL;
+                if (WaitForSingleObject(d->gamepad_thread, 1000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->gamepad_thread);
+                    d->gamepad_thread = NULL;
+                }   /* else vm_display_idd_destroy waits for it before freeing d */
             }
 
             /* Input thread: at most a connect (1s) or send (2s) in flight. */
             if (d->input_thread) {
-                WaitForSingleObject(d->input_thread, 3000);
-                CloseHandle(d->input_thread);
-                d->input_thread = NULL;
+                if (WaitForSingleObject(d->input_thread, 3000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->input_thread);
+                    d->input_thread = NULL;
+                }   /* else vm_display_idd_destroy waits for it before freeing d */
             }
 
             d->open = FALSE;
@@ -3803,7 +3829,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_IDD_EXTRA_CLOSED:
         /* The user closed extra display wp: keep only the displays before it. */
-        if (d && !d->primary && wp >= 1 && wp < IDD_MAX_DISPLAYS && wp < d->display_count) {
+        if (d && !d->primary && !d->closing &&
+            wp >= 1 && wp < IDD_MAX_DISPLAYS && wp < d->display_count) {
             d->display_count = (UINT)wp;
             idd_update_refresh_menu(d);
             idd_display_settings_save(d);
@@ -4085,6 +4112,7 @@ static VmDisplayIdd *idd_alloc(VmInstance *vm, HINSTANCE hInstance, HWND main_hw
 
     InitializeCriticalSection(&d->frame_cs);
     InitializeCriticalSection(&d->input_cs);
+    InitializeCriticalSection(&d->sock_cs);
     d->input_evt = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!d->input_evt) {
         DeleteCriticalSection(&d->input_cs);
@@ -4147,15 +4175,25 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         CloseHandle(display->window_thread);
     }
 
+    /* Every worker below is bounded (socket timeouts, or its socket was shut
+       down), so wait for each to exit: freeing the display under a running
+       thread would be a use-after-free. */
+    EnterCriticalSection(&display->sock_cs);
+    if (display->mic_socket != INVALID_SOCKET)
+        shutdown(display->mic_socket, SD_BOTH);
+    if (display->drop_socket != INVALID_SOCKET)
+        shutdown(display->drop_socket, SD_BOTH);
+    LeaveCriticalSection(&display->sock_cs);
+
     /* recv_thread is cleaned up by WM_CLOSE handler, but guard just in case */
     if (display->recv_thread) {
-        WaitForSingleObject(display->recv_thread, 3000);
+        WaitForSingleObject(display->recv_thread, INFINITE);
         CloseHandle(display->recv_thread);
     }
 
     /* gamepad_thread likewise */
     if (display->gamepad_thread) {
-        WaitForSingleObject(display->gamepad_thread, 1000);
+        WaitForSingleObject(display->gamepad_thread, INFINITE);
         CloseHandle(display->gamepad_thread);
     }
 
@@ -4163,7 +4201,7 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->input_evt)
         SetEvent(display->input_evt);
     if (display->input_thread) {
-        WaitForSingleObject(display->input_thread, 3000);
+        WaitForSingleObject(display->input_thread, INFINITE);
         CloseHandle(display->input_thread);
     }
 
@@ -4175,13 +4213,13 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 
     /* mic_thread guard (WM_CLOSE normally waited for it) */
     if (display->mic_thread) {
-        WaitForSingleObject(display->mic_thread, 3000);
+        WaitForSingleObject(display->mic_thread, INFINITE);
         CloseHandle(display->mic_thread);
     }
 
     /* drop_thread guard (WM_CLOSE normally waited for it) */
     if (display->drop_thread) {
-        WaitForSingleObject(display->drop_thread, 3000);
+        WaitForSingleObject(display->drop_thread, INFINITE);
         CloseHandle(display->drop_thread);
     }
 
@@ -4191,12 +4229,13 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
             closesocket(display->audio_socket);
             display->audio_socket = INVALID_SOCKET;
         }
-        WaitForSingleObject(display->audio_recv_thread, 3000);
+        WaitForSingleObject(display->audio_recv_thread, INFINITE);
         CloseHandle(display->audio_recv_thread);
     }
 
     DeleteCriticalSection(&display->frame_cs);
     DeleteCriticalSection(&display->input_cs);
+    DeleteCriticalSection(&display->sock_cs);
     if (display->input_evt)
         CloseHandle(display->input_evt);
 

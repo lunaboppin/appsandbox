@@ -283,6 +283,13 @@ typedef struct _VDD_MONITOR {
     IDDCX_MONITOR       hMonitor;           /* NULL when not arrived */
     VDD_SWAP_PROC*      pSwapProc;          /* Active swap chain processor */
     BYTE                edid[128];
+
+    /* Cached D3D11 device, per monitor: an immediate context is not
+       thread-safe, and each monitor's swap chain thread uses its own. Kept
+       across swap chain transitions (see VddGetOrCreateD3DDevice). */
+    ID3D11Device*       pCachedDevice;
+    ID3D11DeviceContext* pCachedCtx;
+    LUID                cachedDeviceLuid;
 } VDD_MONITOR;
 
 /* ============================================================================
@@ -294,12 +301,6 @@ typedef struct _VDD_DEVICE_CONTEXT {
     VDD_MONITOR         monitors[VDD_MAX_MONITORS];
     UINT                monitorCount;       /* monitors 0..monitorCount-1 arrived */
 
-    /* Cached D3D11 device — persists across swap chain transitions.
-       Kept alive here so that WdfObjectDelete's IddCx teardown never triggers
-       destruction of the D3D device (which crashes WUDFHost.exe). */
-    ID3D11Device*       pCachedDevice;
-    ID3D11DeviceContext* pCachedCtx;
-    LUID                cachedDeviceLuid;
 
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
@@ -310,7 +311,8 @@ typedef struct _VDD_DEVICE_CONTEXT {
 
     /* Polls MonitorCount and adds/removes monitors (WDF thread, like the
        recovery timer). */
-    WDFTIMER            hMonitorTimer;
+    WDFTIMER            hMonitorTimer;      /* one-shot, re-armed by its callback */
+    volatile BOOL       stopping;           /* cleanup: don't re-arm */
 } VDD_DEVICE_CONTEXT;
 
 /* ============================================================================
