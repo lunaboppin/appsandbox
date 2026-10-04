@@ -881,9 +881,38 @@ static void remember_storage_parent(const wchar_t *root)
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
 
-/* Update the guest agent on the active writable VHDX before attaching SMB.
-   Only the active disk is mounted; checkpoint parents remain frozen. */
-static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
+/* Guest binaries installed into C:\Windows\AppSandbox (same list as the
+   provisioning bins[] in disk_util.c). The agent must stay first: its
+   result is the one the shared-resource path depends on. */
+static const wchar_t *const k_guest_bins[] = {
+    L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe",
+    L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe"
+};
+
+/* Replace one guest file if its hash differs from the host copy. */
+static HRESULT upgrade_guest_file_offline(const wchar_t *source, const wchar_t *dest)
+{
+    wchar_t temp[MAX_PATH];
+    BYTE a[32], b[32];
+    DWORD result;
+    HRESULT hr;
+    swprintf_s(temp,MAX_PATH,L"%s.new",dest);
+    if(SUCCEEDED(sha256_file(source,a))&&SUCCEEDED(sha256_file(dest,b))&&memcmp(a,b,32)==0)return S_FALSE;
+    if(!CopyFileW(source,temp,FALSE)){result=GetLastError();asb_log(L"Guest binary refresh: CopyFile %s failed (%lu).",dest,result);return HRESULT_FROM_WIN32(result);}
+    if(!MoveFileExW(temp,dest,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){result=GetLastError();asb_log(L"Guest binary refresh: MoveFileEx %s failed (%lu).",dest,result);DeleteFileW(temp);return HRESULT_FROM_WIN32(result);}
+    hr=sha256_file(dest,b);if(SUCCEEDED(hr)){hr=sha256_file(source,a);if(SUCCEEDED(hr)&&memcmp(a,b,32)!=0)hr=HRESULT_FROM_WIN32(ERROR_CRC);}
+    if(FAILED(hr))asb_log(L"Guest binary refresh: verification of %s failed (0x%08X).",dest,hr);
+    return SUCCEEDED(hr)?S_OK:hr;
+}
+
+/* Update guest binaries on the active writable VHDX before boot. Only the
+   active disk is mounted; checkpoint parents remain frozen. Files whose hash
+   already matches are not written. The first bin_count entries of
+   k_guest_bins are refreshed; the return value is the agent's result (the
+   other helpers are best-effort and only logged). *any_failed, if given,
+   reports a failure of any file. */
+static HRESULT upgrade_windows_guest_offline(const wchar_t *vhdx_path, int bin_count,
+                                             BOOL *any_failed)
 {
     VIRTUAL_STORAGE_TYPE st;
     OPEN_VIRTUAL_DISK_PARAMETERS op;
@@ -891,15 +920,16 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
     HANDLE disk = INVALID_HANDLE_VALUE;
     DWORD before, after, result, bit, wait;
     wchar_t module[MAX_PATH], dir[MAX_PATH], source[MAX_PATH];
-    wchar_t dest[MAX_PATH], temp[MAX_PATH];
-    BYTE a[32], b[32];
+    wchar_t dest[MAX_PATH];
     HRESULT hr = E_FAIL;
+    int i, updated = 0;
+    if(any_failed)*any_failed=FALSE;
     GetModuleFileNameW(g_dll_module,module,MAX_PATH);
     { wchar_t *s=wcsrchr(module,L'\\');if(s)*s=L'\0'; }
     swprintf_s(dir,MAX_PATH,L"%s\\resources",module);
     if(GetFileAttributesW(dir)==INVALID_FILE_ATTRIBUTES)wcscpy_s(dir,MAX_PATH,module);
-    swprintf_s(source,MAX_PATH,L"%s\\appsandbox-agent.exe",dir);
-    if(GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES)return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    swprintf_s(source,MAX_PATH,L"%s\\%s",dir,k_guest_bins[0]);
+    if(GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES){if(any_failed)*any_failed=TRUE;return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);}
     before=GetLogicalDrives();
     st.DeviceId=VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;st.VendorId=ASB_VHDX_VENDOR_MS;
     /* Version 1 is sufficient for attaching the active writable chain and is
@@ -910,29 +940,43 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
     op.Version1.RWDepth=OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT;
     result=OpenVirtualDisk(&st,vhdx_path,VIRTUAL_DISK_ACCESS_ATTACH_RW,
         OPEN_VIRTUAL_DISK_FLAG_NONE,&op,&disk);
-    if(result!=ERROR_SUCCESS){asb_log(L"Shared-resource agent upgrade: OpenVirtualDisk failed (%lu).",result);return HRESULT_FROM_WIN32(result);}
+    if(result!=ERROR_SUCCESS){asb_log(L"Guest binary refresh: OpenVirtualDisk failed (%lu).",result);return HRESULT_FROM_WIN32(result);}
     ZeroMemory(&ap,sizeof(ap));ap.Version=ATTACH_VIRTUAL_DISK_VERSION_1;
     result=AttachVirtualDisk(disk,NULL,ATTACH_VIRTUAL_DISK_FLAG_NONE,0,&ap,NULL);
-    if(result!=ERROR_SUCCESS){asb_log(L"Shared-resource agent upgrade: AttachVirtualDisk failed (%lu).",result);CloseHandle(disk);return HRESULT_FROM_WIN32(result);}
+    if(result!=ERROR_SUCCESS){asb_log(L"Guest binary refresh: AttachVirtualDisk failed (%lu).",result);CloseHandle(disk);return HRESULT_FROM_WIN32(result);}
     for(wait=0;wait<100;wait++){after=GetLogicalDrives()&~before;if(after)break;Sleep(100);}
     after=GetLogicalDrives()&~before;
     for(bit=0;bit<26;bit++)if(after&(1u<<bit)){
         wchar_t windows[MAX_PATH];swprintf_s(windows,MAX_PATH,L"%c:\\Windows",L'A'+bit);
         if(GetFileAttributesW(windows)==INVALID_FILE_ATTRIBUTES)continue;
-        swprintf_s(dest,MAX_PATH,L"%c:\\Windows\\AppSandbox\\appsandbox-agent.exe",L'A'+bit);
-        swprintf_s(temp,MAX_PATH,L"%s.new",dest);
-        if(SUCCEEDED(sha256_file(source,a))&&SUCCEEDED(sha256_file(dest,b))&&memcmp(a,b,32)==0){hr=S_OK;break;}
-        if(!CopyFileW(source,temp,FALSE)){result=GetLastError();asb_log(L"Shared-resource agent upgrade: CopyFile failed (%lu).",result);hr=HRESULT_FROM_WIN32(result);break;}
-        if(!MoveFileExW(temp,dest,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){result=GetLastError();asb_log(L"Shared-resource agent upgrade: MoveFileEx failed (%lu).",result);hr=HRESULT_FROM_WIN32(result);DeleteFileW(temp);break;}
-        hr=sha256_file(dest,b);if(SUCCEEDED(hr)){hr=sha256_file(source,a);if(SUCCEEDED(hr)&&memcmp(a,b,32)!=0)hr=HRESULT_FROM_WIN32(ERROR_CRC);}
-        if(FAILED(hr))asb_log(L"Shared-resource agent upgrade: verification failed (0x%08X).",hr);
+        for(i=0;i<bin_count;i++){
+            HRESULT fhr;
+            swprintf_s(source,MAX_PATH,L"%s\\%s",dir,k_guest_bins[i]);
+            if(i>0&&GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES){
+                asb_log(L"Guest binary refresh: %s not found on the host; skipped.",k_guest_bins[i]);
+                continue;
+            }
+            swprintf_s(dest,MAX_PATH,L"%c:\\Windows\\AppSandbox\\%s",L'A'+bit,k_guest_bins[i]);
+            fhr=upgrade_guest_file_offline(source,dest);
+            if(fhr==S_OK){updated++;asb_log(L"Guest binary refresh: updated %s.",k_guest_bins[i]);}
+            if(i==0)hr=SUCCEEDED(fhr)?S_OK:fhr;
+            if(FAILED(fhr)&&any_failed)*any_failed=TRUE;
+        }
         break;
     }
     if(!after)hr=HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    if(FAILED(hr)&&any_failed)*any_failed=TRUE;
+    if(SUCCEEDED(hr)&&updated==0)asb_log(L"Guest binary refresh: all guest binaries already current.");
     result=DetachVirtualDisk(disk,DETACH_VIRTUAL_DISK_FLAG_NONE,0);
-    if(result!=ERROR_SUCCESS)asb_log(L"Warning: shared-resource agent upgrade detach failed (%lu).",result);
+    if(result!=ERROR_SUCCESS)asb_log(L"Warning: guest binary refresh detach failed (%lu).",result);
     CloseHandle(disk);
     return hr;
+}
+
+/* Agent only: used by shared_appliance.c for the appliance VM. */
+static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
+{
+    return upgrade_windows_guest_offline(vhdx_path, 1, NULL);
 }
 
 HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path)
@@ -1380,15 +1424,24 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             prepare_gl_layers_share(&args->config.gpu_shares);
     }
 
-    if (args->config.shared_resource_count > 0 && vm->install_complete &&
-        _wcsicmp(vm->os_type, L"Windows") == 0) {
-        hr = upgrade_windows_agent_offline(vm->vhdx_path);
-        if (FAILED(hr)) {
-            shared_upgrade_failed = TRUE;
-            args->config.shared_resource_count = 0;
-            asb_log(L"Shared-resource agent upgrade failed for \"%s\" (0x%08X); mappings disabled for this boot.", vm->name, hr);
-        } else {
-            asb_log(L"Verified the shared-resource guest agent on \"%s\".", vm->name);
+    /* Refresh every guest helper on each start of an installed Windows VM, so
+       existing VMs pick up new helpers without re-provisioning. A failure is
+       logged and the VM boots with the files it has; only shared resources
+       (which need the current agent) are disabled when the agent fails. */
+    if (vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
+        BOOL any_failed = FALSE;
+        hr = upgrade_windows_guest_offline(vm->vhdx_path,
+                                           (int)_countof(k_guest_bins), &any_failed);
+        if (any_failed)
+            asb_log(L"Guest binary refresh incomplete for \"%s\" (agent 0x%08X); booting with the existing files.", vm->name, hr);
+        if (args->config.shared_resource_count > 0) {
+            if (FAILED(hr)) {
+                shared_upgrade_failed = TRUE;
+                args->config.shared_resource_count = 0;
+                asb_log(L"Shared-resource agent upgrade failed for \"%s\" (0x%08X); mappings disabled for this boot.", vm->name, hr);
+            } else {
+                asb_log(L"Verified the shared-resource guest agent on \"%s\".", vm->name);
+            }
         }
     }
 
