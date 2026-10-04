@@ -124,6 +124,13 @@ public:
                     m_ulMaxSystemStreams = m_FilterDesc.Pins[KSPIN_WAVE_RENDER_SINK_SYSTEM].MaxFilterInstanceCount;
                 }
             }
+            else if (IsCaptureDevice())
+            {
+                if (m_FilterDesc.PinCount > KSPIN_WAVE_CAPTURE_SOURCE_HOST)
+                {
+                    m_ulMaxSystemStreams = m_FilterDesc.Pins[KSPIN_WAVE_CAPTURE_SOURCE_HOST].MaxFilterInstanceCount;
+                }
+            }
         }
 
         KeInitializeSpinLock(&m_DeviceFormatsAndModesLock);
@@ -187,7 +194,13 @@ protected:
         return m_DeviceType == eSpeakerDevice ? TRUE : FALSE;
     }
 
+    BOOL IsCaptureDevice()
+    {
+        return m_DeviceType == eMicInDevice ? TRUE : FALSE;
+    }
+
     BOOL IsSystemRenderPin(ULONG nPinId);
+    BOOL IsSystemCapturePin(ULONG nPinId);
     BOOL IsBridgePin(ULONG nPinId);
 
     ULONG GetSystemPinId()

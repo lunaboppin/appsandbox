@@ -8,6 +8,97 @@
 #pragma warning (disable : 4127)
 
 //=============================================================================
+// Microphone feed ring buffer
+//
+// The guest audio helper writes the host microphone's PCM here through
+// KSPROPSETID_AsbMic (VadMicFeedHandler, PASSIVE_LEVEL); running capture
+// streams read it from their position updates (up to DISPATCH_LEVEL). At
+// most MIC_RING_MAX_FILL is kept queued: older audio is dropped so the mic
+// never lags behind the host by more than that. An empty ring reads as
+// silence. Everything here is non-paged.
+//=============================================================================
+
+#define MIC_RING_BYTES      (MICIN_BYTES_PER_SEC / 2)       // 500 ms
+#define MIC_RING_MAX_FILL   (MICIN_BYTES_PER_SEC / 10)      // 100 ms
+
+static BYTE          g_MicRing[MIC_RING_BYTES];
+static ULONG         g_MicRingRead;
+static ULONG         g_MicRingFill;
+static KSPIN_LOCK    g_MicRingLock;     // zero == initialised, unlocked
+static volatile LONG g_MicRunning;
+
+#pragma code_seg()
+VOID VadMicRingWrite(_In_reads_bytes_(Length) const BYTE *Data, _In_ ULONG Length)
+{
+    KIRQL irql;
+
+    // Only the newest MIC_RING_MAX_FILL bytes of a large write matter.
+    if (Length > MIC_RING_MAX_FILL)
+    {
+        Data += Length - MIC_RING_MAX_FILL;
+        Length = MIC_RING_MAX_FILL;
+    }
+
+    KeAcquireSpinLock(&g_MicRingLock, &irql);
+    {
+        ULONG write = (g_MicRingRead + g_MicRingFill) % MIC_RING_BYTES;
+        ULONG first = MIN(Length, MIC_RING_BYTES - write);
+        RtlCopyMemory(g_MicRing + write, Data, first);
+        RtlCopyMemory(g_MicRing, Data + first, Length - first);
+        g_MicRingFill += Length;
+        if (g_MicRingFill > MIC_RING_MAX_FILL)
+        {
+            ULONG drop = g_MicRingFill - MIC_RING_MAX_FILL;
+            drop -= drop % MICIN_BLOCK_ALIGN;   // stay on a frame boundary
+            g_MicRingRead = (g_MicRingRead + drop) % MIC_RING_BYTES;
+            g_MicRingFill -= drop;
+        }
+    }
+    KeReleaseSpinLock(&g_MicRingLock, irql);
+}
+
+#pragma code_seg()
+VOID VadMicRingRead(_Out_writes_bytes_(Length) BYTE *Dest, _In_ ULONG Length)
+{
+    KIRQL irql;
+    ULONG take;
+
+    KeAcquireSpinLock(&g_MicRingLock, &irql);
+    take = MIN(Length, g_MicRingFill);
+    take -= take % MICIN_BLOCK_ALIGN;
+    {
+        ULONG first = MIN(take, MIC_RING_BYTES - g_MicRingRead);
+        RtlCopyMemory(Dest, g_MicRing + g_MicRingRead, first);
+        RtlCopyMemory(Dest + first, g_MicRing, take - first);
+        g_MicRingRead = (g_MicRingRead + take) % MIC_RING_BYTES;
+        g_MicRingFill -= take;
+    }
+    KeReleaseSpinLock(&g_MicRingLock, irql);
+
+    if (take < Length)
+    {
+        RtlZeroMemory(Dest + take, Length - take);   // underrun: silence
+    }
+}
+
+#pragma code_seg()
+VOID VadMicRingReset(VOID)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_MicRingLock, &irql);
+    g_MicRingRead = 0;
+    g_MicRingFill = 0;
+    KeReleaseSpinLock(&g_MicRingLock, irql);
+}
+
+#pragma code_seg()
+ULONG VadMicRunningStreams(VOID)
+{
+    LONG n = g_MicRunning;
+    return n > 0 ? (ULONG)n : 0;
+}
+
+//=============================================================================
 // CVadWaveStream
 //=============================================================================
 
@@ -15,6 +106,12 @@
 CVadWaveStream::~CVadWaveStream(void)
 {
     PAGED_CODE();
+
+    if (m_bMicRunning)
+    {
+        InterlockedDecrement(&g_MicRunning);
+        m_bMicRunning = FALSE;
+    }
 
     if (NULL != m_pMiniport)
     {
@@ -132,6 +229,7 @@ CVadWaveStream::Init
     m_SignalProcessingMode = SignalProcessingMode;
     m_bEoSReceived = FALSE;
     m_bLastBufferRendered = FALSE;
+    m_bMicRunning = FALSE;
 
     m_pPortStream = PortStream_;
     InitializeListHead(&m_NotificationList);
@@ -234,8 +332,9 @@ CVadWaveStream::NonDelegatingQueryInterface
     {
         *Object = PVOID(PMINIPORTWAVERTSTREAMNOTIFICATION(this));
     }
-    else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTOutputStream))
+    else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTOutputStream) && !m_bCapture)
     {
+        // Render-only interface: never offer it on a capture stream.
         *Object = PVOID(PMINIPORTWAVERTOUTPUTSTREAM(this));
     }
     else if (IsEqualGUIDAligned(Interface, IID_IDrmAudioStream))
@@ -837,6 +936,11 @@ NTSTATUS CVadWaveStream::SetState
             break;
 
         case KSSTATE_PAUSE:
+            if (m_KsState > KSSTATE_PAUSE && m_bMicRunning)
+            {
+                InterlockedDecrement(&g_MicRunning);
+                m_bMicRunning = FALSE;
+            }
             if (m_KsState > KSSTATE_PAUSE)
             {
                 // Run -> Pause
@@ -864,6 +968,14 @@ NTSTATUS CVadWaveStream::SetState
         case KSSTATE_RUN:
         {
             LARGE_INTEGER ullPerfCounterTemp;
+
+            if (m_bCapture && !m_bMicRunning)
+            {
+                // Start from fresh audio, then tell the feeder someone records.
+                VadMicRingReset();
+                m_bMicRunning = TRUE;
+                InterlockedIncrement(&g_MicRunning);
+            }
             ullPerfCounterTemp = KeQueryPerformanceCounter(&m_ullPerformanceCounterFrequency);
             m_ullLastDPCTimeStamp = m_ullDmaTimeStamp = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, ullPerfCounterTemp);
 
@@ -943,7 +1055,21 @@ VOID CVadWaveStream::UpdatePosition
         m_bLastBufferRendered = TRUE;
     }
 
-    // Audio data is silently discarded — no read/write of the DMA buffer
+    // Render: audio data is discarded (the guest audio helper captures it by
+    // WASAPI loopback). Capture: fill the span the position moves over with
+    // the host microphone (silence if the feed is empty).
+    if (m_bCapture && m_pDmaBuffer != NULL && m_ulDmaBufferSize > 0 && ByteDisplacement > 0)
+    {
+        ULONG left = MIN(ByteDisplacement, m_ulDmaBufferSize);
+        ULONG pos  = (ULONG)(m_ullWritePosition % m_ulDmaBufferSize);
+        while (left > 0)
+        {
+            ULONG chunk = MIN(left, m_ulDmaBufferSize - pos);
+            VadMicRingRead(m_pDmaBuffer + pos, chunk);
+            pos = (pos + chunk) % m_ulDmaBufferSize;
+            left -= chunk;
+        }
+    }
 
     // Advance the DMA position and wrap at buffer length
     m_ullPlayPosition = m_ullWritePosition =

@@ -124,6 +124,17 @@ typedef struct FileDropResult {
 } FileDropResult;
 #pragma pack(pop)
 
+/* ---- Microphone wire protocol (mirror of tools/agent/audio-mic.c) ---- */
+
+#define MIC_PORT            9
+#define MIC_STATE_IDLE      0u
+#define MIC_STATE_RECORDING 1u
+#define MIC_STATE_NO_DEVICE 0xFFFFFFFFu
+#define MIC_SAMPLE_RATE     48000
+#define MIC_CHANNELS        2
+#define MIC_BITS            16
+#define MIC_FRAME_MAX       (64 * 1024)
+
 /* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
 
@@ -358,6 +369,12 @@ struct VmDisplayIdd {
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
 
+    /* Microphone (:0009 — host→guest). Off unless the user shares it; the
+       host microphone is only opened while the guest is recording. */
+    volatile BOOL    mic_share;
+    HANDLE           mic_thread;
+    volatile SOCKET  mic_socket;
+
     /* File drop (:0011 — host→guest). One transfer at a time. */
     HANDLE           drop_thread;
     volatile SOCKET  drop_socket;
@@ -389,6 +406,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
 #define IDM_FULLSCREEN     0x1030
+#define IDM_SHARE_MIC      0x1040
 #define IDM_REFRESH_BASE   0x1100   /* + 0x10 * index into g_refresh_choices */
 #define IDM_RES_BASE       0x1200   /* + 0x10 * index into g_res_choices */
 
@@ -880,9 +898,9 @@ static void idd_display_settings_save(const VmDisplayIdd *d)
     /* transmitKeyboardHotkeys keeps its name so existing files keep the
        user's Immersive mode choice. */
     fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"refreshRate\":%u,"
-               "\"resolutionWidth\":%u,\"resolutionHeight\":%u}\n",
+               "\"resolutionWidth\":%u,\"resolutionHeight\":%u,\"shareMicrophone\":%d}\n",
             d->transmit_hotkeys ? 1 : 0, d->refresh_pref,
-            d->res_pref_w, d->res_pref_h);
+            d->res_pref_w, d->res_pref_h, d->mic_share ? 1 : 0);
     fclose(f);
 }
 
@@ -897,6 +915,7 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
     d->transmit_hotkeys = FALSE;
     d->refresh_pref = 0;
     d->res_pref_w = d->res_pref_h = RES_KEEP;
+    d->mic_share = FALSE;
     if (d->vhdx_path[0] == L'\0') return;
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
@@ -909,6 +928,8 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
         const char *r;
         if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
             d->transmit_hotkeys = TRUE;
+        if (strstr(buf, "\"shareMicrophone\":1"))
+            d->mic_share = TRUE;
         r = strstr(buf, "\"refreshRate\":");
         if (r) {
             unsigned v = 0;
@@ -2050,6 +2071,178 @@ static void idd_handle_drop(VmDisplayIdd *d, HDROP drop)
 }
 
 /* ==================================================================
+ * Microphone — host -> guest "App Sandbox Microphone"
+ * ================================================================== */
+
+static const IID AUDIO_IID_IAudioCaptureClient =
+    { 0xC8ADBD64, 0xE71E, 0x48A0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
+
+typedef struct MicCapture {
+    IMMDeviceEnumerator *en;
+    IMMDevice           *dev;
+    IAudioClient        *ac;
+    IAudioCaptureClient *cc;
+} MicCapture;
+
+static void mic_capture_stop(MicCapture *m)
+{
+    if (m->ac) IAudioClient_Stop(m->ac);
+    if (m->cc) { IAudioCaptureClient_Release(m->cc); m->cc = NULL; }
+    if (m->ac) { IAudioClient_Release(m->ac); m->ac = NULL; }
+    if (m->dev) { IMMDevice_Release(m->dev); m->dev = NULL; }
+    if (m->en) { IMMDeviceEnumerator_Release(m->en); m->en = NULL; }
+}
+
+/* Open the default recording device, converted by WASAPI to the guest
+   microphone's fixed format (48 kHz, 16-bit, stereo). */
+static BOOL mic_capture_start(VmDisplayIdd *d, MicCapture *m)
+{
+    WAVEFORMATEX wfx;
+    HRESULT hr;
+
+    ZeroMemory(m, sizeof(*m));
+    hr = CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &AUDIO_IID_IMMDeviceEnumerator, (void **)&m->en);
+    if (SUCCEEDED(hr))
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(m->en, eCapture, eConsole, &m->dev);
+    if (SUCCEEDED(hr))
+        hr = IMMDevice_Activate(m->dev, &AUDIO_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&m->ac);
+    if (SUCCEEDED(hr)) {
+        ZeroMemory(&wfx, sizeof(wfx));
+        wfx.wFormatTag      = WAVE_FORMAT_PCM;
+        wfx.nChannels       = MIC_CHANNELS;
+        wfx.nSamplesPerSec  = MIC_SAMPLE_RATE;
+        wfx.wBitsPerSample  = MIC_BITS;
+        wfx.nBlockAlign     = (WORD)(MIC_CHANNELS * MIC_BITS / 8);
+        wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+        hr = IAudioClient_Initialize(m->ac, AUDCLNT_SHAREMODE_SHARED,
+                                     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                     1000000 /* 100 ms */, 0, &wfx, NULL);
+    }
+    if (SUCCEEDED(hr))
+        hr = IAudioClient_GetService(m->ac, &AUDIO_IID_IAudioCaptureClient, (void **)&m->cc);
+    if (SUCCEEDED(hr))
+        hr = IAudioClient_Start(m->ac);
+    if (FAILED(hr)) {
+        idd_log(d, L"Microphone: cannot open the host recording device (0x%08lX).", hr);
+        mic_capture_stop(m);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Send everything captured so far as frames: UINT32 byte count + PCM. */
+static BOOL mic_capture_pump(MicCapture *m, SOCKET s, BYTE *frame)
+{
+    UINT32 packet = 0;
+    while (SUCCEEDED(IAudioCaptureClient_GetNextPacketSize(m->cc, &packet)) && packet > 0) {
+        BYTE *data;
+        UINT32 frames;
+        DWORD flags;
+        UINT32 bytes;
+        if (FAILED(IAudioCaptureClient_GetBuffer(m->cc, &data, &frames, &flags, NULL, NULL)))
+            return TRUE;
+        bytes = frames * (MIC_CHANNELS * MIC_BITS / 8);
+        if (bytes > MIC_FRAME_MAX)
+            bytes = MIC_FRAME_MAX;
+        memcpy(frame, &bytes, sizeof(bytes));
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT)
+            ZeroMemory(frame + sizeof(bytes), bytes);
+        else
+            memcpy(frame + sizeof(bytes), data, bytes);
+        IAudioCaptureClient_ReleaseBuffer(m->cc, frames);
+        if (bytes && !send_all(s, (const char *)frame, (int)(sizeof(bytes) + bytes)))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static DWORD WINAPI idd_mic_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    BOOL com_ok = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED));
+    BYTE *frame = (BYTE *)HeapAlloc(GetProcessHeap(), 0, sizeof(UINT32) + MIC_FRAME_MAX);
+    WSADATA wsa;
+
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    while (!d->stop && frame) {
+        GUID svc;
+        SOCKET s;
+        UINT32 state = MIC_STATE_IDLE;
+        MicCapture cap;
+        BOOL capturing = FALSE, no_device = FALSE;
+
+        if (!d->mic_share) {
+            Sleep(250);
+            continue;
+        }
+        hcs_service_guid(d->os_type, MIC_PORT, &svc);
+        s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
+        if (s == INVALID_SOCKET) {
+            int w;
+            for (w = 0; w < 3000 && !d->stop && d->mic_share; w += 250)
+                Sleep(250);
+            continue;
+        }
+        {
+            DWORD timeout = 2000;
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+        }
+        d->mic_socket = s;
+        idd_log(d, L"Microphone: sharing is on; the host mic opens while the VM records.");
+
+        while (!d->stop && d->mic_share) {
+            BOOL lost = FALSE;
+            while (wait_readable(s, 0)) {
+                UINT32 st;
+                if (!recv_exact(s, &st, sizeof(st))) { lost = TRUE; break; }
+                if (st == MIC_STATE_NO_DEVICE) { no_device = TRUE; lost = TRUE; break; }
+                state = st;
+            }
+            if (lost)
+                break;
+
+            if (state == MIC_STATE_RECORDING && !capturing) {
+                capturing = mic_capture_start(d, &cap);
+                if (capturing)
+                    idd_log(d, L"Microphone: the VM is recording; sending the host microphone.");
+                else
+                    state = MIC_STATE_IDLE;   /* don't retry every 10 ms */
+            } else if (state != MIC_STATE_RECORDING && capturing) {
+                mic_capture_stop(&cap);
+                capturing = FALSE;
+                idd_log(d, L"Microphone: the VM stopped recording; host microphone closed.");
+            }
+
+            if (capturing && !mic_capture_pump(&cap, s, frame))
+                break;
+            Sleep(10);
+        }
+
+        if (capturing)
+            mic_capture_stop(&cap);
+        d->mic_socket = INVALID_SOCKET;
+        closesocket(s);
+        if (no_device) {
+            int w;
+            idd_log(d, L"Microphone: this VM has no App Sandbox Microphone yet "
+                       L"(install the new AppSandboxVAD driver; Test Mode required).");
+            for (w = 0; w < 30000 && !d->stop && d->mic_share; w += 250)
+                Sleep(250);
+        } else if (!d->stop && d->mic_share) {
+            Sleep(500);
+        }
+    }
+    if (frame)
+        HeapFree(GetProcessHeap(), 0, frame);
+    WSACleanup();
+    if (com_ok)
+        CoUninitialize();
+    return 0;
+}
+
+/* ==================================================================
  * D3D11 initialization and teardown
  * ================================================================== */
 
@@ -2657,6 +2850,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             d->audio_recv_thread = CreateThread(NULL, 0, audio_recv_thread_proc, d, 0, NULL);
             idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
         }
+        if (!d->mic_thread)
+            d->mic_thread = CreateThread(NULL, 0, idd_mic_thread_proc, d, 0, NULL);
 
         /* Try to connect frame channel (VDD driver, GUID :0002). A guest mode
            change restarts the driver's listener, so retry quickly and only
@@ -2971,6 +3166,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             UINT i;
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_MIC, L"Share microphone with the VM");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS,
                         L"Immersive mode (send Alt+Tab, Win key, etc. to the VM)");
             AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Fullscreen\tCtrl+Alt+Enter");
@@ -3001,6 +3197,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(sysmenu, IDM_SHARE_MIC,
+                          MF_BYCOMMAND | (d->mic_share ? MF_CHECKED : MF_UNCHECKED));
             idd_update_refresh_menu(d);
         }
     }
@@ -3193,6 +3391,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_send_refresh(d, TRUE);
             return 0;
         }
+        if (d && (wp & 0xFFF0) == IDM_SHARE_MIC) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->mic_share = !d->mic_share;
+            if (sysmenu)
+                CheckMenuItem(sysmenu, IDM_SHARE_MIC,
+                              MF_BYCOMMAND | (d->mic_share ? MF_CHECKED : MF_UNCHECKED));
+            idd_display_settings_save(d);
+            idd_log(d, d->mic_share ? L"Microphone sharing: ON." : L"Microphone sharing: OFF.");
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_FULLSCREEN) {
             idd_set_fullscreen(d, !d->fullscreen);
             return 0;
@@ -3235,6 +3443,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->clipboard) {
                 vm_clipboard_destroy(d->clipboard);
                 d->clipboard = NULL;
+            }
+
+            /* Microphone thread: stops capturing and closes within ~10 ms. */
+            if (d->mic_thread) {
+                SOCKET ms = d->mic_socket;
+                if (ms != INVALID_SOCKET)
+                    shutdown(ms, SD_BOTH);
+                WaitForSingleObject(d->mic_thread, 3000);
+                CloseHandle(d->mic_thread);
+                d->mic_thread = NULL;
             }
 
             /* Abort a running file drop (the worker sees d->stop). */
@@ -3632,6 +3850,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->stop         = FALSE;
     d->audio_socket       = INVALID_SOCKET;
     d->drop_socket        = INVALID_SOCKET;
+    d->mic_socket         = INVALID_SOCKET;
     d->cursor_visible     = 1;   /* until the guest says otherwise */
     d->clipboard          = NULL;
 
@@ -3730,6 +3949,12 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
         display->clipboard = NULL;
+    }
+
+    /* mic_thread guard (WM_CLOSE normally waited for it) */
+    if (display->mic_thread) {
+        WaitForSingleObject(display->mic_thread, 3000);
+        CloseHandle(display->mic_thread);
     }
 
     /* drop_thread guard (WM_CLOSE normally waited for it) */

@@ -95,6 +95,7 @@ protected:
     GUID                        m_SignalProcessingMode;
     BOOLEAN                     m_bEoSReceived;
     BOOLEAN                     m_bLastBufferRendered;
+    BOOLEAN                     m_bMicRunning;      // counted in VadMicRunningStreams()
     KSPIN_LOCK                  m_PositionSpinLock;
 
 public:

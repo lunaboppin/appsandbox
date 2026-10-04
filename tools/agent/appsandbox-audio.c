@@ -96,9 +96,11 @@ static const wchar_t VAD_DEVICE_NAME[] = L"App Sandbox Virtual Audio";
 /* WASAPI requested buffer size (100-ns units). 40 ms = 400000. */
 #define AUDIO_BUFFER_HNS    400000
 
+void mic_start(void);   /* audio-mic.c */
+
 /* ---- Logging ---- */
 
-static void audio_log(const char *fmt, ...)
+void audio_log(const char *fmt, ...)
 {
     FILE *f;
     va_list ap;
@@ -426,6 +428,9 @@ int main(void)
         CoUninitialize();
         return 1;
     }
+
+    /* Host microphone -> guest microphone (own channel and thread). */
+    mic_start();
 
     l = asb_listen(ASB_CH_AUDIO);
     if (!l) {

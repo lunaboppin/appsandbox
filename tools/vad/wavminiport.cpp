@@ -192,7 +192,7 @@ CVadWaveMiniport::Init
     m_plVolumeLevel = NULL;
     RtlZeroMemory(&m_MixDrmRights, sizeof(m_MixDrmRights));
 
-    if (IsRenderDevice())
+    if (IsRenderDevice() || IsCaptureDevice())
     {
         if (m_ulMaxSystemStreams == 0)
         {
@@ -205,7 +205,10 @@ CVadWaveMiniport::Init
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+    }
 
+    if (IsRenderDevice())
+    {
         if (!NT_SUCCESS(Port_->QueryInterface(IID_IDrmPort2, (PVOID *)&m_pDrmPort)))
         {
             m_pDrmPort = NULL;
@@ -436,8 +439,11 @@ CVadWaveMiniport::ValidateStreamCreate
 
     if (_Capture)
     {
-        // Capture not supported
-        ntStatus = STATUS_NOT_SUPPORTED;
+        // Only the microphone endpoint's host pin captures.
+        if (IsCaptureDevice() && IsSystemCapturePin(_Pin))
+        {
+            VERIFY_PIN_INSTANCE_RESOURCES_AVAILABLE(ntStatus, m_ulSystemAllocated, m_ulMaxSystemStreams);
+        }
     }
     else
     {
@@ -541,6 +547,18 @@ BOOL CVadWaveMiniport::IsSystemRenderPin(ULONG nPinId)
 
 //=============================================================================
 #pragma code_seg()
+BOOL CVadWaveMiniport::IsSystemCapturePin(ULONG nPinId)
+{
+    AcquireFormatsAndModesLock();
+
+    PINTYPE pinType = m_DeviceFormatsAndModes[nPinId].PinType;
+
+    ReleaseFormatsAndModesLock();
+    return (pinType == SystemCapturePin);
+}
+
+//=============================================================================
+#pragma code_seg()
 BOOL CVadWaveMiniport::IsBridgePin(ULONG nPinId)
 {
     AcquireFormatsAndModesLock();
@@ -567,7 +585,7 @@ CVadWaveMiniport::StreamCreated
 
     DPF_ENTER(("[CVadWaveMiniport::StreamCreated]"));
 
-    if (IsSystemRenderPin(_Pin))
+    if (IsSystemRenderPin(_Pin) || IsSystemCapturePin(_Pin))
     {
         ALLOCATE_PIN_INSTANCE_RESOURCES(m_ulSystemAllocated);
         streams = m_SystemStreams;
@@ -614,6 +632,12 @@ CVadWaveMiniport::StreamClosed
         streams = m_SystemStreams;
         count = m_ulMaxSystemStreams;
         updateDrmRights = true;
+    }
+    else if (IsSystemCapturePin(_Pin))
+    {
+        FREE_PIN_INSTANCE_RESOURCES(m_ulSystemAllocated);
+        streams = m_SystemStreams;
+        count = m_ulMaxSystemStreams;
     }
 
     if (streams != NULL)
@@ -797,7 +821,7 @@ CVadWaveMiniport::PropertyHandlerProposedFormat
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (IsSystemRenderPin(kspPin->PinId))
+    if (IsSystemRenderPin(kspPin->PinId) || IsSystemCapturePin(kspPin->PinId))
     {
         ntStatus = STATUS_SUCCESS;
     }

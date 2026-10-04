@@ -333,6 +333,19 @@ InstallAllRenderFilters(
         IF_FAILED_JUMP(ntStatus, Exit);
     }
 
+    // The microphone is optional: if it fails to install, keep the speaker
+    // (guest audio to the host) working rather than failing the device.
+    ppAeMiniports = g_CaptureEndpoints;
+    for (ULONG i = 0; i < g_cCaptureEndpoints; ++i, ++ppAeMiniports)
+    {
+        NTSTATUS micStatus = _pAdapterCommon->InstallEndpointFilters(
+            _pIrp, *ppAeMiniports, NULL, NULL, NULL, NULL, NULL);
+        if (!NT_SUCCESS(micStatus))
+        {
+            DPF(D_ERROR, ("Microphone endpoint install failed, 0x%x", micStatus));
+        }
+    }
+
     ntStatus = STATUS_SUCCESS;
 
 Exit:

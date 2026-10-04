@@ -156,6 +156,7 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="appsandbox-audio.c" />
+    <ClCompile Include="audio-mic.c" />
     <ClCompile Include="..\transport\asb_transport.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

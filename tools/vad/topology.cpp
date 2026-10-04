@@ -4,6 +4,7 @@
 #include "pinnodes.h"
 #include "wavminiport.h"
 #include "topofilter.h"
+#include "mictopofilter.h"
 
 //=============================================================================
 // CVadTopologyMiniport
@@ -489,6 +490,119 @@ VadSpeakerFilterHandler
     }
 
     return ntStatus;
+}
+
+//=============================================================================
+// Microphone filter property handler (jack description)
+//=============================================================================
+
+#pragma code_seg("PAGE")
+NTSTATUS
+VadMicFilterHandler
+(
+    _In_ PPCPROPERTY_REQUEST      PropertyRequest
+)
+{
+    PAGED_CODE();
+
+    ASSERT(PropertyRequest);
+
+    DPF_ENTER(("[VadMicFilterHandler]"));
+
+    NTSTATUS ntStatus = STATUS_INVALID_DEVICE_REQUEST;
+    PCVadTopologyMiniport pMiniport = (PCVadTopologyMiniport)PropertyRequest->MajorTarget;
+
+    if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_Jack))
+    {
+        if (PropertyRequest->PropertyItem->Id == KSPROPERTY_JACK_DESCRIPTION)
+        {
+            ntStatus = pMiniport->PropertyHandlerJackDescription(
+                PropertyRequest,
+                ARRAYSIZE(MicJackDescriptions),
+                MicJackDescriptions
+            );
+        }
+        else if (PropertyRequest->PropertyItem->Id == KSPROPERTY_JACK_DESCRIPTION2)
+        {
+            ntStatus = pMiniport->PropertyHandlerJackDescription2(
+                PropertyRequest,
+                ARRAYSIZE(MicJackDescriptions),
+                MicJackDescriptions,
+                0
+            );
+        }
+    }
+
+    return ntStatus;
+}
+
+//=============================================================================
+// AppSandbox mic feed (KSPROPSETID_AsbMic)
+//
+// DATA (SET): PCM in the mic format, appended to the ring buffer the capture
+// stream reads. STATE (GET): number of running capture streams.
+//=============================================================================
+
+#pragma code_seg("PAGE")
+NTSTATUS
+VadMicFeedHandler
+(
+    _In_ PPCPROPERTY_REQUEST      PropertyRequest
+)
+{
+    PAGED_CODE();
+
+    ASSERT(PropertyRequest);
+
+    if (!IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_AsbMic))
+    {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_BASICSUPPORT)
+    {
+        return PropertyHandler_BasicSupport(PropertyRequest,
+                                            PropertyRequest->PropertyItem->Flags,
+                                            VT_ILLEGAL);
+    }
+
+    switch (PropertyRequest->PropertyItem->Id)
+    {
+    case KSPROPERTY_ASBMIC_DATA:
+        if (!(PropertyRequest->Verb & KSPROPERTY_TYPE_SET) || PropertyRequest->Value == NULL)
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if (PropertyRequest->ValueSize == 0 ||
+            PropertyRequest->ValueSize > MICIN_MAX_FEED_BYTES ||
+            (PropertyRequest->ValueSize % MICIN_BLOCK_ALIGN) != 0)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        VadMicRingWrite((const BYTE *)PropertyRequest->Value, PropertyRequest->ValueSize);
+        return STATUS_SUCCESS;
+
+    case KSPROPERTY_ASBMIC_STATE:
+        if (!(PropertyRequest->Verb & KSPROPERTY_TYPE_GET))
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if (PropertyRequest->ValueSize == 0)
+        {
+            PropertyRequest->ValueSize = sizeof(ULONG);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        if (PropertyRequest->ValueSize < sizeof(ULONG) || PropertyRequest->Value == NULL)
+        {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        *(PULONG)PropertyRequest->Value = VadMicRunningStreams();
+        PropertyRequest->ValueSize = sizeof(ULONG);
+        return STATUS_SUCCESS;
+
+    default:
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
 }
 
 //=============================================================================

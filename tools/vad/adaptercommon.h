@@ -53,6 +53,7 @@
 typedef enum
 {
     eSpeakerDevice = 0,
+    eMicInDevice,
     eMaxDeviceType,
 } eDeviceType;
 
@@ -74,6 +75,7 @@ typedef enum
     NoPin,
     BridgePin,
     SystemRenderPin,
+    SystemCapturePin,
 } PINTYPE;
 
 //=============================================================================

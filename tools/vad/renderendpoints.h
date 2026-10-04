@@ -4,6 +4,8 @@
 #include "topology.h"
 #include "topofilter.h"
 #include "wavefilter.h"
+#include "mictopofilter.h"
+#include "micwavefilter.h"
 
 //=============================================================================
 // Factory function declarations
@@ -96,9 +98,63 @@ PENDPOINT_MINIPAIR  g_RenderEndpoints[] =
 #define g_cRenderEndpoints  (SIZEOF_ARRAY(g_RenderEndpoints))
 
 //=============================================================================
+// Microphone physical connection (topology bridge -> wave bridge)
+//
+//              +------+                +------+
+//              | Topo |                | Wave |
+//              |      |                |      |
+//  Mic jack -->|0    1|--------------->|0    1|---> Host (capture stream)
+//              |      |                |      |
+//              +------+                +------+
+//=============================================================================
+
+static
+PHYSICALCONNECTIONTABLE MicInTopologyPhysicalConnections[] =
+{
+    {
+        KSPIN_TOPO_MIC_BRIDGE,
+        KSPIN_WAVE_CAPTURE_BRIDGE,
+        CONNECTIONTYPE_TOPOLOGY_OUTPUT
+    }
+};
+
+//=============================================================================
+// Microphone endpoint miniport pair (fed with the host microphone)
+//=============================================================================
+
+static
+ENDPOINT_MINIPAIR MicInEndpoint =
+{
+    eMicInDevice,
+    L"TopologyMicIn",                                       // must match KSNAME_TopologyMicIn in INF
+    CreateVadTopologyMiniport,
+    &MicTopoFilterDescriptor,
+    0, NULL,                                                // interface properties
+    L"WaveMicIn",                                           // must match KSNAME_WaveMicIn in INF
+    CreateVadWaveMiniport,
+    &MicInWaveFilterDescriptor,
+    0,                                                      // interface properties
+    NULL,
+    MICIN_CHANNELS,
+    MicInPinDeviceFormatsAndModes,
+    SIZEOF_ARRAY(MicInPinDeviceFormatsAndModes),
+    MicInTopologyPhysicalConnections,
+    SIZEOF_ARRAY(MicInTopologyPhysicalConnections),
+    ENDPOINT_NO_FLAGS,
+};
+
+static
+PENDPOINT_MINIPAIR  g_CaptureEndpoints[] =
+{
+    &MicInEndpoint,
+};
+
+#define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))
+
+//=============================================================================
 // Total miniports = endpoints * 2 (topology + wave)
 //=============================================================================
 
-#define g_MaxMiniports  (g_cRenderEndpoints * 2)
+#define g_MaxMiniports  ((g_cRenderEndpoints + g_cCaptureEndpoints) * 2)
 
 #endif // _APPSANDBOXVAD_RENDERENDPOINTS_H_

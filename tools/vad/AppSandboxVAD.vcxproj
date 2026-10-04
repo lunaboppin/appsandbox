@@ -209,6 +209,8 @@
     <ClInclude Include="adaptercommon.h" />
     <ClInclude Include="driverdefs.h" />
     <ClInclude Include="kshelper.h" />
+    <ClInclude Include="mictopofilter.h" />
+    <ClInclude Include="micwavefilter.h" />
     <ClInclude Include="pinnodes.h" />
     <ClInclude Include="poolalloc.h" />
     <ClInclude Include="renderendpoints.h" />

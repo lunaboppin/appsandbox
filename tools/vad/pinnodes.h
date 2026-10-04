@@ -46,6 +46,51 @@ enum
 };
 
 //=============================================================================
+// Microphone (capture) pin layout
+//=============================================================================
+
+// Wave pins: bridge in from the topology filter, streaming out to the OS
+enum
+{
+    KSPIN_WAVE_CAPTURE_BRIDGE = 0,
+    KSPIN_WAVE_CAPTURE_SOURCE_HOST
+};
+
+// Topology pins: the (virtual) microphone jack, bridge out to the wave filter
+enum
+{
+    KSPIN_TOPO_MIC_ELEMENTS = 0,
+    KSPIN_TOPO_MIC_BRIDGE
+};
+
+//=============================================================================
+// AppSandbox microphone feed property set (on the mic topology filter)
+//
+// The guest audio helper pushes the host microphone's PCM (48 kHz, 16-bit,
+// stereo) with KSPROPERTY_ASBMIC_DATA (SET), and polls
+// KSPROPERTY_ASBMIC_STATE (GET, ULONG = running capture streams) so the host
+// only opens its microphone while something in the guest is recording.
+// {6A1C3E52-9F0D-4B7E-A431-5C8E2D7F9016}
+//=============================================================================
+#define STATIC_KSPROPSETID_AsbMic     0x6a1c3e52, 0x9f0d, 0x4b7e, 0xa4, 0x31, 0x5c, 0x8e, 0x2d, 0x7f, 0x90, 0x16
+DEFINE_GUIDSTRUCT("6A1C3E52-9F0D-4B7E-A431-5C8E2D7F9016", KSPROPSETID_AsbMic);
+#define KSPROPSETID_AsbMic DEFINE_GUIDNAMED(KSPROPSETID_AsbMic)
+
+enum
+{
+    KSPROPERTY_ASBMIC_DATA = 0,
+    KSPROPERTY_ASBMIC_STATE
+};
+
+// Mic format: fixed so the feed needs no conversion in the kernel.
+#define MICIN_SAMPLE_RATE       48000
+#define MICIN_CHANNELS          2
+#define MICIN_BITS_PER_SAMPLE   16
+#define MICIN_BLOCK_ALIGN       (MICIN_CHANNELS * MICIN_BITS_PER_SAMPLE / 8)
+#define MICIN_BYTES_PER_SEC     (MICIN_SAMPLE_RATE * MICIN_BLOCK_ALIGN)
+#define MICIN_MAX_FEED_BYTES    (64 * 1024)     // largest single DATA write
+
+//=============================================================================
 // Signal processing mode attribute (for data range attributes)
 //=============================================================================
 
