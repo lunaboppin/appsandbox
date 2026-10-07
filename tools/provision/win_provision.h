@@ -23,12 +23,11 @@ extern "C" {
  *   vm_name    : ComputerName (truncated to 15 chars)
  *   user, pass : local admin account (pass is plaintext; encoded internally)
  *   arch       : "arm64" or "amd64" (processorArchitecture)
- *   test_mode  : non-zero -> bcdedit /set testsigning on
  *   is_arm64   : non-zero -> add the HKLM\SYSTEM\Setup\LabConfig TPM/SecureBoot/... bypass keys
  *   lang       : UI/locale BCP-47 tag (e.g. "en-US")
  * Returns 0 on success. */
 int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
-                           const char *arch, int test_mode, int is_arm64, const char *lang);
+                           const char *arch, int is_arm64, const char *lang);
 
 /* setup.cmd -- first-logon: agent already staged at C:\Windows\AppSandbox\; register the service. */
 int asb_provision_setup_cmd(FILE *f);

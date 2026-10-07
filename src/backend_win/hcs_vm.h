@@ -49,7 +49,6 @@ typedef struct {
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
     BOOL    is_appliance;             /* TRUE = hidden shared-storage appliance */
     BOOL    allow_missing_shared_resources; /* explicit dependency bypass */
-    BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
@@ -101,7 +100,6 @@ typedef struct {
     DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */
     volatile LONG management_busy; /* serializes stopped-VM media/storage/disk operations */
     wchar_t     config_passthrough[4096]; /* unrecognized vms.cfg keys */
-    BOOL        test_mode;       /* TRUE = no Secure Boot (for test-signed drivers) */
     BOOL        building_vhdx;   /* TRUE during iso-patch VHDX creation */
     BOOL        vhdx_staging;    /* TRUE during file staging phase */
     int         vhdx_progress;   /* 0-100 progress percentage */

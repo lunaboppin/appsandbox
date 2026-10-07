@@ -62,7 +62,6 @@ typedef struct {
     const wchar_t *net_adapter;    /* for external mode, or NULL for auto */
     const wchar_t *username;
     const wchar_t *password;
-    BOOL   test_mode;              /* TRUE = disable Secure Boot (test-signed drivers) */
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */

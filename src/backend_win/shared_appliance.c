@@ -692,7 +692,7 @@ static HRESULT build_server_core_os(const SharedApplianceConfig *config)
 
     swprintf_s(file_path, _countof(file_path), L"%s\\unattend.xml", staging);
     if (!generate_unattend_vhdx(file_path, APPLIANCE_VM_NAME, config->admin_user,
-                                config->admin_password, FALSE, L"en-US"))
+                                config->admin_password, L"en-US"))
         return E_FAIL;
     swprintf_s(file_path, _countof(file_path), L"%s\\setup.cmd", staging);
     generate_vhdx_setup_cmd(file_path);
@@ -821,7 +821,6 @@ static void fill_vm_config(VmConfig *config, BOOL provisioning)
     config->gpu_mode = GPU_NONE;
     config->network_mode = NET_NONE;
     config->is_appliance = TRUE;
-    config->test_mode = g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU;
     if (provisioning && GetFileAttributesW(g_appliance.seed_iso_path) != INVALID_FILE_ATTRIBUTES) {
         if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE)
             wcscpy_s(config->image_path, MAX_PATH, g_appliance.windows_iso_path);

@@ -42,7 +42,6 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               wchar_t *admin_pass,
                               const wchar_t *res_dir,
                               BOOL is_template,
-                              BOOL test_mode,
                               BOOL ssh_enabled,
                               const wchar_t *lang);
 
@@ -84,15 +83,13 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *vm_name,
                              const wchar_t *admin_user,
                              const wchar_t *admin_pass,
-                             BOOL test_mode,
                              const wchar_t *lang);
 
 /* Generate unattend.xml for VHDX-first *template* boot.
    Boots into audit mode, runs sysprep /generalize /oobe /shutdown /mode:vm.
    No user account or password needed. */
 BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
-                                      const wchar_t *vm_name,
-                                      BOOL test_mode);
+                                      const wchar_t *vm_name);
 
 /* Generate setup.cmd for VHDX-first boot (agent already on disk). */
 BOOL generate_vhdx_setup_cmd(const wchar_t *output_path);
