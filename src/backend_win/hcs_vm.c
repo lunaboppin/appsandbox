@@ -992,24 +992,22 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     /* Secure Boot — uses ApplySecureBootTemplate + SecureBootTemplateId
        inside the Uefi section. No BootThis — UEFI auto-discovers boot devices.
-       Skip when test_mode is enabled (required for test-signed drivers like VDD).
        Linux: never applies a template — the direct-ISO->VHDX build produces an
        unsigned GRUB/kernel chain, so Secure Boot would block boot. Only the
-       Windows, non-test-mode path applies the MS UEFI CA template below.
+       Windows path applies the MS UEFI CA template below.
        The appliance skips it too: its Server Core image gains nothing from
        Secure Boot, and applying the template into a fresh vm.gs under
        GuestStateOnly was observed to break DVD boot ("SCSI DVD boot loader
        failed") with older Server ISOs. */
     secureboot_section[0] = L'\0';
-    if (config->test_mode || config->is_appliance) {
-        /* No Secure Boot — allows test-signed drivers / older boot chains */
-    } else if (is_windows) {
+    if (!is_windows || config->is_appliance) {
+        /* No Secure Boot section at all. Unsigned boot chains and the
+           appliance's fresh vm.gs both depend on the template being absent
+           rather than merely skipped. */
+    } else {
         wcscpy_s(secureboot_section, 512,
             L",\"ApplySecureBootTemplate\":\"Apply\""
             L",\"SecureBootTemplateId\":\"1734c6e8-3154-4dda-ba5f-a874cc483422\"");
-    } else {
-        wcscpy_s(secureboot_section, 512,
-            L",\"ApplySecureBootTemplate\":\"Skip\"");
     }
 
     /* VMGS + VMRS files — always created regardless of TPM/SecureBoot.
@@ -1380,7 +1378,6 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         instance->network_mode = config->network_mode;
         instance->is_template = config->is_template;
         instance->is_appliance = config->is_appliance;
-        instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
@@ -1501,7 +1498,6 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
         instance->network_mode = config->network_mode;
         instance->is_template = config->is_template;
         instance->is_appliance = config->is_appliance;
-        instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));

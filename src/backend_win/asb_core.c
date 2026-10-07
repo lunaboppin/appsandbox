@@ -545,8 +545,6 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"NatIp=%S\n", g_vms[i].nat_ip);
         if (g_vms[i].is_template)
             fwprintf(f, L"IsTemplate=1\n");
-        if (g_vms[i].test_mode)
-            fwprintf(f, L"TestMode=1\n");
         if (g_vms[i].admin_user[0])
             fwprintf(f, L"AdminUser=%s\n", g_vms[i].admin_user);
         if (g_vms[i].ssh_enabled)
@@ -675,8 +673,6 @@ static void load_vm_list(void)
             WideCharToMultiByte(CP_UTF8, 0, line + 6, -1, vm->nat_ip, sizeof(vm->nat_ip), NULL, NULL);
         else if (wcsncmp(line, L"IsTemplate=", 11) == 0)
             vm->is_template = (_wtoi(line + 11) != 0);
-        else if (wcsncmp(line, L"TestMode=", 9) == 0)
-            vm->test_mode = (_wtoi(line + 9) != 0);
         else if (wcsncmp(line, L"AdminUser=", 10) == 0)
             wcscpy_s(vm->admin_user, 128, line + 10);
         else if (wcsncmp(line, L"SshEnabled=", 11) == 0)
@@ -1516,14 +1512,14 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
     /* Generate unattend.xml */
     swprintf_s(file_path, MAX_PATH, L"%s\\unattend.xml", staging);
     if (args->config.is_template) {
-        if (!generate_unattend_vhdx_template(file_path, args->config.name, args->config.test_mode)) {
+        if (!generate_unattend_vhdx_template(file_path, args->config.name)) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, 512, L"Failed to generate template unattend.xml");
             goto done;
         }
     } else {
         if (!generate_unattend_vhdx(file_path, args->config.name, args->config.admin_user,
-                                     args->config.admin_pass, args->config.test_mode, L"en-US")) {
+                                     args->config.admin_pass, L"en-US")) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, 512, L"Failed to generate unattend.xml");
             goto done;
@@ -1639,7 +1635,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                 swprintf_s(unattend_path, MAX_PATH, L"%s\\unattend.xml", stg);
                                 generate_unattend_vhdx(unattend_path, args->config.name,
                                                         args->config.admin_user, args->config.admin_pass,
-                                                        args->config.test_mode, args->language);
+                                                        args->language);
                             }
                         } else if (strncmp(line, "DONE:", 5) == 0) {
                             args->result = S_OK;
@@ -3161,7 +3157,6 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     cfg.cpu_cores = config->cpu_cores;
     cfg.gpu_mode = config->gpu_mode;
     cfg.network_mode = config->network_mode;
-    cfg.test_mode = config->test_mode;
     cfg.ssh_enabled = config->ssh_enabled;
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
        stores the public key on the instance (the agent deploys it at runtime). */
@@ -3177,14 +3172,6 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
     if (cfg.cpu_cores == 0) cfg.cpu_cores = 4;
-
-    /* Linux defaults: respect the UI's gpu_mode (GPU-PV works via
-       DKMS-built dxgkrnl + asb_drm). Force test_mode=TRUE so the
-       unsigned out-of-tree .ko's load — Secure Boot would otherwise
-       reject them, and we don't ship a MOK enrollment flow. */
-    if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
-        cfg.test_mode = TRUE;
-    }
 
     /* Resolve template */
     if (config->template_name && config->template_name[0] != L'\0') {
@@ -3353,7 +3340,6 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
             inst->is_template = is_template_create;
-            inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
@@ -3428,7 +3414,6 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
             inst->is_template = FALSE;
-            inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
@@ -3512,7 +3497,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
         if (is_template_create) {
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                           res_dir_buf, TRUE, cfg.test_mode, cfg.ssh_enabled, L"en-US");
+                                           res_dir_buf, TRUE, cfg.ssh_enabled, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
             }
@@ -3532,7 +3517,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0' &&
                 cfg.admin_pass[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                           res_dir_buf, FALSE, cfg.test_mode, cfg.ssh_enabled, L"en-US");
+                                           res_dir_buf, FALSE, cfg.ssh_enabled, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }
@@ -3746,7 +3731,6 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         args->config.cpu_cores = inst->cpu_cores;
         args->config.gpu_mode = inst->gpu_mode;
         args->config.network_mode = inst->network_mode;
-        args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);

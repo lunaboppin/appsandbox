@@ -107,7 +107,7 @@ static const char *input_locale(const char *lang) {
 }
 
 int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
-                           const char *arch, int test_mode, int is_arm64, const char *lang) {
+                           const char *arch, int is_arm64, const char *lang) {
     if (!f) return -1;
     char comp[64];   /* up to 15 code points (NetBIOS), each <=4 UTF-8 bytes, + NUL */
     {
@@ -161,13 +161,6 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
             "                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
             "                </RunSynchronousCommand>\n", order, order + 1);
         order += 2;
-        if (test_mode) {
-            fprintf(f,
-                "                <RunSynchronousCommand wcm:action=\"add\">\n"
-                "                    <Order>%d</Order>\n"
-                "                    <Path>bcdedit /set testsigning on</Path>\n"
-                "                </RunSynchronousCommand>\n", order++);
-        }
         if (is_arm64) {
             static const char *const keys[] = {
                 "BypassTPMCheck", "BypassSecureBootCheck", "BypassRAMCheck",

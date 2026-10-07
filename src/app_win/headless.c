@@ -831,7 +831,6 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_int(body, L"cpuCores", &iv)) cfg.cpu_cores = (DWORD)iv;
             if (json_get_int(body, L"gpuMode", &iv)) cfg.gpu_mode = iv;
             if (json_get_int(body, L"networkMode", &iv)) cfg.network_mode = iv;
-            if (json_get_bool(body, L"testMode", &bv)) cfg.test_mode = bv;
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
             if (json_get_bool(body, L"isTemplate", &bv)) cfg.is_template = bv;

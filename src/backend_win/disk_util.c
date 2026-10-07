@@ -347,7 +347,6 @@ static BOOL generate_autounattend(const wchar_t *output_path,
                                    const wchar_t *admin_user,
                                    const wchar_t *b64_password,
                                    BOOL is_template,
-                                   BOOL test_mode,
                                    const wchar_t *lang,
                                    const wchar_t *image_name,
                                    const wchar_t *product_key)
@@ -457,13 +456,6 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
             L"                </RunSynchronousCommand>\n", order, order + 1);
         order += 2;
-        if (test_mode) {
-            fwprintf(f,
-                L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-                L"                    <Order>%d</Order>\n"
-                L"                    <Path>bcdedit /set testsigning on</Path>\n"
-                L"                </RunSynchronousCommand>\n", order++);
-        }
         fwprintf(f,
             L"                <RunSynchronousCommand wcm:action=\"add\">\n"
             L"                    <Order>%d</Order>\n"
@@ -747,7 +739,6 @@ static HRESULT iso_create_resources_ex(const wchar_t *iso_path,
                                         wchar_t *admin_pass,
                                         const wchar_t *res_dir,
                                         BOOL is_template,
-                                        BOOL test_mode,
                                         BOOL ssh_enabled,
                                         const wchar_t *lang,
                                         const wchar_t *image_name,
@@ -787,7 +778,7 @@ static HRESULT iso_create_resources_ex(const wchar_t *iso_path,
     /* autounattend.xml */
     swprintf_s(file_path, MAX_PATH, L"%s\\autounattend.xml", staging);
     if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass,
-                               is_template, test_mode, lang,
+                               is_template, lang,
                                image_name, product_key))
         ui_log(L"Warning: failed to write autounattend.xml");
 
@@ -1411,12 +1402,11 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               wchar_t *admin_pass,
                               const wchar_t *res_dir,
                               BOOL is_template,
-                              BOOL test_mode,
                               BOOL ssh_enabled,
                               const wchar_t *lang)
 {
     return iso_create_resources_ex(iso_path, vm_name, admin_user, admin_pass,
-        res_dir, is_template, test_mode, ssh_enabled, lang,
+        res_dir, is_template, ssh_enabled, lang,
         L"Windows 11 Pro", NULL);
 }
 
@@ -1429,7 +1419,7 @@ HRESULT iso_create_server_core_resources(const wchar_t *iso_path,
                                          const wchar_t *product_key)
 {
     return iso_create_resources_ex(iso_path, vm_name, admin_user, admin_password,
-        res_dir, FALSE, FALSE, TRUE, L"en-US", image_name, product_key);
+        res_dir, FALSE, TRUE, L"en-US", image_name, product_key);
 }
 
 static BOOL copy_appliance_source(const wchar_t *staging, const wchar_t *res_dir,
@@ -1633,7 +1623,6 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *vm_name,
                              const wchar_t *admin_user,
                              const wchar_t *admin_pass,
-                             BOOL test_mode,
                              const wchar_t *lang)
 {
     FILE *f;
@@ -1665,7 +1654,7 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
 
     rc = asb_provision_unattend(f, vm_u, user_u, pass_u,
                                 ASB_IS_ARM64 ? "arm64" : "amd64",
-                                test_mode ? 1 : 0, ASB_IS_ARM64, lang_u);
+                                ASB_IS_ARM64, lang_u);
 
     fclose(f);
     SecureZeroMemory(pass_u, sizeof pass_u);
@@ -1699,8 +1688,7 @@ static void sanitize_computer_name_w(wchar_t *name, size_t cap)
 }
 
 BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
-                                      const wchar_t *vm_name,
-                                      BOOL test_mode)
+                                      const wchar_t *vm_name)
 {
     FILE *f;
     wchar_t comp_name[16];
@@ -1750,13 +1738,6 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
             L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
             L"                </RunSynchronousCommand>\n", order, order + 1);
         order += 2;
-        if (test_mode) {
-            fwprintf(f,
-                L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-                L"                    <Order>%d</Order>\n"
-                L"                    <Path>bcdedit /set testsigning on</Path>\n"
-                L"                </RunSynchronousCommand>\n", order++);
-        }
 #if ASB_IS_ARM64
         write_tpm_bypass_commands(f, order);
 #endif

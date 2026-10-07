@@ -70,7 +70,7 @@ var hostBridge = (function() {
 function sendCmd(action, data) { hostBridge.send(action, data); }
 
 /* On a macOS host, hide the Windows-*host*-only features (templates, snapshots,
- * test-mode, build-template — none supported when the host is a Mac) and the
+ * build-template — none supported when the host is a Mac) and the
  * dormant Linux-version row. The OS-type dropdown stays ENABLED so the user can
  * pick Windows (built from a Microsoft ISO via QEMU) or macOS (VZ restore image).
  * Per-OS field visibility — including the .needs-iso picker — is driven by
@@ -105,15 +105,11 @@ function applyOsTypeUI() {
     var isLinux = osType === 'Linux';
     var winOnly = document.querySelectorAll('.win-only');
     var needsIso = document.querySelectorAll('.needs-iso');
-    var needsWindows = document.querySelectorAll('.needs-windows');
     var needsLinuxVersion = document.querySelectorAll('.needs-linux-version');
     /* .win-only = template/snapshot features that exist only on a Windows *host*;
        never shown on a Mac host, even for a Windows guest. */
     for (var i = 0; i < winOnly.length; i++)
         winOnly[i].style.display = (!hostBridge.isMac && isWindows) ? '' : 'none';
-    /* .needs-windows = Windows-*guest* options (Test Mode); shown for a Windows
-       guest on EITHER host (a Windows-on-Mac VM uses it too), hidden otherwise. */
-    for (var w = 0; w < needsWindows.length; w++) needsWindows[w].style.display = isWindows ? '' : 'none';
     /* ISO picker shows for both Windows and Linux now. */
     for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
     /* Linux distribution dropdown is dormant — kept in the DOM but always
@@ -475,7 +471,6 @@ function gatherConfig() {
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
-        testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked
     };
@@ -617,7 +612,6 @@ function openCreateModal() {
     document.getElementById('admin-user').value = 'user';
     document.getElementById('admin-pass').value = 'test123';
     document.getElementById('admin-confirm').value = 'test123';
-    document.getElementById('test-mode').checked = false;
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
