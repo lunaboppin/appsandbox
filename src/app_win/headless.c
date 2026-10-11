@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <share.h>
 #include <wctype.h>
 
 #include "headless.h"
@@ -184,19 +185,21 @@ static void open_log(void)
     CreateDirectoryW(dir, NULL);
     programdata_path(path, MAX_PATH, L"headless.log");
     InitializeCriticalSection(&g_log_cs);
-    _wfopen_s(&g_log, path, L"w, ccs=UTF-8");
+    g_log = _wfsopen(path, L"w, ccs=UTF-8", _SH_DENYWR);
 }
 
 /* ---- Bootstrap thread (init + park) ---- */
 
 static volatile LONG g_init_done = 0;
+static HRESULT g_init_result = E_PENDING;
 
 static DWORD WINAPI bootstrap_thread(LPVOID p)
 {
     (void)p;
-    asb_init();
-    asb_reconnect_running();
+    g_init_result = asb_init();
+    if (SUCCEEDED(g_init_result)) asb_reconnect_running();
     InterlockedExchange(&g_init_done, 1);
+    if (FAILED(g_init_result)) return 1;
     for (;;) Sleep(60000);   /* park; never exit */
 }
 
@@ -628,6 +631,14 @@ static int handle_request(PHTTP_REQUEST req)
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
             "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
+        /* Additive diagnostic field lets destructive test harnesses verify
+           they reached the isolated daemon, not a normal user installation. */
+        if (asb_test_namespace()[0]) {
+            pos = (int)strlen(buf) - 1;
+            pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",\"testNamespace\":");
+            pos = append_wstr(buf, sizeof(buf), pos, asb_test_namespace());
+            sprintf_s(buf + pos, sizeof(buf) - pos, "}");
+        }
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
     }
@@ -1422,6 +1433,13 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     bt = CreateThread(NULL, 0, bootstrap_thread, NULL, 0, NULL);
     if (!bt) { hlog(L"FATAL: bootstrap thread failed."); return 1; }
     while (!g_init_done) Sleep(25);
+    if (FAILED(g_init_result)) {
+        hlog(L"FATAL: core initialization rejected the configuration (0x%08X).", g_init_result);
+        CloseHandle(bt);
+        CloseHandle(mtx);
+        if (g_log) { fclose(g_log); g_log = NULL; }
+        return 1;
+    }
     hlog(L"core initialized + reconnected (%d VMs).", asb_vm_count());
 
     gen_token();

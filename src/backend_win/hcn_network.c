@@ -89,25 +89,43 @@ BOOL hcn_init(void)
 }
 
 /* Fixed GUIDs for AppSandbox networks so we can clean up across runs */
-static const GUID APPSANDBOX_NAT_GUID = {
+static GUID APPSANDBOX_NAT_GUID = {
     0xA5B01234, 0x5678, 0x9ABC,
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }
 };
 
-static const GUID APPSANDBOX_INTERNAL_GUID = {
+static GUID APPSANDBOX_INTERNAL_GUID = {
     0xA5B01234, 0x5678, 0x9ABC,
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x77 }
 };
 
-static const GUID APPSANDBOX_EXTERNAL_GUID = {
+static GUID APPSANDBOX_EXTERNAL_GUID = {
     0xA5B01234, 0x5678, 0x9ABC,
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x88 }
 };
 
-static const GUID APPSANDBOX_SHARE_GUID = {
+static GUID APPSANDBOX_SHARE_GUID = {
     0xA5B01234, 0x5678, 0x9ABC,
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x99 }
 };
+
+static wchar_t g_network_suffix[48];
+
+void hcn_set_test_namespace(const GUID *id)
+{
+    wchar_t text[40];
+    if (!id || g_hcn_dll) return;
+    APPSANDBOX_NAT_GUID = *id;
+    APPSANDBOX_INTERNAL_GUID = *id;
+    APPSANDBOX_EXTERNAL_GUID = *id;
+    APPSANDBOX_SHARE_GUID = *id;
+    APPSANDBOX_NAT_GUID.Data1 ^= 1;
+    APPSANDBOX_INTERNAL_GUID.Data1 ^= 2;
+    APPSANDBOX_EXTERNAL_GUID.Data1 ^= 3;
+    APPSANDBOX_SHARE_GUID.Data1 ^= 4;
+    StringFromGUID2(id, text, _countof(text));
+    swprintf_s(g_network_suffix, _countof(g_network_suffix), L"-%s", text);
+}
 
 /* Find the adapter that carries the default route (0.0.0.0/0). */
 /* Find a physical adapter that is UP, has a default gateway, and isn't virtual.
@@ -389,11 +407,11 @@ HRESULT hcn_create_share_network(GUID *network_id)
     pick_share_base_once();
     swprintf_s(settings, _countof(settings),
         L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-        L"\"Name\":\"AppSandboxSharedResources\",\"Type\":\"NAT\","
+        L"\"Name\":\"AppSandboxSharedResources%s\",\"Type\":\"NAT\","
         L"\"Ipams\":[{\"Type\":\"Static\",\"Subnets\":[{"
         L"\"IpAddressPrefix\":\"%S.0/24\","
         L"\"Routes\":[{\"NextHop\":\"%S.1\",\"DestinationPrefix\":\"0.0.0.0/0\"}]"
-        L"}]}]}", g_share_base, g_share_base);
+        L"}]}]}", g_network_suffix, g_share_base, g_share_base);
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN shared network error: %s", error_record);
@@ -425,7 +443,7 @@ HRESULT hcn_create_nat_network(GUID *network_id)
     swprintf_s(settings, 1024,
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-        L"\"Name\":\"AppSandboxNAT\","
+        L"\"Name\":\"AppSandboxNAT%s\","
         L"\"Type\":\"NAT\","
         L"\"Ipams\":[{"
             L"\"Type\":\"Static\","
@@ -435,7 +453,7 @@ HRESULT hcn_create_nat_network(GUID *network_id)
             L"}]"
         L"}]"
         L"}",
-        g_nat_base, g_nat_base);
+        g_network_suffix, g_nat_base, g_nat_base);
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
 
@@ -467,9 +485,9 @@ HRESULT hcn_create_internal_network(GUID *network_id)
     swprintf_s(settings, 1024,
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-        L"\"Name\":\"AppSandboxInternal\","
+        L"\"Name\":\"AppSandboxInternal%s\","
         L"\"Type\":\"ICS\""
-        L"}");
+        L"}", g_network_suffix);
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
 
@@ -512,10 +530,10 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
     swprintf_s(settings, 2048,
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-        L"\"Name\":\"AppSandboxExternal\","
+        L"\"Name\":\"AppSandboxExternal%s\","
         L"\"Type\":\"Transparent\","
         L"\"Policies\":[{\"Type\":\"NetAdapterName\",\"Settings\":{\"NetworkAdapterName\":\"%s\"}}]"
-        L"}", adapter);
+        L"}", g_network_suffix, adapter);
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
 

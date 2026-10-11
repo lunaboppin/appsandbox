@@ -1,4 +1,17 @@
 <Project>
+  <!-- Optional workspace-local SDK/WDK. See build/restore-wdk.ps1.
+       Installed kits remain the default unless explicitly selected. -->
+  <PropertyGroup>
+    <AsbWdkPackageVersion>10.0.28000.2526</AsbWdkPackageVersion>
+    <AsbSdkPackageVersion>10.0.28000.1721</AsbSdkPackageVersion>
+    <AsbPackagesRoot>$(MSBuildThisFileDirectory)packages\</AsbPackagesRoot>
+  </PropertyGroup>
+  <Import Project="$(AsbPackagesRoot)Microsoft.Windows.WDK.$(Platform).$(AsbWdkPackageVersion)\build\native\Microsoft.Windows.WDK.$(Platform).props"
+          Condition="'$(AsbUseLocalWdk)' == 'true'" />
+  <Import Project="$(AsbPackagesRoot)Microsoft.Windows.SDK.CPP.$(Platform).$(AsbSdkPackageVersion)\build\native\Microsoft.Windows.SDK.CPP.$(Platform).props"
+          Condition="'$(AsbUseLocalWdk)' == 'true'" />
+  <Import Project="$(AsbPackagesRoot)Microsoft.Windows.SDK.CPP.$(AsbSdkPackageVersion)\build\native\Microsoft.Windows.SDK.CPP.props"
+          Condition="'$(AsbUseLocalWdk)' == 'true'" />
   <!--
     SINGLE SOURCE OF TRUTH for the App Sandbox version.
 
@@ -14,7 +27,7 @@
   <PropertyGroup>
     <AsbVersionMajor>0</AsbVersionMajor>
     <AsbVersionMinor>1</AsbVersionMinor>
-    <AsbVersionPatch>4</AsbVersionPatch>
+    <AsbVersionPatch>6</AsbVersionPatch>
     <AsbVersionRevision>0</AsbVersionRevision>
 
     <!-- Derived forms - do not edit. -->

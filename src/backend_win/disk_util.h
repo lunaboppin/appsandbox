@@ -63,7 +63,9 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
                                         const wchar_t *smb_user,
                                         const wchar_t *smb_password,
                                         const wchar_t *ssh_public_key,
-                                        const wchar_t *res_dir);
+                                        const wchar_t *res_dir,
+                                        const char *nat_mac, const char *nat_base,
+                                        const char *share_mac, const char *share_ip);
 HRESULT iso_create_server_core_resources(const wchar_t *iso_path,
                                          const wchar_t *vm_name,
                                          const wchar_t *admin_user,

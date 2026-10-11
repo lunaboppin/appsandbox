@@ -26,11 +26,13 @@
 #include <dxgi.h>
 #include <d3dcompiler.h>
 #pragma warning(pop)
+#include <dwmapi.h>
 
 #include <stdio.h>
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "asb_core.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
@@ -94,6 +96,18 @@ typedef struct AudioFrameHeader {
 } AudioFrameHeader;
 #pragma pack(pop)
 
+/* Guest -> host control frames share the frame stream: a frame header with
+   AUDIO_CTRL_FLAG set carries flags instead of a PCM length (real frames
+   are capped at 4 MiB, far below the flag bit). */
+#define AUDIO_CTRL_FLAG           0x80000000u
+#define AUDIO_CTRL_MIC_WANTED     0x00000001u  /* a guest app is recording */
+#define AUDIO_CTRL_NO_MIC_SINK    0x00000002u  /* guest has no VB-CABLE */
+#define AUDIO_CTRL_NO_SPEAKER     0x00000004u  /* guest has no playback device */
+
+/* Host -> guest microphone stream on the same socket: one MicHeader (same
+   layout as AudioHeader) per capture start, then AudioFrameHeader + PCM. */
+#define MIC_HEADER_MAGIC          0x314D5341u  /* 'ASM1' */
+
 /* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
 
@@ -103,7 +117,9 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+/* Largest frame the guest may send (7680x4320 BGRA); the receive buffer
+   grows on demand up to this. */
+#define MAX_FRAME_DATA_SIZE (7680u * 4320u * 4u)
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -112,13 +128,23 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_MOUSE_RELATIVE 4
+#define INPUT_DISPLAY_REFRESH 5   /* p1 = host monitor Hz, p3 = display index */
+#define INPUT_DISPLAY_COUNT   6   /* p1 = number of guest monitors (1 or 2) */
+#define INPUT_DISPLAY_RESIZE  7   /* p1 = width, p2 = height, p3 = display index */
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
 #define INPUT_BTN_MIDDLE    2
+#define INPUT_BTN_X1        3
+#define INPUT_BTN_X2        4
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
+#define INPUT_READY_VHID    0x44494856  /* "VHID" little-endian */
+/* Newer guest helpers: same capabilities plus normalized (0..65535) absolute moves. */
+#define INPUT_READY_MAGIC2  0x32445249  /* "IRD2" */
+#define INPUT_READY_VHID2   0x32444856  /* "VHD2" */
 
 #pragma pack(push, 1)
 typedef struct InputPacket {
@@ -135,12 +161,20 @@ typedef struct InputPacket {
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
+#define WM_IDD_INPUT_CAPS       (WM_USER + 102)
+#define WM_IDD_CURSOR_POS       (WM_USER + 103)
+#define WM_IDD_BADGE_MENU       (WM_USER + 104)
+#define WM_IDD_DISPLAY_COUNT    (WM_USER + 105)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
 #define IDT_INPUT       2002
+#define IDT_RESIZE      2003   /* debounce: resize guest after the window settles */
+#define RESIZE_SETTLE_MS 350
 #define MOUSE_MOVE_MIN_INTERVAL_MS 8
+#define IMMERSIVE_MOUSE_MIN_INTERVAL_MS 2
+#define IDH_IMMERSIVE_INPUT  1
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -204,6 +238,10 @@ typedef struct CursorHeader {
 
 struct VmDisplayIdd {
     VmInstance  *vm;
+    UINT         display_index;   /* 0 or 1; maps to HvSocket channel 2 or 8 */
+    BOOL         auxiliary;       /* display 2: frames only, shares primary I/O */
+    struct VmDisplayIdd *primary;
+    struct VmDisplayIdd *secondary;
     wchar_t      vm_name[256];     /* copy of vm->name for safe logging after VM teardown */
     GUID         runtime_id;       /* copy of vm->runtime_id for safe HvSocket after teardown */
     wchar_t      os_type[32];      /* copy of vm->os_type for picking the service GUID variant */
@@ -219,6 +257,7 @@ struct VmDisplayIdd {
     IDXGISwapChain          *swap_chain;
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
+    UINT                     tex_width, tex_height;  /* frame_tex size */
     ID3D11ShaderResourceView *frame_srv;
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
@@ -231,12 +270,15 @@ struct VmDisplayIdd {
     UINT           frame_stride;
     CRITICAL_SECTION frame_cs;
     volatile BOOL  frame_dirty;
+    volatile LONG  frame_ready_posted; /* coalesce receive-thread UI messages */
+    volatile BOOL  has_frame;     /* display 2 stays hidden until first frame */
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
+    CRITICAL_SECTION input_send_cs; /* Display 1 + 2 share one packet stream */
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
     BOOL           pending_mouse;   /* latest move waiting for the rate-limit timer */
@@ -244,6 +286,26 @@ struct VmDisplayIdd {
     UINT           pending_mouse_y;
     DWORD          last_mouse_move_tick;
     BOOL           have_last_mouse_move_tick;
+    volatile BOOL  input_vhid_ready; /* helper has a real virtual HID mouse */
+    volatile BOOL  input_normalized; /* helper takes 0..65535 absolute moves (newer guests) */
+    BOOL           immersive_input; /* raw host mouse -> guest virtual HID */
+    BOOL           immersive_resume; /* paused by focus loss; re-capture on return */
+    UINT           sent_refresh_hz;  /* host monitor rate last sent to the guest */
+    UINT           sent_width, sent_height; /* guest resolution last requested */
+    int            display_count;    /* primary only: 1 or 2 guest monitors */
+    BOOL           fullscreen;       /* borderless on the current monitor */
+    WINDOWPLACEMENT fs_placement;    /* windowed placement to restore */
+    HWND           immersive_badge;  /* Parsec-style icon: drag to move, click for menu */
+    int            badge_fx, badge_fy; /* position in 1/1000 of the picture; -1 = default */
+    BOOL           badge_hover;
+    BOOL           badge_pressing;   /* left button went down on the badge */
+    BOOL           badge_dragged;    /* ...and moved far enough to be a drag */
+    POINT          badge_grab;       /* cursor offset inside the badge */
+    POINT          badge_press;      /* screen point of the press */
+    volatile LONG  pending_relative_x;
+    volatile LONG  pending_relative_y;
+    DWORD          last_relative_tick;
+    BOOL           have_last_relative_tick;
 
     /* Keyboard hotkey handling */
     wchar_t        vhdx_path[MAX_PATH]; /* copy of vm->vhdx_path for settings file */
@@ -261,6 +323,10 @@ struct VmDisplayIdd {
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
     UINT32         cursor_shape_id; /* tracks which shape is current */
     BOOL           cursor_visible;  /* guest cursor visibility */
+    volatile LONG  cursor_x;        /* guest pointer hotspot, display pixels */
+    volatile LONG  cursor_y;
+    UINT32         cursor_xhot;     /* hotspot of the current shape */
+    UINT32         cursor_yhot;
 
     /* Debug log window (separate top-level window) */
     HWND           log_hwnd;        /* top-level log window */
@@ -274,6 +340,8 @@ struct VmDisplayIdd {
     volatile SOCKET  audio_socket;
     HANDLE           audio_recv_thread;
     volatile BOOL    audio_muted;
+    HANDLE           mic_thread;      /* host capture -> guest, while wanted */
+    volatile LONG    mic_stop;
 
     /* Threads */
     HANDLE         recv_thread;
@@ -296,6 +364,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_IMMERSIVE_INPUT 0x1030
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -406,6 +475,7 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     case WM_LBUTTONDOWN: case WM_LBUTTONUP:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
     case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
     case WM_MOUSEWHEEL:
     case WM_MOUSELEAVE:
     case WM_KEYDOWN: case WM_KEYUP:
@@ -491,56 +561,506 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
 /* ---- Send input packet to guest ---- */
 
 static UINT g_input_send_count = 0;
+/* Cross-window ownership is a HWND, never a borrowed display-state pointer. */
+static HWND volatile g_immersive_hwnd;
+
+static VmDisplayIdd *idd_input_owner(VmDisplayIdd *d)
+{
+    return d && d->primary ? d->primary : d;
+}
+
+static BOOL idd_virtual_hid_ready(VmDisplayIdd *d)
+{
+    VmDisplayIdd *owner = idd_input_owner(d);
+    return owner && owner->input_vhid_ready;
+}
+
+/* Immersive mode needs only a connected input channel. With the guest's
+   virtual HID mouse (test-signed kernel driver: Secure Boot guests cannot
+   load it) motion goes through that device; otherwise the guest helper
+   injects the same relative motion with SendInput, which Raw Input readers
+   such as games still receive. */
+static BOOL idd_immersive_available(VmDisplayIdd *d)
+{
+    VmDisplayIdd *owner = idd_input_owner(d);
+    return owner && owner->input_socket != INVALID_SOCKET;
+}
 
 static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
     InputPacket pkt;
+    VmDisplayIdd *owner;
     SOCKET s;
     int ret;
+    int err = 0;
 
-    s = d->input_socket;
-    if (s == INVALID_SOCKET) return;
-
+    owner = idd_input_owner(d);
+    if (!owner) return;
     pkt.magic  = INPUT_MAGIC;
     pkt.type   = type;
     pkt.param1 = p1;
     pkt.param2 = p2;
     pkt.param3 = p3;
 
-    /* Non-blocking send — drop packet if buffer full rather than stall the UI */
-    ret = send(s, (const char *)&pkt, (int)sizeof(pkt), 0);
-    if (ret == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK) {
-            /* Send buffer full: drop this packet (as the comment intends)
-               without tearing down the socket. */
-            return;
-        }
-        idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
-        /* Mark dead — recv thread owns the socket and will close + reconnect */
-        d->input_socket = INVALID_SOCKET;
+    EnterCriticalSection(&owner->input_send_cs);
+    s = owner->input_socket;
+    if (s == INVALID_SOCKET) {
+        LeaveCriticalSection(&owner->input_send_cs);
         return;
     }
-    if (ret != (int)sizeof(pkt)) {
+    /* A lost key/button-up leaves guest input stuck. Fail the connection on
+       backpressure or a partial send; the helper releases held input on EOF. */
+    ret = send(s, (const char *)&pkt, (int)sizeof(pkt), 0);
+    if (ret == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        /* Mark dead — recv thread owns the socket and will close + reconnect */
+        owner->input_socket = INVALID_SOCKET;
+    } else if (ret != (int)sizeof(pkt)) {
         /* Partial send on a stream socket: the guest reads fixed-size 20-byte
            InputPackets, so a truncated packet permanently misaligns the wire.
            Flag for reconnect so the channel resynchronises. */
+        owner->input_socket = INVALID_SOCKET;
+    }
+    if (owner->input_socket == INVALID_SOCKET) shutdown(s, SD_BOTH);
+    LeaveCriticalSection(&owner->input_send_cs);
+    if (ret == SOCKET_ERROR) {
+        idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
+        return;
+    }
+    if (ret != (int)sizeof(pkt)) {
         idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
                 ret, (int)sizeof(pkt));
-        d->input_socket = INVALID_SOCKET;
         return;
     }
 
     g_input_send_count++;
 
     /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
+    if (type != INPUT_MOUSE_MOVE && type != INPUT_MOUSE_RELATIVE) {
         static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
+            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY", L"MOUSE_REL",
+            L"DISPLAY_HZ", L"DISPLAY_COUNT", L"DISPLAY_RESIZE"
         };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
+        const wchar_t *name = type < _countof(type_names) ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
+}
+
+static void flush_pending_relative_mouse(VmDisplayIdd *d)
+{
+    DWORD now;
+    LONG dx, dy;
+    if (!d || !d->immersive_input) return;
+    now = GetTickCount();
+    if (d->have_last_relative_tick &&
+        (DWORD)(now - d->last_relative_tick) < IMMERSIVE_MOUSE_MIN_INTERVAL_MS)
+        return;
+    dx = InterlockedExchange(&d->pending_relative_x, 0);
+    dy = InterlockedExchange(&d->pending_relative_y, 0);
+    if (!dx && !dy) return;
+    send_input(d, INPUT_MOUSE_RELATIVE, (UINT32)dx, (UINT32)dy, 0);
+    d->last_relative_tick = now;
+    d->have_last_relative_tick = TRUE;
+}
+
+static void idd_update_immersive_menu(VmDisplayIdd *d)
+{
+    HMENU menu;
+    if (!d || !d->hwnd) return;
+    menu = GetSystemMenu(d->hwnd, FALSE);
+    if (!menu) return;
+    EnableMenuItem(menu, IDM_IMMERSIVE_INPUT,
+                   MF_BYCOMMAND | (idd_immersive_available(d) ? MF_ENABLED : MF_GRAYED));
+    CheckMenuItem(menu, IDM_IMMERSIVE_INPUT,
+                  MF_BYCOMMAND | (d->immersive_input ? MF_CHECKED : MF_UNCHECKED));
+    DrawMenuBar(d->hwnd);
+}
+
+static void idd_sync_immersive_cursor(VmDisplayIdd *d);
+static void idd_update_immersive_badge(VmDisplayIdd *d);
+static void idd_prefs_save_display_count(const wchar_t *vhdx_path, int count);
+static void idd_prefs_save_badge(const wchar_t *vhdx_path, UINT display_index, int x, int y);
+
+/* Tell the guest the refresh rate of the host monitor this viewer is on so
+   its virtual monitor switches to the closest mode (60-240 Hz). Sent when
+   input connects, after a move/resize, and on display changes; only when
+   the rate actually changed. */
+static void idd_send_host_refresh(VmDisplayIdd *d, BOOL force)
+{
+    MONITORINFOEXW mi;
+    DEVMODEW dm;
+    HMONITOR mon;
+    if (!d || !d->hwnd || !idd_immersive_available(d)) return;
+    mon = MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&mi, sizeof(mi)); mi.cbSize = sizeof(mi);
+    ZeroMemory(&dm, sizeof(dm)); dm.dmSize = sizeof(dm);
+    if (!mon || !GetMonitorInfoW(mon, (MONITORINFO *)&mi) ||
+        !EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1)
+        return;
+    if (!force && dm.dmDisplayFrequency == d->sent_refresh_hz) return;
+    d->sent_refresh_hz = dm.dmDisplayFrequency;
+    send_input(d, INPUT_DISPLAY_REFRESH, dm.dmDisplayFrequency, 0, d->display_index);
+    idd_log(d, L"Host monitor %s runs at %lu Hz; asked guest Display %u to match.",
+            mi.szDevice, dm.dmDisplayFrequency, d->display_index + 1);
+}
+
+/* Guest resolution: 1920x1080, or 2560x1440 once the viewer's picture area is
+   larger than 1080p (snapped large, maximized, full screen). The picture is
+   scaled to the window either way. Both modes always exist in the display
+   driver, so this is an ordinary mode change in the guest. */
+static void idd_request_guest_resize(VmDisplayIdd *d, BOOL force)
+{
+    RECT rc;
+    UINT w, h;
+    if (!d || !d->hwnd || !d->render_hwnd || !idd_immersive_available(d)) return;
+    if (!IsWindowVisible(d->hwnd) || IsIconic(d->hwnd)) return;
+    GetClientRect(d->render_hwnd, &rc);
+    if (rc.right > 1920 || rc.bottom > 1080) { w = 2560; h = 1440; }
+    else { w = 1920; h = 1080; }
+    if (!force && w == d->sent_width && h == d->sent_height) return;
+    d->sent_width = w;
+    d->sent_height = h;
+    send_input(d, INPUT_DISPLAY_RESIZE, w, h, d->display_index);
+    idd_log(d, L"Asked guest Display %u for %ux%u.", d->display_index + 1, w, h);
+}
+/* Borderless full screen on the monitor the window is on; restores the
+   previous windowed placement (Windows snapping keeps working windowed). */
+static void idd_set_fullscreen(VmDisplayIdd *d, BOOL on)
+{
+    if (!d || !d->hwnd || on == d->fullscreen) return;
+    if (on) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof(mi);
+        d->fs_placement.length = sizeof(d->fs_placement);
+        GetWindowPlacement(d->hwnd, &d->fs_placement);
+        if (!GetMonitorInfoW(MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        SetWindowLongPtrW(d->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN);
+        SetWindowPos(d->hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongPtrW(d->hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN);
+        SetWindowPlacement(d->hwnd, &d->fs_placement);
+        SetWindowPos(d->hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    d->fullscreen = on;
+    idd_update_immersive_badge(d);
+}
+
+/* 1 or 2 guest monitors: the guest helper detaches/re-attaches the second
+   virtual monitor, and the second viewer window hides/shows to match.
+   Remembered per VM. */
+static void idd_set_display_count(VmDisplayIdd *d, int count)
+{
+    VmDisplayIdd *owner = idd_input_owner(d);
+    if (!owner) return;
+    owner->display_count = count == 1 ? 1 : 2;
+    idd_prefs_save_display_count(owner->vhdx_path, owner->display_count);
+    send_input(owner, INPUT_DISPLAY_COUNT, (UINT32)owner->display_count, 0, 0);
+    idd_log(owner, L"Guest displays: %d.", owner->display_count);
+    if (owner->secondary && owner->secondary->hwnd)
+        PostMessageW(owner->secondary->hwnd, WM_IDD_DISPLAY_COUNT, 0, 0);
+}
+
+#define IMMERSIVE_BADGE_SIZE 38
+#define IMMERSIVE_BADGE_ICON 24
+#define IMMERSIVE_BADGE_DRAG_PX 4
+
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#define ASB_DWMWCP_ROUND 2
+
+/* Popup menus follow the Windows light/dark setting. uxtheme exports
+   SetPreferredAppMode / AllowDarkModeForWindow / FlushMenuThemes only by
+   ordinal (135 / 133 / 136); they are absent on old builds, so each is
+   optional. */
+static void idd_enable_dark_menus(HWND hwnd)
+{
+    typedef int  (WINAPI *SetPreferredAppModeFn)(int);
+    typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
+    typedef void (WINAPI *FlushMenuThemesFn)(void);
+    static BOOL done;
+    HMODULE ux = GetModuleHandleW(L"uxtheme.dll");
+    if (!ux) ux = LoadLibraryW(L"uxtheme.dll");
+    if (!ux) return;
+    if (!done) {
+        SetPreferredAppModeFn set_mode = (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+        FlushMenuThemesFn flush = (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+        if (set_mode) set_mode(1 /* AllowDark: follow the system setting */);
+        if (flush) flush();
+        done = TRUE;
+    }
+    {
+        AllowDarkModeForWindowFn allow = (AllowDarkModeForWindowFn)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+        if (allow) allow(hwnd, TRUE);
+    }
+}
+
+static void idd_update_immersive_badge(VmDisplayIdd *d);
+static void idd_badge_drag_end(VmDisplayIdd *d);
+static void idd_drag_immersive_badge(VmDisplayIdd *d, POINT cursor);
+
+/* Parsec-style control: the AppSandbox icon floats over the picture (top
+   left by default; position remembered per display). Drag it to move it;
+   click it for the menu (immersive mouse/keyboard, displays, full screen,
+   audio, log). Keyboard capture can send Alt+Tab to the guest and the mouse
+   is clipped in immersive mode, so it is also the always-available way out.
+   An owned popup (not a child) so it draws above the flip-model swap chain;
+   it never activates. In immersive mode legacy mouse messages are off, so
+   its clicks arrive through raw input (WM_INPUT) instead of this proc. */
+static LRESULT CALLBACK idd_badge_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        RECT rc;
+        HDC dc = BeginPaint(hwnd, &ps);
+        HBRUSH bg = CreateSolidBrush(d && (d->badge_hover || d->badge_pressing)
+                                     ? RGB(62, 62, 66) : RGB(32, 32, 34));
+        HICON icon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPSANDBOX),
+                                       IMAGE_ICON, IMMERSIVE_BADGE_ICON, IMMERSIVE_BADGE_ICON, 0);
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, bg);
+        DeleteObject(bg);
+        if (icon) {
+            DrawIconEx(dc, (rc.right - IMMERSIVE_BADGE_ICON) / 2, (rc.bottom - IMMERSIVE_BADGE_ICON) / 2,
+                       icon, IMMERSIVE_BADGE_ICON, IMMERSIVE_BADGE_ICON, 0, NULL, DI_NORMAL);
+            DestroyIcon(icon);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(NULL, IDC_HAND));
+        return TRUE;
+    case WM_LBUTTONDOWN:
+        if (d) {
+            RECT r;
+            SetCapture(hwnd);
+            GetCursorPos(&d->badge_press);
+            GetWindowRect(hwnd, &r);
+            d->badge_grab.x = d->badge_press.x - r.left;
+            d->badge_grab.y = d->badge_press.y - r.top;
+            d->badge_pressing = TRUE;
+            d->badge_dragged = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (d && d->badge_pressing && GetCapture() == hwnd) {
+            POINT pt;
+            GetCursorPos(&pt);
+            idd_drag_immersive_badge(d, pt);
+        } else if (d && !d->badge_hover) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            d->badge_hover = TRUE;
+            TrackMouseEvent(&tme);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (d) { d->badge_hover = FALSE; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    case WM_LBUTTONUP:
+        if (d && d->badge_pressing) {
+            ReleaseCapture();
+            d->badge_pressing = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (d->badge_dragged) idd_badge_drag_end(d);
+            else PostMessageW(d->hwnd, WM_IDD_BADGE_MENU, 0, 0);
+        }
+        return 0;
+    case WM_RBUTTONUP:
+        if (d) PostMessageW(d->hwnd, WM_IDD_BADGE_MENU, 0, 0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Show the badge whenever its display window is visible; keep it inside the
+   picture (stored position is relative, so it survives resizes). */
+static void idd_update_immersive_badge(VmDisplayIdd *d)
+{
+    static BOOL registered;
+    RECT rc;
+    POINT pt;
+    if (!d || !d->hwnd || !d->render_hwnd) return;
+    if (!IsWindowVisible(d->hwnd) || IsIconic(d->hwnd)) {
+        if (d->immersive_badge) ShowWindow(d->immersive_badge, SW_HIDE);
+        return;
+    }
+    if (!d->immersive_badge) {
+        BOOL dark = TRUE;
+        int corner = ASB_DWMWCP_ROUND;
+        COLORREF border = RGB(70, 70, 76);
+        if (!registered) {
+            WNDCLASSEXW wc;
+            ZeroMemory(&wc, sizeof(wc));
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = idd_badge_proc;
+            wc.hInstance = d->hInstance;
+            wc.lpszClassName = L"AppSandboxIddBadge";
+            registered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+        }
+        d->immersive_badge = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"AppSandboxIddBadge", L"AppSandbox",
+            WS_POPUP, 0, 0, IMMERSIVE_BADGE_SIZE, IMMERSIVE_BADGE_SIZE,
+            d->hwnd, NULL, d->hInstance, NULL);
+        if (!d->immersive_badge) return;
+        SetWindowLongPtrW(d->immersive_badge, GWLP_USERDATA, (LONG_PTR)d);
+        /* Windows 11 rounds and shadows it; older builds ignore these. */
+        DwmSetWindowAttribute(d->immersive_badge, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+        DwmSetWindowAttribute(d->immersive_badge, DWMWA_BORDER_COLOR, &border, sizeof(border));
+        DwmSetWindowAttribute(d->immersive_badge, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    }
+    GetClientRect(d->render_hwnd, &rc);
+    pt.x = d->badge_fx >= 0 ? MulDiv(d->badge_fx, rc.right - IMMERSIVE_BADGE_SIZE, 1000) : 10;
+    pt.y = d->badge_fy >= 0 ? MulDiv(d->badge_fy, rc.bottom - IMMERSIVE_BADGE_SIZE, 1000) : 10;
+    if (pt.x > rc.right - IMMERSIVE_BADGE_SIZE) pt.x = rc.right - IMMERSIVE_BADGE_SIZE;
+    if (pt.y > rc.bottom - IMMERSIVE_BADGE_SIZE) pt.y = rc.bottom - IMMERSIVE_BADGE_SIZE;
+    if (pt.x < 0) pt.x = 0;
+    if (pt.y < 0) pt.y = 0;
+    ClientToScreen(d->render_hwnd, &pt);
+    SetWindowPos(d->immersive_badge, HWND_TOP, pt.x, pt.y,
+                 IMMERSIVE_BADGE_SIZE, IMMERSIVE_BADGE_SIZE,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+/* TRUE if the (guest-synced) cursor is over the visible badge. */
+static BOOL idd_cursor_on_immersive_badge(VmDisplayIdd *d)
+{
+    RECT r;
+    POINT pt;
+    return d && d->immersive_badge && IsWindowVisible(d->immersive_badge) &&
+           GetWindowRect(d->immersive_badge, &r) && GetCursorPos(&pt) &&
+           PtInRect(&r, pt);
+}
+
+/* While the left button is held on the badge, it follows the cursor once the
+   cursor has moved past a small threshold (otherwise it is a click). */
+static void idd_drag_immersive_badge(VmDisplayIdd *d, POINT cursor)
+{
+    POINT pos;
+    RECT rc;
+    int span_x, span_y;
+    if (!d->badge_pressing || !d->immersive_badge) return;
+    if (!d->badge_dragged &&
+        abs(cursor.x - d->badge_press.x) <= IMMERSIVE_BADGE_DRAG_PX &&
+        abs(cursor.y - d->badge_press.y) <= IMMERSIVE_BADGE_DRAG_PX)
+        return;
+    d->badge_dragged = TRUE;
+    pos.x = cursor.x - d->badge_grab.x;
+    pos.y = cursor.y - d->badge_grab.y;
+    ScreenToClient(d->render_hwnd, &pos);
+    GetClientRect(d->render_hwnd, &rc);
+    span_x = rc.right - IMMERSIVE_BADGE_SIZE;
+    span_y = rc.bottom - IMMERSIVE_BADGE_SIZE;
+    d->badge_fx = span_x > 0 ? MulDiv(max(0, min(pos.x, span_x)), 1000, span_x) : 0;
+    d->badge_fy = span_y > 0 ? MulDiv(max(0, min(pos.y, span_y)), 1000, span_y) : 0;
+    idd_update_immersive_badge(d);
+}
+
+static void idd_badge_drag_end(VmDisplayIdd *d)
+{
+    idd_prefs_save_badge(d->vhdx_path, d->display_index, d->badge_fx, d->badge_fy);
+}
+/* Window title: VM/display, frame size, receive counter, and the immersive
+   state so the user can tell whether the mouse is captured or paused. */
+static void idd_update_title(VmDisplayIdd *d)
+{
+    wchar_t title[300];
+    if (!d || !d->hwnd) return;
+    swprintf_s(title, _countof(title), L"%s%s Display %u %ux%u recv=%u%s",
+               d->audio_muted ? L"\U0001F507 " : L"",
+               d->vm_name, d->display_index + 1,
+               d->frame_width, d->frame_height, d->recv_count,
+               d->immersive_input ? L" — Immersive (Ctrl+Alt+Shift+I to exit)"
+               : d->immersive_resume ? L" — Immersive paused (click to resume)" : L"");
+    SetWindowTextW(d->hwnd, title);
+}
+
+static void idd_set_immersive_input(VmDisplayIdd *d, BOOL enabled)
+{
+    RAWINPUTDEVICE rid;
+    RECT clip;
+    POINT tl, br;
+    if (!d || d->immersive_input == enabled) return;
+
+    if (enabled) {
+        if (!idd_immersive_available(d) || !d->render_hwnd) {
+            idd_log(d, L"Immersive input requires the guest input channel.");
+            return;
+        }
+        HWND current = (HWND)InterlockedCompareExchangePointer((PVOID volatile *)&g_immersive_hwnd, NULL, NULL);
+        if (current && current != d->hwnd) {
+            DWORD_PTR ignored;
+            SendMessageTimeoutW(current, WM_SYSCOMMAND,
+                                IDM_IMMERSIVE_INPUT, 0,
+                                SMTO_ABORTIFHUNG, 1000, &ignored);
+            current = (HWND)InterlockedCompareExchangePointer((PVOID volatile *)&g_immersive_hwnd, NULL, NULL);
+            if (current && current != d->hwnd) {
+                idd_log(d, L"Another display still owns immersive input.");
+                return;
+            }
+        }
+        ZeroMemory(&rid, sizeof(rid));
+        rid.usUsagePage = 0x01;
+        rid.usUsage = 0x02;
+        rid.dwFlags = RIDEV_NOLEGACY | RIDEV_CAPTUREMOUSE;
+        rid.hwndTarget = d->hwnd;
+        if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+            idd_log(d, L"Raw mouse registration failed (err %lu).", GetLastError());
+            return;
+        }
+        GetClientRect(d->render_hwnd, &clip);
+        tl.x = clip.left; tl.y = clip.top;
+        br.x = clip.right; br.y = clip.bottom;
+        ClientToScreen(d->render_hwnd, &tl);
+        ClientToScreen(d->render_hwnd, &br);
+        clip.left = tl.x; clip.top = tl.y;
+        clip.right = br.x; clip.bottom = br.y;
+        ClipCursor(&clip);
+        SetCapture(d->render_hwnd);
+        d->immersive_input = TRUE;
+        d->mouse_in = TRUE;
+        InterlockedExchangePointer((PVOID volatile *)&g_immersive_hwnd, d->hwnd);
+        idd_sync_immersive_cursor(d);
+        idd_log(d, idd_virtual_hid_ready(d)
+                ? L"Immersive input ON (raw host mouse -> guest virtual HID). Hotkey: Ctrl+Alt+Shift+I."
+                : L"Immersive input ON (raw host mouse -> guest SendInput relative). Hotkey: Ctrl+Alt+Shift+I.");
+    } else {
+        ZeroMemory(&rid, sizeof(rid));
+        rid.usUsagePage = 0x01;
+        rid.usUsage = 0x02;
+        rid.dwFlags = RIDEV_REMOVE;
+        RegisterRawInputDevices(&rid, 1, sizeof(rid));
+        ClipCursor(NULL);
+        ReleaseCapture();
+        d->immersive_input = FALSE;
+        d->badge_pressing = FALSE;
+        InterlockedExchange(&d->pending_relative_x, 0);
+        InterlockedExchange(&d->pending_relative_y, 0);
+        d->have_last_relative_tick = FALSE;
+        send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
+        send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
+        send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
+        send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_X1, 0, 0);
+        send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_X2, 0, 0);
+        InterlockedCompareExchangePointer((PVOID volatile *)&g_immersive_hwnd, NULL, d->hwnd);
+        if (d->render_hwnd) InvalidateRect(d->render_hwnd, NULL, FALSE);
+        idd_log(d, L"Immersive input OFF.");
+    }
+    idd_update_immersive_menu(d);
+    idd_update_title(d);
+    idd_update_immersive_badge(d);
 }
 
 /* Mouse messages can arrive much faster than the guest display refreshes.
@@ -550,13 +1070,27 @@ static void flush_pending_mouse(VmDisplayIdd *d)
 {
     DWORD now;
 
-    if (!d || !d->pending_mouse || !d->mouse_in)
+    if (!d) return;
+    if (d->immersive_input) {
+        flush_pending_relative_mouse(d);
+        return;
+    }
+    if (!d->pending_mouse || !d->mouse_in)
         return;
     now = GetTickCount();
     if (d->have_last_mouse_move_tick &&
         (DWORD)(now - d->last_mouse_move_tick) < MOUSE_MOVE_MIN_INTERVAL_MS)
         return;
-    send_input(d, INPUT_MOUSE_MOVE, d->pending_mouse_x, d->pending_mouse_y, 0);
+    /* Normalized 0..65535 across the guest frame, so the guest helper maps
+       correctly at any resolution, including mid-resize. A guest whose tools
+       were not refreshed yet expects frame pixels (it assumes 1920x1080). */
+    if (idd_input_owner(d)->input_normalized)
+        send_input(d, INPUT_MOUSE_MOVE,
+                   (UINT32)((UINT64)d->pending_mouse_x * 65535u / (d->frame_width > 1 ? d->frame_width - 1 : 1)),
+                   (UINT32)((UINT64)d->pending_mouse_y * 65535u / (d->frame_height > 1 ? d->frame_height - 1 : 1)),
+                   d->display_index);
+    else
+        send_input(d, INPUT_MOUSE_MOVE, d->pending_mouse_x, d->pending_mouse_y, d->display_index);
     d->pending_mouse = FALSE;
     d->last_mouse_move_tick = now;
     d->have_last_mouse_move_tick = TRUE;
@@ -581,40 +1115,117 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
     swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
 }
 
-static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+/* Per-VM viewer preferences (display_settings.json beside the VHDX). Both
+   display windows read-modify-write it, so access is serialized. Badge
+   positions are stored in thousandths of the picture so they survive window
+   resizes; -1 = default corner. */
+typedef struct {
+    int transmit_hotkeys;
+    int display_count;         /* 1 or 2 guest monitors */
+    int badge_x[2], badge_y[2];
+} ViewerPrefs;
+
+static SRWLOCK g_prefs_lock = SRWLOCK_INIT;
+
+static int prefs_int(const char *json, const char *key, int fallback)
+{
+    char pattern[64];
+    const char *p;
+    sprintf_s(pattern, sizeof(pattern), "\"%s\":", key);
+    p = strstr(json, pattern);
+    return p ? atoi(p + strlen(pattern)) : fallback;
+}
+
+static void prefs_read(const wchar_t *vhdx_path, ViewerPrefs *p, BOOL *exists)
+{
+    wchar_t path[MAX_PATH];
+    char buf[512] = {0};
+    FILE *f;
+    p->transmit_hotkeys = 0;
+    p->display_count = 2;
+    p->badge_x[0] = p->badge_y[0] = p->badge_x[1] = p->badge_y[1] = -1;
+    if (exists) *exists = FALSE;
+    if (!vhdx_path || vhdx_path[0] == L'\0') return;
+    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    if (exists) *exists = TRUE;
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    p->transmit_hotkeys = prefs_int(buf, "transmitKeyboardHotkeys", 0) != 0;
+    p->display_count = prefs_int(buf, "displayCount", 2) == 1 ? 1 : 2;
+    p->badge_x[0] = prefs_int(buf, "badge1X", -1);
+    p->badge_y[0] = prefs_int(buf, "badge1Y", -1);
+    p->badge_x[1] = prefs_int(buf, "badge2X", -1);
+    p->badge_y[1] = prefs_int(buf, "badge2Y", -1);
+}
+
+static void prefs_write(const wchar_t *vhdx_path, const ViewerPrefs *p)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"displayCount\":%d,"
+               "\"badge1X\":%d,\"badge1Y\":%d,\"badge2X\":%d,\"badge2Y\":%d}\n",
+            p->transmit_hotkeys ? 1 : 0, p->display_count,
+            p->badge_x[0], p->badge_y[0], p->badge_x[1], p->badge_y[1]);
     fclose(f);
+}
+
+static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+{
+    ViewerPrefs p;
+    AcquireSRWLockExclusive(&g_prefs_lock);
+    prefs_read(vhdx_path, &p, NULL);
+    p.transmit_hotkeys = transmit_hotkeys;
+    prefs_write(vhdx_path, &p);
+    ReleaseSRWLockExclusive(&g_prefs_lock);
 }
 
 /* Read the persisted setting; if the file is absent, create it with the
    default (off) and return FALSE. Returns the transmit-hotkeys value. */
 static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
 {
-    wchar_t path[MAX_PATH];
-    FILE *f;
-    char buf[256];
-    BOOL transmit = FALSE;
+    ViewerPrefs p;
+    BOOL exists;
+    AcquireSRWLockExclusive(&g_prefs_lock);
+    prefs_read(vhdx_path, &p, &exists);
+    /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
+    if (!exists) prefs_write(vhdx_path, &p);
+    ReleaseSRWLockExclusive(&g_prefs_lock);
+    return p.transmit_hotkeys;
+}
 
-    if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
-    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+static ViewerPrefs idd_prefs_load(const wchar_t *vhdx_path)
+{
+    ViewerPrefs p;
+    AcquireSRWLockShared(&g_prefs_lock);
+    prefs_read(vhdx_path, &p, NULL);
+    ReleaseSRWLockShared(&g_prefs_lock);
+    return p;
+}
 
-    if (_wfopen_s(&f, path, L"r") != 0 || !f) {
-        /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE);
-        return FALSE;
-    }
-    if (fgets(buf, sizeof(buf), f)) {
-        if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
-            transmit = TRUE;
-    }
-    fclose(f);
-    return transmit;
+static void idd_prefs_save_display_count(const wchar_t *vhdx_path, int count)
+{
+    ViewerPrefs p;
+    AcquireSRWLockExclusive(&g_prefs_lock);
+    prefs_read(vhdx_path, &p, NULL);
+    p.display_count = count == 1 ? 1 : 2;
+    prefs_write(vhdx_path, &p);
+    ReleaseSRWLockExclusive(&g_prefs_lock);
+}
+
+static void idd_prefs_save_badge(const wchar_t *vhdx_path, UINT display_index, int x, int y)
+{
+    ViewerPrefs p;
+    if (display_index > 1) return;
+    AcquireSRWLockExclusive(&g_prefs_lock);
+    prefs_read(vhdx_path, &p, NULL);
+    p.badge_x[display_index] = x;
+    p.badge_y[display_index] = y;
+    prefs_write(vhdx_path, &p);
+    ReleaseSRWLockExclusive(&g_prefs_lock);
 }
 
 /* ==================================================================
@@ -778,6 +1389,32 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     if (*vy >= vm_h) *vy = vm_h - 1;
 }
 
+/* Immersive mode: the host cursor stands in for the guest's hardware cursor.
+   Show the guest's shape (or nothing if the guest hid it, e.g. in a game) at
+   the guest pointer's position. SetCursorPos produces no raw input, so the
+   relative motion forwarded to the guest is unaffected. Window thread only. */
+static void idd_sync_immersive_cursor(VmDisplayIdd *d)
+{
+    RECT rc;
+    POINT pt;
+    float vp_x, vp_y, vp_w, vp_h;
+    if (!d || !d->immersive_input || !d->render_hwnd || !d->frame_width || !d->frame_height)
+        return;
+    GetClientRect(d->render_hwnd, &rc);
+    compute_letterbox((UINT)rc.right, (UINT)rc.bottom, d->frame_width, d->frame_height,
+                      &vp_x, &vp_y, &vp_w, &vp_h);
+    pt.x = (LONG)(vp_x + (float)InterlockedCompareExchange(&d->cursor_x, 0, 0) * vp_w / (float)d->frame_width);
+    pt.y = (LONG)(vp_y + (float)InterlockedCompareExchange(&d->cursor_y, 0, 0) * vp_h / (float)d->frame_height);
+    if (pt.x < 0) pt.x = 0;
+    if (pt.y < 0) pt.y = 0;
+    if (pt.x >= rc.right) pt.x = rc.right - 1;
+    if (pt.y >= rc.bottom) pt.y = rc.bottom - 1;
+    ClientToScreen(d->render_hwnd, &pt);
+    SetCursorPos(pt.x, pt.y);
+    SetCursor(d->cursor_visible && d->guest_cursor ? d->guest_cursor : NULL);
+    idd_drag_immersive_badge(d, pt);
+}
+
 /* ---- Reliable recv: read exactly `len` bytes ---- */
 
 static BOOL recv_exact(SOCKET s, void *buf, int len)
@@ -861,6 +1498,190 @@ static const IID AUDIO_IID_IAudioClient =
 static const IID AUDIO_IID_IAudioRenderClient =
     { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
 
+/* ==================================================================
+ * Microphone passthrough — host -> guest
+ * ================================================================== */
+
+static const IID AUDIO_IID_IAudioCaptureClient =
+    { 0xC8ADBD64, 0xE71E, 0x48A0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
+static const PROPERTYKEY AUDIO_PKEY_Device_FriendlyName =
+    { { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
+static const GUID AUDIO_SUBTYPE_IEEE_FLOAT =
+    { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID AUDIO_SUBTYPE_PCM =
+    { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
+static UINT16 audio_wire_format_tag(const WAVEFORMATEX *wfx)
+{
+    if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        wfx->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+        const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)wfx;
+        if (IsEqualGUID(&ext->SubFormat, &AUDIO_SUBTYPE_IEEE_FLOAT)) return WAVE_FORMAT_IEEE_FLOAT;
+        if (IsEqualGUID(&ext->SubFormat, &AUDIO_SUBTYPE_PCM)) return WAVE_FORMAT_PCM;
+    }
+    return wfx->wFormatTag;
+}
+
+static BOOL send_all_socket(SOCKET s, const void *buf, int len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        int n = send(s, p, len, 0);
+        if (n <= 0) return FALSE;
+        p += n;
+        len -= n;
+    }
+    return TRUE;
+}
+
+/* Enumerate active host capture endpoints (for the Settings device list). */
+void idd_enum_capture_devices(void (*cb)(const wchar_t *id, const wchar_t *name, void *ud), void *ud)
+{
+    IMMDeviceEnumerator *pEnum = NULL;
+    IMMDeviceCollection *pColl = NULL;
+    UINT count = 0, i;
+    HRESULT co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                   &AUDIO_IID_IMMDeviceEnumerator, (void **)&pEnum)) &&
+        SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(pEnum, eCapture, DEVICE_STATE_ACTIVE, &pColl))) {
+        IMMDeviceCollection_GetCount(pColl, &count);
+        for (i = 0; i < count; i++) {
+            IMMDevice *pDev = NULL;
+            IPropertyStore *pProps = NULL;
+            LPWSTR id = NULL;
+            PROPVARIANT name;
+            PropVariantInit(&name);
+            if (FAILED(IMMDeviceCollection_Item(pColl, i, &pDev))) continue;
+            if (SUCCEEDED(IMMDevice_GetId(pDev, &id)) &&
+                SUCCEEDED(IMMDevice_OpenPropertyStore(pDev, STGM_READ, &pProps)) &&
+                SUCCEEDED(IPropertyStore_GetValue(pProps, &AUDIO_PKEY_Device_FriendlyName, &name)) &&
+                name.vt == VT_LPWSTR && name.pwszVal)
+                cb(id, name.pwszVal, ud);
+            PropVariantClear(&name);
+            if (pProps) IPropertyStore_Release(pProps);
+            if (id) CoTaskMemFree(id);
+            IMMDevice_Release(pDev);
+        }
+    }
+    if (pColl) IMMDeviceCollection_Release(pColl);
+    if (pEnum) IMMDeviceEnumerator_Release(pEnum);
+    if (SUCCEEDED(co)) CoUninitialize();
+}
+
+/* Capture the chosen host input (Windows' default when none is chosen) and
+   stream it to the guest helper, which plays it into VB-CABLE's input so
+   guest apps hear it on "CABLE Output". Runs only while the guest reports
+   that an app is recording, so the host mic is not held open otherwise. */
+static DWORD WINAPI mic_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    SOCKET s = d->audio_socket;
+    IMMDeviceEnumerator *pEnum = NULL;
+    IMMDevice *pDev = NULL;
+    IAudioClient *pAC = NULL;
+    IAudioCaptureClient *pCC = NULL;
+    WAVEFORMATEX *wfx = NULL;
+    AudioHeader hdr;
+    wchar_t device_id[512];
+    BOOL enabled = FALSE, started = FALSE;
+    static BYTE silence[16384];
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    BOOL com_ok = SUCCEEDED(hr);
+
+    asb_get_mic_settings(&enabled, device_id, _countof(device_id));
+    if (!enabled || s == INVALID_SOCKET) goto done;
+    hr = CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &AUDIO_IID_IMMDeviceEnumerator, (void **)&pEnum);
+    if (FAILED(hr)) goto done;
+    if (!device_id[0] || FAILED(IMMDeviceEnumerator_GetDevice(pEnum, device_id, &pDev))) {
+        if (device_id[0]) idd_log(d, L"Mic: chosen input device missing; using the Windows default.");
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(pEnum, eCapture, eConsole, &pDev);
+        if (FAILED(hr)) { idd_log(d, L"Mic: no host input device (0x%08lX).", hr); goto done; }
+    }
+    if (FAILED(hr = IMMDevice_Activate(pDev, &AUDIO_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&pAC)) ||
+        FAILED(hr = IAudioClient_GetMixFormat(pAC, &wfx)) ||
+        FAILED(hr = IAudioClient_Initialize(pAC, AUDCLNT_SHAREMODE_SHARED, 0, 200000, 0, wfx, NULL)) ||
+        FAILED(hr = IAudioClient_GetService(pAC, &AUDIO_IID_IAudioCaptureClient, (void **)&pCC)) ||
+        FAILED(hr = IAudioClient_Start(pAC))) {
+        idd_log(d, L"Mic: capture setup failed (0x%08lX).", hr);
+        goto done;
+    }
+    started = TRUE;
+
+    hdr.magic           = MIC_HEADER_MAGIC;
+    hdr.sample_rate     = wfx->nSamplesPerSec;
+    hdr.channels        = wfx->nChannels;
+    hdr.bits_per_sample = wfx->wBitsPerSample;
+    hdr.format_tag      = audio_wire_format_tag(wfx);
+    hdr.block_align     = wfx->nBlockAlign;
+    if (!send_all_socket(s, &hdr, sizeof(hdr))) goto done;
+    idd_log(d, L"Mic: streaming host input to guest (%lu Hz, %u ch, %u bit).",
+            hdr.sample_rate, hdr.channels, hdr.bits_per_sample);
+
+    while (!InterlockedCompareExchange(&d->mic_stop, 0, 0) && !d->stop) {
+        UINT32 packet = 0;
+        Sleep(5);
+        while (SUCCEEDED(IAudioCaptureClient_GetNextPacketSize(pCC, &packet)) && packet) {
+            BYTE *data = NULL;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            AudioFrameHeader fh;
+            if (FAILED(IAudioCaptureClient_GetBuffer(pCC, &data, &frames, &flags, NULL, NULL))) goto done;
+            fh.bytes = frames * wfx->nBlockAlign;
+            if (fh.bytes && fh.bytes < 4 * 1024 * 1024) {
+                BOOL ok = send_all_socket(s, &fh, sizeof(fh));
+                if (ok && (flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                    UINT32 left = fh.bytes;
+                    while (ok && left) {
+                        UINT32 chunk = left > sizeof(silence) ? (UINT32)sizeof(silence) : left;
+                        ok = send_all_socket(s, silence, (int)chunk);
+                        left -= chunk;
+                    }
+                } else if (ok) {
+                    ok = send_all_socket(s, data, (int)fh.bytes);
+                }
+                if (!ok) { IAudioCaptureClient_ReleaseBuffer(pCC, frames); goto done; }
+            }
+            IAudioCaptureClient_ReleaseBuffer(pCC, frames);
+        }
+    }
+done:
+    if (started) IAudioClient_Stop(pAC);
+    if (pCC) IAudioCaptureClient_Release(pCC);
+    if (pAC) IAudioClient_Release(pAC);
+    if (wfx) CoTaskMemFree(wfx);
+    if (pDev) IMMDevice_Release(pDev);
+    if (pEnum) IMMDeviceEnumerator_Release(pEnum);
+    if (started) idd_log(d, L"Mic: stopped.");
+    if (com_ok) CoUninitialize();
+    return 0;
+}
+
+static void mic_stop_thread(VmDisplayIdd *d)
+{
+    if (!d->mic_thread) return;
+    InterlockedExchange(&d->mic_stop, 1);
+    WaitForSingleObject(d->mic_thread, 2000);
+    CloseHandle(d->mic_thread);
+    d->mic_thread = NULL;
+}
+
+static void mic_set_wanted(VmDisplayIdd *d, BOOL wanted)
+{
+    if (wanted && !d->mic_thread) {
+        InterlockedExchange(&d->mic_stop, 0);
+        d->mic_thread = CreateThread(NULL, 0, mic_thread_proc, d, 0, NULL);
+    } else if (!wanted && d->mic_thread) {
+        mic_stop_thread(d);
+    } else if (wanted && d->mic_thread &&
+               WaitForSingleObject(d->mic_thread, 0) == WAIT_OBJECT_0) {
+        /* Previous capture ended on its own (device lost); start again. */
+        mic_stop_thread(d);
+        InterlockedExchange(&d->mic_stop, 0);
+        d->mic_thread = CreateThread(NULL, 0, mic_thread_proc, d, 0, NULL);
+    }
+}
+
 static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -920,6 +1741,13 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
         idd_log(d, L"Audio header: %lu Hz, %u ch, %u bits, tag=%u.",
                  hdr.sample_rate, hdr.channels, hdr.bits_per_sample, hdr.format_tag);
 
+        /* sample_rate 0: the guest has no playback device to capture, but
+           keeps the session for control frames (microphone passthrough). */
+        if (!hdr.sample_rate) {
+            idd_log(d, L"Audio: guest has no playback device; control channel only.");
+            goto receive_loop;
+        }
+
         /* Set up WASAPI render on the default endpoint */
         hr = CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL,
                                CLSCTX_ALL, &AUDIO_IID_IMMDeviceEnumerator,
@@ -975,7 +1803,7 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
 
         idd_log(d, L"Audio render started: buf=%lu frames.", buf_frames);
 
-        /* Receive loop */
+receive_loop:
         while (!d->stop) {
             AudioFrameHeader fh;
             UINT32 frames_in_payload;
@@ -985,6 +1813,19 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
             BYTE *dst;
 
             if (!recv_exact(s, &fh, sizeof(fh))) break;
+            if (fh.bytes & AUDIO_CTRL_FLAG) {
+                static BOOL warned_sink, warned_speaker;
+                if ((fh.bytes & AUDIO_CTRL_NO_MIC_SINK) && !warned_sink) {
+                    warned_sink = TRUE;
+                    idd_log(d, L"Guest has no VB-CABLE: microphone passthrough is unavailable until it is installed in the VM.");
+                }
+                if ((fh.bytes & AUDIO_CTRL_NO_SPEAKER) && !warned_speaker) {
+                    warned_speaker = TRUE;
+                    idd_log(d, L"Guest has no playback device: install Hi-Fi Cable or VB-CABLE in the VM for sound.");
+                }
+                mic_set_wanted(d, (fh.bytes & AUDIO_CTRL_MIC_WANTED) != 0);
+                continue;
+            }
             if (fh.bytes == 0 || fh.bytes > 4 * 1024 * 1024) break;
 
             if (fh.bytes > scratch_cap) {
@@ -997,8 +1838,8 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
             }
             if (!recv_exact(s, scratch, (int)fh.bytes)) break;
 
-            /* Host-side mute: keep draining the socket but don't push to WASAPI */
-            if (d->audio_muted) continue;
+            /* Host-side mute (or no render stream): keep draining the socket */
+            if (d->audio_muted || !pAC || !render_block_align) continue;
 
             frames_in_payload = fh.bytes / render_block_align;
             if (frames_in_payload == 0) continue;
@@ -1020,6 +1861,7 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
         }
 
 session_cleanup:
+        mic_stop_thread(d);   /* it sends on this session's socket */
         if (stream_started && pAC) {
             IAudioClient_Stop(pAC);
             stream_started = FALSE;
@@ -1073,6 +1915,51 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+/* (Re)create the CPU-writable frame texture + SRV at the guest frame size;
+   the guest resolution follows the viewer window, so this changes at runtime. */
+static BOOL d3d_create_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    HRESULT hr;
+    if (d->frame_srv) { d->frame_srv->lpVtbl->Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL; }
+    d->tex_width = d->tex_height = 0;
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = width;
+    td.Height             = height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D(%ux%u) failed (0x%08X)", width, height, hr);
+        return FALSE;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
+        d->frame_tex->lpVtbl->Release(d->frame_tex);
+        d->frame_tex = NULL;
+        return FALSE;
+    }
+    d->tex_width = width;
+    d->tex_height = height;
+    return TRUE;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
@@ -1086,7 +1973,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
 
     /* Create device and swap chain */
     ZeroMemory(&scd, sizeof(scd));
-    scd.BufferCount                        = 1;
+    scd.BufferCount                        = 2;
     scd.BufferDesc.Width                   = DEFAULT_WIDTH;
     scd.BufferDesc.Height                  = DEFAULT_HEIGHT;
     scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1096,7 +1983,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.OutputWindow                       = d->render_hwnd;
     scd.SampleDesc.Count                   = 1;
     scd.Windowed                           = TRUE;
-    scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    scd.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     hr = D3D11CreateDeviceAndSwapChain(
         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
@@ -1126,37 +2013,9 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
-    ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
-    td.MipLevels          = 1;
-    td.ArraySize          = 1;
-    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
-    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
-
-    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateTexture2D failed (0x%08X)", hr);
+    (void)td; (void)srv_desc;
+    if (!d3d_create_frame_texture(d, DEFAULT_WIDTH, DEFAULT_HEIGHT))
         return FALSE;
-    }
-
-    /* Shader resource view for the frame texture */
-    ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Texture2D.MipLevels       = 1;
-    srv_desc.Texture2D.MostDetailedMip = 0;
-
-    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
-            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
-        return FALSE;
-    }
 
     /* Compile and create vertex shader */
     if (!d3d_compile_shader(g_vs_hlsl, "main", "vs_4_0", &vs_blob))
@@ -1254,6 +2113,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
+        if ((d->frame_width != d->tex_width || d->frame_height != d->tex_height) &&
+            !d3d_create_frame_texture(d, d->frame_width, d->frame_height)) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1265,7 +2129,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height && row < d->tex_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -1294,13 +2158,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
     }
 
     /* Refresh the title once per uploaded frame (~frame rate). */
-    if (frame_uploaded && d->hwnd) {
-        wchar_t title[256];
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
-                   d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
-        SetWindowTextW(d->hwnd, title);
-    }
+    if (frame_uploaded) idd_update_title(d);
     d->render_count++;
 
     d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
@@ -1319,7 +2177,9 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
 
-    d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    /* Pace presentation to the desktop compositor instead of queueing frames
+       as fast as the receiver can post them. */
+    d->swap_chain->lpVtbl->Present(d->swap_chain, 1, 0);
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
@@ -1547,11 +2407,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    UINT32 recv_cap = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    /* Receive buffer for frame pixel data; grows with the guest resolution. */
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_cap);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -1560,13 +2421,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     /* The agent connection has one synchronous command slot.  Startup uses it
        for network and shared-resource configuration, so wait for that sequence
        to finish before asking the agent to respawn the console-session helper. */
-    while (!d->stop && d->vm && d->vm->agent_online &&
+    while (!d->auxiliary && !d->stop && d->vm && d->vm->agent_online &&
            d->vm->agent_initializing) {
         Sleep(100);
     }
 
     /* Tell the agent to respawn input helper in console session. */
-    if (!d->stop && d->vm && d->vm->agent_online &&
+    if (!d->auxiliary && !d->stop && d->vm && d->vm->agent_online &&
         !d->vm->agent_initializing) {
         idd_log(d, L"Sending idd_connect to agent...");
         vm_agent_send(d->vm, "idd_connect", NULL, 0, 30000);
@@ -1581,22 +2442,30 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     while (!d->stop) {
         SOCKET s;
         FrameHeader hdr;
+        const wchar_t *frame_step = L"connect";
+        DWORD last_msg_tick = 0;
 
         /* Ensure input channel is connected (independent of frame channel) */
-        if (input_s == INVALID_SOCKET) {
+        if (!d->auxiliary && input_s == INVALID_SOCKET) {
             GUID svc; hcs_service_guid(d->os_type, 3, &svc);
             input_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
             if (input_s != INVALID_SOCKET) {
                 UINT32 ready_magic = 0;
                 if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == INPUT_READY_MAGIC) {
+                    (ready_magic == INPUT_READY_MAGIC || ready_magic == INPUT_READY_VHID ||
+                     ready_magic == INPUT_READY_MAGIC2 || ready_magic == INPUT_READY_VHID2)) {
                     DWORD zero_timeout = 0;
                     u_long nb = 1;
                     setsockopt(input_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
                     ioctlsocket(input_s, FIONBIO, &nb);
                     d->input_socket = input_s;
+                    d->input_vhid_ready = ready_magic == INPUT_READY_VHID || ready_magic == INPUT_READY_VHID2;
+                    d->input_normalized = ready_magic == INPUT_READY_MAGIC2 || ready_magic == INPUT_READY_VHID2;
+                    if (d->hwnd) PostMessageW(d->hwnd, WM_IDD_INPUT_CAPS, 0, 0);
                     g_input_send_count = 0;
-                    idd_log(d, L"Input connected + ready (GUID :0003).");
+                    idd_log(d, d->input_vhid_ready
+                               ? L"Input connected: virtual HID immersive mode available."
+                               : L"Input connected in legacy compatibility mode.");
                 } else {
                     idd_log(d, L"Input handshake failed - closing.");
                     closesocket(input_s);
@@ -1606,7 +2475,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         /* Clipboard module (handles :0005 + :0006 internally) */
-        if (!d->clipboard) {
+        if (!d->auxiliary && !d->clipboard) {
             d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
                                                d->hwnd, clip_log_callback, d);
             if (d->clipboard)
@@ -1615,7 +2484,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Ensure audio recv thread is running (:0004, guest→host).
            The thread handles connecting on its own — the helper may not be up yet. */
-        if (!d->audio_recv_thread) {
+        if (!d->auxiliary && !d->audio_recv_thread) {
             d->audio_recv_thread = CreateThread(NULL, 0, audio_recv_thread_proc, d, 0, NULL);
             idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
         }
@@ -1623,7 +2492,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         /* Try to connect frame channel (VDD driver, GUID :0002) */
         idd_log(d, L"Connecting to frame service...");
         {
-            GUID svc; hcs_service_guid(d->os_type, 2, &svc);
+            GUID svc;
+            hcs_service_guid(d->os_type, d->display_index == 0 ? 2 : 8, &svc);
             s = connect_to_hv_service(&d->runtime_id, &svc, 3000);
         }
         if (s == INVALID_SOCKET) {
@@ -1637,6 +2507,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         idd_log(d, L"Frame channel connected.");
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
+        frame_step = L"select";
+        last_msg_tick = GetTickCount();
         while (!d->stop) {
             RECT dirty_rects[MAX_DIRTY_RECTS];
             UINT32 data_size;
@@ -1644,7 +2516,26 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             UINT32 i;
             UINT32 magic;
 
+            /* Wait for the next message without a deadline: the guest sends
+               nothing while the desktop is static (no keepalive frames), and
+               the socket's 5 s receive timeout used to turn every quiet
+               moment into a reconnect -- dropping cursor updates and forcing
+               a full-frame resend. The timeout still guards stalls inside a
+               message. Idle wakeups still service the input channel. */
+            {
+                fd_set rfds;
+                struct timeval tv = { 1, 0 };
+                int ready;
+                FD_ZERO(&rfds);
+                FD_SET(s, &rfds);
+                frame_step = L"select";
+                ready = select(0, &rfds, NULL, NULL, &tv);
+                if (ready == SOCKET_ERROR) break;
+                if (ready == 0) goto input_maintenance;
+            }
+
             /* Peek at magic to determine message type */
+            frame_step = L"magic";
             if (!recv_exact(s, &magic, sizeof(magic)))
                 break;
 
@@ -1652,11 +2543,23 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 /* Read rest of cursor header (already read magic) */
                 CursorHeader chdr;
                 chdr.magic = magic;
+                frame_step = L"cursor";
+                last_msg_tick = GetTickCount();
                 if (!recv_exact(s, (BYTE *)&chdr + sizeof(UINT32),
                                 sizeof(CursorHeader) - sizeof(UINT32)))
                     break;
 
                 d->cursor_visible = chdr.visible;
+                if (chdr.shape_updated) {
+                    d->cursor_xhot = chdr.xhot;
+                    d->cursor_yhot = chdr.yhot;
+                }
+                /* IddCx reports the shape's top-left; the pointer tip is the
+                   hotspot. Immersive mode mirrors it with the host cursor. */
+                InterlockedExchange(&d->cursor_x, chdr.x + (LONG)d->cursor_xhot);
+                InterlockedExchange(&d->cursor_y, chdr.y + (LONG)d->cursor_yhot);
+                if (d->immersive_input && d->hwnd)
+                    PostMessageW(d->hwnd, WM_IDD_CURSOR_POS, 0, 0);
 
                 if (chdr.shape_updated && chdr.shape_data_size > 0) {
                     BYTE *cursor_buf;
@@ -1705,6 +2608,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Read rest of frame header (already read magic) */
             hdr.magic = magic;
+            frame_step = L"frame";
+            last_msg_tick = GetTickCount();
             if (!recv_exact(s, (BYTE *)&hdr + sizeof(UINT32),
                             sizeof(FrameHeader) - sizeof(UINT32)))
                 break;
@@ -1740,6 +2645,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
 
             /* Read pixel data */
+            if (data_size > recv_cap) {
+                BYTE *grown = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, data_size);
+                if (!grown) { idd_log(d, L"Frame buffer allocation failed (%u bytes).", data_size); break; }
+                recv_buf = grown;
+                recv_cap = data_size;
+            }
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))
                     break;
@@ -1826,34 +2737,45 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
 
             d->frame_dirty = TRUE;
+            d->has_frame = TRUE;
             d->recv_count++;
             LeaveCriticalSection(&d->frame_cs);
 
             /* Signal the window thread to repaint */
-            if (d->hwnd && IsWindow(d->hwnd))
+            if (d->hwnd && IsWindow(d->hwnd) &&
+                InterlockedExchange(&d->frame_ready_posted, 1) == 0)
                 PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
 
+        input_maintenance:
             /* Reconnect input socket if send_input flagged it dead */
-            if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
+            if (!d->auxiliary && d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
                 closesocket(input_s);
                 input_s = INVALID_SOCKET;
+                d->input_vhid_ready = FALSE;
+                if (d->hwnd) PostMessageW(d->hwnd, WM_IDD_INPUT_CAPS, 0, 0);
                 idd_log(d, L"Input socket closed, will reconnect...");
             }
-            if (input_s == INVALID_SOCKET) {
+            if (!d->auxiliary && input_s == INVALID_SOCKET) {
                 GUID svc; hcs_service_guid(d->os_type, 3, &svc);
                 SOCKET new_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
                 if (new_s != INVALID_SOCKET) {
                     UINT32 ready_magic = 0;
                     if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
-                        ready_magic == INPUT_READY_MAGIC) {
+                        (ready_magic == INPUT_READY_MAGIC || ready_magic == INPUT_READY_VHID ||
+                         ready_magic == INPUT_READY_MAGIC2 || ready_magic == INPUT_READY_VHID2)) {
                         DWORD zero_timeout = 0;
                         u_long nb = 1;
                         setsockopt(new_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
                         ioctlsocket(new_s, FIONBIO, &nb);
                         input_s = new_s;
                         d->input_socket = new_s;
+                        d->input_vhid_ready = ready_magic == INPUT_READY_VHID || ready_magic == INPUT_READY_VHID2;
+                    d->input_normalized = ready_magic == INPUT_READY_MAGIC2 || ready_magic == INPUT_READY_VHID2;
+                        if (d->hwnd) PostMessageW(d->hwnd, WM_IDD_INPUT_CAPS, 0, 0);
                         g_input_send_count = 0;
-                        idd_log(d, L"Input reconnected + ready (GUID :0003).");
+                        idd_log(d, d->input_vhid_ready
+                                   ? L"Input reconnected: virtual HID immersive mode available."
+                                   : L"Input reconnected in legacy compatibility mode.");
                     } else {
                         closesocket(new_s);
                     }
@@ -1863,13 +2785,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         /* Frame channel lost — close it but keep input alive */
-        closesocket(s);
-        idd_log(d, L"Frame channel disconnected, reconnecting...");
+        {
+            int frame_wsa = WSAGetLastError();
+            closesocket(s);
+            idd_log(d, L"Frame channel disconnected at %s (WSA %d, %lu ms since last message), reconnecting...",
+                    frame_step, frame_wsa, GetTickCount() - last_msg_tick);
+        }
 
         /* Check if input is still alive (send_input may have flagged it dead) */
-        if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
+        if (!d->auxiliary && d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
             closesocket(input_s);
             input_s = INVALID_SOCKET;
+            d->input_vhid_ready = FALSE;
+            if (d->hwnd) PostMessageW(d->hwnd, WM_IDD_INPUT_CAPS, 0, 0);
             idd_log(d, L"Input socket flagged dead, will reconnect.");
         }
 
@@ -1882,7 +2810,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     }
 
     /* Final cleanup — close input socket on thread exit */
-    d->input_socket = INVALID_SOCKET;
+    if (!d->auxiliary) {
+        d->input_socket = INVALID_SOCKET;
+        d->input_vhid_ready = FALSE;
+        if (d->hwnd) PostMessageW(d->hwnd, WM_IDD_INPUT_CAPS, 0, 0);
+    }
     if (input_s != INVALID_SOCKET) {
         closesocket(input_s);
     }
@@ -1909,11 +2841,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     ensure_idd_class(d->hInstance);
 
-    swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
+    swprintf_s(title, 300, L"%s - Display %u", d->vm_name,
+               d->display_index + 1);
 
     /* Compute outer window size so the client area is exactly 1920x1080 */
     {
-        DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
+        DWORD style   = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        if (!d->auxiliary) style |= WS_VISIBLE;
         DWORD exstyle = 0;
         RECT wr = { 0, 0, 1920, 1080 };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -1942,18 +2876,30 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
+            AppendMenuW(sysmenu, d->auxiliary ? (MF_STRING | MF_GRAYED) : MF_STRING,
+                        IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_IMMERSIVE_INPUT,
+                        L"Immersive Mouse Input\tCtrl+Alt+Shift+I");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
+    /* A deliberate escape chord works even while RIDEV_NOLEGACY suppresses
+       ordinary mouse messages. */
+    if (!d->auxiliary)
+        RegisterHotKey(d->hwnd, IDH_IMMERSIVE_INPUT,
+                       MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'I');
+    idd_update_immersive_menu(d);
+
     /* Bring the display window to the foreground on open */
-    ShowWindow(d->hwnd, SW_SHOW);
-    BringWindowToTop(d->hwnd);
-    SetForegroundWindow(d->hwnd);
+    if (!d->auxiliary) {
+        ShowWindow(d->hwnd, SW_SHOW);
+        BringWindowToTop(d->hwnd);
+        SetForegroundWindow(d->hwnd);
+    }
 
     /* Render child fills entire client area */
     {
@@ -1966,6 +2912,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             0, 0, rc.right, rc.bottom,
             d->hwnd, NULL, d->hInstance, NULL);
     }
+    idd_enable_dark_menus(d->hwnd);
+    idd_update_immersive_badge(d);
 
     /* Separate top-level log window */
     {
@@ -2056,8 +3004,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     if (msg == WM_CREATE) {
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        AddClipboardFormatListener(hwnd);
+        VmDisplayIdd *created = (VmDisplayIdd *)cs->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)created);
+        if (!created || !created->auxiliary)
+            AddClipboardFormatListener(hwnd);
         return 0;
     }
 
@@ -2065,6 +3015,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_IMMERSIVE_INPUT) {
+            /* An explicit toggle (hotkey/menu) also cancels a paused resume. */
+            BOOL enable = !d->immersive_input && !d->immersive_resume;
+            d->immersive_resume = FALSE;
+            if (d->immersive_input || enable) idd_set_immersive_input(d, enable);
+            else idd_update_title(d);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
@@ -2074,9 +3032,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                               MF_BYCOMMAND | (d->audio_muted ? MF_CHECKED : MF_UNCHECKED));
             }
             if (d->audio_muted)
-                swprintf_s(title, 300, L"\U0001F507 %s - IDD Display", d->vm_name);
+                swprintf_s(title, 300, L"\U0001F507 %s - Display %u",
+                           d->vm_name, d->display_index + 1);
             else
-                swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
+                swprintf_s(title, 300, L"%s - Display %u",
+                           d->vm_name, d->display_index + 1);
             SetWindowTextW(hwnd, title);
             idd_log(d, d->audio_muted ? L"Audio muted." : L"Audio unmuted.");
             return 0;
@@ -2121,12 +3081,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             BOOL user_initiated = d->open;
 
-            RemoveClipboardFormatListener(hwnd);
+            if (!d->auxiliary) RemoveClipboardFormatListener(hwnd);
+            if (!d->auxiliary && d->secondary && d->secondary->hwnd)
+                PostMessageW(d->secondary->hwnd, WM_CLOSE, 0, 0);
 
             /* Remove the hotkey hook and release any keys still held in the
                guest before tearing the window down. */
             idd_remove_kbd_hook(d);
             idd_flush_held_keys(d);
+            idd_set_immersive_input(d, FALSE);
 
             /* Stop recv threads */
             d->stop = TRUE;
@@ -2139,20 +3102,25 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Wait for audio recv thread (:0004) */
             if (d->audio_recv_thread) {
+                DWORD audio_wait;
                 if (d->audio_socket != INVALID_SOCKET) {
                     closesocket(d->audio_socket);
                     d->audio_socket = INVALID_SOCKET;
                 }
-                WaitForSingleObject(d->audio_recv_thread, 2000);
-                CloseHandle(d->audio_recv_thread);
-                d->audio_recv_thread = NULL;
+                audio_wait = WaitForSingleObject(d->audio_recv_thread, 7000);
+                if (audio_wait == WAIT_OBJECT_0) {
+                    CloseHandle(d->audio_recv_thread);
+                    d->audio_recv_thread = NULL;
+                }
             }
 
             /* Wait briefly for recv thread to exit */
             if (d->recv_thread) {
-                WaitForSingleObject(d->recv_thread, 2000);
-                CloseHandle(d->recv_thread);
-                d->recv_thread = NULL;
+                DWORD recv_wait = WaitForSingleObject(d->recv_thread, 7000);
+                if (recv_wait == WAIT_OBJECT_0) {
+                    CloseHandle(d->recv_thread);
+                    d->recv_thread = NULL;
+                }
             }
 
             d->open = FALSE;
@@ -2173,7 +3141,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
 
             /* Notify main UI only if user closed the window */
-            if (user_initiated && d->main_hwnd && d->vm)
+            if (user_initiated && !d->auxiliary && d->main_hwnd && d->vm)
                 PostMessageW(d->main_hwnd, WM_VM_DISPLAY_CLOSED,
                              1, (LPARAM)d->vm);
         }
@@ -2183,6 +3151,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
         KillTimer(hwnd, IDT_INPUT);
+        UnregisterHotKey(hwnd, IDH_IMMERSIVE_INPUT);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
@@ -2199,14 +3168,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
-            wr.left = 0; wr.top = 0;
-            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
-            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
-            mmi->ptMaxTrackSize.x = wr.right - wr.left;
-            mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
-        }
+        /* No maximum: the guest resolution follows the window (resize,
+           Windows snapping, maximize and full screen all work). */
         return 0;
     }
 
@@ -2217,9 +3180,118 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            idd_update_immersive_badge(d);
+            if (wp != SIZE_MINIMIZED)
+                SetTimer(hwnd, IDT_RESIZE, RESIZE_SETTLE_MS, NULL);
         }
         return 0;
 
+    case WM_MOVE:
+        if (d) idd_update_immersive_badge(d);
+        break;
+
+    /* Window dropped on another monitor, or the host changed modes. */
+    case WM_EXITSIZEMOVE:
+    case WM_DISPLAYCHANGE:
+        if (d) idd_send_host_refresh(d, FALSE);
+        break;
+
+    /* Badge menu. Immersive capture is released while the menu is open (it
+       needs a normal cursor) and restored afterwards unless the choice was
+       to turn it off. */
+    case WM_IDD_BADGE_MENU:
+        if (d && d->immersive_badge) {
+            enum { BM_MOUSE = 1, BM_KEYBOARD, BM_BOTH, BM_ONE_DISPLAY, BM_TWO_DISPLAYS,
+                   BM_FULLSCREEN, BM_MUTE, BM_LOG };
+            VmDisplayIdd *owner = idd_input_owner(d);
+            BOOL was_immersive = d->immersive_input;
+            BOOL keyboard = d->transmit_hotkeys;
+            BOOL available = idd_immersive_available(d);
+            BOOL restore_immersive;
+            wchar_t header[300];
+            RECT br;
+            HMENU menu, displays;
+            UINT cmd;
+            GetWindowRect(d->immersive_badge, &br);
+            d->immersive_resume = FALSE;
+            if (was_immersive) idd_set_immersive_input(d, FALSE);
+            menu = CreatePopupMenu();
+            displays = CreatePopupMenu();
+            if (!menu || !displays) {
+                if (menu) DestroyMenu(menu);
+                if (displays) DestroyMenu(displays);
+                if (was_immersive) idd_set_immersive_input(d, TRUE);
+                return 0;
+            }
+            swprintf_s(header, _countof(header), L"%s  \u00b7  Display %u", d->vm_name, d->display_index + 1);
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, header);
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(menu, MF_STRING | (was_immersive ? MF_CHECKED : 0) | (available ? 0 : MF_GRAYED),
+                        BM_MOUSE, L"Immersive mouse\tCtrl+Alt+Shift+I");
+            AppendMenuW(menu, MF_STRING | (keyboard ? MF_CHECKED : 0), BM_KEYBOARD,
+                        L"Capture keyboard shortcuts");
+            AppendMenuW(menu, MF_STRING | (was_immersive && keyboard ? MF_CHECKED : 0) |
+                        (available ? 0 : MF_GRAYED), BM_BOTH, L"Immersive mouse && keyboard");
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(displays, MF_STRING, BM_ONE_DISPLAY, L"1 display");
+            AppendMenuW(displays, MF_STRING, BM_TWO_DISPLAYS, L"2 displays");
+            CheckMenuRadioItem(displays, BM_ONE_DISPLAY, BM_TWO_DISPLAYS,
+                               owner->display_count == 1 ? BM_ONE_DISPLAY : BM_TWO_DISPLAYS, MF_BYCOMMAND);
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)displays, L"Displays");
+            AppendMenuW(menu, MF_STRING | (d->fullscreen ? MF_CHECKED : 0), BM_FULLSCREEN, L"Full screen");
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(menu, MF_STRING | (owner->audio_muted ? MF_CHECKED : 0), BM_MUTE, L"Mute VM audio");
+            AppendMenuW(menu, MF_STRING, BM_LOG, L"Show log");
+            SetForegroundWindow(hwnd);
+            cmd = (UINT)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+                                       br.left, br.bottom + 4, 0, hwnd, NULL);
+            DestroyMenu(menu);   /* also destroys the Displays submenu */
+            restore_immersive = was_immersive;
+            switch (cmd) {
+            case BM_MOUSE:
+                restore_immersive = !was_immersive;
+                break;
+            case BM_KEYBOARD:
+                SendMessageW(hwnd, WM_SYSCOMMAND, IDM_XMIT_HOTKEYS, 0);
+                break;
+            case BM_BOTH: {
+                BOOL on = !(was_immersive && keyboard);
+                if (keyboard != on) SendMessageW(hwnd, WM_SYSCOMMAND, IDM_XMIT_HOTKEYS, 0);
+                restore_immersive = on;
+                break;
+            }
+            case BM_ONE_DISPLAY:
+            case BM_TWO_DISPLAYS:
+                idd_set_display_count(d, cmd == BM_ONE_DISPLAY ? 1 : 2);
+                break;
+            case BM_FULLSCREEN:
+                idd_set_fullscreen(d, !d->fullscreen);
+                break;
+            case BM_MUTE:
+                SendMessageW(owner->hwnd, WM_SYSCOMMAND, IDM_AUDIO_MUTE, 0);
+                break;
+            case BM_LOG:
+                SendMessageW(hwnd, WM_SYSCOMMAND, IDM_SHOW_LOG, 0);
+                break;
+            }
+            if (restore_immersive && available) idd_set_immersive_input(d, TRUE);
+        }
+        return 0;
+
+    /* Primary changed the display count: show or hide this (second) window. */
+    case WM_IDD_DISPLAY_COUNT:
+        if (d && d->auxiliary) {
+            if (idd_input_owner(d)->display_count < 2) {
+                if (d->immersive_input) idd_set_immersive_input(d, FALSE);
+                if (d->fullscreen) idd_set_fullscreen(d, FALSE);
+                ShowWindow(hwnd, SW_HIDE);
+                idd_update_immersive_badge(d);
+            } else if (d->has_frame) {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                idd_update_immersive_badge(d);
+            }
+        }
+        return 0;
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
@@ -2232,8 +3304,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_INPUT && d) {
             flush_pending_mouse(d);
-            if (d->pending_mouse)
+            if (d->immersive_input &&
+                (InterlockedCompareExchange(&d->pending_relative_x, 0, 0) != 0 ||
+                 InterlockedCompareExchange(&d->pending_relative_y, 0, 0) != 0))
+                SetTimer(hwnd, IDT_INPUT, IMMERSIVE_MOUSE_MIN_INTERVAL_MS, NULL);
+            else if (d->pending_mouse)
                 SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
+            else
+                KillTimer(hwnd, IDT_INPUT);
+            return 0;
+        }
+        if (wp == IDT_RESIZE && d) {
+            KillTimer(hwnd, IDT_RESIZE);
+            idd_request_guest_resize(d, FALSE);
             return 0;
         }
         if (wp == IDT_PRESENT && d) {
@@ -2243,8 +3326,45 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_IDD_FRAME_READY:
-        if (d) d3d_render_frame(d);
+        if (d) {
+            InterlockedExchange(&d->frame_ready_posted, 0);
+            if (d->auxiliary && d->has_frame && !IsWindowVisible(hwnd) &&
+                idd_input_owner(d)->display_count >= 2) {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                idd_update_immersive_badge(d);
+            }
+            d3d_render_frame(d);
+        }
         return 0;
+
+    case WM_IDD_CURSOR_POS:
+        idd_sync_immersive_cursor(d);
+        return 0;
+
+    case WM_IDD_INPUT_CAPS:
+        if (d) {
+            if (!idd_immersive_available(d)) {
+                d->immersive_resume = FALSE;
+                if (d->immersive_input) idd_set_immersive_input(d, FALSE);
+            }
+            idd_update_immersive_menu(d);
+            /* (Re)connected input: the guest helper may be new; resend. */
+            idd_send_host_refresh(d, TRUE);
+            if (!d->auxiliary && idd_immersive_available(d))
+                send_input(d, INPUT_DISPLAY_COUNT, (UINT32)d->display_count, 0, 0);
+            idd_request_guest_resize(d, TRUE);
+            if (!d->auxiliary && d->secondary && d->secondary->hwnd)
+                PostMessageW(d->secondary->hwnd, WM_IDD_INPUT_CAPS, 0, 0);
+        }
+        return 0;
+
+    case WM_HOTKEY:
+        if (d && wp == IDH_IMMERSIVE_INPUT) {
+            HWND target = (HWND)InterlockedCompareExchangePointer((PVOID volatile *)&g_immersive_hwnd, NULL, NULL);
+            PostMessageW(target ? target : d->hwnd, WM_SYSCOMMAND, IDM_IMMERSIVE_INPUT, 0);
+            return 0;
+        }
+        break;
 
     case WM_CLIPBOARDUPDATE:
         if (d && d->clipboard) {
@@ -2288,8 +3408,28 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (!d->input_focused)
+            if (!d->input_focused) {
                 idd_flush_held_keys(d);
+                /* Release the mouse while another window is active, but
+                   remember immersive mode so returning re-captures it. */
+                if (d->immersive_input) d->immersive_resume = TRUE;
+                idd_set_immersive_input(d, FALSE);
+            } else if (d->immersive_resume && d->render_hwnd) {
+                /* Keyboard return (Alt+Tab) or a click inside the picture
+                   resumes now; a click elsewhere (title bar drag, resize)
+                   waits for the next click inside the picture. */
+                RECT rc;
+                POINT pt;
+                BOOL inside = FALSE;
+                if (GetCursorPos(&pt) && GetClientRect(d->render_hwnd, &rc)) {
+                    ScreenToClient(d->render_hwnd, &pt);
+                    inside = PtInRect(&rc, pt);
+                }
+                if (LOWORD(wp) == WA_ACTIVE || inside) {
+                    d->immersive_resume = FALSE;
+                    idd_set_immersive_input(d, TRUE);
+                }
+            }
         }
         break;
 
@@ -2337,7 +3477,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && d->guest_cursor)
+            if (d && d->immersive_input)
+                SetCursor(d->cursor_visible && d->guest_cursor ? d->guest_cursor : NULL);
+            else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -2345,8 +3487,83 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
+    case WM_INPUT:
+        if (d && d->immersive_input) {
+            RAWINPUT raw;
+            UINT size = sizeof(raw);
+            if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &raw, &size,
+                                sizeof(RAWINPUTHEADER)) == size &&
+                raw.header.dwType == RIM_TYPEMOUSE) {
+                USHORT buttons = raw.data.mouse.usButtonFlags;
+                /* Badge press/release is for the host: drag it, or click it
+                   for the menu. Motion is still forwarded so the guest cursor
+                   (which the host cursor and the badge follow) keeps moving. */
+                if (d->badge_pressing) {
+                    if (buttons & RI_MOUSE_LEFT_BUTTON_UP) {
+                        d->badge_pressing = FALSE;
+                        if (!d->badge_dragged)
+                            PostMessageW(hwnd, WM_IDD_BADGE_MENU, 0, 0);
+                        else
+                            idd_badge_drag_end(d);
+                        buttons &= ~RI_MOUSE_LEFT_BUTTON_UP;
+                    }
+                } else if ((buttons & RI_MOUSE_LEFT_BUTTON_DOWN) &&
+                           idd_cursor_on_immersive_badge(d)) {
+                    RECT r;
+                    GetCursorPos(&d->badge_press);
+                    GetWindowRect(d->immersive_badge, &r);
+                    d->badge_grab.x = d->badge_press.x - r.left;
+                    d->badge_grab.y = d->badge_press.y - r.top;
+                    d->badge_pressing = TRUE;
+                    d->badge_dragged = FALSE;
+                    buttons &= ~RI_MOUSE_LEFT_BUTTON_DOWN;
+                }
+                if (!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                    InterlockedExchangeAdd(&d->pending_relative_x,
+                                           raw.data.mouse.lLastX);
+                    InterlockedExchangeAdd(&d->pending_relative_y,
+                                           raw.data.mouse.lLastY);
+                    flush_pending_relative_mouse(d);
+                    if (InterlockedCompareExchange(&d->pending_relative_x, 0, 0) != 0 ||
+                        InterlockedCompareExchange(&d->pending_relative_y, 0, 0) != 0)
+                        SetTimer(hwnd, IDT_INPUT, IMMERSIVE_MOUSE_MIN_INTERVAL_MS, NULL);
+                }
+                if (buttons & RI_MOUSE_LEFT_BUTTON_DOWN)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
+                if (buttons & RI_MOUSE_LEFT_BUTTON_UP)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
+                if (buttons & RI_MOUSE_RIGHT_BUTTON_DOWN)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
+                if (buttons & RI_MOUSE_RIGHT_BUTTON_UP)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
+                if (buttons & RI_MOUSE_MIDDLE_BUTTON_DOWN)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
+                if (buttons & RI_MOUSE_MIDDLE_BUTTON_UP)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
+                if (buttons & RI_MOUSE_BUTTON_4_DOWN)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_X1, 1, 0);
+                if (buttons & RI_MOUSE_BUTTON_4_UP)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_X1, 0, 0);
+                if (buttons & RI_MOUSE_BUTTON_5_DOWN)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_X2, 1, 0);
+                if (buttons & RI_MOUSE_BUTTON_5_UP)
+                    send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_X2, 0, 0);
+                if (buttons & RI_MOUSE_WHEEL)
+                    send_input(d, INPUT_MOUSE_WHEEL,
+                               (UINT32)(INT32)(SHORT)raw.data.mouse.usButtonData, 0, 0);
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        break;
+
     /* ---- Mouse button/wheel forwarding (only when cursor is in render area) ---- */
     case WM_LBUTTONDOWN:
+        if (d && d->mouse_in && d->immersive_resume && d->input_focused) {
+            /* Deferred resume: this click re-captures; don't forward it. */
+            d->immersive_resume = FALSE;
+            idd_set_immersive_input(d, TRUE);
+            return 0;
+        }
         if (d && d->mouse_in) {
             if (d->render_hwnd) SetCapture(d->render_hwnd);
             send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
@@ -2370,6 +3587,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MBUTTONUP:
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
         return 0;
+
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+        if (d && d->mouse_in)
+            send_input(d, INPUT_MOUSE_BUTTON,
+                       GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? INPUT_BTN_X1 : INPUT_BTN_X2,
+                       msg == WM_XBUTTONDOWN, 0);
+        return TRUE;
 
     case WM_MOUSEWHEEL:
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
@@ -2407,7 +3632,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * Public API
  * ================================================================== */
 
-VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+static VmDisplayIdd *vm_display_idd_create_one(VmInstance *vm,
+                                                HINSTANCE hInstance,
+                                                HWND main_hwnd,
+                                                UINT display_index,
+                                                VmDisplayIdd *primary)
 {
     VmDisplayIdd *d;
 
@@ -2420,6 +3649,9 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     if (!d) return NULL;
 
     d->vm           = vm;
+    d->display_index = display_index;
+    d->auxiliary     = display_index != 0;
+    d->primary       = primary;
     wcscpy_s(d->vm_name, 256, vm->name);
     wcscpy_s(d->vhdx_path, MAX_PATH, vm->vhdx_path);
     d->runtime_id   = vm->runtime_id;
@@ -2435,7 +3667,15 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is
        installed later, on the window thread, once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    d->transmit_hotkeys = primary ? primary->transmit_hotkeys
+                                  : idd_display_settings_load_or_create(vm->vhdx_path);
+    {
+        ViewerPrefs prefs = idd_prefs_load(vm->vhdx_path);
+        UINT slot = display_index > 1 ? 1 : display_index;
+        d->badge_fx = prefs.badge_x[slot];
+        d->badge_fy = prefs.badge_y[slot];
+        d->display_count = prefs.display_count;
+    }
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
@@ -2449,12 +3689,14 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     InitializeCriticalSection(&d->frame_cs);
+    InitializeCriticalSection(&d->input_send_cs);
 
     /* Start the window thread (which will then start the recv thread) */
     d->window_thread = CreateThread(NULL, 0, idd_window_thread_proc, d, 0, NULL);
     if (!d->window_thread) {
         ui_log(L"IDD: Failed to create window thread.");
         DeleteCriticalSection(&d->frame_cs);
+        DeleteCriticalSection(&d->input_send_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
         return NULL;
@@ -2463,9 +3705,22 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     return d;
 }
 
-void vm_display_idd_destroy(VmDisplayIdd *display)
+VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
 {
-    if (!display) return;
+    VmDisplayIdd *primary, *secondary;
+    primary = vm_display_idd_create_one(vm, hInstance, main_hwnd, 0, NULL);
+    if (!primary) return NULL;
+    /* Display 2 is created hidden.  It becomes visible only after channel 8
+       delivers a frame, so an older single-monitor guest remains unchanged. */
+    secondary = vm_display_idd_create_one(vm, hInstance, main_hwnd, 1, primary);
+    if (secondary) primary->secondary = secondary;
+    else ui_log(L"IDD: Display 2 viewer could not be created; Display 1 remains available.");
+    return primary;
+}
+
+static BOOL vm_display_idd_destroy_one(VmDisplayIdd *display)
+{
+    if (!display) return TRUE;
 
     /* Signal stop */
     display->stop = TRUE;
@@ -2478,24 +3733,34 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     /* Wait for window thread (pumping messages to stay responsive) */
     if (display->window_thread) {
         DWORD result;
-        do {
+        for (;;) {
             result = MsgWaitForMultipleObjects(
-                1, &display->window_thread, FALSE, 5000, QS_ALLINPUT);
+                1, &display->window_thread, FALSE, 15000, QS_ALLINPUT);
+            if (result == WAIT_OBJECT_0) break;
             if (result == WAIT_OBJECT_0 + 1) {
                 MSG msg;
                 while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                continue;
             }
-        } while (result == WAIT_OBJECT_0 + 1);
+            ui_log(L"IDD: window thread did not stop; preserving display state to avoid use-after-free.");
+            return FALSE;
+        }
         CloseHandle(display->window_thread);
+        display->window_thread = NULL;
     }
 
     /* recv_thread is cleaned up by WM_CLOSE handler, but guard just in case */
     if (display->recv_thread) {
-        WaitForSingleObject(display->recv_thread, 3000);
+        DWORD recv_wait = WaitForSingleObject(display->recv_thread, 7000);
+        if (recv_wait != WAIT_OBJECT_0) {
+            ui_log(L"IDD: receiver did not stop; preserving display state to avoid use-after-free.");
+            return FALSE;
+        }
         CloseHandle(display->recv_thread);
+        display->recv_thread = NULL;
     }
 
     /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
@@ -2510,11 +3775,16 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
             closesocket(display->audio_socket);
             display->audio_socket = INVALID_SOCKET;
         }
-        WaitForSingleObject(display->audio_recv_thread, 3000);
+        if (WaitForSingleObject(display->audio_recv_thread, 7000) != WAIT_OBJECT_0) {
+            ui_log(L"IDD: audio receiver did not stop; preserving display state to avoid use-after-free.");
+            return FALSE;
+        }
         CloseHandle(display->audio_recv_thread);
+        display->audio_recv_thread = NULL;
     }
 
     DeleteCriticalSection(&display->frame_cs);
+    DeleteCriticalSection(&display->input_send_cs);
 
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
@@ -2525,6 +3795,23 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);
 
     HeapFree(GetProcessHeap(), 0, display);
+    return TRUE;
+}
+
+void vm_display_idd_destroy(VmDisplayIdd *display)
+{
+    if (!display) return;
+
+    if (!display->auxiliary && display->secondary) {
+        /* The auxiliary viewer borrows the primary input owner. Never free
+           the primary while a timed-out secondary worker can still use it. */
+        if (!vm_display_idd_destroy_one(display->secondary)) {
+            ui_log(L"IDD: preserving primary state while Display 2 finishes stopping.");
+            return;
+        }
+        display->secondary = NULL;
+    }
+    (void)vm_display_idd_destroy_one(display);
 }
 
 BOOL vm_display_idd_is_open(VmDisplayIdd *display)

@@ -25,6 +25,7 @@
 #include <shlobj.h>
 #include <userenv.h>
 #include <ntsecapi.h>
+#include <wincrypt.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -38,6 +39,7 @@
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "crypt32.lib")
 
 /* GUID_DEVCLASS_DISPLAY = {4D36E968-E325-11CE-BFC1-08002BE10318} */
 static const GUID GUID_DISPLAY_CLASS =
@@ -1530,7 +1532,9 @@ emit:
 
 /* ---- Helper: run devcon command and capture stdout ---- */
 
-static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD *out_exit_code)
+static BOOL run_devcon_timeout(const wchar_t *args, char *output,
+                               int output_size, DWORD *out_exit_code,
+                               DWORD timeout_ms)
 {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -1541,6 +1545,8 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
     wchar_t *slash;
     DWORD bytes_read;
     int pos = 0;
+    ULONGLONG deadline;
+    BOOL timed_out = FALSE;
 
     GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
     slash = wcsrchr(exe_dir, L'\\');
@@ -1569,23 +1575,188 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
     }
     CloseHandle(hWrite);
 
-    /* Wait for devcon to finish (10s max). If it hangs, kill it. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
-        agent_log("run_devcon: process timed out, killing.");
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 3000);
+    /* Drain while devcon runs, including output beyond our diagnostic buffer.
+       Waiting first can deadlock when the child fills the anonymous pipe. */
+    deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        char chunk[1024];
+        DWORD available = 0;
+        if (!PeekNamedPipe(hRead, NULL, 0, NULL, &available, NULL)) break;
+        if (available) {
+            DWORD take = available < sizeof(chunk) ? available : sizeof(chunk);
+            if (!ReadFile(hRead, chunk, take, &bytes_read, NULL) || !bytes_read) break;
+            if (output && pos < output_size - 1) {
+                int keep = (int)bytes_read < output_size - pos - 1 ?
+                           (int)bytes_read : output_size - pos - 1;
+                memcpy(output + pos, chunk, keep);
+                pos += keep;
+            }
+        } else if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+        else if (GetTickCount64() >= deadline) {
+            agent_log("run_devcon: process timed out, killing.");
+            TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+            WaitForSingleObject(pi.hProcess, 3000);
+            timed_out = TRUE;
+            break;
+        } else Sleep(20);
     }
-
-    /* Now read whatever output is available (process is dead, pipe will EOF) */
-    while (ReadFile(hRead, output + pos, (DWORD)(output_size - pos - 1), &bytes_read, NULL) && bytes_read > 0)
-        pos += (int)bytes_read;
-    output[pos] = '\0';
+    if (output && output_size > 0) output[pos] = '\0';
     CloseHandle(hRead);
 
     if (out_exit_code) GetExitCodeProcess(pi.hProcess, out_exit_code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return TRUE;
+    return !timed_out;
+}
+
+static BOOL run_devcon(const wchar_t *args, char *output, int output_size,
+                       DWORD *out_exit_code)
+{
+    return run_devcon_timeout(args, output, output_size, out_exit_code, 2000);
+}
+
+/* The host refreshes these packages while the VM is offline.  Applying them
+   at the next boot upgrades pre-existing VMs without modifying checkpoints or
+   requiring a new VM image. */
+static BOOL staged_root_device_present(const wchar_t *hardware_id)
+{
+    HDEVINFO devs = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    SP_DEVINFO_DATA info;
+    DWORD index;
+    BOOL present = FALSE;
+    /* A failed enumeration must not lead to creating duplicate root devices. */
+    if (devs == INVALID_HANDLE_VALUE) return TRUE;
+    ZeroMemory(&info, sizeof(info)); info.cbSize = sizeof(info);
+    for (index = 0; SetupDiEnumDeviceInfo(devs, index, &info); ++index) {
+        wchar_t ids[1024] = {0};
+        wchar_t *id;
+        if (!SetupDiGetDeviceRegistryPropertyW(devs, &info, SPDRP_HARDWAREID, NULL,
+                (PBYTE)ids, sizeof(ids) - 2 * sizeof(wchar_t), NULL)) continue;
+        for (id = ids; *id; id += wcslen(id) + 1)
+            if (_wcsicmp(id, hardware_id) == 0) present = TRUE;
+        if (present) break;
+    }
+    SetupDiDestroyDeviceInfoList(devs);
+    return present;
+}
+
+static BOOL staged_driver_digest(const wchar_t *dir, const wchar_t *stem, BYTE digest[32])
+{
+    static const wchar_t *exts[] = { L"inf", L"cat", NULL };
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD i, bytes, size = 32;
+    BYTE buffer[4096];
+    wchar_t path[MAX_PATH];
+    BOOL ok = FALSE;
+    if (!CryptAcquireContextW(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) ||
+        !CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) goto done;
+    for (i = 0; i < 3; ++i) {
+        const wchar_t *ext = i < 2 ? exts[i] :
+                            (_wcsicmp(stem, L"AppSandboxVDD") == 0 ? L"dll" : L"sys");
+        swprintf_s(path, _countof(path), L"%s%s.%s", dir, stem, ext);
+        file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (file == INVALID_HANDLE_VALUE) goto done;
+        for (;;) {
+            if (!ReadFile(file, buffer, sizeof(buffer), &bytes, NULL)) goto done;
+            if (!bytes) break;
+            if (!CryptHashData(hash, buffer, bytes, 0)) goto done;
+        }
+        CloseHandle(file); file = INVALID_HANDLE_VALUE;
+    }
+    ok = CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0);
+done:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (hash) CryptDestroyHash(hash);
+    if (provider) CryptReleaseContext(provider, 0);
+    return ok;
+}
+
+static void install_staged_root_driver(const wchar_t *inf_name,
+                                       const wchar_t *hardware_id,
+                                       const char *label)
+{
+    wchar_t exe_dir[MAX_PATH], driver_dir[MAX_PATH], inf_path[MAX_PATH], args[2 * MAX_PATH];
+    wchar_t stem[64], marker[MAX_PATH];
+    wchar_t *slash;
+    char output[4096];
+    DWORD exit_code = 0;
+    DWORD bytes;
+    BYTE digest[32], previous[32];
+    HANDLE file;
+    BOOL present;
+    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    swprintf_s(inf_path, MAX_PATH, L"%sdrivers\\%s", exe_dir, inf_name);
+    if (GetFileAttributesW(inf_path) == INVALID_FILE_ATTRIBUTES) return;
+    swprintf_s(driver_dir, _countof(driver_dir), L"%sdrivers\\", exe_dir);
+    wcscpy_s(stem, _countof(stem), inf_name);
+    slash = wcsrchr(stem, L'.'); if (slash) *slash = L'\0';
+    swprintf_s(marker, _countof(marker), L"%s%s.pending", driver_dir, stem);
+    if (GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES) {
+        agent_log("%s package copy is incomplete; retaining the installed driver.", label);
+        return;
+    }
+    swprintf_s(marker, _countof(marker), L"%s%s.applied", driver_dir, stem);
+    if (!staged_driver_digest(driver_dir, stem, digest)) {
+        agent_log("%s package is incomplete/unreadable; keeping the installed driver.", label);
+        return;
+    }
+    present = staged_root_device_present(hardware_id);
+    file = CreateFileW(marker, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        BOOL same = ReadFile(file, previous, sizeof(previous), &bytes, NULL) &&
+                    bytes == sizeof(previous) && !memcmp(previous, digest, sizeof(previous));
+        CloseHandle(file);
+        if (present && same) return; /* no devcon restart of unchanged VDD on every boot */
+    }
+    swprintf_s(args, _countof(args), L"%s \"%s\" %s", present ? L"update" : L"install", inf_path, hardware_id);
+    if (!run_devcon_timeout(args, output, sizeof(output), &exit_code, 60000)) {
+        agent_log("%s driver install could not launch devcon (%lu).", label, GetLastError());
+        return;
+    }
+    agent_log("%s driver install (exit=%lu): %.400s", label, exit_code, output);
+    /* Devcon 1 is success with reboot required, not an installation failure.
+       Never follow a failed update with install: that creates a second root. */
+    if (exit_code == 0 || exit_code == 1) {
+        file = CreateFileW(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, digest, sizeof(digest), &bytes, NULL);
+            FlushFileBuffers(file);
+            CloseHandle(file);
+        }
+        if (exit_code == 1) agent_log("%s driver update requires a guest reboot.", label);
+    }
+}
+
+/* Secure Boot blocks test-signed kernel drivers (test signing is ignored),
+   so installing them would only leave failed devices behind. */
+static BOOL secure_boot_enabled(void)
+{
+    DWORD value = 0, size = sizeof(value);
+    return RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+                        L"UEFISecureBootEnabled", RRF_RT_REG_DWORD, NULL, &value, &size) == ERROR_SUCCESS &&
+           value != 0;
+}
+
+static void install_staged_integration_drivers(void)
+{
+    /* The display driver is user-mode (UMDF): its certificate in Root +
+       TrustedPublisher is enough even with Secure Boot on. */
+    install_staged_root_driver(L"AppSandboxVDD.inf", L"Root\\AppSandboxVDD", "VDD");
+    if (secure_boot_enabled()) {
+        static BOOL logged;
+        if (!logged) {
+            logged = TRUE;
+            agent_log("Secure Boot is on: skipping the test-signed kernel drivers (VHID mouse, VAD audio). "
+                      "Immersive input uses SendInput; sound and microphone use the VB-Audio drivers.");
+        }
+        return;
+    }
+    install_staged_root_driver(L"AppSandboxVHID.inf", L"Root\\AppSandboxVHID", "VHID");
+    install_staged_root_driver(L"AppSandboxVAD.inf", L"Root\\AppSandboxVAD", "VAD");
 }
 
 /* ---- VDD device check: restart if not running ---- */
@@ -3315,6 +3486,16 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Wire p9copy logging into agent_log */
     p9_set_log(p9copy_log);
 
+    /* Driver servicing may legitimately take longer than the SCM start
+       window.  The listener is not ready yet, but reporting RUNNING keeps
+       Windows from terminating a healthy upgrade in progress; the host's
+       normal connection retry covers this short interval. */
+    set_service_status(SERVICE_RUNNING, 0);
+
+    /* Install/update offline-staged drivers before any console helper probes
+       them.  This is early boot, before a display connection is opened. */
+    install_staged_integration_drivers();
+
     /* Start listener on a worker thread */
     thread = CreateThread(NULL, 0, listener_thread, NULL, 0, NULL);
 
@@ -3330,7 +3511,6 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start audio capture monitor (SYSTEM, :0004) */
     start_audio_monitor();
 
-    set_service_status(SERVICE_RUNNING, 0);
     /* Stamp the build into the guest log. Without it there is no way to tell,
        from the log alone, whether the VM is running the agent you just built
        or one baked into its disk by an earlier install. */

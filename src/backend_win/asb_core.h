@@ -108,6 +108,7 @@ typedef void (*AsbVmRemovedCallback)(int index, void *user_data);
 /* Initialize the core library.
    Loads HCS/HCN DLLs, enumerates GPUs, loads VM list from vms.cfg, scans templates. */
 ASB_API HRESULT asb_init(void);
+ASB_API const wchar_t *asb_test_namespace(void);
 
 /* Shut down all running VMs and free resources. */
 ASB_API void asb_cleanup(void);
@@ -250,6 +251,10 @@ ASB_API void asb_set_last_iso_path(const wchar_t *path);
 ASB_API const wchar_t *asb_get_last_iso_path(void);
 ASB_API void asb_set_last_storage_parent(const wchar_t *path);
 ASB_API const wchar_t *asb_get_last_storage_parent(void);
+/* Microphone passthrough (global). device_id = IMMDevice id of the host
+   capture endpoint, empty = Windows' default input. */
+ASB_API void asb_get_mic_settings(BOOL *enabled, wchar_t *device_id, size_t device_id_chars);
+ASB_API BOOL asb_set_mic_settings(BOOL enabled, const wchar_t *device_id);
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress);
 ASB_API BOOL asb_get_suppress_tray_warn(void);
 ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int capacity);

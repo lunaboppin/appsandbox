@@ -13,6 +13,22 @@ Then prints a per-thread summary + a coverage table (function -> where tested).
 Launch as a background task. Self-cleaning: every VM is a brk-* throwaway.
 """
 import sys, os, subprocess, threading
+from pathlib import Path
+from uuid import UUID
+
+if os.name == "nt":
+    # Naming a VM brk-* alone is not isolation: the old sweep could delete a
+    # user's VM with that prefix. Require the native daemon's test namespace.
+    try:
+        _test_namespace = "{" + str(UUID(os.environ["ASB_TEST_NAMESPACE"])) + "}"
+        _test_data = Path(os.environ["ProgramData"]).resolve()
+        _marker = _test_data / "AppSandbox" / ".asb-test-namespace"
+        if _marker.read_text(encoding="ascii") != _test_namespace:
+            raise ValueError("test namespace marker does not match")
+    except (KeyError, ValueError, OSError) as e:
+        raise SystemExit("Refusing destructive VM tests outside an isolated daemon. "
+                         "Use build/start-disposable-daemon.ps1 and set ProgramData + "
+                         "ASB_TEST_NAMESPACE to its values. (%s)" % e)
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))   # parent: for asb.py
 sys.path.insert(0, HERE)                     # this dir: for vm_lifecycle + sibling test modules
@@ -92,6 +108,8 @@ COVERAGE = [
 try:
     _c = asb.connect()
     v = _c.version()
+    if os.name == "nt" and v.get("testNamespace") != _test_namespace:
+        raise RuntimeError("endpoint is not the expected isolated test daemon")
     print("daemon reachable: %s %s (%s)" % (v.get("product"), v.get("version"), v.get("hostOs")))
 except Exception as e:
     print("PREFLIGHT FAIL: daemon not reachable (%s).\nStart it with: %s"
@@ -114,12 +132,17 @@ if RUN_STATIC:
     results["manage-contract"] = [] if p.returncode == 0 else ["test_manage_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_resources_contract.py")], cwd=HERE)
     results["shared-contract"] = [] if p.returncode == 0 else ["test_shared_resources_contract.py exit %d" % p.returncode]
+    if not IS_MAC:
+        p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_mapping_behavior.py")], cwd=HERE)
+        results["host-mapping-behavior"] = [] if p.returncode == 0 else ["test_host_mapping_behavior.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_appliance_contract.py")], cwd=HERE)
     results["appliance-contract"] = [] if p.returncode == 0 else ["test_shared_appliance_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_appliance_retry_contract.py")], cwd=HERE)
     results["appliance-retry"] = [] if p.returncode == 0 else ["test_shared_appliance_retry_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_release_shared_resource_artifacts.py")], cwd=HERE)
     results["appliance-artifacts"] = [] if p.returncode == 0 else ["test_release_shared_resource_artifacts.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_remote_display_contract.py")], cwd=HERE)
+    results["remote-display-contract"] = [] if p.returncode == 0 else ["test_remote_display_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_and_validation.py")], cwd=HERE)
     results["static"] = [] if p.returncode == 0 else ["test_host_and_validation.py exit %d" % p.returncode]
 

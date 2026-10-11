@@ -18,6 +18,7 @@
  */
 
 #include <dirent.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -34,6 +35,7 @@
 #include <unistd.h>
 
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1074,11 +1076,25 @@ static int appliance_token_valid(const char *value)
 static int configure_shared_nic(const char *arguments)
 {
     char copy[128], *separator, command[512];
+    struct in_addr address;
+    size_t i;
+    if (!arguments || strlen(arguments) >= sizeof(copy)) return EINVAL;
     snprintf(copy, sizeof(copy), "%s", arguments);
     separator = strrchr(copy, ':');
     if (!separator) return EINVAL;
     *separator++ = '\0';
-    if (strlen(copy) != 17 || !*separator) return EINVAL;
+    if (strlen(copy) != 17 || inet_pton(AF_INET, separator, &address) != 1)
+        return EINVAL;
+    /* HCN uses hyphens; ip link prints colons. Match either wire format,
+       and validate before interpolating into the shell command. */
+    for (i = 0; i < 17; ++i) {
+        if (i % 3 == 2) {
+            if (copy[i] != '-' && copy[i] != ':') return EINVAL;
+            copy[i] = ':';
+        } else if (!((copy[i] >= '0' && copy[i] <= '9') ||
+                     (copy[i] >= 'a' && copy[i] <= 'f') ||
+                     (copy[i] >= 'A' && copy[i] <= 'F'))) return EINVAL;
+    }
     snprintf(command, sizeof(command),
         "iface=$(ip -o link | awk -v mac='%s' 'tolower($0) ~ tolower(mac){gsub(\":\",\"\",$2);print $2;exit}'); "
         "[ -n \"$iface\" ] && ip link set $iface up && ip addr replace %s/24 dev $iface",
@@ -1125,9 +1141,29 @@ static int appliance_set_account(const char *arguments)
     return rc;
 }
 
+static int appliance_reload_shares(void)
+{
+    /* Samba includes one literal file; it does not expand a shell glob.
+       Rebuild an atomic aggregate whenever a share is added or removed. */
+    return run_sync(
+        "mkdir -p /etc/samba/appsandbox-shares && "
+        "tmp=/etc/samba/appsandbox-shares.conf.tmp; "
+        ": > \"$tmp\" || exit 1; "
+        "for f in /etc/samba/appsandbox-shares/*.conf; do "
+        "[ -f \"$f\" ] || continue; cat \"$f\" >> \"$tmp\" || exit 1; done; "
+        "chmod 0644 \"$tmp\" && mv -f \"$tmp\" /etc/samba/appsandbox-shares.conf || exit 1; "
+        "sed -i '\\|^[[:space:]]*include = /etc/samba/appsandbox-shares/\\*\\.conf[[:space:]]*$|d' /etc/samba/smb.conf || exit 1; "
+        "grep -Fqx 'include = /etc/samba/appsandbox-shares.conf' /etc/samba/smb.conf || "
+        "printf '\\n[global]\\ninclude = /etc/samba/appsandbox-shares.conf\\n' >> /etc/samba/smb.conf; "
+        "testparm -s >/dev/null 2>&1 && systemctl reload smbd");
+}
+
 static int appliance_reconcile_share(const char *arguments)
 {
     char copy[256], *mode, directory[128], path[256], command[512];
+    char desired[512], current[512];
+    size_t current_length = 0;
+    int rc;
     FILE *file;
     snprintf(copy, sizeof(copy), "%s", arguments);
     mode = strchr(copy, ':');
@@ -1142,15 +1178,29 @@ static int appliance_reconcile_share(const char *arguments)
         directory, directory);
     if (run_sync(command) != 0) return EIO;
     snprintf(path, sizeof(path), "/etc/samba/appsandbox-shares/%s.conf", directory);
-    file = fopen(path, "w");
-    if (!file) return errno;
-    fprintf(file,
+    snprintf(desired, sizeof(desired),
         "[%s]\npath = /srv/appsandbox/%s\nbrowseable = no\nvalid users = AppSandboxShare\nread only = %s\nforce user = AppSandboxShare\n",
         copy, directory, strcmp(mode, "ro") == 0 ? "yes" : "no");
+    file = fopen(path, "r");
+    if (file) {
+        current_length = fread(current, 1, sizeof(current) - 1, file);
+        fclose(file);
+    }
+    current[current_length] = '\0';
+    if (file && strcmp(current, desired) == 0) return appliance_reload_shares();
+    file = fopen(path, "w");
+    if (!file) return errno;
+    fputs(desired, file);
     fclose(file);
-    if (run_sync("grep -q 'include = /etc/samba/appsandbox-shares/*.conf' /etc/samba/smb.conf || echo 'include = /etc/samba/appsandbox-shares/*.conf' >> /etc/samba/smb.conf") != 0)
-        return EIO;
-    return run_sync("testparm -s >/dev/null 2>&1 && systemctl reload smbd");
+    rc = appliance_reload_shares();
+    /* Samba applies "read only" at tree connect, and Windows keeps tree
+       connections alive across a remap. When an existing definition changed,
+       drop current connections; clients reconnect with the new settings. */
+    if (rc == 0 && current_length) {
+        snprintf(command, sizeof(command), "smbcontrol smbd close-share '%s'", copy);
+        run_sync(command);
+    }
+    return rc;
 }
 
 static int appliance_purge_share(const char *share)
@@ -1160,9 +1210,10 @@ static int appliance_purge_share(const char *share)
     snprintf(directory, sizeof(directory), "%s", share);
     { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
     snprintf(command, sizeof(command),
-        "rm -f /etc/samba/appsandbox-shares/%s.conf && rm -rf -- /srv/appsandbox/%s && systemctl reload smbd",
+        "rm -f /etc/samba/appsandbox-shares/%s.conf && rm -rf -- /srv/appsandbox/%s",
         directory, directory);
-    return run_sync(command);
+    if (run_sync(command) != 0) return EIO;
+    return appliance_reload_shares();
 }
 
 static int appliance_remove_share(const char *share)
@@ -1172,9 +1223,10 @@ static int appliance_remove_share(const char *share)
     snprintf(directory, sizeof(directory), "%s", share);
     { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
     snprintf(command, sizeof(command),
-        "rm -f /etc/samba/appsandbox-shares/%s.conf && systemctl reload smbd",
+        "rm -f /etc/samba/appsandbox-shares/%s.conf",
         directory);
-    return run_sync(command);
+    if (run_sync(command) != 0) return EIO;
+    return appliance_reload_shares();
 }
 
 /* ---- Per-client command dispatch ---- */

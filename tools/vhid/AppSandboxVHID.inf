@@ -1,0 +1,61 @@
+; AppSandbox virtual HID relative mouse (VHF/KMDF).
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = AppSandboxVHID.cat
+PnpLockdown = 1
+; DriverVer is stamped from Directory.Build.props.
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+AppSandboxVHID.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64.10.0...22000,NTARM64.10.0...22000
+
+[Standard.NTamd64.10.0...22000]
+%DeviceDesc% = ASB_Install, Root\AppSandboxVHID
+
+[Standard.NTARM64.10.0...22000]
+%DeviceDesc% = ASB_Install, Root\AppSandboxVHID
+
+[ASB_Install.NT]
+CopyFiles = ASB_Copy
+
+[ASB_Copy]
+AppSandboxVHID.sys
+
+[ASB_Install.NT.HW]
+AddReg = ASB_VhfFilter
+
+[ASB_VhfFilter]
+HKR,,"LowerFilters",0x00010000,"vhf"
+
+[ASB_Install.NT.Services]
+AddService = AppSandboxVHID, 0x00000002, ASB_Service
+
+[ASB_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\AppSandboxVHID.sys
+
+[ASB_Install.NT.Wdf]
+KmdfService = AppSandboxVHID, ASB_Wdf
+
+[ASB_Wdf]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ManufacturerName = "AppSandbox"
+DiskName         = "AppSandbox Virtual HID Installation Disk"
+DeviceDesc       = "AppSandbox Virtual HID Mouse"
+ServiceDesc      = "AppSandbox Virtual HID Mouse Driver"

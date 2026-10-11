@@ -3,6 +3,7 @@
 #include "../../tools/provision/win_provision.h"
 #include <virtdisk.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <imapi2fs.h>
@@ -854,6 +855,13 @@ static HRESULT iso_create_resources_ex(const wchar_t *iso_path,
                 "\"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
                 "echo [VDD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
                 "\r\n"
+                "REM Install virtual HID mouse for raw/relative game input\r\n"
+                "if exist \"%ISODRV%\\drivers\\AppSandboxVHID.inf\" (\r\n"
+                "    echo [VHID] Installing driver with devcon... >> \"%LOG%\"\r\n"
+                "    \"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVHID.inf\" Root\\AppSandboxVHID >> \"%LOG%\" 2>&1\r\n"
+                "    echo [VHID] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
+                ")\r\n"
+                "\r\n"
                 "REM Disable display sleep so IDD swap chain stays alive\r\n"
                 "powercfg /change monitor-timeout-ac 0\r\n"
                 "powercfg /change monitor-timeout-dc 0\r\n"
@@ -1230,6 +1238,44 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
         }
     }
 
+    /* Virtual HID mouse driver — enables true relative/raw game input. */
+    {
+        wchar_t drivers_staging[MAX_PATH], vhid_dir[MAX_PATH], vhid_src[MAX_PATH];
+        const wchar_t *vhid_files[] = {
+            L"AppSandboxVHID.sys", L"AppSandboxVHID.inf",
+            L"AppSandboxVHID.cat", L"AppSandboxVHID.cer"
+        };
+        BOOL found_vhid = FALSE;
+        int vf;
+        swprintf_s(drivers_staging, MAX_PATH, L"%s\\drivers", staging);
+        if (res_dir) {
+            swprintf_s(vhid_dir, MAX_PATH, L"%s\\drivers", res_dir);
+            swprintf_s(vhid_src, MAX_PATH, L"%s\\AppSandboxVHID.sys", vhid_dir);
+            found_vhid = GetFileAttributesW(vhid_src) != INVALID_FILE_ATTRIBUTES;
+        }
+        if (!found_vhid) {
+            wchar_t exe_dir2[MAX_PATH], *slash2;
+            GetModuleFileNameW(NULL, exe_dir2, MAX_PATH);
+            slash2 = wcsrchr(exe_dir2, L'\\');
+            if (slash2) *slash2 = L'\0';
+            swprintf_s(vhid_dir, MAX_PATH, L"%s\\drivers", exe_dir2);
+            swprintf_s(vhid_src, MAX_PATH, L"%s\\AppSandboxVHID.sys", vhid_dir);
+            found_vhid = GetFileAttributesW(vhid_src) != INVALID_FILE_ATTRIBUTES;
+        }
+        if (found_vhid) {
+            CreateDirectoryW(drivers_staging, NULL);
+            for (vf = 0; vf < (int)_countof(vhid_files); ++vf) {
+                swprintf_s(vhid_src, MAX_PATH, L"%s\\%s", vhid_dir, vhid_files[vf]);
+                swprintf_s(file_path, MAX_PATH, L"%s\\%s", drivers_staging, vhid_files[vf]);
+                if (GetFileAttributesW(vhid_src) != INVALID_FILE_ATTRIBUTES)
+                    CopyFileW(vhid_src, file_path, FALSE);
+            }
+            ui_log(L"Staged AppSandboxVHID driver files for the Windows VM.");
+        } else {
+            ui_log(L"Warning: AppSandboxVHID bundle not found; immersive mouse input will be unavailable.");
+        }
+    }
+
     /* VAD driver files — copy to drivers\ subdirectory if available */
     {
         wchar_t drivers_staging[MAX_PATH];
@@ -1356,6 +1402,13 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 "\"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
                 "echo [VDD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
                 "\r\n"
+                "REM Install virtual HID mouse for raw/relative game input\r\n"
+                "if exist \"%ISODRV%\\drivers\\AppSandboxVHID.inf\" (\r\n"
+                "    echo [VHID] Installing driver with devcon... >> \"%LOG%\"\r\n"
+                "    \"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVHID.inf\" Root\\AppSandboxVHID >> \"%LOG%\" 2>&1\r\n"
+                "    echo [VHID] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
+                ")\r\n"
+                "\r\n"
                 "REM Disable display sleep so IDD swap chain stays alive\r\n"
                 "powercfg /change monitor-timeout-ac 0\r\n"
                 "powercfg /change monitor-timeout-dc 0\r\n"
@@ -1435,20 +1488,54 @@ static BOOL copy_appliance_source(const wchar_t *staging, const wchar_t *res_dir
     return CopyFileW(source, destination, FALSE);
 }
 
+/* NoCloud detects user-data by its first bytes. A CRT ccs=UTF-8 stream adds
+   a BOM, which cloud-init does not strip before matching #cloud-config. */
+static BOOL cloud_init_printf(FILE *file, const wchar_t *format, ...)
+{
+    va_list args;
+    wchar_t *wide = NULL;
+    char *utf8 = NULL;
+    int chars, bytes = 0;
+    BOOL ok = FALSE;
+    va_start(args, format);
+    chars = _vscwprintf(format, args);
+    va_end(args);
+    if (chars < 0) return FALSE;
+    wide = HeapAlloc(GetProcessHeap(), 0, (chars + 1) * sizeof(wchar_t));
+    if (!wide) return FALSE;
+    va_start(args, format);
+    vswprintf_s(wide, chars + 1, format, args);
+    va_end(args);
+    bytes = WideCharToMultiByte(CP_UTF8, 0, wide, chars, NULL, 0, NULL, NULL);
+    if (bytes <= 0) goto done;
+    utf8 = HeapAlloc(GetProcessHeap(), 0, bytes);
+    if (!utf8) goto done;
+    if (!WideCharToMultiByte(CP_UTF8, 0, wide, chars, utf8, bytes, NULL, NULL)) goto done;
+    ok = fwrite(utf8, 1, bytes, file) == (size_t)bytes;
+done:
+    if (utf8) { SecureZeroMemory(utf8, bytes); HeapFree(GetProcessHeap(), 0, utf8); }
+    SecureZeroMemory(wide, (chars + 1) * sizeof(wchar_t));
+    HeapFree(GetProcessHeap(), 0, wide);
+    return ok;
+}
+
 HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
                                         const wchar_t *admin_user,
                                         const wchar_t *admin_password,
                                         const wchar_t *smb_user,
                                         const wchar_t *smb_password,
                                         const wchar_t *ssh_public_key,
-                                        const wchar_t *res_dir)
+                                        const wchar_t *res_dir,
+                                        const char *nat_mac, const char *nat_base,
+                                        const char *share_mac, const char *share_ip)
 {
     wchar_t dir[MAX_PATH], staging[MAX_PATH], path[MAX_PATH], *slash;
     char password_hash[256];
     FILE *file = NULL;
     HRESULT hr;
     if (!iso_path || !admin_user || !admin_password || !smb_user ||
-        !smb_password || !ssh_public_key || !ssh_public_key[0] || !res_dir) return E_INVALIDARG;
+        !smb_password || !ssh_public_key || !ssh_public_key[0] || !res_dir ||
+        !nat_mac || !nat_base || !share_mac || !share_ip) return E_INVALIDARG;
     if (!unix_password_hash(admin_password, password_hash, sizeof(password_hash)))
         return E_FAIL;
     wcscpy_s(dir, _countof(dir), iso_path);
@@ -1459,13 +1546,37 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         return HRESULT_FROM_WIN32(GetLastError());
 
     swprintf_s(path, _countof(path), L"%s\\meta-data", staging);
-    if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
-    fwprintf(file, L"instance-id: appsandbox-shared-appliance\nlocal-hostname: appsandbox-share\n");
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    if (!cloud_init_printf(file, L"instance-id: appsandbox-shared-appliance\nlocal-hostname: appsandbox-share\n")) { hr = E_FAIL; goto cleanup; }
+    fclose(file); file = NULL;
+
+    /* NAT uses static HCN addressing, not a DHCP service. Configure it before
+       cloud-init tries apt; the guest agent cannot configure its own bootstrap
+       network until the compiler and dependencies have already installed. */
+    swprintf_s(path, _countof(path), L"%s\\network-config", staging);
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    {
+        char nat_match[32], share_match[32];
+        size_t i;
+        strcpy_s(nat_match, sizeof(nat_match), nat_mac);
+        strcpy_s(share_match, sizeof(share_match), share_mac);
+        for (i = 0; nat_match[i]; ++i) if (nat_match[i] == '-') nat_match[i] = ':';
+        for (i = 0; share_match[i]; ++i) if (share_match[i] == '-') share_match[i] = ':';
+        if (!cloud_init_printf(file,
+            L"version: 2\nethernets:\n"
+            L"  maintenance:\n    match: {macaddress: '%S'}\n    dhcp4: false\n"
+            L"    addresses: ['%S.254/24']\n"
+            L"    routes: [{to: default, via: '%S.1'}]\n"
+            L"    nameservers: {addresses: [1.1.1.1, 8.8.8.8]}\n"
+            L"  shared:\n    match: {macaddress: '%S'}\n    dhcp4: false\n"
+            L"    addresses: ['%S/24']\n    optional: true\n",
+            nat_match, nat_base, nat_base, share_match, share_ip)) { hr = E_FAIL; goto cleanup; }
+    }
     fclose(file); file = NULL;
 
     swprintf_s(path, _countof(path), L"%s\\user-data", staging);
-    if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
-    fwprintf(file,
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    if (!cloud_init_printf(file,
         L"#cloud-config\n"
         L"users:\n  - default\n  - name: %s\n    groups: [adm, sudo]\n"
         L"    shell: /bin/bash\n    lock_passwd: false\n    passwd: '%S'\n"
@@ -1495,7 +1606,7 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         L"runcmd:\n  - [/usr/local/sbin/appsandbox-appliance-firstboot]\n"
         L"final_message: 'AppSandbox appliance provisioned'\n",
         admin_user, password_hash, ssh_public_key, smb_user, smb_user,
-        smb_password, smb_password, smb_user);
+        smb_password, smb_password, smb_user)) { hr = E_FAIL; goto cleanup; }
     fclose(file); file = NULL;
     SecureZeroMemory(password_hash, sizeof(password_hash));
 
@@ -1981,6 +2092,38 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
             }
         } else {
             ui_log(L"Warning: AppSandboxVDD driver bundle not found; the new Windows VM IDD display will not be available.");
+        }
+    }
+
+    /* 3a. Virtual HID mouse driver files */
+    {
+        const wchar_t *vhid_files[] = {
+            L"AppSandboxVHID.sys", L"AppSandboxVHID.inf",
+            L"AppSandboxVHID.cat", L"AppSandboxVHID.cer"
+        };
+        wchar_t vhid_dir[MAX_PATH];
+        BOOL found_vhid = FALSE;
+        int vf;
+        if (res_dir) {
+            swprintf_s(vhid_dir, MAX_PATH, L"%s\\drivers", res_dir);
+            swprintf_s(src, MAX_PATH, L"%s\\AppSandboxVHID.sys", vhid_dir);
+            found_vhid = GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES;
+        }
+        if (!found_vhid) {
+            swprintf_s(vhid_dir, MAX_PATH, L"%s\\drivers", exe_dir);
+            swprintf_s(src, MAX_PATH, L"%s\\AppSandboxVHID.sys", vhid_dir);
+            found_vhid = GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES;
+        }
+        if (found_vhid) {
+            for (vf = 0; vf < (int)_countof(vhid_files); ++vf) {
+                swprintf_s(src, MAX_PATH, L"%s\\%s", vhid_dir, vhid_files[vf]);
+                if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
+                    fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\drivers\\%s\n", src, vhid_files[vf]);
+                    count++;
+                }
+            }
+        } else {
+            ui_log(L"Warning: AppSandboxVHID bundle not found; immersive mouse input will be unavailable.");
         }
     }
 

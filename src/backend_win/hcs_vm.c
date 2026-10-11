@@ -1,4 +1,5 @@
 #include "hcs_vm.h"
+#include "asb_core.h"
 #include "vm_agent.h"
 #include "ui.h"
 #include "disk_util.h"   /* ASB_IS_ARM64 */
@@ -734,6 +735,9 @@ void hcs_destroy_stale(const wchar_t *name)
     HCS_OPERATION op;
     HRESULT hr;
 
+    /* A disposable test never force-cleans a compute system found by name.
+       An unexpected collision is an error, not permission to terminate it. */
+    if (asb_test_namespace()[0]) return;
     if (!g_hcs_dll || !pfnClose || !pfnOpen) return;
 
     hr = pfnOpen(name, GENERIC_ALL, &stale);
@@ -957,11 +961,21 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         ((endpoint_guid && endpoint_guid[0] != L'\0') ||
          (share_endpoint_guid && share_endpoint_guid[0] != L'\0'))) {
         wchar_t default_mac_field[64] = L"";
+        wchar_t default_endpoint_clsid[40];
         wchar_t share_mac_field[64] = L"";
         char default_mac[32] = "";
         GUID default_endpoint_id;
+        /* HCN returns bare UUIDs, while CLSIDFromString accepts the braced
+           COM representation. Without this conversion the adapter gets a
+           fresh MAC and cannot match the cloud-init bootstrap network. */
+        if (endpoint_guid && wcslen(endpoint_guid) == 36)
+            swprintf_s(default_endpoint_clsid, _countof(default_endpoint_clsid),
+                       L"{%s}", endpoint_guid);
+        else
+            default_endpoint_clsid[0] = L'\0';
         if (endpoint_guid && endpoint_guid[0] != L'\0' &&
-            SUCCEEDED(CLSIDFromString(endpoint_guid, &default_endpoint_id)) &&
+            SUCCEEDED(CLSIDFromString(default_endpoint_clsid[0] ?
+                default_endpoint_clsid : endpoint_guid, &default_endpoint_id)) &&
             SUCCEEDED(hcn_get_endpoint_mac(&default_endpoint_id,
                                            default_mac, sizeof(default_mac))) &&
             default_mac[0])
@@ -1000,7 +1014,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        GuestStateOnly was observed to break DVD boot ("SCSI DVD boot loader
        failed") with older Server ISOs. */
     secureboot_section[0] = L'\0';
-    if (!is_windows || config->is_appliance) {
+    if (!is_windows || config->is_appliance || asb_test_namespace()[0]) {
         /* No Secure Boot section at all. Unsigned boot chains and the
            appliance's fresh vm.gs both depend on the template being absent
            rather than merely skipped. */
@@ -1197,14 +1211,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        Linux guests get the vsock-template form so a guest doing
        bind(AF_VSOCK, port=N) ends up registered as the corresponding
        <N>-FACB-... GUID on the host side. Same security descriptors
-       for both. Ports 1–6 cover agent + frame + input + audio + the
-       two clipboard channels. */
+       for both. Ports 1–8 cover agent, both displays, input, audio,
+       clipboard, and the SSH proxy. */
     {
         wchar_t entry[256];
         wchar_t guid_str[64];
         unsigned port;
         service_table[0] = L'\0';
-        for (port = 1; port <= 6; port++) {
+        for (port = 1; port <= 8; port++) {
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"
@@ -1339,7 +1353,11 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
     /* Dump JSON to file for debugging */
     {
         FILE *dbg = NULL;
-        _wfopen_s(&dbg, L"C:\\ProgramData\\AppSandbox\\last_vm.json", L"w,ccs=UTF-8");
+        wchar_t base[MAX_PATH], path[MAX_PATH];
+        if (!GetEnvironmentVariableW(L"ProgramData", base, _countof(base)))
+            wcscpy_s(base, _countof(base), L"C:\\ProgramData");
+        swprintf_s(path, _countof(path), L"%s\\AppSandbox\\last_vm.json", base);
+        _wfopen_s(&dbg, path, L"w,ccs=UTF-8");
         if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
     }
 
@@ -1445,7 +1463,11 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
     /* Dump JSON to file for debugging */
     {
         FILE *dbg = NULL;
-        _wfopen_s(&dbg, L"C:\\ProgramData\\AppSandbox\\last_vm.json", L"w,ccs=UTF-8");
+        wchar_t base[MAX_PATH], path[MAX_PATH];
+        if (!GetEnvironmentVariableW(L"ProgramData", base, _countof(base)))
+            wcscpy_s(base, _countof(base), L"C:\\ProgramData");
+        swprintf_s(path, _countof(path), L"%s\\AppSandbox\\last_vm.json", base);
+        _wfopen_s(&dbg, path, L"w,ccs=UTF-8");
         if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
     }
 
@@ -1872,6 +1894,7 @@ BOOL hcs_find_runtime_id(const wchar_t *vm_name, GUID *out)
     HRESULT hr;
     PWSTR result_doc = NULL;
     wchar_t needle[300];
+    wchar_t escaped[600], query[660];
     const wchar_t *p;
 
     if (!g_hcs_dll || !pfnEnumSystems || !pfnCreateOp || !pfnWaitOp)
@@ -1880,7 +1903,9 @@ BOOL hcs_find_runtime_id(const wchar_t *vm_name, GUID *out)
     op = pfnCreateOp(NULL, NULL);
     if (!op) return FALSE;
 
-    hr = pfnEnumSystems(NULL, op);
+    escape_json_path(vm_name, escaped, _countof(escaped));
+    swprintf_s(query, _countof(query), L"{\"Ids\":[\"%s\"]}", escaped);
+    hr = pfnEnumSystems(query, op);
     if (SUCCEEDED(hr))
         hr = pfnWaitOp(op, 5000, &result_doc);
     pfnCloseOp(op);
@@ -1890,8 +1915,6 @@ BOOL hcs_find_runtime_id(const wchar_t *vm_name, GUID *out)
         if (result_doc) LocalFree(result_doc);
         return FALSE;
     }
-
-    ui_log(L"HCS enumerate: %s", result_doc);
 
     /* Find our VM by name in the JSON array, then find its RuntimeId */
     swprintf_s(needle, 300, L"\"%s\"", vm_name);

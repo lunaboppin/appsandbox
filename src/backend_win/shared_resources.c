@@ -144,6 +144,28 @@ const AsbSharedResourceInfo *shared_resources_find(const wchar_t *id)
     return index >= 0 ? &g_resources[index] : NULL;
 }
 
+int shared_resources_snapshot(AsbSharedResourceInfo *out, int capacity)
+{
+    int count;
+    if (!out || capacity <= 0 || !g_resource_cs_ready) return 0;
+    EnterCriticalSection(&g_resource_cs);
+    count = g_resource_count < capacity ? g_resource_count : capacity;
+    memcpy(out, g_resources, count * sizeof(*out));
+    LeaveCriticalSection(&g_resource_cs);
+    return count;
+}
+
+BOOL shared_resources_copy(const wchar_t *id, AsbSharedResourceInfo *out)
+{
+    int index;
+    if (!id || !out || !g_resource_cs_ready) return FALSE;
+    EnterCriticalSection(&g_resource_cs);
+    index = find_id(id);
+    if (index >= 0) *out = g_resources[index];
+    LeaveCriticalSection(&g_resource_cs);
+    return index >= 0;
+}
+
 static HRESULT validate_info(const AsbSharedResourceInfo *in, int ignore,
                              AsbSharedResourceInfo *normalized)
 {

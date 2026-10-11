@@ -145,6 +145,7 @@ window.onHostMessage = function(msg) {
         case 'manageBrowseResult': onManageBrowseResult(msg); break;
         case 'createStorageBrowseResult': document.getElementById('storage-parent').value = msg.path || ''; break;
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
+        case 'audioSettings': onAudioSettings(msg); break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
@@ -1250,7 +1251,25 @@ function renderManageSharedResources(vm) {
     if(vm.sharedResourceError){var err=document.createElement('span');err.className='field-warn';err.textContent=vm.sharedResourceError;box.appendChild(err);}
 }
 
-function openSettingsModal(){if(hostBridge.isMac)return;populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
+function openSettingsModal(){if(hostBridge.isMac)return;populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();sendCmd('getAudioSettings');document.getElementById('settings-overlay').classList.add('active');}
+/* Settings > Audio: microphone passthrough on/off and host input device
+   (empty id = Windows default input). A saved device that is not currently
+   connected stays selectable so the choice is not silently lost. */
+function onAudioSettings(msg){
+    var sel=document.getElementById('mic-device'),devices=msg.devices||[],found=false;
+    document.getElementById('mic-passthrough').checked=!!msg.enabled;
+    sel.innerHTML='';
+    var def=document.createElement('option');def.value='';def.textContent='Windows default';sel.appendChild(def);
+    devices.forEach(function(dev){var o=document.createElement('option');o.value=dev.id;o.textContent=dev.name;if(dev.id===msg.deviceId)found=true;sel.appendChild(o);});
+    if(msg.deviceId&&!found){var m=document.createElement('option');m.value=msg.deviceId;m.textContent='Saved device (not connected)';sel.appendChild(m);}
+    sel.value=msg.deviceId||'';
+    sel.disabled=!msg.enabled;
+}
+function saveAudioSettings(){
+    var enabled=document.getElementById('mic-passthrough').checked;
+    document.getElementById('mic-device').disabled=!enabled;
+    sendCmd('setAudioSettings',{enabled:enabled,deviceId:document.getElementById('mic-device').value});
+}
 function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}
 function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-editor-title').textContent='Add shared resource';}
@@ -1269,7 +1288,7 @@ function renderSettingsResources(){
         name.textContent=r.driveLetter+': '+r.name;
         var meta=document.createElement('span');
         meta.className='settings-resource-meta';
-        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.enabled?'':' · Disabled')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
+        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.hostDriveLetter?' · Host '+r.hostDriveLetter+': auto-mount':' · Not mounted on host')+(r.enabled?'':' · Disabled')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
         details.append(name,meta);
         var actions=document.createElement('div');
         actions.className='settings-resource-actions';
@@ -1277,13 +1296,15 @@ function renderSettingsResources(){
         edit.type='button';edit.textContent='Edit';edit.title='Edit this shared resource definition.';
         edit.onclick=function(){editResource(r.id);};
         var mount=document.createElement('button');
-        mount.type='button';mount.textContent='Mount Host';mount.title='Mount this resource on the host using its configured host drive letter.';
+        mount.type='button';mount.textContent='Retry Mount';mount.title='Retry this resource\'s configured host drive mapping.';
+        mount.disabled=!r.hostDriveLetter||!r.enabled;
         mount.onclick=function(){mountHostResource(r.id);};
         var open=document.createElement('button');
         open.type='button';open.textContent='Open Share';open.title='Open this resource in File Explorer on the host.';
         open.onclick=function(){sendCmd('openHostResource',{id:r.id});};
         var unmount=document.createElement('button');
         unmount.type='button';unmount.textContent='Unmount';unmount.title='Unmount this resource from the host.';
+        unmount.disabled=!r.hostDriveLetter;
         unmount.onclick=function(){sendCmd('unmountHostResource',{id:r.id});};
         var purge=document.createElement('button');
         purge.type='button';purge.className='danger';purge.textContent='Purge Data';purge.title='Permanently delete all data stored in this resource.';

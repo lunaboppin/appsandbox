@@ -35,6 +35,9 @@ void shared_resources_init(void);
 int shared_resources_count(void);
 const AsbSharedResourceInfo *shared_resources_get(int index);
 const AsbSharedResourceInfo *shared_resources_find(const wchar_t *id);
+/* Copies remain valid while configuration is edited on another thread. */
+int shared_resources_snapshot(AsbSharedResourceInfo *out, int capacity);
+BOOL shared_resources_copy(const wchar_t *id, AsbSharedResourceInfo *out);
 void shared_resources_share_name(const wchar_t *id, wchar_t *out, size_t chars);
 HRESULT shared_resources_create(const AsbSharedResourceInfo *info,
                                 BOOL confirm_permissions,

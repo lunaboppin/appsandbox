@@ -78,6 +78,8 @@ void shared_appliance_release_client(VmInstance *runtime);
 
 HRESULT shared_appliance_mount_host_resource(const wchar_t *resource_id);
 HRESULT shared_appliance_unmount_host_resource(const wchar_t *resource_id);
+BOOL shared_appliance_has_host_resources(void);
+HRESULT shared_appliance_reconcile_host_resources(void);
 HRESULT shared_appliance_purge_resource(const wchar_t *resource_id);
 HRESULT shared_appliance_unpublish_resource(const wchar_t *resource_id);
 HRESULT shared_appliance_open_terminal(void);

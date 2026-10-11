@@ -19,6 +19,8 @@ typedef void *HCN_ENDPOINT;
 /* Initialize HCN - loads computenetwork.dll dynamically.
    Returns TRUE if HCN is available. */
 BOOL hcn_init(void);
+/* Called only by the opt-in disposable-VM harness, before HCN initialization. */
+void hcn_set_test_namespace(const GUID *id);
 
 /* Clean up HCN module. */
 void hcn_cleanup(void);

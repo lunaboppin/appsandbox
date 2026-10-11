@@ -187,6 +187,12 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <SDLCheck>false</SDLCheck>
     </ClCompile>
+    <!-- Shared with the macOS builder: BCD store from BCD-Template (bcdboot fallback). -->
+    <ClCompile Include="..\iso-patch-mac\engine\bcd_patch.c">
+      <AdditionalIncludeDirectories>$(ProjectDir)compat;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4244;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="iso_patch_log.h" />

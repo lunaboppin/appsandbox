@@ -18,6 +18,8 @@
 #include <winioctl.h>
 #include <imapi2fs.h>
 #include <shlwapi.h>
+#include <shlobj.h>
+#include <dbt.h>
 #include <stdio.h>
 
 #include "ubuntu_vhdx.h"
@@ -25,11 +27,14 @@
 #include "prefetch_wsl_deps.h"
 #include "prefetch_repo.h"
 #include "target_arch.h"
+#include "../iso-patch-mac/engine/bcd_patch.h"
 
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
 
 /* ---- GUIDs ---- */
 /* Use custom names to avoid clashing with EXTERN_C declarations in imapi2fs.h */
@@ -532,6 +537,132 @@ static HRESULT navigate_fsi_path(IFsiDirectoryItem *root, IFsiDirectoryItem **ou
 #define EFI_SIZE_MB     200
 #define MSR_SIZE_MB     128
 #define DEFAULT_VHDX_SIZE_GB 64
+
+/* ---- Manual UEFI boot-file install (bcdboot fallback) ----
+   Some host builds' bcdboot loads every newly created system store under the
+   fixed key BCD00000000, which the host's own boot store already occupies, so
+   it fails with STATUS_OBJECT_NAME_COLLISION (c0000035) for ANY target ESP.
+   Do what the macOS builder does instead: copy the image's own EFI binaries
+   and build the system store offline from the image's BCD-Template with
+   bcd_patch (no registry APIs, no host BCD involvement). */
+
+static BOOL robocopy_tree(const wchar_t *src, const wchar_t *dst)
+{
+    wchar_t cmd[1024], sys_dir[MAX_PATH];
+    int rc;
+    if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) return TRUE;   /* optional dir */
+    GetSystemDirectoryW(sys_dir, MAX_PATH);
+    swprintf_s(cmd, 1024, L"%s\\robocopy.exe \"%s\" \"%s\" /E /R:0 /W:0 /NP /NFL /NDL /NJH /NJS",
+               sys_dir, src, dst);
+    rc = run_command(cmd, TRUE);
+    return rc >= 0 && rc < 8;             /* robocopy: 0-7 success, 8+ failure */
+}
+
+static BOOL read_whole_file(const wchar_t *path, uint8_t **data, size_t *len)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    LARGE_INTEGER size;
+    DWORD got = 0;
+    *data = NULL;
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    if (!GetFileSizeEx(f, &size) || size.QuadPart <= 0 || size.QuadPart > 64 * 1024 * 1024 ||
+        !(*data = (uint8_t *)malloc((size_t)size.QuadPart)) ||
+        !ReadFile(f, *data, (DWORD)size.QuadPart, &got, NULL) || got != (DWORD)size.QuadPart) {
+        CloseHandle(f);
+        free(*data); *data = NULL;
+        return FALSE;
+    }
+    CloseHandle(f);
+    *len = (size_t)size.QuadPart;
+    return TRUE;
+}
+
+static int install_boot_files_manual(HANDLE disk_handle, const wchar_t *win_mount, const wchar_t *efi_dir)
+{
+    wchar_t src[MAX_PATH], dst[MAX_PATH];
+    BYTE layout_buf[sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 8 * sizeof(PARTITION_INFORMATION_EX)];
+    DRIVE_LAYOUT_INFORMATION_EX *layout = (DRIVE_LAYOUT_INFORMATION_EX *)layout_buf;
+    bcd_guids_t guids;
+    uint8_t *tpl = NULL, *bcd = NULL;
+    size_t tpl_len = 0, bcd_len = 0;
+    DWORD bytes, i, written = 0;
+    BOOL have_esp = FALSE, have_win = FALSE;
+    HANDLE out;
+    int rc;
+
+    /* GPT identities: the store's device elements reference these. In-memory
+       GUID layout is exactly the GPT on-disk (mixed-endian) form bcd_patch wants. */
+    if (!DeviceIoControl(disk_handle, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0,
+                         layout_buf, sizeof(layout_buf), &bytes, NULL) ||
+        layout->PartitionStyle != PARTITION_STYLE_GPT) {
+        log_msg(L"Manual boot install: cannot read GPT layout (error %lu)", GetLastError());
+        return 1;
+    }
+    memcpy(guids.disk_guid, &layout->Gpt.DiskId, 16);
+    for (i = 0; i < layout->PartitionCount; i++) {
+        const PARTITION_INFORMATION_EX *p = &layout->PartitionEntry[i];
+        if (p->PartitionNumber == 1) { memcpy(guids.esp_part_guid, &p->Gpt.PartitionId, 16); have_esp = TRUE; }
+        if (p->PartitionNumber == 3) { memcpy(guids.win_part_guid, &p->Gpt.PartitionId, 16); have_win = TRUE; }
+    }
+    if (!have_esp || !have_win) {
+        log_msg(L"Manual boot install: ESP/Windows partitions not found in layout");
+        return 1;
+    }
+
+    /* Boot binaries from the image itself, as bcdboot would copy them. */
+    swprintf_s(src, MAX_PATH, L"%sWindows\\Boot\\EFI", win_mount);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot", efi_dir);
+    if (!robocopy_tree(src, dst)) { log_msg(L"Manual boot install: copying %s failed", src); return 1; }
+    swprintf_s(src, MAX_PATH, L"%sWindows\\Boot\\Fonts", win_mount);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\Fonts", efi_dir);
+    if (!robocopy_tree(src, dst)) { log_msg(L"Manual boot install: copying %s failed", src); return 1; }
+    swprintf_s(src, MAX_PATH, L"%sWindows\\Boot\\Resources", win_mount);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\Resources", efi_dir);
+    if (!robocopy_tree(src, dst)) { log_msg(L"Manual boot install: copying %s failed", src); return 1; }
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Boot", efi_dir);
+    CreateDirectoryW(dst, NULL);
+    swprintf_s(src, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\bootmgfw.efi", efi_dir);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Boot\\bootx64.efi", efi_dir);
+    if (!CopyFileW(src, dst, FALSE)) {
+        log_msg(L"Manual boot install: bootx64.efi copy failed (error %lu)", GetLastError());
+        return 1;
+    }
+
+    /* System store from the image's own BCD-Template. */
+    swprintf_s(src, MAX_PATH, L"%sWindows\\System32\\config\\BCD-Template", win_mount);
+    if (!read_whole_file(src, &tpl, &tpl_len)) {
+        log_msg(L"Manual boot install: cannot read %s (error %lu)", src, GetLastError());
+        return 1;
+    }
+    rc = bcd_build(tpl, tpl_len, &guids, &bcd, &bcd_len);
+    free(tpl);
+    if (rc != 0) {
+        log_msg(L"Manual boot install: BCD-Template not usable (bcd_build %d)", rc);
+        return 1;
+    }
+
+    /* Replace whatever the failed bcdboot attempts left on the ESP. */
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\BCD.LOG", efi_dir);  DeleteFileW(dst);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\BCD.LOG1", efi_dir); DeleteFileW(dst);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\BCD.LOG2", efi_dir); DeleteFileW(dst);
+    swprintf_s(dst, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\BCD", efi_dir);
+    SetFileAttributesW(dst, FILE_ATTRIBUTE_NORMAL);
+    out = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    rc = 1;
+    if (out != INVALID_HANDLE_VALUE) {
+        if (WriteFile(out, bcd, (DWORD)bcd_len, &written, NULL) && written == (DWORD)bcd_len &&
+            FlushFileBuffers(out))
+            rc = 0;
+        CloseHandle(out);
+    }
+    free(bcd);
+    if (rc != 0) {
+        log_msg(L"Manual boot install: writing %s failed (error %lu)", dst, GetLastError());
+        return 1;
+    }
+    log_msg(L"Manual boot install: BCD written from BCD-Template (%Iu bytes)", bcd_len);
+    return 0;
+}
 
 /* Find the volume GUID path for a partition on a given disk.
    disk_number: the disk number from GetVirtualDiskPhysicalPath
@@ -1269,6 +1400,10 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
                         L"%sWindows\\System32\\bcdboot.exe \"%s\" /s \"%s\" /f UEFI",
                         win_mount, windows_dir, efi_clean);
             ret = run_command_logged(cmd);
+        }
+        if (ret != 0) {
+            log_msg(L"Image bcdboot failed (exit %d); building the boot store from BCD-Template...", ret);
+            if (install_boot_files_manual(disk_handle, win_mount, efi_clean) == 0) ret = 0;
         }
         if (ret != 0) {
             log_err(L"Failed to install boot files (bcdboot exit code %d)", ret);
@@ -2949,6 +3084,35 @@ int wmain(int argc, wchar_t *argv[])
         wprintf(L"      --stage <file>   tab-separated manifest: <src>\\t<rootfs-path>\n\n");
         wprintf(L"Output defaults to next to iso-patch.exe.\n");
         return 1;
+    }
+
+    /* --shell-notify-drive <letter> <add|remove>: tell Explorer a network
+       drive appeared/disappeared. AppSandbox maps shared-resource drives from
+       its elevated process, and Explorer ignores change notifications from
+       elevated processes, so it launches this (asInvoker) mode with the
+       desktop shell's token -- the same notices `net use` sends. */
+    if (_wcsicmp(argv[1], L"--shell-notify-drive") == 0) {
+        wchar_t root[4];
+        BOOL add;
+        DEV_BROADCAST_VOLUME volume;
+        DWORD recipients = BSM_APPLICATIONS;
+        if (argc < 4 || !iswalpha(argv[2][0])) return 1;
+        add = _wcsicmp(argv[3], L"remove") != 0;
+        root[0] = (wchar_t)towupper(argv[2][0]); root[1] = L':'; root[2] = L'\\'; root[3] = L'\0';
+        SHChangeNotify(add ? SHCNE_DRIVEADD : SHCNE_DRIVEREMOVED, SHCNF_PATHW, root, NULL);
+        if (add) {
+            SHChangeNotify(SHCNE_DRIVEADDGUI, SHCNF_PATHW, root, NULL);
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, root, NULL);
+        }
+        ZeroMemory(&volume, sizeof(volume));
+        volume.dbcv_size = sizeof(volume);
+        volume.dbcv_devicetype = DBT_DEVTYP_VOLUME;
+        volume.dbcv_unitmask = 1u << (root[0] - L'A');
+        volume.dbcv_flags = DBTF_NET;
+        BroadcastSystemMessageW(BSF_IGNORECURRENTTASK | BSF_NOHANG | BSF_NOTIMEOUTIFNOTHUNG,
+                                &recipients, WM_DEVICECHANGE,
+                                add ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE, (LPARAM)&volume);
+        return 0;
     }
 
     if (_wcsicmp(argv[1], L"--patch-grub-debug") == 0) {

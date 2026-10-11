@@ -63,13 +63,24 @@ def main():
           "HOST_MAPPING_NOT_PRESENT" in host_mapper and
           "host_mapping_command(resource, TRUE)" in appliance and
           "if (hr == S_FALSE) hr = S_OK;" in appliance and
-          "if (SUCCEEDED(hr) && bit)" in appliance and
+          "set_host_mapping_tracked(resource, TRUE)" in appliance and
           "InterlockedOr(&g_appliance.host_mount_mask" in appliance,
           "host mount accounting is not idempotent")
     check("host_mount_mask" in appliance and
           "InterlockedOr" in appliance and
           "InterlockedAnd" in appliance,
           "host mount accounting does not track unique mapped drives")
+    check("shared_appliance_reconcile_host_resources" in appliance and
+          "shared_appliance_has_host_resources" in appliance and
+          "host_hr = shared_appliance_reconcile_host_resources();" in core,
+          "configured host drive letters are not restored automatically")
+    check("SHChangeNotify" in appliance and
+          "SHCNE_DRIVEADDGUI" in appliance and
+          "SHCNE_DRIVEREMOVED" in appliance,
+          "host mapping changes do not refresh Explorer")
+    check("host_mapping_cs" in appliance and
+          "EnterCriticalSection(&g_appliance.host_mapping_cs)" in appliance,
+          "concurrent host mappings can race process-wide credential variables")
     check("Get-Item -LiteralPath $root -Force -ErrorAction Stop" in agent and
           "for($attempt=0;$attempt -lt 8;$attempt++)" in agent and
           "Remove-SmbGlobalMapping -LocalPath $local -Force" in agent,

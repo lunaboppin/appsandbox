@@ -1,4 +1,26 @@
 <Project>
+  <!-- NuGet kits contain native x64/ARM64 tools, not the installed kit's x86
+       defaults. Set tool paths before WindowsDriver.Common.targets imports. -->
+  <PropertyGroup Condition="'$(AsbUseLocalWdk)' == 'true'">
+    <AsbBuildHostArch>x64</AsbBuildHostArch>
+    <AsbBuildHostArch Condition="'$(PROCESSOR_ARCHITECTURE)' == 'ARM64' Or '$(PROCESSOR_ARCHITEW6432)' == 'ARM64'">ARM64</AsbBuildHostArch>
+    <InfToolPath>$(WDKBinRoot)\$(AsbBuildHostArch)\</InfToolPath>
+    <InfToolArchitecture>Native64Bit</InfToolArchitecture>
+    <BinplaceToolPath>$(WDKBinRoot)\$(AsbBuildHostArch)\</BinplaceToolPath>
+    <BinplaceToolArchitecture>Native64Bit</BinplaceToolArchitecture>
+    <!-- Inf2Cat is still distributed as x86, even in native-tool packages. -->
+    <Inf2CatToolPath>$(WDKBinRoot)\x86\</Inf2CatToolPath>
+    <Inf2CatToolArchitecture>Native32Bit</Inf2CatToolArchitecture>
+    <ApiValidator_CmdLine>&quot;$(WDKBinRoot)\$(AsbBuildHostArch)\ApiValidator.exe&quot; [AllOptions]</ApiValidator_CmdLine>
+    <ApiValidator_ApiExtractorExePath>$(WDKBinRoot)\$(AsbBuildHostArch)</ApiValidator_ApiExtractorExePath>
+    <ExecutablePath>$(WDKBinRoot)\$(AsbBuildHostArch);$(WindowsSDKVersionedBinRoot)\$(AsbBuildHostArch);$(ExecutablePath)</ExecutablePath>
+  </PropertyGroup>
+  <!-- Diagnostic-only fallback for a damaged local PDB server installation.
+       Explicit opt-in; normal release/debug build settings are unchanged. -->
+  <ItemDefinitionGroup Condition="'$(AsbNoPdb)' == 'true'">
+    <ClCompile><DebugInformationFormat>OldStyle</DebugInformationFormat></ClCompile>
+    <Link><GenerateDebugInformation>false</GenerateDebugInformation></Link>
+  </ItemDefinitionGroup>
   <!--
     Auto-embed a VERSIONINFO resource (driven by Directory.Build.props) into every EXE/DLL we
     build, so FileVersion / ProductVersion / CompanyName come from the single source. Each

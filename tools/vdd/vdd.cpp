@@ -6,7 +6,7 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
+    AppSandbox Virtual Display Driver - Two 1920x1080 monitors with
     direct HvSocket frame transport to the host (no agent middleman).
 
     IddCx lifecycle:
@@ -15,7 +15,7 @@ Abstract:
     - DeviceAdd with PnP callbacks, IddCx config, EvtCleanupCallback,
       heap-allocated context (IndirectDeviceContextWrapper)
     - D0Entry -> InitAdapter (context type on adapter object)
-    - AdapterInitFinished -> FinishInit -> CreateMonitor
+    - AdapterInitFinished -> FinishInit -> CreateMonitor (twice)
     - ParseMonitorDescription, GetDefaultModes, QueryTargetModes
     - AssignSwapChain with direct HvSocket frame transport to host
     - UnassignSwapChain with cleanup
@@ -83,44 +83,109 @@ static void VddLog(const char* fmt, ...)
 /*  EDID with computed checksum                                              */
 /* ========================================================================= */
 
-static const BYTE* VddGetEdid()
-{
-    static BYTE edid[128];
-    static BOOL computed = FALSE;
+static const GUID g_monitorContainerIds[VDD_MONITOR_COUNT] = {
+    { 0xd54e2d6a, 0x9935, 0x4ca0, { 0x8b, 0x5d, 0x54, 0x63, 0x0e, 0x08, 0x31, 0x01 } },
+    { 0xd54e2d6a, 0x9935, 0x4ca0, { 0x8b, 0x5d, 0x54, 0x63, 0x0e, 0x08, 0x31, 0x02 } }
+};
 
-    if (!computed)
+static const BYTE* VddGetEdid(UINT displayIndex)
+{
+    static BYTE edid[VDD_MONITOR_COUNT][128];
+    static BOOL computed[VDD_MONITOR_COUNT] = {};
+
+    if (displayIndex >= VDD_MONITOR_COUNT) displayIndex = 0;
+    if (!computed[displayIndex])
     {
-        memcpy(edid, VDD_EDID, 127);
+        memcpy(edid[displayIndex], VDD_EDID, 127);
+        /* Give Windows two stable EDID serials so display topology survives
+           adapter restarts and the monitors cannot be de-duplicated. */
+        edid[displayIndex][12] = (BYTE)(displayIndex + 1);
+        edid[displayIndex][13] = 0xA5;
+        edid[displayIndex][14] = 0xB0;
+        edid[displayIndex][15] = 0x01;
         BYTE sum = 0;
         for (int i = 0; i < 127; i++)
-            sum += edid[i];
-        edid[127] = (BYTE)(256 - sum);
-        computed = TRUE;
+            sum += edid[displayIndex][i];
+        edid[displayIndex][127] = (BYTE)(256 - sum);
+        computed[displayIndex] = TRUE;
     }
-    return edid;
+    return edid[displayIndex];
 }
 
 /* ========================================================================= */
 /*  Monitor mode helper                                                      */
 /* ========================================================================= */
 
-static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider)
+/* Refresh rates offered at 1920x1080. 60 Hz stays preferred so a guest
+   always starts in a safe mode; the guest input helper switches to the
+   closest rate to the host monitor the viewer is on. */
+static const UINT kVddRefreshRates[] = { 60, 120, 144, 165, 240 };
+static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider, UINT hz,
+                                 UINT width = VDD_WIDTH, UINT height = VDD_HEIGHT);
+
+#define VDD_RATE_COUNT ((UINT)(sizeof(kVddRefreshRates) / sizeof(kVddRefreshRates[0])))
+
+/* Resolutions offered at every rate. 1920x1080 first, so mode 0 is the
+   preferred 1080p60. The host picks between them by viewer window size
+   (larger than 1080p -> 1440p) and scales the picture to the window. Both
+   modes always exist, so switching is an ordinary mode change. */
+static const UINT kVddBaseSizes[][2] = {
+    { 1920, 1080 }, { 2560, 1440 },
+};
+#define VDD_BASE_SIZE_COUNT ((UINT)(sizeof(kVddBaseSizes) / sizeof(kVddBaseSizes[0])))
+#define VDD_MAX_SIZES VDD_BASE_SIZE_COUNT
+#define VDD_MAX_MODES (VDD_MAX_SIZES * VDD_RATE_COUNT)
+
+static IDDCX_MONITOR g_vddMonitorObjects[VDD_MONITOR_COUNT];
+
+static int VddMonitorIndex(IDDCX_MONITOR monitor)
+{
+    for (int i = 0; i < (int)VDD_MONITOR_COUNT; i++)
+        if (g_vddMonitorObjects[i] == monitor) return i;
+    return -1;
+}
+
+/* Sizes offered on a display (the same fixed list everywhere). */
+static UINT VddSizes(int displayIndex, UINT out[VDD_MAX_SIZES][2])
+{
+    UNREFERENCED_PARAMETER(displayIndex);
+    for (UINT i = 0; i < VDD_BASE_SIZE_COUNT; i++) { out[i][0] = kVddBaseSizes[i][0]; out[i][1] = kVddBaseSizes[i][1]; }
+    return VDD_BASE_SIZE_COUNT;
+}
+static UINT VddModeTotal(int displayIndex)
+{
+    UINT sizes[VDD_MAX_SIZES][2];
+    return VddSizes(displayIndex, sizes) * VDD_RATE_COUNT;
+}
+
+/* Mode i of a display: size i / rates, refresh i % rates. */
+static void VddFillMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider, int displayIndex, UINT i)
+{
+    UINT sizes[VDD_MAX_SIZES][2];
+    UINT n = VddSizes(displayIndex, sizes);
+    UINT s = i / VDD_RATE_COUNT;
+    if (s >= n) s = 0;
+    VddCreateMonitorMode(sig, vSyncDivider, kVddRefreshRates[i % VDD_RATE_COUNT], sizes[s][0], sizes[s][1]);
+}
+
+static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider, UINT hz,
+                                 UINT width, UINT height)
 {
     /* totalSize == activeSize, pixelRate = refresh * w * h.
        IddCx validates these relationships; using actual blanking values causes
        STATUS_INVALID_PARAMETER from IddCxMonitorArrival. */
-    sig->totalSize.cx                           = VDD_WIDTH;
-    sig->totalSize.cy                           = VDD_HEIGHT;
-    sig->activeSize.cx                          = VDD_WIDTH;
-    sig->activeSize.cy                          = VDD_HEIGHT;
+    sig->totalSize.cx                           = width;
+    sig->totalSize.cy                           = height;
+    sig->activeSize.cx                          = width;
+    sig->activeSize.cy                          = height;
     sig->AdditionalSignalInfo.vSyncFreqDivider  = vSyncDivider;
     sig->AdditionalSignalInfo.videoStandard     = 255;
-    sig->vSyncFreq.Numerator                    = 60;
+    sig->vSyncFreq.Numerator                    = hz;
     sig->vSyncFreq.Denominator                  = 1;
-    sig->hSyncFreq.Numerator                    = 60 * VDD_HEIGHT;
+    sig->hSyncFreq.Numerator                    = hz * height;
     sig->hSyncFreq.Denominator                  = 1;
     sig->scanLineOrdering                       = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    sig->pixelRate                               = (UINT64)60 * VDD_WIDTH * VDD_HEIGHT;
+    sig->pixelRate                               = (UINT64)hz * width * height;
 }
 
 /* ========================================================================= */
@@ -171,15 +236,16 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
     VDD_SWAP_PROC* proc = (VDD_SWAP_PROC*)lpParameter;
     AsbListener* l = NULL;
 
-    VddLog("Network: starting");
+    int channel = proc->displayIndex == 0 ? ASB_CH_DISPLAY : ASB_CH_DISPLAY2;
+    VddLog("Network: display %u starting on channel %d", proc->displayIndex + 1, channel);
     VddEnsureTransportInit();
 
     while (!proc->bStopNetwork) {
         /* (Re)create the listener. PC: socket(AF_HYPERV)+bind(ch2 GUID, wildcard)+listen;
            Mac: bind the ivshmem ch2 slot. */
-        l = asb_listen(ASB_CH_DISPLAY);
+        l = asb_listen(channel);
         if (!l) {
-            VddLog("Network: asb_listen(ch2) failed, retrying in 3s (transport=%s)",
+            VddLog("Network: asb_listen(ch%d) failed, retrying in 3s (transport=%s)", channel,
                    asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
             for (int w = 0; w < 3000 && !proc->bStopNetwork; w += 500)
                 Sleep(500);
@@ -195,6 +261,19 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
             if (!nc)
                 continue;
 
+            /* Never let a stalled viewer pin the IddCx capture thread
+               indefinitely.  Local HvSocket transfers normally complete far
+               below this bound; a non-draining peer is disconnected and can
+               reconnect to the latest full frame. */
+            asb_set_timeout(nc, 0, 1000);
+            {
+                unsigned long long socketValue = asb_conn_socket_u64(nc);
+                if (socketValue != ~0ull) {
+                    int sendBuffer = 16 * 1024 * 1024;
+                    setsockopt((SOCKET)socketValue, SOL_SOCKET, SO_SNDBUF,
+                               (const char*)&sendBuffer, sizeof(sendBuffer));
+                }
+            }
             VddLog("Network: host connected");
 
             /* If a previous pending connection wasn't picked up yet, close it. */
@@ -234,6 +313,7 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
 static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid,
                                         ID3D11Device** ppDevice, ID3D11DeviceContext** ppCtx)
 {
+    EnterCriticalSection(&ctx->d3dCacheLock);
     /* Check if cached device matches the requested LUID and is still healthy */
     if (ctx->pCachedDevice &&
         ctx->cachedDeviceLuid.HighPart == adapterLuid.HighPart &&
@@ -246,6 +326,12 @@ static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid
                    adapterLuid.HighPart, adapterLuid.LowPart);
             *ppDevice = ctx->pCachedDevice;
             *ppCtx = ctx->pCachedCtx;
+            /* The cache owns its references; each swap processor owns another
+               pair so replacing a removed/mismatched cached device cannot
+               invalidate the other monitor's live worker. */
+            (*ppDevice)->AddRef();
+            (*ppCtx)->AddRef();
+            LeaveCriticalSection(&ctx->d3dCacheLock);
             return S_OK;
         }
         VddLog("GetOrCreateD3DDevice: cached device removed (reason=0x%08X), recreating",
@@ -274,6 +360,7 @@ static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid
     if (FAILED(hr))
     {
         VddLog("GetOrCreateD3DDevice: CreateDXGIFactory2 FAILED hr=0x%08X", hr);
+        LeaveCriticalSection(&ctx->d3dCacheLock);
         return hr;
     }
 
@@ -284,6 +371,7 @@ static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid
     if (FAILED(hr))
     {
         VddLog("GetOrCreateD3DDevice: EnumAdapterByLuid FAILED hr=0x%08X", hr);
+        LeaveCriticalSection(&ctx->d3dCacheLock);
         return hr;
     }
 
@@ -307,10 +395,22 @@ static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid
     if (FAILED(hr))
     {
         VddLog("GetOrCreateD3DDevice: D3D11CreateDevice FAILED hr=0x%08X", hr);
+        LeaveCriticalSection(&ctx->d3dCacheLock);
         return hr;
     }
 
     VddLog("GetOrCreateD3DDevice: D3D11 device created successfully");
+
+    /* Both monitors share this cached immediate context.  Ask D3D11 to
+       serialize context access across their independent capture threads. */
+    {
+        ID3D11Multithread* multithread = nullptr;
+        if (SUCCEEDED(pDevCtx->QueryInterface(__uuidof(ID3D11Multithread),
+                                              (void**)&multithread))) {
+            multithread->SetMultithreadProtected(TRUE);
+            multithread->Release();
+        }
+    }
 
     /* Cache in device context */
     ctx->pCachedDevice = pDevice;
@@ -319,6 +419,11 @@ static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid
 
     *ppDevice = pDevice;
     *ppCtx = pDevCtx;
+    /* Preserve the creation references as the cache's ownership and give the
+       caller a separate pair for this monitor's swap processor. */
+    pDevice->AddRef();
+    pDevCtx->AddRef();
+    LeaveCriticalSection(&ctx->d3dCacheLock);
     return S_OK;
 }
 
@@ -342,6 +447,75 @@ static HRESULT VddCreateStagingTexture(VDD_SWAP_PROC* proc, UINT width, UINT hei
 /* ========================================================================= */
 
 static void VddSwapChainRunCore(VDD_SWAP_PROC* proc);
+
+/* Largest wire frame for a w x h surface: header + every dirty rect + size
+   word + a full frame. The buffer grows with the guest resolution. */
+#define VDD_SEND_BUF_BYTES_FOR(w, h) (sizeof(VDD_WIRE_FRAME_HEADER) + VDD_MAX_DIRTY_RECTS * sizeof(RECT) + \
+                                      sizeof(UINT32) + (size_t)(w) * (h) * 4)
+
+static void VddEnsureSendBuf(VDD_SWAP_PROC* proc)
+{
+    size_t need = VDD_SEND_BUF_BYTES_FOR(proc->frameW, proc->frameH);
+    if (proc->pSendBuf && proc->sendBufCap >= need) return;
+    BYTE* grown = (BYTE*)realloc(proc->pSendBuf, need);
+    if (grown) { proc->pSendBuf = grown; proc->sendBufCap = need; }
+    else VddLog("SwapChain: send buffer growth to %zu bytes failed; using per-row sends", need);
+}
+
+/* Send one frame (full when rectCount == 0, else the clamped dirty rects).
+   Assembles the whole wire frame and sends it in one call: per-row sends
+   cost ~1080 transport calls per full frame and starved video playback.
+   Returns 0 on success, -1 on send failure, 1 if the rects' pixel data would
+   not fit the buffer (caller sends a full frame instead). */
+static int VddSendFrame(VDD_SWAP_PROC* proc, AsbConn* s, const VDD_WIRE_FRAME_HEADER* whdr,
+                        const RECT* rects, UINT32 rectCount, UINT32 dataSize,
+                        const D3D11_MAPPED_SUBRESOURCE* mapped)
+{
+    BYTE* p = proc->pSendBuf;
+    size_t total = sizeof(*whdr) + rectCount * sizeof(RECT) + sizeof(dataSize) + dataSize;
+    UINT32 i;
+
+    if (!p) {
+        /* No buffer: fall back to row-by-row sends. */
+        if (VddSendAll(s, (const char*)whdr, sizeof(*whdr)) != 0 ||
+            (rectCount && VddSendAll(s, (const char*)rects, rectCount * sizeof(RECT)) != 0) ||
+            VddSendAll(s, (const char*)&dataSize, sizeof(dataSize)) != 0)
+            return -1;
+        if (!rectCount) {
+            for (UINT row = 0; row < proc->frameH; row++)
+                if (VddSendAll(s, (const char*)((const BYTE*)mapped->pData + row * mapped->RowPitch), (int)(proc->frameW * 4)) != 0)
+                    return -1;
+            return 0;
+        }
+        for (i = 0; i < rectCount; i++) {
+            UINT rw = (UINT)(rects[i].right - rects[i].left), rh = (UINT)(rects[i].bottom - rects[i].top);
+            for (UINT row = 0; row < rh; row++) {
+                const BYTE* src = (const BYTE*)mapped->pData + ((UINT)rects[i].top + row) * mapped->RowPitch +
+                                  (UINT)rects[i].left * 4;
+                if (rw && VddSendAll(s, (const char*)src, rw * 4) != 0) return -1;
+            }
+        }
+        return 0;
+    }
+
+    if (total > proc->sendBufCap || total > INT_MAX) return 1;
+    memcpy(p, whdr, sizeof(*whdr));                          p += sizeof(*whdr);
+    if (rectCount) { memcpy(p, rects, rectCount * sizeof(RECT)); p += rectCount * sizeof(RECT); }
+    memcpy(p, &dataSize, sizeof(dataSize));                  p += sizeof(dataSize);
+    if (!rectCount) {
+        for (UINT row = 0; row < proc->frameH; row++, p += proc->frameW * 4)
+            memcpy(p, (const BYTE*)mapped->pData + row * mapped->RowPitch, proc->frameW * 4);
+    } else {
+        for (i = 0; i < rectCount; i++) {
+            UINT rw = (UINT)(rects[i].right - rects[i].left), rh = (UINT)(rects[i].bottom - rects[i].top);
+            if (!rw) continue;
+            for (UINT row = 0; row < rh; row++, p += rw * 4)
+                memcpy(p, (const BYTE*)mapped->pData + ((UINT)rects[i].top + row) * mapped->RowPitch +
+                          (UINT)rects[i].left * 4, rw * 4);
+        }
+    }
+    return VddSendAll(s, (const char*)proc->pSendBuf, (int)total) == 0 ? 0 : -1;
+}
 
 static DWORD WINAPI VddSwapChainThread(LPVOID lpParameter)
 {
@@ -368,7 +542,13 @@ static DWORD WINAPI VddSwapChainThread(LPVOID lpParameter)
         }
     }
 
+    VddEnsureSendBuf(proc);
+
     VddSwapChainRunCore(proc);
+
+    free(proc->pSendBuf);
+    proc->pSendBuf = NULL;
+    proc->sendBufCap = 0;
 
     /* Always delete the swap chain when the processing loop terminates, to
        kick the system to provide a new swap chain if necessary.  The D3D
@@ -504,7 +684,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
        we have a valid frame in the staging texture for resend on idle. */
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
-    UINT cachedRowPitch = VDD_STRIDE;
+    UINT cachedRowPitch = proc->frameW * 4;
 
 
     /* Main frame acquisition loop */
@@ -565,9 +745,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 break;
             }
 
-            /* On timeout with a connected client and a cached frame, resend
-               the staging texture contents to keep the connection alive. */
-            if (waitResult == WAIT_TIMEOUT && bHasFrame &&
+            /* A client can connect while the desktop is completely static.
+               Send the cached image once so it has an initial frame, but do
+               not use full-frame traffic as a keepalive: at 1080p that was
+               8 MiB every 100 ms and could starve fresh frames. */
+            if (waitResult == WAIT_TIMEOUT && bHasFrame && !bSentFullFrame &&
                 proc->hClientConn != NULL && proc->pStagingTex)
             {
                 D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -575,38 +757,27 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 if (SUCCEEDED(hr))
                 {
                     VDD_WIRE_FRAME_HEADER whdr;
-                    UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
-                    BOOL send_ok = TRUE;
-                    AsbConn* s = proc->hClientConn;
+                    BOOL send_ok;
 
                     proc->frameSeq++;
                     whdr.magic            = VDD_FRAME_MAGIC;
-                    whdr.width            = VDD_WIDTH;
-                    whdr.height           = VDD_HEIGHT;
-                    whdr.stride           = VDD_STRIDE;
+                    whdr.width            = proc->frameW;
+                    whdr.height           = proc->frameH;
+                    whdr.stride           = proc->frameW * 4;
                     whdr.frame_seq        = proc->frameSeq;
                     whdr.dirty_rect_count = 0;
 
-                    if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                        VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0) {
-                        send_ok = FALSE;
-                    }
-                    if (send_ok) {
-                        for (UINT row = 0; row < VDD_HEIGHT; row++) {
-                            if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                           VDD_STRIDE) != 0) {
-                                send_ok = FALSE;
-                                break;
-                            }
-                        }
-                    }
+                    send_ok = VddSendFrame(proc, proc->hClientConn, &whdr, NULL, 0,
+                                           proc->frameW * proc->frameH * 4, &mapped) == 0;
 
                     proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
 
                     if (!send_ok) {
-                        VddLog("Frame: resend failed, disconnecting (seq=%llu)", proc->frameSeq);
+                        VddLog("Frame: initial cached frame failed, disconnecting (seq=%llu)", proc->frameSeq);
                         VddCloseConn(&proc->hClientConn);
                         bSentFullFrame = FALSE;
+                    } else {
+                        bSentFullFrame = TRUE;
                     }
                 }
             }
@@ -617,17 +788,78 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             retryDelay = RETRY_DELAY_INIT;
             retryCount = 0;
 
-            /* New frame from IddCx — capture and send to host if connected */
+            /* New frame from IddCx — capture and send to host if connected.
+               Only the GPU copy and the dirty-rect query need the IddCx
+               surface; release it as soon as both are queued (as the IddCx
+               sample does) so the compositor can render the next frame while
+               this one is read back and sent. */
+            BOOL frameFinished = FALSE;
+            HRESULT finishHr = S_OK;
             if (pSurface && proc->pStagingTex)
             {
                 ID3D11Texture2D* pTexture = nullptr;
                 hr = pSurface->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
                 if (SUCCEEDED(hr) && pTexture)
                 {
-                    proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
+                    RECT dirtyRects[VDD_MAX_DIRTY_RECTS];
+                    UINT32 rectCount = 0;
+                    D3D11_TEXTURE2D_DESC surfaceDesc;
+
+                    /* The guest resolution follows the host viewer window: when
+                       the surface size changes, recreate the staging copy and
+                       start the new size with a full frame. */
+                    pTexture->GetDesc(&surfaceDesc);
+                    if (surfaceDesc.Width != proc->frameW || surfaceDesc.Height != proc->frameH) {
+                        ID3D11Texture2D* oldStaging = proc->pStagingTex;
+                        proc->pStagingTex = nullptr;
+                        if (SUCCEEDED(VddCreateStagingTexture(proc, surfaceDesc.Width, surfaceDesc.Height))) {
+                            if (oldStaging) oldStaging->Release();
+                            VddLog("SwapChain[%u]: surface %ux%u -> %ux%u", proc->displayIndex,
+                                   proc->frameW, proc->frameH, surfaceDesc.Width, surfaceDesc.Height);
+                            proc->frameW = surfaceDesc.Width;
+                            proc->frameH = surfaceDesc.Height;
+                            VddEnsureSendBuf(proc);
+                            bSentFullFrame = FALSE;
+                            bHasFrame = FALSE;
+                        } else {
+                            proc->pStagingTex = oldStaging;   /* keep the old size; copy below is skipped */
+                        }
+                    }
+                    BOOL sendFull = !bSentFullFrame;  /* first frame (or new size) must be full */
+
+                    if (surfaceDesc.Width == proc->frameW && surfaceDesc.Height == proc->frameH)
+                        proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
+                    proc->pDeviceContext->Flush();
+
+                    /* Query dirty rects from IddCx.  If GetDirtyRects returns
+                       0 rects OR fails, fall back to sending a full frame.
+                       0 rects does NOT reliably mean "identical" — during early
+                       boot the presenter may not supply dirty rect metadata,
+                       and skipping would stall updates until the E_PENDING
+                       timeout resend path fires ~100ms later. */
+                    if (proc->hClientConn != NULL && !sendFull) {
+                        IDARG_IN_GETDIRTYRECTS drIn = {};
+                        IDARG_OUT_GETDIRTYRECTS drOut = {};
+                        drIn.DirtyRectInCount = VDD_MAX_DIRTY_RECTS;
+                        drIn.pDirtyRects = dirtyRects;
+                        HRESULT drHr = IddCxSwapChainGetDirtyRects(proc->hSwapChain, &drIn, &drOut);
+                        if (SUCCEEDED(drHr) && drOut.DirtyRectOutCount > 0) {
+                            rectCount = drOut.DirtyRectOutCount;
+                        } else {
+                            sendFull = TRUE;
+                        }
+                    }
+
+                    pTexture->Release();
+                    pSurface->Release();
+                    pSurface = nullptr;
+                    finishHr = IddCxSwapChainFinishedProcessingFrame(proc->hSwapChain);
+                    frameFinished = TRUE;
 
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
-                    hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                    hr = SUCCEEDED(finishHr)
+                        ? proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped)
+                        : finishHr;
                     if (SUCCEEDED(hr))
                     {
                         bHasFrame = TRUE;
@@ -635,108 +867,48 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 
                         if (proc->hClientConn != NULL)
                         {
-                            RECT dirtyRects[VDD_MAX_DIRTY_RECTS];
-                            UINT32 rectCount = 0;
-                            BOOL sendFull = !bSentFullFrame;  /* first frame must be full */
-
-                            /* Query dirty rects from IddCx.  If GetDirtyRects returns
-                               0 rects OR fails, fall back to sending a full frame.
-                               0 rects does NOT reliably mean "identical" — during early
-                               boot the presenter may not supply dirty rect metadata,
-                               and skipping would stall updates until the E_PENDING
-                               timeout resend path fires ~100ms later. */
-                            if (!sendFull) {
-                                IDARG_IN_GETDIRTYRECTS drIn = {};
-                                IDARG_OUT_GETDIRTYRECTS drOut = {};
-                                drIn.DirtyRectInCount = VDD_MAX_DIRTY_RECTS;
-                                drIn.pDirtyRects = dirtyRects;
-                                HRESULT drHr = IddCxSwapChainGetDirtyRects(proc->hSwapChain, &drIn, &drOut);
-                                if (SUCCEEDED(drHr) && drOut.DirtyRectOutCount > 0) {
-                                    rectCount = drOut.DirtyRectOutCount;
-                                } else {
-                                    sendFull = TRUE;
-                                }
-                            }
-
                             VDD_WIRE_FRAME_HEADER whdr;
                             BOOL send_ok = TRUE;
                             AsbConn* s = proc->hClientConn;
+                            UINT32 data_size = 0;
+                            int sent;
+
+                            if (!sendFull) {
+                                /* Clamp rects to frame bounds; an inverted rect becomes empty. */
+                                for (UINT32 i = 0; i < rectCount; i++) {
+                                    if (dirtyRects[i].left < 0) dirtyRects[i].left = 0;
+                                    if (dirtyRects[i].top  < 0) dirtyRects[i].top  = 0;
+                                    if (dirtyRects[i].right  > (LONG)proc->frameW) dirtyRects[i].right  = (LONG)proc->frameW;
+                                    if (dirtyRects[i].bottom > (LONG)proc->frameH) dirtyRects[i].bottom = (LONG)proc->frameH;
+                                    if (dirtyRects[i].right < dirtyRects[i].left)  dirtyRects[i].right  = dirtyRects[i].left;
+                                    if (dirtyRects[i].bottom < dirtyRects[i].top)  dirtyRects[i].bottom = dirtyRects[i].top;
+                                    data_size += (UINT32)(dirtyRects[i].right - dirtyRects[i].left) * 4 *
+                                                 (UINT32)(dirtyRects[i].bottom - dirtyRects[i].top);
+                                }
+                                /* All rects zero area after clamping — skip send */
+                                if (data_size == 0) goto skip_send;
+                            }
 
                             proc->frameSeq++;
                             whdr.magic            = VDD_FRAME_MAGIC;
-                            whdr.width            = VDD_WIDTH;
-                            whdr.height           = VDD_HEIGHT;
-                            whdr.stride           = VDD_STRIDE;
+                            whdr.width            = proc->frameW;
+                            whdr.height           = proc->frameH;
+                            whdr.stride           = proc->frameW * 4;
                             whdr.frame_seq        = proc->frameSeq;
 
-                            if (sendFull) {
-                                /* Full frame */
-                                UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
-                                whdr.dirty_rect_count = 0;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                if (send_ok) {
-                                    for (UINT row = 0; row < VDD_HEIGHT; row++) {
-                                        if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                                       VDD_STRIDE) != 0) {
-                                            send_ok = FALSE;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (send_ok) bSentFullFrame = TRUE;
-                            } else {
-                                /* Dirty rects only */
-                                UINT32 data_size = 0;
-                                UINT32 i;
-
-                                /* Clamp rects to frame bounds and calculate total data size */
-                                for (i = 0; i < rectCount; i++) {
-                                    if (dirtyRects[i].left < 0) dirtyRects[i].left = 0;
-                                    if (dirtyRects[i].top  < 0) dirtyRects[i].top  = 0;
-                                    if (dirtyRects[i].right  > (LONG)VDD_WIDTH)  dirtyRects[i].right  = VDD_WIDTH;
-                                    if (dirtyRects[i].bottom > (LONG)VDD_HEIGHT) dirtyRects[i].bottom = VDD_HEIGHT;
-                                    if (dirtyRects[i].left < dirtyRects[i].right &&
-                                        dirtyRects[i].top < dirtyRects[i].bottom) {
-                                        UINT rw = (UINT)(dirtyRects[i].right - dirtyRects[i].left);
-                                        UINT rh = (UINT)(dirtyRects[i].bottom - dirtyRects[i].top);
-                                        data_size += rw * 4 * rh;
-                                    }
-                                }
-
-                                /* All rects zero area after clamping — skip send */
-                                if (data_size == 0) goto skip_send;
-
+                            sent = 1;
+                            if (!sendFull) {
                                 whdr.dirty_rect_count = rectCount;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)dirtyRects, rectCount * sizeof(RECT)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                /* Send per-rect pixel rows */
-                                if (send_ok) {
-                                    for (i = 0; i < rectCount && send_ok; i++) {
-                                        LONG left = dirtyRects[i].left;
-                                        LONG top  = dirtyRects[i].top;
-                                        UINT rw   = (UINT)(dirtyRects[i].right - left);
-                                        UINT rh   = (UINT)(dirtyRects[i].bottom - top);
-                                        if (rw == 0 || rh == 0) continue;
-                                        for (UINT row = 0; row < rh; row++) {
-                                            const BYTE *src = (const BYTE*)mapped.pData
-                                                              + ((UINT)top + row) * mapped.RowPitch
-                                                              + (UINT)left * 4;
-                                            if (VddSendAll(s, (const char*)src, rw * 4) != 0) {
-                                                send_ok = FALSE;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                                sent = VddSendFrame(proc, s, &whdr, dirtyRects, rectCount, data_size, &mapped);
                             }
+                            if (sent == 1) {
+                                /* Full frame (first frame, no rect metadata, or rects
+                                   overlapping beyond a full frame's worth of pixels). */
+                                whdr.dirty_rect_count = 0;
+                                sent = VddSendFrame(proc, s, &whdr, NULL, 0, proc->frameW * proc->frameH * 4, &mapped);
+                                if (sent == 0) bSentFullFrame = TRUE;
+                            }
+                            send_ok = (sent == 0);
 
                             if (!send_ok) {
                                 VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
@@ -744,14 +916,16 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 bSentFullFrame = FALSE;
                             } else if (proc->frameSeq == 1) {
                                 VddLog("Frame: first frame sent (%ux%u, %u bytes)",
-                                       VDD_WIDTH, VDD_HEIGHT, VDD_STRIDE * VDD_HEIGHT);
+                                       proc->frameW, proc->frameH, proc->frameW * 4 * proc->frameH);
                             }
                         skip_send:;
                         }
 
                         proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
                     }
-
+                }
+                else if (pTexture)
+                {
                     pTexture->Release();
                 }
             }
@@ -766,10 +940,10 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 VddSendCursorUpdate(proc);
             }
 
-
-            hr = IddCxSwapChainFinishedProcessingFrame(proc->hSwapChain);
-            if (FAILED(hr)) {
-                VddLog("SwapChainRunCore: FinishedProcessingFrame FAILED hr=0x%08X, exiting for reassignment", hr);
+            if (!frameFinished)
+                finishHr = IddCxSwapChainFinishedProcessingFrame(proc->hSwapChain);
+            if (FAILED(finishHr)) {
+                VddLog("SwapChainRunCore: FinishedProcessingFrame FAILED hr=0x%08X, exiting for reassignment", finishHr);
                 break;
             }
         } else {
@@ -796,9 +970,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 /*  Swap chain cleanup helper                                                */
 /* ========================================================================= */
 
-static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
+static BOOL VddDestroySwapProc(VDD_SWAP_PROC* proc)
 {
-    if (!proc) return;
+    DWORD swapWait = WAIT_OBJECT_0;
+    DWORD networkWait = WAIT_OBJECT_0;
+    if (!proc) return TRUE;
 
     /* Stop network first */
     proc->bStopNetwork = TRUE;
@@ -807,22 +983,34 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
     if (proc->hTerminateEvent)
         SetEvent(proc->hTerminateEvent);
 
+    /* Connection wrappers belong to the workers, which can close/free them
+       concurrently. Never dereference those slots from this teardown thread.
+       Socket sends are bounded by SO_SNDTIMEO; accept polls the stop flag. */
+
     if (proc->hThread)
     {
         VddLog("DestroySwapProc: waiting for swap chain thread...");
-        WaitForSingleObject(proc->hThread, 5000);
-        VddLog("DestroySwapProc: swap chain thread exited");
-        CloseHandle(proc->hThread);
+        swapWait = WaitForSingleObject(proc->hThread, 15000);
+        VddLog("DestroySwapProc: swap chain wait result=0x%lX", swapWait);
     }
 
     /* Wait for network thread to exit */
     if (proc->hNetworkThread)
     {
         VddLog("DestroySwapProc: waiting for network thread...");
-        WaitForSingleObject(proc->hNetworkThread, 5000);
-        VddLog("DestroySwapProc: network thread exited");
-        CloseHandle(proc->hNetworkThread);
+        networkWait = WaitForSingleObject(proc->hNetworkThread, 15000);
+        VddLog("DestroySwapProc: network wait result=0x%lX", networkWait);
     }
+
+    /* A timed-out worker still owns proc and its D3D resources.  Leaking that
+       rare failure is safer than the previous use-after-free in WUDFHost. */
+    if (swapWait != WAIT_OBJECT_0 || networkWait != WAIT_OBJECT_0) {
+        VddLog("DestroySwapProc: worker did not stop; preserving state to avoid use-after-free");
+        return FALSE;
+    }
+    if (proc->hThread) CloseHandle(proc->hThread);
+    if (proc->hNetworkThread) CloseHandle(proc->hNetworkThread);
+    proc->hThread = proc->hNetworkThread = NULL;
 
     /* Close any remaining client connection */
     VddLog("DestroySwapProc: closing client connection (%p)", (void*)proc->hClientConn);
@@ -844,19 +1032,21 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
     if (proc->pCursorShapeBuffer)
         free(proc->pCursorShapeBuffer);
 
-    /* Only release the per-swap-chain staging texture.  The D3D device and
-       context are cached in VDD_DEVICE_CONTEXT and intentionally NOT released
-       here — this is the fix for the pDevice->Release() crash after session
-       logoff.  Destroying the D3D device after WdfObjectDelete triggers IddCx
-       teardown corrupts DXGI internal state. */
-    VddLog("DestroySwapProc: releasing staging texture (staging=%p, device=%p cached)",
+    /* Release the processor's references. The cache retains a separate pair,
+       so these calls cannot destroy the shared device during IddCx teardown. */
+    VddLog("DestroySwapProc: releasing swap resources (staging=%p, device=%p cached)",
            (void*)proc->pStagingTex, (void*)proc->pDevice);
     if (proc->pStagingTex)
         proc->pStagingTex->Release();
-    VddLog("DestroySwapProc: staging texture released");
+    if (proc->pDeviceContext)
+        proc->pDeviceContext->Release();
+    if (proc->pDevice)
+        proc->pDevice->Release();
+    VddLog("DestroySwapProc: per-monitor D3D references released");
 
     free(proc);
     VddLog("DestroySwapProc: COMPLETE");
+    return TRUE;
 }
 
 /* ========================================================================= */
@@ -867,14 +1057,17 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->wdfDevice = device;
+    InitializeCriticalSection(&ctx->d3dCacheLock);
 
-    /* Pre-populate the single 1920x1080@60Hz mode */
-    VddCreateMonitorMode(&ctx->modes[0], 0);  /* vSyncDivider=0 for monitor modes */
+    /* Pre-populate the preferred 1920x1080@60Hz mode shared by both monitors. */
+    VddCreateMonitorMode(&ctx->modes[0], 0, kVddRefreshRates[0]);  /* vSyncDivider=0 for monitor modes */
     ctx->modeCount = 1;
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
 {
+    UINT i;
+    BOOL canReleaseDevice = TRUE;
     VddLog("Context cleanup starting");
 
     /* Stop recovery timer (wait for any in-progress callback to finish) */
@@ -882,22 +1075,27 @@ static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
         WdfTimerStop(ctx->hRecoveryTimer, TRUE);
     }
 
-    if (ctx->pSwapProc)
-    {
-        VddDestroySwapProc(ctx->pSwapProc);
-        ctx->pSwapProc = nullptr;
+    for (i = 0; i < VDD_MONITOR_COUNT; ++i) {
+        if (ctx->pSwapProcs[i]) {
+            if (!VddDestroySwapProc(ctx->pSwapProcs[i]))
+                canReleaseDevice = FALSE;
+            ctx->pSwapProcs[i] = nullptr;
+        }
     }
 
     /* Release cached D3D device (safe here — no IddCx teardown in progress) */
-    if (ctx->pCachedCtx) {
+    if (canReleaseDevice && ctx->pCachedCtx) {
         ctx->pCachedCtx->Release();
         ctx->pCachedCtx = nullptr;
     }
-    if (ctx->pCachedDevice) {
+    if (canReleaseDevice && ctx->pCachedDevice) {
         VddLog("Context cleanup: releasing cached D3D device");
         ctx->pCachedDevice->Release();
         ctx->pCachedDevice = nullptr;
     }
+    if (!canReleaseDevice)
+        VddLog("Context cleanup: preserving cached D3D device for a live worker");
+    DeleteCriticalSection(&ctx->d3dCacheLock);
 
     VddLog("Context cleanup done");
 }
@@ -923,7 +1121,7 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
     adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_NONE;
     VddLog("InitAdapter: SDR only (FP16 not advertised)");
 
-    adapterCaps.MaxMonitorsSupported = 1;
+    adapterCaps.MaxMonitorsSupported = VDD_MONITOR_COUNT;
 
     adapterCaps.EndPointDiagnostics.Size = sizeof(adapterCaps.EndPointDiagnostics);
     adapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
@@ -988,27 +1186,26 @@ static void VddFinishInit(VDD_DEVICE_CONTEXT* ctx)
 /*  CreateMonitor (called after adapter init finished)                       */
 /* ========================================================================= */
 
-static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx)
+static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx, UINT displayIndex)
 {
-    VddLog("CreateMonitor: entered (ctx=%p, adapter=%p)", (void*)ctx, (void*)ctx->hAdapter);
+    VddLog("CreateMonitor: display %u entered (ctx=%p, adapter=%p)",
+           displayIndex + 1, (void*)ctx, (void*)ctx->hAdapter);
 
     IDDCX_MONITOR_INFO monitorInfo = {};
     monitorInfo.Size = sizeof(monitorInfo);
     monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-    monitorInfo.ConnectorIndex = 0;
+    monitorInfo.ConnectorIndex = displayIndex;
 
     monitorInfo.MonitorDescription.Size     = sizeof(monitorInfo.MonitorDescription);
     monitorInfo.MonitorDescription.Type     = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
     monitorInfo.MonitorDescription.DataSize = 128;
-    monitorInfo.MonitorDescription.pData    = (void*)VddGetEdid();
+    monitorInfo.MonitorDescription.pData    = (void*)VddGetEdid(displayIndex);
 
     VddLog("CreateMonitor: EDID checksum byte=0x%02X, IDDCX_MONITOR_INFO.Size=%u",
            ((const BYTE*)monitorInfo.MonitorDescription.pData)[127],
            (unsigned)monitorInfo.Size);
 
-    /* Generate a container GUID */
-    HRESULT hrGuid = CoCreateGuid(&monitorInfo.MonitorContainerId);
-    VddLog("CreateMonitor: CoCreateGuid hr=0x%08X", hrGuid);
+    monitorInfo.MonitorContainerId = g_monitorContainerIds[displayIndex];
 
     WDF_OBJECT_ATTRIBUTES monAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&monAttrs, MonitorContextWrapper);
@@ -1028,15 +1225,17 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx)
     }
     VddLog("CreateMonitor: IddCxMonitorCreate succeeded (monitor=%p)", (void*)createOut.MonitorObject);
 
-    ctx->hMonitor = createOut.MonitorObject;
+    ctx->hMonitors[displayIndex] = createOut.MonitorObject;
+    g_vddMonitorObjects[displayIndex] = createOut.MonitorObject;
 
     /* Store context on the monitor object */
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(createOut.MonitorObject);
     pMonCtx->pContext = ctx;
+    pMonCtx->displayIndex = displayIndex;
 
     VddLog("CreateMonitor: calling IddCxMonitorArrival...");
     IDARG_OUT_MONITORARRIVAL arrivalOut = {};
-    st = IddCxMonitorArrival(ctx->hMonitor, &arrivalOut);
+    st = IddCxMonitorArrival(ctx->hMonitors[displayIndex], &arrivalOut);
     if (!NT_SUCCESS(st))
     {
         VddLog("CreateMonitor: IddCxMonitorArrival FAILED st=0x%08X", st);
@@ -1059,9 +1258,10 @@ static VOID VddRecoveryTimerCallback(WDFTIMER Timer)
     RecoveryTimerContext* timerCtx = WdfObjectGet_RecoveryTimerContext(Timer);
     VDD_DEVICE_CONTEXT* ctx = timerCtx->pContext;
 
-    /* If a swap chain was assigned in the meantime, nothing to do */
-    if (ctx->pSwapProc) {
-        VddLog("Recovery: swap chain already reassigned, skipping");
+    /* If either swap chain was assigned in the meantime, the adapter is
+       healthy.  Each monitor will still be reassigned independently by DWM. */
+    if (ctx->pSwapProcs[0] || ctx->pSwapProcs[1]) {
+        VddLog("Recovery: at least one swap chain already reassigned, skipping");
         return;
     }
 
@@ -1086,6 +1286,8 @@ NTSTATUS VddMonitorAssignSwapChain(
 
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(MonitorObject);
     VDD_DEVICE_CONTEXT* ctx = pMonCtx->pContext;
+    UINT displayIndex = pMonCtx->displayIndex;
+    if (displayIndex >= VDD_MONITOR_COUNT) return STATUS_INVALID_PARAMETER;
 
     /* Cancel any pending recovery timer — a new swap chain is being assigned */
     if (ctx->hRecoveryTimer) {
@@ -1094,11 +1296,14 @@ NTSTATUS VddMonitorAssignSwapChain(
     }
 
     /* Destroy existing swap proc if any */
-    if (ctx->pSwapProc)
+    if (ctx->pSwapProcs[displayIndex])
     {
-        VddLog("AssignSwapChain: destroying existing swap proc");
-        VddDestroySwapProc(ctx->pSwapProc);
-        ctx->pSwapProc = nullptr;
+        VddLog("AssignSwapChain: destroying existing display %u swap proc", displayIndex + 1);
+        if (!VddDestroySwapProc(ctx->pSwapProcs[displayIndex])) {
+            VddLog("AssignSwapChain: old worker did not stop; abandoning reassignment");
+            return (NTSTATUS)0xC01E0012L;
+        }
+        ctx->pSwapProcs[displayIndex] = nullptr;
         VddLog("AssignSwapChain: existing swap proc destroyed");
     }
 
@@ -1110,6 +1315,7 @@ NTSTATUS VddMonitorAssignSwapChain(
         return STATUS_NO_MEMORY;
     }
     memset(proc, 0, sizeof(*proc));
+    proc->displayIndex = displayIndex;
     VddLog("AssignSwapChain: swap proc allocated at %p", (void*)proc);
 
     proc->hSwapChain      = pInArgs->hSwapChain;
@@ -1143,12 +1349,16 @@ NTSTATUS VddMonitorAssignSwapChain(
     proc->frameSeq       = 0;
 
     /* Create staging texture for CPU readback */
-    VddLog("AssignSwapChain: creating staging texture (%ux%u)...", VDD_WIDTH, VDD_HEIGHT);
-    hr = VddCreateStagingTexture(proc, VDD_WIDTH, VDD_HEIGHT);
+    /* Initial size; the swap-chain loop resizes to the real surface. */
+    proc->frameW = VDD_WIDTH;
+    proc->frameH = VDD_HEIGHT;
+    VddLog("AssignSwapChain: creating staging texture (%ux%u)...", proc->frameW, proc->frameH);
+    hr = VddCreateStagingTexture(proc, proc->frameW, proc->frameH);
     if (FAILED(hr))
     {
         VddLog("AssignSwapChain: staging texture creation FAILED hr=0x%08X", hr);
-        /* Don't release pDevice/pDeviceContext — they're cached in ctx */
+        proc->pDeviceContext->Release();
+        proc->pDevice->Release();
         if (proc->hTerminateEvent)
             CloseHandle(proc->hTerminateEvent);
         free(proc);
@@ -1199,7 +1409,8 @@ NTSTATUS VddMonitorAssignSwapChain(
     {
         VddLog("AssignSwapChain: CreateThread FAILED err=%u", GetLastError());
         proc->pStagingTex->Release();
-        /* Don't release pDevice/pDeviceContext — they're cached in ctx */
+        proc->pDeviceContext->Release();
+        proc->pDevice->Release();
         if (proc->hTerminateEvent)
             CloseHandle(proc->hTerminateEvent);
         if (proc->hCursorEvent)
@@ -1223,7 +1434,7 @@ NTSTATUS VddMonitorAssignSwapChain(
         VddLog("AssignSwapChain: network thread created (handle=%p)", (void*)proc->hNetworkThread);
     }
 
-    ctx->pSwapProc = proc;
+    ctx->pSwapProcs[displayIndex] = proc;
 
     VddLog("AssignSwapChain: COMPLETE — swap chain assigned, all threads started");
     return STATUS_SUCCESS;
@@ -1235,11 +1446,13 @@ NTSTATUS VddMonitorUnassignSwapChain(
 {
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(MonitorObject);
     VDD_DEVICE_CONTEXT* ctx = pMonCtx->pContext;
+    UINT displayIndex = pMonCtx->displayIndex;
+    if (displayIndex >= VDD_MONITOR_COUNT) return STATUS_INVALID_PARAMETER;
 
-    if (ctx->pSwapProc)
+    if (ctx->pSwapProcs[displayIndex])
     {
-        VddDestroySwapProc(ctx->pSwapProc);
-        ctx->pSwapProc = nullptr;
+        if (VddDestroySwapProc(ctx->pSwapProcs[displayIndex]))
+            ctx->pSwapProcs[displayIndex] = nullptr;
     }
 
     VddLog("SwapChain unassigned — starting recovery timer (5s)");
@@ -1266,21 +1479,24 @@ NTSTATUS VddParseMonitorDescription(
 {
     VddLog("ParseMonitorDescription: InputCount=%u", pInArgs->MonitorModeBufferInputCount);
 
-    pOutArgs->MonitorModeBufferOutputCount = 1;
+    UINT count = VddModeTotal(-1);
+    pOutArgs->MonitorModeBufferOutputCount = count;
 
     if (pInArgs->MonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->MonitorModeBufferInputCount < 1)
+    if (pInArgs->MonitorModeBufferInputCount < count)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE* pMode = pInArgs->pMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
+    for (UINT i = 0; i < count; i++) {
+        IDDCX_MONITOR_MODE* pMode = &pInArgs->pMonitorModes[i];
+        pMode->Size = sizeof(IDDCX_MONITOR_MODE);
+        pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+        VddFillMode(&pMode->MonitorVideoSignalInfo, 0, -1, i); /* vSyncDivider=0 for monitor modes */
+    }
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription: returning 1 mode (1920x1080@60)");
+    VddLog("ParseMonitorDescription: returning %u modes", count);
     return STATUS_SUCCESS;
 }
 
@@ -1298,21 +1514,25 @@ NTSTATUS VddMonitorGetDefaultModes(
 
     VddLog("GetDefaultModes: InputCount=%u", pInArgs->DefaultMonitorModeBufferInputCount);
 
-    pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
+    int displayIndex = VddMonitorIndex(MonitorObject);
+    UINT count = VddModeTotal(displayIndex);
+    pOutArgs->DefaultMonitorModeBufferOutputCount = count;
     pOutArgs->PreferredMonitorModeIdx = 0;
 
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->DefaultMonitorModeBufferInputCount < 1)
+    if (pInArgs->DefaultMonitorModeBufferInputCount < count)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE* pMode = pInArgs->pDefaultMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
+    for (UINT i = 0; i < count; i++) {
+        IDDCX_MONITOR_MODE* pMode = &pInArgs->pDefaultMonitorModes[i];
+        pMode->Size = sizeof(IDDCX_MONITOR_MODE);
+        pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+        VddFillMode(&pMode->MonitorVideoSignalInfo, 0, displayIndex, i); /* vSyncDivider=0 for monitor modes */
+    }
 
-    VddLog("GetDefaultModes: returning 1 default mode");
+    VddLog("GetDefaultModes: returning %u default modes", count);
     return STATUS_SUCCESS;
 }
 
@@ -1330,19 +1550,23 @@ NTSTATUS VddMonitorQueryTargetModes(
 
     VddLog("QueryTargetModes: InputCount=%u", pInArgs->TargetModeBufferInputCount);
 
-    pOutArgs->TargetModeBufferOutputCount = 1;
+    int displayIndex = VddMonitorIndex(MonitorObject);
+    UINT count = VddModeTotal(displayIndex);
+    pOutArgs->TargetModeBufferOutputCount = count;
 
     if (pInArgs->TargetModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->TargetModeBufferInputCount < 1)
+    if (pInArgs->TargetModeBufferInputCount < count)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_TARGET_MODE* pMode = pInArgs->pTargetModes;
-    pMode->Size = sizeof(IDDCX_TARGET_MODE);
-    VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1); /* vSyncDivider=1 for TARGET modes */
+    for (UINT i = 0; i < count; i++) {
+        IDDCX_TARGET_MODE* pMode = &pInArgs->pTargetModes[i];
+        pMode->Size = sizeof(IDDCX_TARGET_MODE);
+        VddFillMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, displayIndex, i); /* vSyncDivider=1 for TARGET modes */
+    }
 
-    VddLog("QueryTargetModes: returning 1 target mode");
+    VddLog("QueryTargetModes: returning %u target modes", count);
     return STATUS_SUCCESS;
 }
 
@@ -1395,22 +1619,25 @@ NTSTATUS VddParseMonitorDescription2(
 {
     VddLog("ParseMonitorDescription2: InputCount=%u", pInArgs->MonitorModeBufferInputCount);
 
-    pOutArgs->MonitorModeBufferOutputCount = 1;
+    UINT count = VddModeTotal(-1);
+    pOutArgs->MonitorModeBufferOutputCount = count;
 
     if (pInArgs->MonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->MonitorModeBufferInputCount < 1)
+    if (pInArgs->MonitorModeBufferInputCount < count)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE2* pMode = pInArgs->pMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE2);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0);
-    pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+    for (UINT i = 0; i < count; i++) {
+        IDDCX_MONITOR_MODE2* pMode = &pInArgs->pMonitorModes[i];
+        pMode->Size = sizeof(IDDCX_MONITOR_MODE2);
+        pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+        VddFillMode(&pMode->MonitorVideoSignalInfo, 0, -1, i);
+        pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+    }
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription2: returning 1 mode (8bpc)");
+    VddLog("ParseMonitorDescription2: returning %u modes (8bpc)", count);
     return STATUS_SUCCESS;
 }
 
@@ -1428,17 +1655,21 @@ NTSTATUS VddMonitorQueryTargetModes2(
 
     VddLog("QueryTargetModes2: InputCount=%u", pInArgs->TargetModeBufferInputCount);
 
-    pOutArgs->TargetModeBufferOutputCount = 1;
+    int displayIndex = VddMonitorIndex(MonitorObject);
+    UINT count = VddModeTotal(displayIndex);
+    pOutArgs->TargetModeBufferOutputCount = count;
 
-    if (pInArgs->TargetModeBufferInputCount >= 1)
+    if (pInArgs->TargetModeBufferInputCount >= count)
     {
-        IDDCX_TARGET_MODE2* pMode = pInArgs->pTargetModes;
-        pMode->Size = sizeof(IDDCX_TARGET_MODE2);
-        pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
-        VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1);
+        for (UINT i = 0; i < count; i++) {
+            IDDCX_TARGET_MODE2* pMode = &pInArgs->pTargetModes[i];
+            pMode->Size = sizeof(IDDCX_TARGET_MODE2);
+            pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+            VddFillMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, displayIndex, i);
+        }
     }
 
-    VddLog("QueryTargetModes2: returning 1 target mode (8bpc)");
+    VddLog("QueryTargetModes2: returning %u target modes (8bpc)", count);
     return STATUS_SUCCESS;
 }
 
@@ -1510,11 +1741,18 @@ NTSTATUS VddAdapterInitFinished(
 
     if (NT_SUCCESS(pInArgs->AdapterInitStatus))
     {
-        VddLog("AdapterInitFinished: adapter init succeeded, creating monitor...");
+        NTSTATUS st;
+        UINT i;
+        VddLog("AdapterInitFinished: adapter init succeeded, creating %u monitors...",
+               VDD_MONITOR_COUNT);
         VddFinishInit(pWrapper->pContext);
-        NTSTATUS st = VddCreateMonitor(pWrapper->pContext);
-        VddLog("AdapterInitFinished: VddCreateMonitor returned 0x%08X", st);
-        return st;
+        for (i = 0; i < VDD_MONITOR_COUNT; ++i) {
+            st = VddCreateMonitor(pWrapper->pContext, i);
+            VddLog("AdapterInitFinished: display %u VddCreateMonitor returned 0x%08X",
+                   i + 1, st);
+            if (!NT_SUCCESS(st)) return st;
+        }
+        return STATUS_SUCCESS;
     }
 
     VddLog("AdapterInitFinished: adapter init FAILED, not creating monitor");

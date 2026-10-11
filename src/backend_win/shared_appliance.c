@@ -12,7 +12,9 @@
 #include <urlmon.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <shlobj.h>
 #include <shlwapi.h>
+#include <dbt.h>
 #include <virtdisk.h>
 #include <stdio.h>
 #include <io.h>
@@ -23,10 +25,12 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "virtdisk.lib")
 
-#define APPLIANCE_VM_NAME L"AppSandbox.SharedAppliance"
+static wchar_t g_appliance_vm_name[128] = L"AppSandbox.SharedAppliance";
+#define APPLIANCE_VM_NAME g_appliance_vm_name
 #define APPLIANCE_UNIQUE_ID ((UINT64)0xFFFFFFFFFFFFFF00ull)
 #define APPLIANCE_SERVICE_USER L"AppSandboxShare"
 #define APPLIANCE_IDLE_MS (5ull * 60ull * 1000ull)
@@ -53,6 +57,7 @@ typedef struct {
 typedef struct {
     CRITICAL_SECTION cs;
     CRITICAL_SECTION command_cs;
+    CRITICAL_SECTION host_mapping_cs;
     BOOL initialized;
     SharedApplianceStatus status;
     wchar_t windows_iso_path[MAX_PATH];
@@ -72,6 +77,9 @@ typedef struct {
     LONG idle_generation;
     LONG restart_attempts;
     volatile LONG host_mount_mask;
+    /* Exact ownership, not merely a drive-letter mask. Protected by
+       host_mapping_cs along with commands and mount accounting. */
+    AsbSharedResourceInfo host_mappings[L'Z' - L'D' + 1];
 } SharedApplianceGlobal;
 
 typedef struct {
@@ -89,6 +97,8 @@ static const GUID ASB_VHDX_VENDOR = {
 
 static SharedApplianceGlobal g_appliance;
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
+static void notify_shell_host_drive(wchar_t letter, BOOL mounted);
+static void set_host_mapping_tracked(const AsbSharedResourceInfo *resource, BOOL mounted);
 static HRESULT reconcile_internal(void);
 static volatile LONG g_setup_invalid_parameter;
 static wchar_t g_setup_invalid_function[128];
@@ -591,7 +601,8 @@ static HRESULT download_ubuntu_image(wchar_t *image_path, size_t image_chars)
     return S_OK;
 }
 
-static HRESULT run_hidden_process(wchar_t *command, DWORD timeout_ms)
+static HRESULT run_hidden_process_env(wchar_t *command, DWORD timeout_ms,
+                                      const wchar_t *environment)
 {
     STARTUPINFOW startup;
     PROCESS_INFORMATION process;
@@ -599,14 +610,20 @@ static HRESULT run_hidden_process(wchar_t *command, DWORD timeout_ms)
     ZeroMemory(&startup, sizeof(startup)); startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
     ZeroMemory(&process, sizeof(process));
-    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                        NULL, NULL, &startup, &process))
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW | (environment ? CREATE_UNICODE_ENVIRONMENT : 0),
+                        (void *)environment, NULL, &startup, &process))
         return HRESULT_FROM_WIN32(GetLastError());
     wait = WaitForSingleObject(process.hProcess, timeout_ms);
     if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exit_code);
     else { TerminateProcess(process.hProcess, ERROR_TIMEOUT); exit_code = ERROR_TIMEOUT; }
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
     return exit_code == 0 ? S_OK : HRESULT_FROM_WIN32(exit_code);
+}
+
+static HRESULT run_hidden_process(wchar_t *command, DWORD timeout_ms)
+{
+    return run_hidden_process_env(command, timeout_ms, NULL);
 }
 
 static HRESULT launch_process(wchar_t *command)
@@ -625,17 +642,27 @@ static HRESULT launch_process(wchar_t *command)
 
 static HRESULT build_ubuntu_os(const SharedApplianceConfig *config)
 {
-    wchar_t image[MAX_PATH], exe[MAX_PATH], command[2048], resource_dir[MAX_PATH];
-    wchar_t admin_password[256], smb_password[256], ssh_public_key[512];
+    wchar_t image[MAX_PATH], exe[MAX_PATH], command[2048];
     wchar_t *slash;
     HRESULT hr;
+    (void)config;
     hr = download_ubuntu_image(image, _countof(image)); if (FAILED(hr)) return hr;
     set_progress(20, L"Converting Ubuntu cloud image to VHDX...");
     GetModuleFileNameW(NULL, exe, _countof(exe)); slash = wcsrchr(exe, L'\\'); if (slash) *slash = L'\0';
     swprintf_s(command, _countof(command),
         L"\"%s\\iso-patch.exe\" --qcow2-to-vhdx \"%s\" --output \"%s\"",
         exe, image, g_appliance.status.os_vhdx_path);
-    hr = run_hidden_process(command, 30 * 60 * 1000); if (FAILED(hr)) return hr;
+    return run_hidden_process(command, 30 * 60 * 1000);
+}
+
+static HRESULT build_ubuntu_seed(const char *nat_mac, const char *share_mac,
+                                 const char *share_ip)
+{
+    wchar_t exe[MAX_PATH], resource_dir[MAX_PATH];
+    wchar_t admin_password[256], smb_password[256], ssh_public_key[512];
+    wchar_t *slash;
+    HRESULT hr;
+    GetModuleFileNameW(NULL, exe, _countof(exe)); slash = wcsrchr(exe, L'\\'); if (slash) *slash = L'\0';
     hr = load_credentials(admin_password, _countof(admin_password), smb_password, _countof(smb_password));
     if (FAILED(hr)) return hr;
     if (!asb_ensure_ssh_key(ssh_public_key, _countof(ssh_public_key))) {
@@ -644,10 +671,11 @@ static HRESULT build_ubuntu_os(const SharedApplianceConfig *config)
         return E_FAIL;
     }
     swprintf_s(resource_dir, _countof(resource_dir), L"%s\\resources", exe);
-    set_progress(55, L"Creating Ubuntu cloud-init seed...");
+    set_progress(65, L"Creating Ubuntu cloud-init seed...");
     hr = iso_create_appliance_cloud_init(g_appliance.seed_iso_path,
-            config->admin_user, admin_password, APPLIANCE_SERVICE_USER,
-            smb_password, ssh_public_key, resource_dir);
+            g_appliance.status.admin_user, admin_password, APPLIANCE_SERVICE_USER,
+            smb_password, ssh_public_key, resource_dir,
+            nat_mac, hcn_nat_subnet_base(), share_mac, share_ip);
     SecureZeroMemory(admin_password, sizeof(admin_password));
     SecureZeroMemory(smb_password, sizeof(smb_password));
     return hr;
@@ -1059,6 +1087,14 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         }
         if (FAILED(hr)) goto fail;
         g_appliance.maintenance_endpoint_created = TRUE;
+        if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU) {
+            char nat_mac[32];
+            hr = hcn_get_endpoint_mac(&g_appliance.maintenance_endpoint_id,
+                                      nat_mac, sizeof(nat_mac));
+            if (FAILED(hr)) goto fail;
+            hr = build_ubuntu_seed(nat_mac, server_mac, server_ip);
+            if (FAILED(hr)) goto fail;
+        }
     }
 
     ZeroMemory(&g_appliance.runtime, sizeof(g_appliance.runtime));
@@ -1150,6 +1186,10 @@ wait_existing:
     commands_sent = 0;
     file_size_bytes(g_appliance.status.os_vhdx_path, &last_vhdx_bytes);
     while (GetTickCount64() < deadline) {
+        if (!g_appliance.runtime.running) {
+            hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            goto fail;
+        }
         /* Unattended installs run 10-30+ minutes with no agent to talk to.
            Without the heartbeat below the UI sits frozen at 65% and any
            terminal request fails with ERROR_NOT_READY, looking like a hang.
@@ -1220,8 +1260,7 @@ wait_existing:
                next pass, so the agent ends up serving a backlog of overlapping
                heavy commands and the connection eventually drops. Send each
                one once and wait for the guest's own answer. */
-            if (!net_configured &&
-                g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE) {
+            if (!net_configured) {
                 char net_command[128];
                 sprintf_s(net_command, sizeof(net_command), "shared_net:%s:%s",
                           g_appliance.runtime.share_mac, g_appliance.runtime.share_ip);
@@ -1374,7 +1413,11 @@ void shared_appliance_init(void)
     ZeroMemory(&g_appliance, sizeof(g_appliance));
     InitializeCriticalSection(&g_appliance.cs);
     InitializeCriticalSection(&g_appliance.command_cs);
+    InitializeCriticalSection(&g_appliance.host_mapping_cs);
     g_appliance.initialized = TRUE;
+    if (asb_test_namespace()[0])
+        swprintf_s(g_appliance_vm_name, _countof(g_appliance_vm_name),
+                   L"AppSandbox.TestAppliance-%s", asb_test_namespace());
     g_appliance.status.state = ASB_APPLIANCE_STATE_UNCONFIGURED;
     g_appliance.status.data_size_gb = 256;
     load_config();
@@ -1384,13 +1427,19 @@ void shared_appliance_cleanup(void)
 {
     int i;
     if (!g_appliance.initialized) return;
-    for (i = 0; i < shared_resources_count(); ++i) {
-        const AsbSharedResourceInfo *resource = shared_resources_get(i);
-        if (resource && resource->host_drive_letter)
-            host_mapping_command(resource, FALSE);
+    EnterCriticalSection(&g_appliance.host_mapping_cs);
+    for (i = 0; i < _countof(g_appliance.host_mappings); ++i) {
+        const AsbSharedResourceInfo *resource = &g_appliance.host_mappings[i];
+        if (resource->id[0]) {
+            HRESULT hr = host_mapping_command(resource, FALSE);
+            if (hr == S_OK)
+                notify_shell_host_drive(resource->host_drive_letter, FALSE);
+        }
     }
+    ZeroMemory(g_appliance.host_mappings, sizeof(g_appliance.host_mappings));
     InterlockedExchange(&g_appliance.host_mount_mask, 0);
     g_appliance.status.host_mounts = 0;
+    LeaveCriticalSection(&g_appliance.host_mapping_cs);
     shared_appliance_stop(FALSE);
     cleanup_runtime_network();
 }
@@ -1783,24 +1832,203 @@ static DWORD host_mount_bit(const AsbSharedResourceInfo *resource)
     int offset;
     if (!resource || !resource->host_drive_letter) return 0;
     offset = towupper(resource->host_drive_letter) - L'D';
-    return offset >= 0 && offset < 26 ? (DWORD)1u << offset : 0;
+    return offset >= 0 && offset <= L'Z' - L'D' ? (DWORD)1u << offset : 0;
+}
+
+/* Run `iso-patch.exe --shell-notify-drive <letter> add|remove` (asInvoker)
+   with the desktop shell's token, so the change notices come from the same
+   unelevated context as Explorer. Best effort: no shell (service / no one
+   signed in) or no SeImpersonatePrivilege simply skips it. */
+static void notify_shell_as_user(wchar_t letter, BOOL mounted)
+{
+    HWND shell = GetShellWindow();
+    DWORD pid = 0;
+    HANDLE process = NULL, token = NULL, primary = NULL;
+    wchar_t exe[MAX_PATH], *slash, command[MAX_PATH + 64];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    if (!shell || !GetWindowThreadProcessId(shell, &pid) || !pid) return;
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return;
+    if (OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &token) &&
+        DuplicateTokenEx(token, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &primary)) {
+        GetModuleFileNameW(NULL, exe, _countof(exe));
+        slash = wcsrchr(exe, L'\\');
+        if (slash) *slash = L'\0';
+        wcscat_s(exe, _countof(exe), L"\\iso-patch.exe");
+        swprintf_s(command, _countof(command), L"\"%s\" --shell-notify-drive %c %s",
+                   exe, towupper(letter), mounted ? L"add" : L"remove");
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        si.lpDesktop = L"winsta0\\default";
+        if (CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, command, CREATE_NO_WINDOW,
+                                    NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 3000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
+    if (primary) CloseHandle(primary);
+    if (token) CloseHandle(token);
+    CloseHandle(process);
+}
+
+static void notify_shell_host_drive(wchar_t letter, BOOL mounted)
+{
+    wchar_t root[4] = { towupper(letter), L':', L'\\', L'\0' };
+    DEV_BROADCAST_VOLUME volume;
+    DWORD recipients = BSM_APPLICATIONS;
+    SHChangeNotify(mounted ? SHCNE_DRIVEADD : SHCNE_DRIVEREMOVED,
+                   SHCNF_PATHW, root, NULL);
+    if (mounted) {
+        SHChangeNotify(SHCNE_DRIVEADDGUI, SHCNF_PATHW, root, NULL);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, root, NULL);
+    }
+    /* Explorer ignores these notices from an elevated process, so also send
+       them from the desktop shell's own (non-elevated) context. */
+    notify_shell_as_user(letter, mounted);
+    /* Explorer's navigation pane refreshes on the volume broadcast that
+       `net use` sends, not on SHChangeNotify alone. */
+    ZeroMemory(&volume, sizeof(volume));
+    volume.dbcv_size = sizeof(volume);
+    volume.dbcv_devicetype = DBT_DEVTYP_VOLUME;
+    volume.dbcv_unitmask = 1u << (towupper(letter) - L'A');
+    volume.dbcv_flags = DBTF_NET;
+    BroadcastSystemMessageW(BSF_IGNORECURRENTTASK | BSF_NOHANG | BSF_NOTIMEOUTIFNOTHUNG,
+                            &recipients, WM_DEVICECHANGE,
+                            mounted ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE,
+                            (LPARAM)&volume);
+}
+
+/* Explorer labels a mapped share "<share> (\\server)"; show the resource's
+   name instead. Per-user MountPoints2 key, named after the UNC path with
+   '\' replaced by '#'. Best effort. */
+static void label_host_drive(const AsbSharedResourceInfo *resource)
+{
+    wchar_t share[64], key[256];
+    HKEY h;
+    if (!resource || !resource->name[0]) return;
+    shared_resources_share_name(resource->id, share, _countof(share));
+    swprintf_s(key, _countof(key),
+               L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2\\##%S#%s",
+               shared_appliance_server_ip(), share);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_SET_VALUE, NULL, &h, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(h, L"_LabelFromReg", 0, REG_SZ, (const BYTE *)resource->name,
+                       (DWORD)((wcslen(resource->name) + 1) * sizeof(wchar_t)));
+        RegCloseKey(h);
+    }
+}
+
+static void set_host_mapping_tracked(const AsbSharedResourceInfo *resource,
+                                     BOOL mounted)
+{
+    DWORD bit = host_mount_bit(resource);
+    LONG previous;
+    if (!bit) return;
+    if (mounted)
+        g_appliance.host_mappings[towupper(resource->host_drive_letter) - L'D'] = *resource;
+    else
+        ZeroMemory(&g_appliance.host_mappings[towupper(resource->host_drive_letter) - L'D'],
+                   sizeof(*resource));
+    if (mounted) {
+        previous = InterlockedOr(&g_appliance.host_mount_mask, (LONG)bit);
+        if (!(previous & (LONG)bit))
+            InterlockedIncrement(&g_appliance.status.host_mounts);
+    } else {
+        previous = InterlockedAnd(&g_appliance.host_mount_mask, ~(LONG)bit);
+        if ((previous & (LONG)bit) && g_appliance.status.host_mounts > 0)
+            InterlockedDecrement(&g_appliance.status.host_mounts);
+    }
+}
+
+static BOOL host_mapping_environment_skip(const wchar_t *entry)
+{
+    /* Windows PowerShell must discover its own modules, even when AppSandbox
+       was launched from PowerShell 7. Credentials belong only to this child. */
+    return !_wcsnicmp(entry, L"PSModulePath=", _countof(L"PSModulePath=") - 1) ||
+           !_wcsnicmp(entry, L"ASB_SMB_PASSWORD=", _countof(L"ASB_SMB_PASSWORD=") - 1) ||
+           !_wcsnicmp(entry, L"ASB_SMB_USER=", _countof(L"ASB_SMB_USER=") - 1);
+}
+
+static void host_mapping_environment_append(wchar_t **out, const wchar_t *key,
+                                            const wchar_t *value)
+{
+    size_t length = wcslen(key) + wcslen(value) + 1;
+    swprintf_s(*out, length, L"%s%s", key, value);
+    *out += length;
+}
+
+static wchar_t *host_mapping_environment(const wchar_t *user, const wchar_t *password,
+                                         size_t *environment_bytes)
+{
+    wchar_t *inherited = GetEnvironmentStringsW(), *block, *out;
+    const wchar_t *entry;
+    size_t chars = 1;
+    BOOL user_written = FALSE, password_written = FALSE;
+    if (!inherited) return NULL;
+    for (entry = inherited; *entry; entry += wcslen(entry) + 1)
+        if (!host_mapping_environment_skip(entry)) chars += wcslen(entry) + 1;
+    if (user) chars += wcslen(L"ASB_SMB_USER=") + wcslen(user) + 1;
+    if (password) chars += wcslen(L"ASB_SMB_PASSWORD=") + wcslen(password) + 1;
+    /* Leave two terminating NULs even for an empty inherited environment. */
+    *environment_bytes = (chars + 1) * sizeof(wchar_t);
+    block = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, *environment_bytes);
+    if (!block) {
+        FreeEnvironmentStringsW(inherited);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    out = block;
+    for (entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        size_t length = wcslen(entry) + 1;
+        if (host_mapping_environment_skip(entry)) continue;
+        /* Preserve Windows' case-insensitive environment-block sort order. */
+        if (password && !password_written && _wcsicmp(entry, L"ASB_SMB_PASSWORD=") > 0) {
+            host_mapping_environment_append(&out, L"ASB_SMB_PASSWORD=", password);
+            password_written = TRUE;
+        }
+        if (user && !user_written && _wcsicmp(entry, L"ASB_SMB_USER=") > 0) {
+            host_mapping_environment_append(&out, L"ASB_SMB_USER=", user);
+            user_written = TRUE;
+        }
+        memcpy(out, entry, length * sizeof(wchar_t));
+        out += length;
+    }
+    if (password && !password_written)
+        host_mapping_environment_append(&out, L"ASB_SMB_PASSWORD=", password);
+    if (user && !user_written)
+        host_mapping_environment_append(&out, L"ASB_SMB_USER=", user);
+    FreeEnvironmentStringsW(inherited);
+    return block;
 }
 
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount)
 {
     wchar_t admin[256] = {0}, password[256] = {0};
     wchar_t command[4096], share[64], target[256];
+    wchar_t qualified[192] = {0}, *environment;
+    size_t environment_bytes;
     DWORD exit_code;
     HRESULT hr;
-    if (!resource || !resource->host_drive_letter) return E_INVALIDARG;
+    if (!resource || !resource->id[0] || !host_mount_bit(resource)) return E_INVALIDARG;
+    EnterCriticalSection(&g_appliance.host_mapping_cs);
     if (mount) {
         hr = load_credentials(admin, _countof(admin), password, _countof(password));
-        if (FAILED(hr)) return hr;
-        wchar_t qualified[192];
+        if (FAILED(hr)) {
+            LeaveCriticalSection(&g_appliance.host_mapping_cs);
+            return hr;
+        }
         swprintf_s(qualified, _countof(qualified), L"%S\\%s",
                    shared_appliance_server_ip(), APPLIANCE_SERVICE_USER);
-        SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
-        SetEnvironmentVariableW(L"ASB_SMB_USER", qualified);
+    }
+    environment = host_mapping_environment(mount ? qualified : NULL,
+                                            mount ? password : NULL, &environment_bytes);
+    if (!environment) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        SecureZeroMemory(password, sizeof(password));
+        SecureZeroMemory(admin, sizeof(admin));
+        LeaveCriticalSection(&g_appliance.host_mapping_cs);
+        return hr;
     }
     shared_resources_share_name(resource->id, share, _countof(share));
     swprintf_s(target, _countof(target), L"\\\\%S\\%s", shared_appliance_server_ip(), share);
@@ -1812,7 +2040,8 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
           L"try{$m=Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue;"
           L"if($m){if($m.RemotePath -ieq $r){"
           L"try{$null=Get-Item -LiteralPath ($l+'\\') -Force -ErrorAction Stop;exit 100}catch{}"
-          L"};exit 85};"
+          L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction Stop"
+          L"}else{exit 85}};"
           L"$p=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force;"
           L"$c=[pscredential]::new($env:ASB_SMB_USER,$p);"
           L"New-SmbGlobalMapping -LocalPath $l -RemotePath $r -Credential $c "
@@ -1826,77 +2055,171 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     } else {
         swprintf_s(command, _countof(command),
           L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
-          L"$ErrorActionPreference='SilentlyContinue';$l='%c:';"
-          L"if(-not (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue)){exit 101};"
+          L"$ErrorActionPreference='Stop';$l='%c:';$r='%s';"
+          L"$m=Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue;"
+          L"if(-not $m -or $m.RemotePath -ine $r){exit 101};"
           L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction SilentlyContinue;"
           L"for($i=0;$i -lt 20 -and (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue);$i++){"
           L"Start-Sleep -Milliseconds 250};"
           L"if(Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue){exit 1};exit 0\"",
-          resource->host_drive_letter);
+          resource->host_drive_letter, target);
     }
-    hr = run_hidden_process(command, 60000);
+    hr = run_hidden_process_env(command, 60000, environment);
     exit_code = HRESULT_CODE(hr);
     if ((mount && exit_code == HOST_MAPPING_ALREADY_PRESENT) ||
         (!mount && exit_code == HOST_MAPPING_NOT_PRESENT))
         hr = S_FALSE;
-    SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", NULL);
-    SetEnvironmentVariableW(L"ASB_SMB_USER", NULL);
+    SecureZeroMemory(environment, environment_bytes);
+    HeapFree(GetProcessHeap(), 0, environment);
     SecureZeroMemory(password, sizeof(password));
     SecureZeroMemory(admin, sizeof(admin));
+    LeaveCriticalSection(&g_appliance.host_mapping_cs);
     return hr;
 }
 
 HRESULT shared_appliance_mount_host_resource(const wchar_t *resource_id)
 {
-    const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
-    DWORD bit;
-    LONG previous;
+    AsbSharedResourceInfo snapshot;
+    const AsbSharedResourceInfo *resource = &snapshot;
     HRESULT hr;
-    if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    bit = host_mount_bit(resource);
+    if (!shared_resources_copy(resource_id, &snapshot)) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (!resource->enabled || !resource->host_drive_letter) return E_INVALIDARG;
     hr = shared_appliance_start(TRUE, 120000); if (FAILED(hr)) return hr;
+    hr = shared_appliance_reconcile(); if (FAILED(hr)) return hr;
+    EnterCriticalSection(&g_appliance.host_mapping_cs);
     hr = host_mapping_command(resource, TRUE);
     if (hr == S_FALSE) hr = S_OK;
-    if (SUCCEEDED(hr) && bit) {
-        previous = InterlockedOr(&g_appliance.host_mount_mask, (LONG)bit);
-        if (!(previous & (LONG)bit))
-            InterlockedIncrement(&g_appliance.status.host_mounts);
+    if (SUCCEEDED(hr)) {
+        set_host_mapping_tracked(resource, TRUE);
+        label_host_drive(resource);
+        notify_shell_host_drive(resource->host_drive_letter, TRUE);
     }
+    LeaveCriticalSection(&g_appliance.host_mapping_cs);
     return hr;
 }
 
 HRESULT shared_appliance_unmount_host_resource(const wchar_t *resource_id)
 {
-    const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
-    DWORD bit;
-    LONG previous;
+    AsbSharedResourceInfo snapshot;
+    const AsbSharedResourceInfo *resource = &snapshot;
     HRESULT hr;
-    if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    bit = host_mount_bit(resource);
+    if (!shared_resources_copy(resource_id, &snapshot)) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (!resource->host_drive_letter) return S_OK;
+    EnterCriticalSection(&g_appliance.host_mapping_cs);
     hr = host_mapping_command(resource, FALSE);
-    if (hr == S_FALSE) hr = S_OK;
-    if (SUCCEEDED(hr) && bit) {
-        previous = InterlockedAnd(&g_appliance.host_mount_mask, ~(LONG)bit);
-        if ((previous & (LONG)bit) && g_appliance.status.host_mounts > 0)
-            InterlockedDecrement(&g_appliance.status.host_mounts);
+    if (SUCCEEDED(hr)) {
+        if (hr == S_OK) notify_shell_host_drive(resource->host_drive_letter, FALSE);
+        set_host_mapping_tracked(resource, FALSE);
+        hr = S_OK;
     }
+    LeaveCriticalSection(&g_appliance.host_mapping_cs);
     InterlockedIncrement(&g_appliance.idle_generation);
     return hr;
 }
 
+BOOL shared_appliance_has_host_resources(void)
+{
+    AsbSharedResourceInfo resources[ASB_MAX_SHARED_RESOURCES];
+    int i, count = shared_resources_snapshot(resources, _countof(resources));
+    for (i = 0; i < count; ++i) {
+        const AsbSharedResourceInfo *resource = &resources[i];
+        if (resource && resource->enabled && resource->host_drive_letter)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* HostDriveLetter is a desired-state setting, not a one-shot button action.
+   Reconcile it after configuration changes and on app startup so Explorer
+   sees the drive without requiring Open Share. Snapshots retain the old share
+   identity so changing/reusing a letter never unmaps someone else's share. */
+HRESULT shared_appliance_reconcile_host_resources(void)
+{
+    AsbSharedResourceInfo resources[ASB_MAX_SHARED_RESOURCES];
+    DWORD desired = 0, tracked;
+    HRESULT first_error = S_OK, hr;
+    int i, j, count = shared_resources_snapshot(resources, _countof(resources));
+
+    EnterCriticalSection(&g_appliance.host_mapping_cs);
+    for (i = 0; i < count; ++i) {
+        const AsbSharedResourceInfo *resource = &resources[i];
+        if (resource && resource->enabled && resource->host_drive_letter)
+            desired |= host_mount_bit(resource);
+    }
+
+    tracked = (DWORD)InterlockedCompareExchange(
+        &g_appliance.host_mount_mask, 0, 0);
+    for (i = 0; i <= L'Z' - L'D'; ++i) {
+        DWORD bit = (DWORD)1u << i;
+        AsbSharedResourceInfo stale = g_appliance.host_mappings[i];
+        BOOL keep = FALSE;
+        if (!(tracked & bit)) continue;
+        for (j = 0; j < count; ++j)
+            if (resources[j].enabled && resources[j].host_drive_letter == stale.host_drive_letter &&
+                _wcsicmp(resources[j].id, stale.id) == 0) keep = TRUE;
+        if (keep) continue;
+        hr = host_mapping_command(&stale, FALSE);
+        if (SUCCEEDED(hr)) {
+            if (hr == S_OK) notify_shell_host_drive(stale.host_drive_letter, FALSE);
+            set_host_mapping_tracked(&stale, FALSE);
+        } else if (SUCCEEDED(first_error)) first_error = hr;
+    }
+
+    if (!desired) goto done;
+    hr = shared_appliance_start(TRUE, 120000);
+    if (FAILED(hr)) {
+        if (SUCCEEDED(first_error)) first_error = hr;
+        goto done;
+    }
+
+    /* An already-running appliance has not necessarily published a newly
+       created resource yet. Publish before attempting SMB mappings, not
+       after all mount retries have been exhausted. */
+    hr = shared_appliance_reconcile();
+    if (FAILED(hr)) {
+        if (SUCCEEDED(first_error)) first_error = hr;
+        goto done;
+    }
+
+    for (i = 0; i < count; ++i) {
+        const AsbSharedResourceInfo *resource = &resources[i];
+        if (!resource || !resource->enabled || !resource->host_drive_letter)
+            continue;
+        hr = host_mapping_command(resource, TRUE);
+        if (hr == S_FALSE) hr = S_OK;
+        if (SUCCEEDED(hr)) {
+            set_host_mapping_tracked(resource, TRUE);
+            label_host_drive(resource);
+        notify_shell_host_drive(resource->host_drive_letter, TRUE);
+        } else if (SUCCEEDED(first_error)) first_error = hr;
+    }
+done:
+    LeaveCriticalSection(&g_appliance.host_mapping_cs);
+    return first_error;
+}
+
 HRESULT shared_appliance_purge_resource(const wchar_t *resource_id)
 {
-    const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
+    AsbSharedResourceInfo snapshot;
     wchar_t share_w[64]; char share[128], command[256], response[256];
     HRESULT hr;
-    if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    if (g_appliance.status.active_clients || g_appliance.status.host_mounts)
+    if (!shared_resources_copy(resource_id, &snapshot)) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (g_appliance.status.active_clients)
         return HRESULT_FROM_WIN32(ERROR_BUSY);
     hr = shared_appliance_start(TRUE, 120000); if (FAILED(hr)) return hr;
-    shared_resources_share_name(resource->id, share_w, _countof(share_w));
+    shared_resources_share_name(snapshot.id, share_w, _countof(share_w));
     WideCharToMultiByte(CP_UTF8, 0, share_w, -1, share, sizeof(share), NULL, NULL);
     sprintf_s(command, sizeof(command), "appliance_purge:%s", share);
-    return appliance_send(command, response, sizeof(response), 120000) ? S_OK : E_FAIL;
+    /* Host mappings are automatic now, so other resources' drives are
+       normally mounted. Only this resource's own drive blocks a purge: drop
+       it under the mapping lock so reconciliation cannot remount it before
+       the guest has deleted the data. */
+    EnterCriticalSection(&g_appliance.host_mapping_cs);
+    hr = shared_appliance_unmount_host_resource(snapshot.id);
+    if (SUCCEEDED(hr))
+        hr = appliance_send(command, response, sizeof(response), 120000) ? S_OK : E_FAIL;
+    LeaveCriticalSection(&g_appliance.host_mapping_cs);
+    return hr;
 }
 
 HRESULT shared_appliance_unpublish_resource(const wchar_t *resource_id)

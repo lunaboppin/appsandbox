@@ -3,31 +3,53 @@
 Self-contained integration tests for the AppSandbox headless daemon. They drive
 the daemon over its HTTP/JSON API through the [`asb.py`](../asb.py) client — no
 test framework, just stdlib Python. Every test creates the throwaway VMs it needs
-(named `brk-*`) and deletes them at the end, so the suite **assumes no existing
-configuration and never touches your VMs, templates, or snapshots**. The same
-suite runs on Windows and macOS hosts; feature differences (snapshots/templates
+(named `brk-*`) and deletes them at the end. The suite also sweeps leftover
+`brk-*` definitions, so it must run against an isolated test configuration,
+not a normal installation. On Windows the harness verifies the namespace
+marker and the daemon's matching `testNamespace` before making API calls that
+change state. The same suite runs on Windows and macOS hosts; feature differences (snapshots/templates
 are Windows-only) are gated on `version()["capabilities"]`.
 
 ## Running
 
-**Windows** — start the daemon (elevated), point the suite at your install
-ISOs, then run the harness from this folder's parent:
+**Windows** — from the repository root, create a fresh namespace in an elevated
+PowerShell window and start the isolated daemon:
 
 ```
-appsandbox.exe --headless
-set ASB_ISO_LINUX=C:\path\to\ubuntu-desktop-amd64.iso
-set ASB_ISO_WINDOWS=C:\path\to\Win11_x64.iso
-python tests\run_all.py
+$testId = [Guid]::NewGuid().ToString('B')
+$testRoot = Join-Path $PWD ('bin\disposable-tests\' + $testId.Trim('{}'))
+.\build\start-disposable-daemon.ps1 -Namespace $testId -TestRoot $testRoot
 ```
+
+In a second PowerShell window, set `ProgramData` to that exact test root and
+`ASB_TEST_NAMESPACE` to that exact braced GUID, then run:
+
+```powershell
+$env:ProgramData = '<the testRoot from the first window>'
+$env:ASB_TEST_NAMESPACE = '<the braced testId from the first window>'
+$env:ASB_ISO_LINUX = 'C:\path\to\ubuntu-desktop-amd64.iso'
+$env:ASB_ISO_WINDOWS = 'C:\path\to\Win11_x64.iso'
+python tools\headless-api\tests\run_all.py
+```
+
+The launcher refuses a reused root unless `-Resume` is given with an exact
+matching marker. The isolated core uses distinct appliance/network identities,
+does not terminate stale user compute systems, and does not alter the host's
+Secure Boot or driver-signing policy. Local test driver certificates are for
+disposable guests only; never install them into an existing VM or the host.
 
 **macOS** — start the daemon with sudo (required; it is fully non-interactive
 and still operates on YOUR user's VM registry + restore-image cache via
 `SUDO_USER`), then run the harness:
 
-```
+```sh
 sudo AppSandbox.app/Contents/MacOS/AppSandbox --headless
 python3 tests/run_all.py
 ```
+
+The Windows namespace guard is not implemented for macOS. The macOS suite
+operates on the user's real VM registry and restore-image cache, including its
+`brk-*` cleanup and cached-IPSW rename. Use a dedicated test account/configuration.
 
 ISOs default to this `tests/` folder if the env vars are unset. macOS guests
 install from a restore IPSW: `ASB_IPSW_MACOS` overrides; by default the suite

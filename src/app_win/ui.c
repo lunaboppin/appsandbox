@@ -716,6 +716,42 @@ static void do_connect_idd(int idx)
    basic-session pipe, which renders the Hyper-V Video adapter framebuffer
    with no guest cooperation -- during unattended provisioning no agent
    exists yet, so this is the only way to watch the install progress. */
+/* ---- Microphone passthrough settings (Settings > Audio) ---- */
+
+typedef struct { JsonBuilder *jb; int count; } AudioDeviceJson;
+
+static void audio_device_to_json(const wchar_t *id, const wchar_t *name, void *ud)
+{
+    AudioDeviceJson *ctx = (AudioDeviceJson *)ud;
+    if (ctx->count++) jb_append(ctx->jb, L",");
+    jb_object_begin(ctx->jb);
+    jb_string(ctx->jb, L"id", id);
+    jb_string(ctx->jb, L"name", name);
+    jb_object_end(ctx->jb);
+}
+
+static void post_audio_settings(void)
+{
+    static wchar_t json_buf[32768];
+    JsonBuilder jb;
+    AudioDeviceJson ctx;
+    BOOL enabled = TRUE;
+    wchar_t device_id[512] = {0};
+    asb_get_mic_settings(&enabled, device_id, _countof(device_id));
+    jb_init(&jb, json_buf, _countof(json_buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"audioSettings");
+    jb_bool(&jb, L"enabled", enabled);
+    jb_string(&jb, L"deviceId", device_id);
+    jb_array_begin(&jb, L"devices");
+    ctx.jb = &jb;
+    ctx.count = 0;
+    idd_enum_capture_devices(audio_device_to_json, &ctx);
+    jb_array_end(&jb);
+    jb_object_end(&jb);
+    webview2_post(json_buf);
+}
+
 static void do_connect_appliance_console(void)
 {
     VmInstance *v;
@@ -1466,6 +1502,15 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"openSharedApplianceTerminal") == 0) {
         HRESULT hr = asb_shared_appliance_open_terminal();
         if (FAILED(hr)) send_manage_result(0, hr);
+    } else if (wcscmp(action, L"getAudioSettings") == 0) {
+        post_audio_settings();
+    } else if (wcscmp(action, L"setAudioSettings") == 0) {
+        BOOL enabled = TRUE;
+        wchar_t device_id[512] = {0};
+        json_get_bool(json, L"enabled", &enabled);
+        json_get_string(json, L"deviceId", device_id, _countof(device_id));
+        asb_set_mic_settings(enabled, device_id);
+        post_audio_settings();
     } else if (wcscmp(action, L"openSharedApplianceScreen") == 0) {
         do_connect_appliance_console();
     } else if (wcscmp(action, L"mountHostResource") == 0 ||

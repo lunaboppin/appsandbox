@@ -416,7 +416,7 @@ int asb_send(AsbConn *c, const void *buf, int len) {
         while (off < len) {
             int n;
             MemoryBarrier();
-            /* Disconnect if the host left ESTABLISHED, OR (ch1-7) re-armed the slot with a NEW
+            /* Disconnect if the host left ESTABLISHED, OR (ivshmem ch1-7) re-armed the slot with a NEW
                host_token — the latter means a fresh arm superseded ours, so we must stop producing
                into the old arm's ring BEFORE the host zeroes/reuses it (C4). my_host_token==0 on the
                9P connector path, where this token check is skipped (9P keys on state only). */
@@ -500,7 +500,7 @@ void asb_close(AsbConn *c) {
                CLOSING if we still hold it (don't clobber a re-armed slot). Baseline behavior. */
             if (c->state && *c->state == ASB_SLOT_ESTABLISHED) { *c->state = ASB_SLOT_CLOSING; MemoryBarrier(); }
         } else {
-            /* ch1-7: the HOST owns `state`; the guest must NEVER write it. Signal close by bumping our
+            /* ivshmem ch1-7: the HOST owns `state`; the guest must NEVER write it. Signal close by bumping our
                owner_id (guest-sole) so the host pump's owner_id guard fails and its done: writes FREE.
                C5 self-check: only bump if WE still own THIS acceptance, so a stale wrapper (its
                acceptance long superseded on a reused single slot) can't bump a stranger's owner_id. */

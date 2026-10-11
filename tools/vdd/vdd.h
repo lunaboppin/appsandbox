@@ -6,10 +6,10 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
+    AppSandbox Virtual Display Driver - Two 1920x1080 monitors with
     direct HvSocket frame transport to the host (no agent middleman).
 
-    Single fixed-resolution monitor with framebuffer readback sent directly
+    Fixed-resolution monitors with framebuffer readback sent directly
     over Hyper-V sockets.
 
 Environment:
@@ -44,6 +44,7 @@ Environment:
 #define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
 #define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
+#define VDD_MONITOR_COUNT     2
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -131,8 +132,10 @@ static const BYTE VDD_EDID[] = {
     /* Digital input, 8-bit color depth, DisplayPort */
     0xA5,
 
-    /* 53cm x 30cm (approx 24" diagonal for 1920x1080) */
-    0x35, 0x1E,
+    /* Physical size 0 x 0 = undefined. The guest resolution follows the host
+       viewer window, so a fixed size would make Windows pick 125-150%
+       scaling at larger resolutions; undefined keeps it at 100%. */
+    0x00, 0x00,
 
     /* Gamma 2.2 (value = (gamma*100)-100 = 120 = 0x78) */
     0x78,
@@ -152,7 +155,7 @@ static const BYTE VDD_EDID[] = {
 
     /* Detailed Timing Descriptor #1: 1920x1080 @ 60Hz */
     0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
-    0x58, 0x2C, 0x45, 0x00, 0x12, 0x2C, 0x21, 0x00,
+    0x58, 0x2C, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,   /* image size 0 mm (undefined) */
     0x00, 0x1E,
 
     /* Descriptor #2: Monitor name "AppSandboxVDD" */
@@ -180,14 +183,15 @@ static const BYTE VDD_EDID[] = {
  *  Swap chain processor state (heap-allocated per AssignSwapChain)
  * ============================================================================ */
 typedef struct _VDD_SWAP_PROC {
+    UINT                displayIndex;
     IDDCX_SWAPCHAIN     hSwapChain;
     HANDLE              hAvailableEvent;    /* from pInArgs->hNextSurfaceAvailable */
     HANDLE              hTerminateEvent;
     HANDLE              hThread;
 
-    /* Non-owning pointers to cached D3D11 device (owned by VDD_DEVICE_CONTEXT).
-       The device is cached across swap chain transitions to avoid destroying it
-       during IddCx teardown to avoid re-creation overhead. */
+    /* Per-worker references to the cached D3D11 device/context. The cache owns
+       a separate pair, so one monitor can recover without invalidating the
+       other monitor's live capture worker. */
     ID3D11Device*       pDevice;
     ID3D11DeviceContext* pDeviceContext;
 
@@ -201,6 +205,9 @@ typedef struct _VDD_SWAP_PROC {
     AsbConn * volatile  hPendingConn;       /* new client from network thread, picked up by swap chain */
     volatile BOOL       bStopNetwork;
     UINT64              frameSeq;
+    BYTE*               pSendBuf;           /* one wire frame (header+rects+pixels), owned by the swap-chain thread */
+    size_t              sendBufCap;
+    UINT                frameW, frameH;     /* current surface (= staging texture) size */
 
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */
@@ -216,8 +223,8 @@ typedef struct _VDD_SWAP_PROC {
 typedef struct _VDD_DEVICE_CONTEXT {
     WDFDEVICE           wdfDevice;
     IDDCX_ADAPTER       hAdapter;
-    IDDCX_MONITOR       hMonitor;
-    VDD_SWAP_PROC*      pSwapProc;          /* Active swap chain processor */
+    IDDCX_MONITOR       hMonitors[VDD_MONITOR_COUNT];
+    VDD_SWAP_PROC*      pSwapProcs[VDD_MONITOR_COUNT];
 
     /* Cached D3D11 device — persists across swap chain transitions.
        Kept alive here so that WdfObjectDelete's IddCx teardown never triggers
@@ -225,6 +232,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11Device*       pCachedDevice;
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
+    CRITICAL_SECTION    d3dCacheLock;
 
     /* Monitor mode list */
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
@@ -251,6 +259,7 @@ WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 struct MonitorContextWrapper
 {
     VDD_DEVICE_CONTEXT* pContext;
+    UINT displayIndex;
 };
 
 WDF_DECLARE_CONTEXT_TYPE(MonitorContextWrapper);

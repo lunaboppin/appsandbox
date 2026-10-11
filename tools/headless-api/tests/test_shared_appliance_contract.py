@@ -33,6 +33,7 @@ def main() -> None:
     headless = read("src/app_win/headless.c")
     sdk = read("tools/headless-api/asb.py")
     project = read("AppSandboxCore.vcxproj")
+    disk = read("src/backend_win/disk_util.c")
 
     for token in (
         "SharedApplianceConfig", "SharedApplianceStatus", "shared_appliance_setup",
@@ -59,13 +60,41 @@ def main() -> None:
                   "UBUNTU_IMAGE_BUILD", "SHA256SUMS", "--qcow2-to-vhdx", "CIDATA"):
         check(token in impl, f"managed Ubuntu appliance provisioning missing {token}")
     check("/current/" not in impl, "Ubuntu appliance image still follows a moving alias")
+    seed = disk[disk.index("HRESULT iso_create_appliance_cloud_init"):disk.index("HRESULT iso_create_instance_resources", disk.index("HRESULT iso_create_appliance_cloud_init"))]
+    check('L"w,ccs=UTF-8"' not in seed and "cloud_init_printf(file" in seed and
+          "network-config" in seed and "macaddress:" in seed and
+          "build_ubuntu_seed(nat_mac, server_mac, server_ip)" in impl,
+          "NoCloud seed has a BOM or lacks a MAC-bound static bootstrap network")
     for token in ("server_core", "windows_image_name", "product_key"):
         check(token in impl + header, f"Server Core provisioning missing {token}")
 
     check("data_vhdx_path" in hcs_header and "data_vhdx" in hcs,
           "HCS document cannot attach the appliance data disk")
+    check("default_endpoint_clsid" in hcs and 'L"{%s}"' in hcs and
+          "hcn_get_endpoint_mac(&default_endpoint_id" in hcs,
+          "HCS bootstrap MAC lookup must accept the bare endpoint UUID from HCN")
     check("hcn_create_share_server_endpoint" in hcn and ".2" in hcn,
           "isolated HCN network has no fixed appliance endpoint")
+    host_reconcile = impl[impl.index("HRESULT shared_appliance_reconcile_host_resources"):
+                          impl.index("HRESULT shared_appliance_purge_resource")]
+    check(host_reconcile.index("shared_appliance_reconcile();") <
+          host_reconcile.index("host_mapping_command(resource, TRUE)"),
+          "host mounts are attempted before publishing a newly created share")
+    purge = impl[impl.index("HRESULT shared_appliance_purge_resource"):
+                 impl.index("HRESULT shared_appliance_unpublish_resource")]
+    check("host_mounts" not in purge and
+          "shared_appliance_unmount_host_resource(snapshot.id)" in purge,
+          "purge must only unmount its own resource; other host drives are always mounted")
+    check("asb_request_shared_resource_sync();" in
+          core[core.index("ASB_API HRESULT asb_shared_resource_purge"):],
+          "purged resources must be republished and remapped")
+    check("include = /etc/samba/appsandbox-shares.conf" in linux_agent and
+          "appliance_reload_shares" in linux_agent and "sed -i" in linux_agent,
+          "Samba does not expand include globs; the agent must aggregate share files")
+    check("smbcontrol smbd close-share" in linux_agent,
+          "changed share settings (read only) must drop existing tree connections")
+    check("inet_pton(AF_INET, separator" in linux_agent and "copy[i] = ':'" in linux_agent,
+          "Linux private NIC configuration must normalize the HCN MAC format")
     check("RemoteAddresses\\\":\\\"%S.2/32" in hcn,
           "client SMB ACL does not target the appliance")
     check("shared_appliance_prepare_client" in core and

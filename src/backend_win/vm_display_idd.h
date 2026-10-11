@@ -19,4 +19,8 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
    Safe to call from any thread; the work is marshaled to the window thread. */
 void vm_display_idd_focus(VmDisplayIdd *display);
 
+/* Enumerate active host capture endpoints (id + friendly name) for the
+   microphone passthrough device picker. */
+void idd_enum_capture_devices(void (*cb)(const wchar_t *id, const wchar_t *name, void *ud), void *ud);
+
 #endif /* VM_DISPLAY_IDD_H */

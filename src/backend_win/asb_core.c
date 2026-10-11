@@ -30,6 +30,7 @@
 #include <io.h>
 #include <bcrypt.h>
 #include <virtdisk.h>
+#include <winioctl.h>
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "bcrypt.lib")
 
@@ -125,11 +126,21 @@ static const GUID ASB_VHDX_VENDOR_MS = {
     { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b }
 };
 static BOOL g_suppress_tray_warn = FALSE;
+/* Microphone passthrough: host capture device streamed to the guest's
+   virtual cable while a guest app records. Empty id = Windows default. */
+static BOOL g_mic_passthrough = TRUE;
+static wchar_t g_mic_device_id[512];
 
 static CRITICAL_SECTION g_cs;
 static SRWLOCK g_save_lock = SRWLOCK_INIT;
 static wchar_t g_settings_passthrough[4096];
 static BOOL g_initialized = FALSE;
+static wchar_t g_test_namespace[40];
+static volatile LONG g_share_sync_state;
+static HANDLE g_share_sync_thread;
+static HANDLE g_share_sync_stop_event;
+static volatile LONG g_share_sync_stopping;
+static void stop_shared_resource_sync(void);
 static volatile LONG g_management_active = 0;
 static void asb_log(const wchar_t *fmt, ...);
 
@@ -508,9 +519,13 @@ static BOOL save_vm_list(void)
     }
 
     if (g_last_iso_path[0] != L'\0' || g_last_storage_parent[0] != L'\0' ||
-        g_suppress_tray_warn ||
+        g_suppress_tray_warn || !g_mic_passthrough || g_mic_device_id[0] != L'\0' ||
         g_settings_passthrough[0] != L'\0') {
         fwprintf(f, L"[Settings]\n");
+        if (!g_mic_passthrough)
+            fwprintf(f, L"MicPassthrough=0\n");
+        if (g_mic_device_id[0] != L'\0')
+            fwprintf(f, L"MicDevice=%s\n", g_mic_device_id);
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
         if (g_last_storage_parent[0] != L'\0')
@@ -632,6 +647,10 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_storage_parent, MAX_PATH, line + 18);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"MicPassthrough=", 15) == 0)
+                g_mic_passthrough = (_wtoi(line + 15) != 0);
+            else if (wcsncmp(line, L"MicDevice=", 10) == 0)
+                wcscpy_s(g_mic_device_id, _countof(g_mic_device_id), line + 10);
             else
                 preserve_config_line(g_settings_passthrough,
                                      _countof(g_settings_passthrough), line);
@@ -877,26 +896,125 @@ static void remember_storage_parent(const wchar_t *root)
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
 
-/* Update the guest agent on the active writable VHDX before attaching SMB.
-   Only the active disk is mounted; checkpoint parents remain frozen. */
+static HRESULT copy_guest_payload_file(const wchar_t *source,
+                                       const wchar_t *dest, BOOL required)
+{
+    wchar_t temp[MAX_PATH];
+    BYTE source_hash[32], dest_hash[32];
+    HRESULT hr;
+    DWORD error;
+    if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES)
+        return required ? HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) : S_FALSE;
+    if (SUCCEEDED(sha256_file(source, source_hash)) &&
+        SUCCEEDED(sha256_file(dest, dest_hash)) &&
+        memcmp(source_hash, dest_hash, sizeof(source_hash)) == 0)
+        return S_FALSE;
+    swprintf_s(temp, MAX_PATH, L"%s.new", dest);
+    DeleteFileW(temp);
+    if (!CopyFileW(source, temp, FALSE)) {
+        error = GetLastError();
+        return HRESULT_FROM_WIN32(error);
+    }
+    if (!MoveFileExW(temp, dest,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = GetLastError();
+        DeleteFileW(temp);
+        return HRESULT_FROM_WIN32(error);
+    }
+    hr = sha256_file(source, source_hash);
+    if (SUCCEEDED(hr)) hr = sha256_file(dest, dest_hash);
+    if (SUCCEEDED(hr) && memcmp(source_hash, dest_hash, sizeof(source_hash)) != 0)
+        hr = HRESULT_FROM_WIN32(ERROR_CRC);
+    return hr;
+}
+
+/* A durable pending marker makes a partially copied package ineligible for
+   guest installation. Existing installed drivers stay in the Driver Store.
+   Remove the marker only after the complete INF/catalog/binary has verified. */
+static HRESULT stage_guest_driver_package(const wchar_t *source_dir,
+                                          const wchar_t *guest_dir,
+                                          const wchar_t *stem, const wchar_t *binary_ext)
+{
+    const wchar_t *exts[] = { L"inf", L"cat", binary_ext, L"cer" };
+    wchar_t source[MAX_PATH], dest[MAX_PATH], marker[MAX_PATH];
+    HANDLE file;
+    HRESULT hr;
+    size_t i;
+    for (i = 0; i < 3; ++i) {
+        swprintf_s(source, _countof(source), L"%s\\%s.%s", source_dir, stem, exts[i]);
+        if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES) {
+            asb_log(L"Guest upgrade: %s package is incomplete/absent; retaining the installed driver.", stem);
+            return S_FALSE;
+        }
+    }
+    swprintf_s(marker, _countof(marker), L"%s\\%s.pending", guest_dir, stem);
+    file = CreateFileW(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    FlushFileBuffers(file);
+    CloseHandle(file);
+    for (i = 0; i < _countof(exts); ++i) {
+        swprintf_s(source, _countof(source), L"%s\\%s.%s", source_dir, stem, exts[i]);
+        swprintf_s(dest, _countof(dest), L"%s\\%s.%s", guest_dir, stem, exts[i]);
+        hr = copy_guest_payload_file(source, dest, i < 3);
+        if (FAILED(hr)) return hr; /* leave marker until a complete retry */
+    }
+    return DeleteFileW(marker) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+}
+
+/* Update all guest integration payloads while the VM is stopped.  This is
+   deliberately offline and touches only the active writable VHDX: existing
+   checkpoints remain immutable, and the guest never observes a half-replaced
+   executable or driver package. */
+static BOOL guest_volume_is_on_disk(wchar_t letter, DWORD disk_number)
+{
+    wchar_t volume[] = L"\\\\.\\X:";
+    VOLUME_DISK_EXTENTS extents;
+    DWORD returned = 0;
+    HANDLE handle;
+    BOOL matches;
+    volume[4] = letter;
+    handle = CreateFileW(volume, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         NULL, OPEN_EXISTING, 0, NULL);
+    if (handle == INVALID_HANDLE_VALUE) return FALSE;
+    ZeroMemory(&extents, sizeof(extents));
+    matches = DeviceIoControl(handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                              NULL, 0, &extents, sizeof(extents), &returned, NULL) &&
+              extents.NumberOfDiskExtents == 1 &&
+              extents.Extents[0].DiskNumber == disk_number;
+    CloseHandle(handle);
+    return matches;
+}
+
 static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
 {
+    static const wchar_t *binaries[] = {
+        L"appsandbox-agent.exe", L"appsandbox-input.exe",
+        L"appsandbox-displays.exe", L"appsandbox-clipboard.exe",
+        L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe"
+    };
+    static const struct { const wchar_t *stem, *ext; } drivers[] = {
+        { L"AppSandboxVDD", L"dll" }, { L"AppSandboxVHID", L"sys" }, { L"AppSandboxVAD", L"sys" }
+    };
     VIRTUAL_STORAGE_TYPE st;
     OPEN_VIRTUAL_DISK_PARAMETERS op;
     ATTACH_VIRTUAL_DISK_PARAMETERS ap;
     HANDLE disk = INVALID_HANDLE_VALUE;
-    DWORD before, after, result, bit, wait;
-    wchar_t module[MAX_PATH], dir[MAX_PATH], source[MAX_PATH];
-    wchar_t dest[MAX_PATH], temp[MAX_PATH];
-    BYTE a[32], b[32];
+    DWORD after = 0, result, bit, wait, disk_number, physical_chars;
+    wchar_t physical[MAX_PATH];
+    wchar_t module[MAX_PATH], resources[MAX_PATH], driver_source[MAX_PATH];
+    wchar_t guest_root[MAX_PATH], guest_drivers[MAX_PATH];
+    wchar_t source[MAX_PATH], dest[MAX_PATH];
+    size_t i;
     HRESULT hr = E_FAIL;
     GetModuleFileNameW(g_dll_module,module,MAX_PATH);
     { wchar_t *s=wcsrchr(module,L'\\');if(s)*s=L'\0'; }
-    swprintf_s(dir,MAX_PATH,L"%s\\resources",module);
-    if(GetFileAttributesW(dir)==INVALID_FILE_ATTRIBUTES)wcscpy_s(dir,MAX_PATH,module);
-    swprintf_s(source,MAX_PATH,L"%s\\appsandbox-agent.exe",dir);
+    swprintf_s(resources,MAX_PATH,L"%s\\resources",module);
+    if(GetFileAttributesW(resources)==INVALID_FILE_ATTRIBUTES)wcscpy_s(resources,MAX_PATH,module);
+    swprintf_s(source,MAX_PATH,L"%s\\appsandbox-agent.exe",resources);
     if(GetFileAttributesW(source)==INVALID_FILE_ATTRIBUTES)return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-    before=GetLogicalDrives();
+    swprintf_s(driver_source,MAX_PATH,L"%s\\drivers",module);
+    if(GetFileAttributesW(driver_source)==INVALID_FILE_ATTRIBUTES)
+        swprintf_s(driver_source,MAX_PATH,L"%s\\drivers",resources);
     st.DeviceId=VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;st.VendorId=ASB_VHDX_VENDOR_MS;
     /* Version 1 is sufficient for attaching the active writable chain and is
        accepted by every VirtDisk provider that supports VHDX.  Version 2 is
@@ -904,29 +1022,70 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
        ERROR_INVALID_PARAMETER on some host builds when used for attachment. */
     ZeroMemory(&op,sizeof(op));op.Version=OPEN_VIRTUAL_DISK_VERSION_1;
     op.Version1.RWDepth=OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT;
-    result=OpenVirtualDisk(&st,vhdx_path,VIRTUAL_DISK_ACCESS_ATTACH_RW,
+    result=OpenVirtualDisk(&st,vhdx_path,VIRTUAL_DISK_ACCESS_ATTACH_RW | VIRTUAL_DISK_ACCESS_GET_INFO,
         OPEN_VIRTUAL_DISK_FLAG_NONE,&op,&disk);
     if(result!=ERROR_SUCCESS){asb_log(L"Shared-resource agent upgrade: OpenVirtualDisk failed (%lu).",result);return HRESULT_FROM_WIN32(result);}
     ZeroMemory(&ap,sizeof(ap));ap.Version=ATTACH_VIRTUAL_DISK_VERSION_1;
     result=AttachVirtualDisk(disk,NULL,ATTACH_VIRTUAL_DISK_FLAG_NONE,0,&ap,NULL);
     if(result!=ERROR_SUCCESS){asb_log(L"Shared-resource agent upgrade: AttachVirtualDisk failed (%lu).",result);CloseHandle(disk);return HRESULT_FROM_WIN32(result);}
-    for(wait=0;wait<100;wait++){after=GetLogicalDrives()&~before;if(after)break;Sleep(100);}
-    after=GetLogicalDrives()&~before;
+    physical_chars = sizeof(physical);
+    result = GetVirtualDiskPhysicalPath(disk, &physical_chars, physical);
+    if (result != ERROR_SUCCESS ||
+        swscanf_s(physical, L"\\\\.\\PhysicalDrive%lu", &disk_number) != 1) {
+        hr = HRESULT_FROM_WIN32(result != ERROR_SUCCESS ? result : ERROR_INVALID_DATA);
+        goto detach;
+    }
+    /* Match disk extents, not a before/after drive-letter diff. Another VM
+       or removable disk mounting concurrently must never receive our files. */
+    for (wait = 0; wait < 100 && !after; ++wait) {
+        DWORD drives = GetLogicalDrives();
+        for (bit = 0; bit < 26; ++bit) {
+            wchar_t windows[MAX_PATH];
+            if (!(drives & (1u << bit)) || !guest_volume_is_on_disk((wchar_t)(L'A' + bit), disk_number)) continue;
+            swprintf_s(windows, MAX_PATH, L"%c:\\Windows", L'A' + bit);
+            if (GetFileAttributesW(windows) != INVALID_FILE_ATTRIBUTES) after |= 1u << bit;
+        }
+        if (!after) Sleep(100);
+    }
     for(bit=0;bit<26;bit++)if(after&(1u<<bit)){
         wchar_t windows[MAX_PATH];swprintf_s(windows,MAX_PATH,L"%c:\\Windows",L'A'+bit);
         if(GetFileAttributesW(windows)==INVALID_FILE_ATTRIBUTES)continue;
-        swprintf_s(dest,MAX_PATH,L"%c:\\Windows\\AppSandbox\\appsandbox-agent.exe",L'A'+bit);
-        swprintf_s(temp,MAX_PATH,L"%s.new",dest);
-        if(SUCCEEDED(sha256_file(source,a))&&SUCCEEDED(sha256_file(dest,b))&&memcmp(a,b,32)==0){hr=S_OK;break;}
-        if(!CopyFileW(source,temp,FALSE)){result=GetLastError();asb_log(L"Shared-resource agent upgrade: CopyFile failed (%lu).",result);hr=HRESULT_FROM_WIN32(result);break;}
-        if(!MoveFileExW(temp,dest,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){result=GetLastError();asb_log(L"Shared-resource agent upgrade: MoveFileEx failed (%lu).",result);hr=HRESULT_FROM_WIN32(result);DeleteFileW(temp);break;}
-        hr=sha256_file(dest,b);if(SUCCEEDED(hr)){hr=sha256_file(source,a);if(SUCCEEDED(hr)&&memcmp(a,b,32)!=0)hr=HRESULT_FROM_WIN32(ERROR_CRC);}
-        if(FAILED(hr))asb_log(L"Shared-resource agent upgrade: verification failed (0x%08X).",hr);
+        swprintf_s(guest_root, MAX_PATH, L"%c:\\Windows\\AppSandbox", L'A'+bit);
+        swprintf_s(guest_drivers, MAX_PATH, L"%s\\drivers", guest_root);
+        CreateDirectoryW(guest_root, NULL);
+        CreateDirectoryW(guest_drivers, NULL);
+        hr = S_OK;
+        for (i = 0; i < _countof(binaries); ++i) {
+            HRESULT copy_hr;
+            swprintf_s(source, MAX_PATH, L"%s\\%s", resources, binaries[i]);
+            swprintf_s(dest, MAX_PATH, L"%s\\%s", guest_root, binaries[i]);
+            copy_hr = copy_guest_payload_file(source, dest, i < 2);
+            if (FAILED(copy_hr)) {
+                asb_log(L"Guest tools upgrade failed for %s (0x%08X).", binaries[i], copy_hr);
+                hr = copy_hr;
+                break;
+            }
+        }
+        if (SUCCEEDED(hr)) {
+            swprintf_s(source, MAX_PATH, L"%s\\devcon.exe", driver_source);
+            swprintf_s(dest, MAX_PATH, L"%s\\devcon.exe", guest_drivers);
+            hr = copy_guest_payload_file(source, dest, FALSE);
+            for (i = 0; i < _countof(drivers); ++i) {
+                HRESULT copy_hr = stage_guest_driver_package(driver_source, guest_drivers,
+                                                              drivers[i].stem, drivers[i].ext);
+                if (FAILED(copy_hr)) {
+                    asb_log(L"Guest driver staging failed for %s (0x%08X).", drivers[i].stem, copy_hr);
+                    hr = copy_hr;
+                    break;
+                }
+            }
+        }
         break;
     }
     if(!after)hr=HRESULT_FROM_WIN32(ERROR_NOT_READY);
+detach:
     result=DetachVirtualDisk(disk,DETACH_VIRTUAL_DISK_FLAG_NONE,0);
-    if(result!=ERROR_SUCCESS)asb_log(L"Warning: shared-resource agent upgrade detach failed (%lu).",result);
+    if(result!=ERROR_SUCCESS)asb_log(L"Warning: guest tools upgrade detach failed (%lu).",result);
     CloseHandle(disk);
     return hr;
 }
@@ -1376,15 +1535,17 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             prepare_gl_layers_share(&args->config.gpu_shares);
     }
 
-    if (args->config.shared_resource_count > 0 && vm->install_complete &&
-        _wcsicmp(vm->os_type, L"Windows") == 0) {
+    if (vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
         hr = upgrade_windows_agent_offline(vm->vhdx_path);
         if (FAILED(hr)) {
-            shared_upgrade_failed = TRUE;
-            args->config.shared_resource_count = 0;
-            asb_log(L"Shared-resource agent upgrade failed for \"%s\" (0x%08X); mappings disabled for this boot.", vm->name, hr);
+            asb_log(L"Guest tools upgrade failed for \"%s\" (0x%08X).", vm->name, hr);
+            if (args->config.shared_resource_count > 0) {
+                shared_upgrade_failed = TRUE;
+                args->config.shared_resource_count = 0;
+                asb_log(L"Shared-resource mappings disabled for this boot because the guest agent could not be verified.");
+            }
         } else {
-            asb_log(L"Verified the shared-resource guest agent on \"%s\".", vm->name);
+            asb_log(L"Verified guest integration tools on \"%s\".", vm->name);
         }
     }
 
@@ -1605,7 +1766,11 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                         char *line = cbuf + start;
 
                         if (strncmp(line, "STATUS:", 7) == 0) {
-                            /* Informational */
+                            /* Step changes and captured tool output (e.g. the
+                               BFSVC reason behind a bcdboot failure). */
+                            wchar_t status[512];
+                            MultiByteToWideChar(CP_ACP, 0, line + 7, -1, status, _countof(status));
+                            asb_log(L"Build \"%s\": %s", args->config.name, status);
                         } else if (strncmp(line, "PROGRESS:", 9) == 0) {
                             int pct = atoi(line + 9);
                             BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
@@ -3011,17 +3176,65 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
 
 /* ---- Init / Cleanup ---- */
 
+ASB_API const wchar_t *asb_test_namespace(void)
+{
+    return g_test_namespace;
+}
+
+/* Fail closed before loading any VM metadata or deleting network objects.
+   The harness supplies a fresh non-default ProgramData directory with a
+   matching marker; production installations never set this variable. */
+static HRESULT configure_disposable_test_namespace(void)
+{
+    wchar_t requested[40], data[MAX_PATH], actual[MAX_PATH], full[MAX_PATH];
+    wchar_t marker[MAX_PATH], saved[40] = {0};
+    GUID id;
+    FILE *file = NULL;
+    DWORD chars = GetEnvironmentVariableW(L"ASB_TEST_NAMESPACE", requested, _countof(requested));
+    if (!chars) return S_OK;
+    if (chars >= _countof(requested) || FAILED(CLSIDFromString(requested, &id))) return E_INVALIDARG;
+    if (!GetEnvironmentVariableW(L"ProgramData", data, _countof(data)) ||
+        !GetFullPathNameW(data, _countof(full), full, NULL) ||
+        FAILED(SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, SHGFP_TYPE_CURRENT, actual)) ||
+        _wcsicmp(full, actual) == 0) return E_ACCESSDENIED;
+    swprintf_s(marker, _countof(marker), L"%s\\AppSandbox\\.asb-test-namespace", full);
+    if (_wfopen_s(&file, marker, L"rt") != 0 || !file) return E_ACCESSDENIED;
+    if (!fgetws(saved, _countof(saved), file)) saved[0] = L'\0';
+    fclose(file);
+    saved[wcscspn(saved, L"\r\n")] = L'\0';
+    if (_wcsicmp(saved, requested)) return E_ACCESSDENIED;
+    wcscpy_s(g_test_namespace, _countof(g_test_namespace), requested);
+    hcn_set_test_namespace(&id);
+    return S_OK;
+}
+
 ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
+    {
+        HRESULT hr = configure_disposable_test_namespace();
+        if (FAILED(hr)) return hr;
+    }
     InitializeCriticalSection(&g_cs);
+    g_share_sync_state = 0;
+    g_share_sync_stopping = 0;
+    g_share_sync_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_share_sync_stop_event) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        DeleteCriticalSection(&g_cs);
+        return hr;
+    }
 
     if (!hcs_init())
         asb_log(L"HCS: NOT available (is Hyper-V enabled?)");
     else
         asb_log(L"HCS: Available");
 
-    vmms_cert_ensure();
+    if (g_test_namespace[0]) {
+        /* Tests may reuse an existing VMMS cert, but must not replace/create
+           machine-wide certificate/key state as a side effect. */
+        if (!vmms_cert_exists()) asb_log(L"Disposable test: VMMS certificate is absent; leaving host certificate state unchanged.");
+    } else vmms_cert_ensure();
 
     if (!hcn_init()) {
         asb_log(L"HCN: NOT available");
@@ -3069,6 +3282,8 @@ ASB_API HRESULT asb_init(void)
         asb_log(L"Loaded %d shared resource(s).", shared_resources_count());
 
     g_initialized = TRUE;
+    if (shared_appliance_has_host_resources())
+        asb_request_shared_resource_sync();
     return S_OK;
 }
 
@@ -3076,6 +3291,7 @@ ASB_API void asb_cleanup(void)
 {
     int i;
     if (!g_initialized) return;
+    stop_shared_resource_sync();
 
     for (i = 0; i < g_vm_count; i++) {
         hcs_stop_monitor(&g_vms[i]);
@@ -3097,6 +3313,7 @@ ASB_API void asb_detach(void)
 {
     int i;
     if (!g_initialized) return;
+    stop_shared_resource_sync();
 
     /* Cleanly release HCS resources WITHOUT terminating running VMs.
        Used by short-lived consumers that start a VM
@@ -4753,7 +4970,6 @@ static BOOL shared_resource_retry_eligible(const VmInstance *inst)
 
 /* 0 = idle, 1 = a pass is running, 2 = a pass is running and the resource set
    changed again since it started. */
-static volatile LONG g_share_sync_state;
 
 #define SHARED_RESOURCE_RETRY_DELAY_MS 2000
 #define SHARED_RESOURCE_RETRY_PASSES   30
@@ -4763,14 +4979,21 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
     (void)parameter;
     for (;;) {
         SharedApplianceStatus appliance;
+        HRESULT host_hr;
         HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_READY);
         int attempt, i;
         BOOL retry_pending;
+        if (WaitForSingleObject(g_share_sync_stop_event, 0) == WAIT_OBJECT_0) break;
         /* Publish the definitions on the appliance before any guest tries to
            mount them. A stopped appliance has nothing to publish to and
            republishes the whole set when it next boots; one that is mid-start
            is worth waiting for, since the change was made for the VM the user
            is starting right now. */
+        host_hr = shared_appliance_reconcile_host_resources();
+        if (WaitForSingleObject(g_share_sync_stop_event, 0) == WAIT_OBJECT_0) break;
+        if (FAILED(host_hr))
+            asb_log(L"Error: Failed to reconcile host shared-drive mappings (0x%08X)",
+                    host_hr);
         for (attempt = 0; attempt < 150; ++attempt) {
             hr = shared_appliance_reconcile();
             if (hr != HRESULT_FROM_WIN32(ERROR_NOT_READY)) break;
@@ -4778,7 +5001,7 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
             if (appliance.state != ASB_APPLIANCE_STATE_STARTING &&
                 appliance.state != ASB_APPLIANCE_STATE_PROVISIONING &&
                 appliance.state != ASB_APPLIANCE_STATE_UPDATING) break;
-            Sleep(2000);
+            if (WaitForSingleObject(g_share_sync_stop_event, 2000) == WAIT_OBJECT_0) return 0;
         }
         if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED) ||
             hr == HRESULT_FROM_WIN32(ERROR_NOT_READY))
@@ -4787,6 +5010,7 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
             asb_log(L"Error: Failed to publish shared resources on the appliance (0x%08X)", hr);
         retry_pending = FALSE;
         for (i = 0; i < g_vm_count; i++) {
+            if (WaitForSingleObject(g_share_sync_stop_event, 0) == WAIT_OBJECT_0) return 0;
             sync_vm_shared_resources(&g_vms[i]);
             if (shared_resource_retry_eligible(&g_vms[i]))
                 retry_pending = TRUE;
@@ -4804,9 +5028,10 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
             if ((attempt % 5) == 0)
                 asb_log(L"Waiting for shared-resource mappings to become ready (attempt %d/%d).",
                         attempt + 1, SHARED_RESOURCE_RETRY_PASSES);
-            Sleep(SHARED_RESOURCE_RETRY_DELAY_MS);
+            if (WaitForSingleObject(g_share_sync_stop_event, SHARED_RESOURCE_RETRY_DELAY_MS) == WAIT_OBJECT_0) return 0;
             retry_pending = FALSE;
             for (i = 0; i < g_vm_count; i++) {
+                if (WaitForSingleObject(g_share_sync_stop_event, 0) == WAIT_OBJECT_0) return 0;
                 if (!shared_resource_retry_eligible(&g_vms[i])) continue;
                 sync_vm_shared_resources(&g_vms[i]);
                 if (shared_resource_retry_eligible(&g_vms[i]))
@@ -4829,17 +5054,43 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
    notification each mapping raises. */
 void asb_request_shared_resource_sync(void)
 {
-    HANDLE thread;
-    if (InterlockedCompareExchange(&g_share_sync_state, 1, 0) != 0) {
-        InterlockedExchange(&g_share_sync_state, 2);
+    if (!g_initialized || InterlockedCompareExchange(&g_share_sync_stopping, 0, 0)) return;
+    EnterCriticalSection(&g_cs);
+    if (g_share_sync_stopping) {
+        LeaveCriticalSection(&g_cs);
         return;
     }
-    thread = CreateThread(NULL, 0, share_sync_thread, NULL, 0, NULL);
-    if (thread) CloseHandle(thread);
-    else {
+    if (InterlockedCompareExchange(&g_share_sync_state, 1, 0) != 0) {
+        InterlockedExchange(&g_share_sync_state, 2);
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
+    if (g_share_sync_thread) CloseHandle(g_share_sync_thread);
+    g_share_sync_thread = CreateThread(NULL, 0, share_sync_thread, NULL, 0, NULL);
+    if (!g_share_sync_thread) {
         InterlockedExchange(&g_share_sync_state, 0);
         asb_log(L"Error: Failed to start the shared-resource sync (%lu)", GetLastError());
     }
+    LeaveCriticalSection(&g_cs);
+}
+
+static void stop_shared_resource_sync(void)
+{
+    HANDLE thread;
+    EnterCriticalSection(&g_cs);
+    InterlockedExchange(&g_share_sync_stopping, 1);
+    SetEvent(g_share_sync_stop_event);
+    thread = g_share_sync_thread;
+    g_share_sync_thread = NULL;
+    LeaveCriticalSection(&g_cs);
+    /* Do not release VM/appliance/HCN state until its worker has exited. */
+    if (thread) {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+    CloseHandle(g_share_sync_stop_event);
+    g_share_sync_stop_event = NULL;
+    InterlockedExchange(&g_share_sync_state, 0);
 }
 
 ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,
@@ -4867,7 +5118,13 @@ ASB_API HRESULT asb_shared_resource_update(const wchar_t *id,
 
 ASB_API HRESULT asb_shared_resource_remove(const wchar_t *id)
 {
+    const AsbSharedResourceInfo *resource = shared_resources_find(id);
     HRESULT hr;
+    if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (resource->host_drive_letter) {
+        hr = shared_appliance_unmount_host_resource(id);
+        if (FAILED(hr)) return hr;
+    }
     shared_appliance_unpublish_resource(id);
     hr = shared_resources_remove(id);
     if (SUCCEEDED(hr)) {
@@ -4931,13 +5188,41 @@ ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id)
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id)
 { return shared_appliance_unmount_host_resource(id); }
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id)
-{ return shared_appliance_purge_resource(id); }
+{
+    /* Purge drops the share and its host drive; republish the (now empty)
+       resource and restore its desired mapping in the background. */
+    HRESULT hr = shared_appliance_purge_resource(id);
+    if (SUCCEEDED(hr)) asb_request_shared_resource_sync();
+    return hr;
+}
 ASB_API HRESULT asb_shared_appliance_open_terminal(void)
 { return shared_appliance_open_terminal(); }
 ASB_API void asb_shared_appliance_collect_guest_log(void)
 { shared_appliance_collect_guest_log(); }
 ASB_API VmInstance *asb_shared_appliance_runtime(void)
 { return shared_appliance_runtime(); }
+
+ASB_API void asb_get_mic_settings(BOOL *enabled, wchar_t *device_id, size_t device_id_chars)
+{
+    EnterCriticalSection(&g_cs);
+    if (enabled) *enabled = g_mic_passthrough;
+    if (device_id && device_id_chars)
+        wcscpy_s(device_id, device_id_chars, g_mic_device_id);
+    LeaveCriticalSection(&g_cs);
+}
+
+ASB_API BOOL asb_set_mic_settings(BOOL enabled, const wchar_t *device_id)
+{
+    BOOL ok;
+    EnterCriticalSection(&g_cs);
+    g_mic_passthrough = enabled;
+    wcscpy_s(g_mic_device_id, _countof(g_mic_device_id), device_id ? device_id : L"");
+    LeaveCriticalSection(&g_cs);
+    ok = save_vm_list();
+    asb_log(L"Microphone passthrough %s (%s).", enabled ? L"on" : L"off",
+            device_id && device_id[0] ? device_id : L"Windows default input");
+    return ok;
+}
 
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
 {

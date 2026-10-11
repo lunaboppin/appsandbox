@@ -17,8 +17,9 @@ Windows features:
 - Checkpoints and branches
 - Per-VM management for installer media, storage relocation, grow-only disk resizing, and display auto-open preferences
 - Creation-time placement of the complete VM tree (disk, resources, checkpoints, branches, and metadata) on a selected fixed NTFS/ReFS volume
-- Global host folders exposed to Windows guests as deterministic Virtual SMB drives, with per-VM opt-outs and read-only/read-write modes
-- Fixed 1080P60 display, with displayless starts by default and an explicit monitor button
+- Global host folders exposed to Windows guests as deterministic Virtual SMB drives, automatically mapped on the host, with per-VM opt-outs and read-only/read-write modes
+- Two fixed 1080p60 displays, with displayless starts by default and an explicit monitor button
+- Optional immersive mouse mode backed by a virtual HID device for relative/raw-input games
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
@@ -100,7 +101,7 @@ rather than going through Hyper-V Manager. GPU acceleration uses GPU paravirtual
 (GPU-PV) to share the host's installed GPU with the guest — the same WSL2 path, not a
 dedicated passthrough (no VFIO/IOMMU, no second GPU). Windows guests get DirectX 12, OpenGL,
 Vulkan, CUDA, and OpenCL; Ubuntu guests the same minus DirectX; macOS guests Metal. A custom
-**IddCx** indirect display driver and a virtual audio device carry the screen and sound, and
+**IddCx** indirect display driver, a virtual HID mouse, and a virtual audio device carry the screen, input, and sound, and
 guest↔host clipboard, audio, input, and SSH run over **Hyper-V sockets**. Guest disks are
 built by an in-repo tool with support for ext4, squashfs, qcow2, and VHDX. On macOS, App
 Sandbox uses Apple's **Virtualization.framework** (`VZVirtualMachine`, `VZMacOSInstaller`)
@@ -109,7 +110,7 @@ DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa
 apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
 
 # Tips:
-[Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
+[Windows] Enable hotkeys, immersive mouse input, or mute the VM audio: connect to the VM and right-click the connection title bar. Immersive mouse mode can also be toggled with `Ctrl+Alt+Shift+I`. Existing Windows VMs receive the required guest driver on their next stopped start.
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 

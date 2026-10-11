@@ -254,6 +254,14 @@
 <!-- Application settings: hidden shared-storage appliance -->
 <div class="modal-overlay win-host-only" id="settings-overlay">
     <div class="modal manage-modal">
+        <fieldset id="audio-settings-card">
+            <legend>Audio</legend>
+            <div class="form-grid resource-editor">
+                <label>Microphone:</label><label class="manage-check"><input type="checkbox" id="mic-passthrough" onchange="saveAudioSettings()" checked> Pass the host microphone through to VMs</label>
+                <label for="mic-device">Input device:</label><select id="mic-device" onchange="saveAudioSettings()"><option value="">Windows default</option></select>
+                <span></span><small>The microphone is only captured while an app in the VM is recording. Windows VMs need the free VB-CABLE driver installed (AppSandbox offers it inside the VM).</small>
+            </div>
+        </fieldset>
         <fieldset id="shared-appliance-card">
             <legend>Shared Appliance</legend>
             <p id="appliance-status">Not configured</p>
@@ -293,7 +301,8 @@
             <div class="form-grid resource-editor">
                 <label for="resource-name">Name:</label><input id="resource-name" maxlength="63">
                 <label for="resource-letter">Drive letter:</label><select id="resource-letter"></select>
-                <label for="resource-host-letter">Optional host letter:</label><select id="resource-host-letter"><option value="">Not mounted</option></select>
+                <label for="resource-host-letter">Host drive letter:</label><select id="resource-host-letter"><option value="">Not mounted on host</option></select>
+                <span></span><small>An enabled host drive is mounted automatically while AppSandbox is running.</small>
                 <label>Options:</label><div><label class="manage-check"><input type="checkbox" id="resource-enabled" checked> Enabled</label> <label class="manage-check"><input type="checkbox" id="resource-readonly"> Read-only</label></div>
             </div>
             <div class="modal-buttons"><button type="button" onclick="clearResourceEditor()" title="Clear the shared resource editor and prepare a new resource.">Clear</button><button type="button" class="primary" onclick="saveResourceEditor()" title="Save this shared resource definition.">Save</button></div>

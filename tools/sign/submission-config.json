@@ -48,6 +48,14 @@
       "sourceDir": "..\\..\\bin\\Release\\drivers",
       "required": [ "AppSandboxSHM.sys", "AppSandboxSHM.inf", "AppSandboxSHM.cat" ],
       "optional": [ "AppSandboxSHM.pdb" ]
+    },
+    {
+      "productName": "App Sandbox Virtual HID Driver",
+      "cabFolder": "AppSandboxVHID",
+      "cabName": "AppSandboxVHID.cab",
+      "sourceDir": "..\\..\\bin\\Release\\drivers",
+      "required": [ "AppSandboxVHID.sys", "AppSandboxVHID.inf", "AppSandboxVHID.cat" ],
+      "optional": [ "AppSandboxVHID.pdb" ]
     }
   ]
 }
