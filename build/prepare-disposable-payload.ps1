@@ -1,6 +1,7 @@
-# Test certificates are file-only and imported into disposable guests only.
+# Test certificates are file-only and imported into guests only: disposable test
+# guests, or with -Release the guests of a test-signed release build.
 # This script never writes to a host certificate store or changes host signing policy.
-param([ValidateSet('x64')][string]$Platform = 'x64')
+param([ValidateSet('x64')][string]$Platform = 'x64', [switch]$Release)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $out = Join-Path $repo 'bin\Release'
@@ -16,10 +17,22 @@ $inf2cat = Join-Path $wdk 'bin\10.0.28000.0\x86\Inf2Cat.exe'
 $infverif = Join-Path $wdk 'tools\10.0.28000.0\x64\infverif.exe'
 $pfx = Join-Path $signDir 'disposable-only.pfx'
 $cer = Join-Path $signDir 'disposable-only.cer'
+$subject = 'CN=AppSandbox Disposable Guest Tests ONLY'
+$lifetimeMonths = 2
+if ($Release) {
+    # Kept out of git (tools\vdd\certs\ is ignored) and reused for every test-signed
+    # release, so guests keep trusting the same certificate.
+    $signDir = Join-Path $repo 'tools\vdd\certs'
+    New-Item -ItemType Directory -Path $signDir -Force | Out-Null
+    $pfx = Join-Path $signDir 'appsandbox-test-signing.pfx'
+    $cer = Join-Path $signDir 'appsandbox-test-signing.cer'
+    $subject = 'CN=AppSandbox Test Signing'
+    $lifetimeMonths = 60
+}
 if (-not (Test-Path -LiteralPath $pfx)) {
     $rsa = [Security.Cryptography.RSA]::Create(3072)
     $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-        'CN=AppSandbox Disposable Guest Tests ONLY', $rsa,
+        $subject, $rsa,
         [Security.Cryptography.HashAlgorithmName]::SHA256,
         [Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
@@ -27,7 +40,7 @@ if (-not (Test-Path -LiteralPath $pfx)) {
     $eku = [Security.Cryptography.OidCollection]::new()
     $eku.Add([Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3')) | Out-Null
     $request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($eku, $true))
-    $certificate = $request.CreateSelfSigned([DateTimeOffset]::Now.AddDays(-1), [DateTimeOffset]::Now.AddMonths(2))
+    $certificate = $request.CreateSelfSigned([DateTimeOffset]::Now.AddDays(-1), [DateTimeOffset]::Now.AddMonths($lifetimeMonths))
     [IO.File]::WriteAllBytes($pfx, $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx))
     [IO.File]::WriteAllBytes($cer, $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
     $certificate.Dispose()

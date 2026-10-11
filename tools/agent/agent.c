@@ -1673,6 +1673,59 @@ done:
     return ok;
 }
 
+/* First boot trusts the driver certificate from SetupComplete.cmd only, so a
+   VM created by an older build would reject drivers re-signed by a newer one.
+   Trust the staged self-signed code-signing certificate before updating. */
+static void trust_staged_driver_cert(const wchar_t *driver_dir, const wchar_t *stem, const char *label)
+{
+    static const wchar_t *stores[] = { L"Root", L"TrustedPublisher" };
+    wchar_t path[MAX_PATH];
+    BYTE data[8192];
+    DWORD size = 0, usage_size = 0, i;
+    HANDLE file;
+    PCCERT_CONTEXT cert;
+    PCERT_ENHKEY_USAGE usage = NULL;
+    BOOL code_signing = FALSE;
+
+    swprintf_s(path, _countof(path), L"%s%s.cer", driver_dir, stem);
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    if (!ReadFile(file, data, sizeof(data), &size, NULL)) size = 0;
+    CloseHandle(file);
+    cert = size ? CertCreateCertificateContext(X509_ASN_ENCODING, data, size) : NULL;
+    if (!cert) return;
+    if (CertGetEnhancedKeyUsage(cert, CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, NULL, &usage_size) &&
+        (usage = (PCERT_ENHKEY_USAGE)HeapAlloc(GetProcessHeap(), 0, usage_size)) != NULL &&
+        CertGetEnhancedKeyUsage(cert, CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, usage, &usage_size)) {
+        for (i = 0; i < usage->cUsageIdentifier; i++)
+            if (!strcmp(usage->rgpszUsageIdentifier[i], szOID_PKIX_KP_CODE_SIGNING)) code_signing = TRUE;
+    }
+    if (usage) HeapFree(GetProcessHeap(), 0, usage);
+    /* Only a self-signed certificate restricted to code signing. */
+    if (!code_signing || !CertCompareCertificateName(X509_ASN_ENCODING, &cert->pCertInfo->Subject,
+                                                     &cert->pCertInfo->Issuer)) {
+        agent_log("%s certificate is not a self-signed code-signing certificate; not trusted.", label);
+        CertFreeCertificateContext(cert);
+        return;
+    }
+    for (i = 0; i < _countof(stores); i++) {
+        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                                         CERT_SYSTEM_STORE_LOCAL_MACHINE, stores[i]);
+        PCCERT_CONTEXT existing;
+        if (!store) continue;
+        existing = CertFindCertificateInStore(store, X509_ASN_ENCODING, 0, CERT_FIND_EXISTING, cert, NULL);
+        if (existing) {
+            CertFreeCertificateContext(existing);
+        } else if (CertAddCertificateContextToStore(store, cert, CERT_STORE_ADD_USE_EXISTING, NULL)) {
+            agent_log("%s certificate added to the %ls store.", label, stores[i]);
+        } else {
+            agent_log("%s certificate could not be added to the %ls store (%lu).", label, stores[i], GetLastError());
+        }
+        CertCloseStore(store, 0);
+    }
+    CertFreeCertificateContext(cert);
+}
+
 static void install_staged_root_driver(const wchar_t *inf_name,
                                        const wchar_t *hardware_id,
                                        const char *label)
@@ -1712,6 +1765,7 @@ static void install_staged_root_driver(const wchar_t *inf_name,
         CloseHandle(file);
         if (present && same) return; /* no devcon restart of unchanged VDD on every boot */
     }
+    trust_staged_driver_cert(driver_dir, stem, label);
     swprintf_s(args, _countof(args), L"%s \"%s\" %s", present ? L"update" : L"install", inf_path, hardware_id);
     if (!run_devcon_timeout(args, output, sizeof(output), &exit_code, 60000)) {
         agent_log("%s driver install could not launch devcon (%lu).", label, GetLastError());
