@@ -1073,16 +1073,35 @@ static int appliance_token_valid(const char *value)
 
 static int configure_shared_nic(const char *arguments)
 {
-    char copy[128], *separator, command[512];
+    char copy[128], subnet[64], *separator, *dot, *p, command[1024];
     snprintf(copy, sizeof(copy), "%s", arguments);
     separator = strrchr(copy, ':');
     if (!separator) return EINVAL;
     *separator++ = '\0';
     if (strlen(copy) != 17 || !*separator) return EINVAL;
+    /* The host speaks Windows MAC notation; ip(8) prints colons. */
+    for (p = copy; *p; ++p) {
+        if (*p == '-') *p = ':';
+        if (!isxdigit((unsigned char)*p) && *p != ':') return EINVAL;
+    }
+    /* Both values are interpolated into a shell command. */
+    for (p = separator; *p; ++p)
+        if (!isdigit((unsigned char)*p) && *p != '.') return EINVAL;
+    snprintf(subnet, sizeof(subnet), "%s", separator);
+    dot = strrchr(subnet, '.');
+    if (!dot) return EINVAL;
+    snprintf(dot, sizeof(subnet) - (size_t)(dot - subnet), ".0/24");
+    /* The share network is LAN-only: drop any default route DHCP gave this
+       adapter and refuse egress off the share subnet, so the appliance cannot
+       reach the internet through it. Best effort: the address is what the
+       shares need, and HCN ACLs on the host enforce the same boundary. */
     snprintf(command, sizeof(command),
         "iface=$(ip -o link | awk -v mac='%s' 'tolower($0) ~ tolower(mac){gsub(\":\",\"\",$2);print $2;exit}'); "
-        "[ -n \"$iface\" ] && ip link set $iface up && ip addr replace %s/24 dev $iface",
-        copy, separator);
+        "[ -n \"$iface\" ] && ip link set $iface up && ip addr replace %s/24 dev $iface && "
+        "{ ip route del default dev $iface 2>/dev/null; "
+        "iptables -C OUTPUT -o $iface ! -d %s -j DROP 2>/dev/null || "
+        "iptables -A OUTPUT -o $iface ! -d %s -j DROP 2>/dev/null; true; }",
+        copy, separator, subnet, subnet);
     return run_sync(command);
 }
 

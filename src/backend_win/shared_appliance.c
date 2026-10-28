@@ -1076,9 +1076,17 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         }
     }
 
+    /* The appliance is LAN-only. Its only adapter in normal operation is the
+       share endpoint, whose ACLs (hcn_create_share_server_endpoint) allow SMB
+       from the share subnet and management from the host and block the rest,
+       so nothing reaches the internet. The one exception is this temporary
+       NAT adapter, attached only for maintenance boots (Ubuntu package
+       install at setup, and the explicit Update action) and dropped by the
+       stop that ends them. Client VM starts never take this path. */
     if (provisioning) {
         char nat_ip[32];
-        ui_log(L"Shared appliance: creating maintenance NAT endpoint...");
+        ui_log(L"Shared appliance: creating temporary maintenance NAT endpoint "
+               L"(internet access for this maintenance boot only)...");
         hr = hcn_create_nat_network(&g_appliance.maintenance_network_id);
         if (SUCCEEDED(hr)) {
             sprintf_s(nat_ip, sizeof(nat_ip), "%s.254", hcn_nat_subnet_base());
@@ -1269,11 +1277,18 @@ wait_existing:
                next pass, so the agent ends up serving a backlog of overlapping
                heavy commands and the connection eventually drops. Send each
                one once and wait for the guest's own answer. */
-            if (!net_configured &&
-                g_appliance.status.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE) {
-                char net_command[128];
+            /* Every backend gets shared_net: besides the address it strips any
+               default route from the share adapter and blocks egress off the
+               share subnet, the guest half of keeping the appliance LAN-only.
+               Ubuntu gets colon notation, which older Linux agents need to
+               find the adapter by MAC. */
+            if (!net_configured) {
+                char net_command[128], mac[32], *c;
+                strcpy_s(mac, sizeof(mac), g_appliance.runtime.share_mac);
+                if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU)
+                    for (c = mac; *c; ++c) if (*c == '-') *c = ':';
                 sprintf_s(net_command, sizeof(net_command), "shared_net:%s:%s",
-                          g_appliance.runtime.share_mac, g_appliance.runtime.share_ip);
+                          mac, g_appliance.runtime.share_ip);
                 commands_sent++;
                 if (appliance_send(net_command, response, sizeof(response), 60000))
                     net_configured = TRUE;
@@ -1801,7 +1816,9 @@ HRESULT shared_appliance_update(void)
     if (g_appliance.status.active_clients || g_appliance.status.host_mounts)
         return HRESULT_FROM_WIN32(ERROR_BUSY);
     hr = shared_appliance_stop(FALSE); if (FAILED(hr)) return hr;
-    hr = start_internal(TRUE, TRUE, 120000); if (FAILED(hr)) return hr;
+    hr = start_internal(TRUE, TRUE, 120000);
+    /* Never leave a failed maintenance boot running on its NAT adapter. */
+    if (FAILED(hr)) { shared_appliance_stop(TRUE); return hr; }
     EnterCriticalSection(&g_appliance.cs);
     g_appliance.status.state = ASB_APPLIANCE_STATE_UPDATING;
     g_appliance.status.busy = TRUE;
