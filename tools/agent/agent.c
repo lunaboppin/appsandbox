@@ -2009,6 +2009,20 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
         "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NET_IP -PrefixLength 24 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
         "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue\r\n"
+        /* The share network is LAN-only: no route off it, and a firewall
+           backstop in case DHCP or a stale config ever hands it a gateway.
+           Scoped to this adapter, so a client VM's own NAT adapter is
+           unaffected. Non-fatal: shares still work if the firewall is off. */
+        "Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+        "try{\r\n"
+        " function AsbN($s){$b=([ipaddress]$s).GetAddressBytes();[array]::Reverse($b);[BitConverter]::ToUInt32($b,0)}\r\n"
+        " function AsbS($n){$b=[BitConverter]::GetBytes([uint32]$n);[array]::Reverse($b);([ipaddress]$b).ToString()}\r\n"
+        " $lo=AsbN (($env:ASB_NET_IP -replace '\\.\\d+$','')+'.0'); $hi=$lo+255; $r=@()\r\n"
+        " if($lo -gt 0){$r+=('0.0.0.0-'+(AsbS ($lo-1)))}\r\n"
+        " if($hi -lt [uint32]::MaxValue){$r+=((AsbS ($hi+1))+'-255.255.255.255')}\r\n"
+        " Get-NetFirewallRule -DisplayName 'AppSandbox Shared Network Egress' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
+        " New-NetFirewallRule -DisplayName 'AppSandbox Shared Network Egress' -Direction Outbound -Action Block -InterfaceAlias $a.Name -RemoteAddress $r -Profile Any -ErrorAction Stop | Out-Null\r\n"
+        "}catch{Write-Output ('egress block not applied: ' + $_.Exception.Message)}\r\n"
         "for($i=0;$i -lt 20;$i++){\r\n"
         " if(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NET_IP}){exit 0}\r\n"
         " Start-Sleep -Milliseconds 250\r\n"
