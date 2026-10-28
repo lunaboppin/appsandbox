@@ -31,6 +31,13 @@ def main() -> int:
 
     check("vm_display_auto.c" in proj, "vm_display_auto.c is not compiled into AppSandbox.exe")
 
+    # vmwp.exe only creates the BasicSession pipe when the VideoMonitor has
+    # ConnectionOptions; without it every client VM's console stays blank.
+    hcs = read("src/backend_win/hcs_vm.c")
+    video = hcs[hcs.index("/* VideoMonitor is REQUIRED"):hcs.index("/* ComPorts")]
+    check('"ConnectionOptions' in video and "is_appliance" not in video,
+          "the Hyper-V console pipe is not configured for every VM")
+
     # The console is vmwp.exe's BasicSession pipe; readiness is the passive latched
     # flag, never a frame-channel probe.
     check(".BasicSession" in auto, "boot screen does not use the Hyper-V BasicSession pipe")
