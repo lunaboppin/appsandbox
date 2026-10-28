@@ -64,26 +64,6 @@ governs that file.
   (redistributable tool).
 - **Copyright:** Copyright (c) Microsoft Corporation.
 
-## vendor/qemu-ivshmem/ — QEMU + its runtime dependencies (bundled macOS VMM)
-
-- **License:** QEMU — GNU General Public License, version 2 (`SPDX: GPL-2.0`);
-  GLib and gettext/libintl — GNU Lesser General Public License, version 2.1
-  (`SPDX: LGPL-2.1`); PCRE2 — BSD ("PCRE2 Licence"); EDK2/TianoCore guest UEFI
-  firmware — BSD-2-Clause-Patent (`SPDX: BSD-2-Clause-Patent`).
-- **Copyright:** the QEMU, GLib, GNU gettext, PCRE2 (University of Cambridge),
-  and TianoCore/EDK2 contributors.
-- The macOS host runs Windows guests on a vendored, patched build of **QEMU
-  11.0.1** (ivshmem-plain on HVF) together with its GLib / gettext / PCRE2
-  runtime and the EDK2 UEFI firmware, embedded under
-  `AppSandbox.app/Contents/Resources/qemu/`. QEMU runs as a separate process
-  (aggregated with, not linked into, the app); the LGPL dylibs are dynamically
-  linked (LGPL §6 relink clause satisfied). Per-component notices, the GPL/LGPL
-  written offer, and corresponding-source pointers are in
-  [`vendor/qemu-ivshmem/LICENSES/NOTICE.md`](vendor/qemu-ivshmem/LICENSES/NOTICE.md)
-  and [`vendor/qemu-ivshmem/WRITTEN_OFFER.txt`](vendor/qemu-ivshmem/WRITTEN_OFFER.txt)
-  (both also shipped in the app bundle); `vendor/qemu-ivshmem/fetch-sources.sh`
-  retrieves the corresponding source tarballs.
-
 ## vendor/virtio-win/ — NetKVM (Red Hat VirtIO Ethernet Adapter)
 
 - **License:** BSD 3-Clause (`SPDX: BSD-3-Clause`). License text:

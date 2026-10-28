@@ -2,11 +2,9 @@
  * win_provision.h -- platform-neutral generator for the Windows-guest provisioning files
  * (unattend.xml / setup.cmd / SetupComplete.cmd).
  *
- * SINGLE SOURCE OF TRUTH: compiled into BOTH the Windows backend (src/backend_win/disk_util.c
- * delegates here) and the macOS tools/iso-patch-mac target, so the staged scripts are byte-identical
- * regardless of host. There is no is-mac/is-pc fork. The AppSandboxSHM driver install is included
- * unconditionally; it is a harmless no-op on Windows-to-Windows (no ivshmem PCI device present).
- * See the [[windows-on-mac-provisioning-unification]] memory.
+ * Compiled into the Windows backend (src/backend_win/disk_util.c delegates here). The
+ * AppSandboxSHM driver install is included unconditionally; it is a harmless no-op on
+ * Windows-to-Windows (no ivshmem PCI device present).
  */
 #ifndef ASB_WIN_PROVISION_H
 #define ASB_WIN_PROVISION_H

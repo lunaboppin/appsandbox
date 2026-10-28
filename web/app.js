@@ -36,65 +36,31 @@ const netNames = ['None', 'NAT', 'External', 'Internal'];
 
 /* ---- Message bridge ----
  *
- * Two host environments are supported:
- *   - WebView2 on Windows  (window.chrome.webview)
- *   - WKWebView on macOS   (window.webkit.messageHandlers.host)
- *
- * Native code on both platforms calls window.onHostMessage(obj) with a
- * parsed message object; the JS side only sees one uniform surface. On
- * Windows we keep using the native chrome.webview event path because it
- * is the existing, tested route — onHostMessage is simply wired into the
- * same listener.
+ * The host is WebView2 (window.chrome.webview). Native code calls
+ * window.onHostMessage(obj) with a parsed message object; it is wired into
+ * the same listener as the native chrome.webview event path.
  */
 
 var hostBridge = (function() {
     var isWebView2 = !!(window.chrome && window.chrome.webview);
-    var isWKWebView = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.host);
 
     function send(action, data) {
         var msg = Object.assign({ action: action }, data || {});
         if (isWebView2) {
             window.chrome.webview.postMessage(msg);
-        } else if (isWKWebView) {
-            /* WKWebView only accepts JSON-serializable values; strings round-trip
-             * most reliably so we hand the native side the raw JSON text. */
-            window.webkit.messageHandlers.host.postMessage(JSON.stringify(msg));
         } else {
             console.warn('[hostBridge] no native host available; dropping', msg);
         }
     }
 
-    return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView, isMac: isWKWebView };
+    return { send: send, isWebView2: isWebView2 };
 })();
 
 function sendCmd(action, data) { hostBridge.send(action, data); }
 
-/* On a macOS host, hide the Windows-*host*-only features (templates, snapshots,
- * build-template — none supported when the host is a Mac) and the
- * dormant Linux-version row. The OS-type dropdown stays ENABLED so the user can
- * pick Windows (built from a Microsoft ISO via QEMU) or macOS (VZ restore image).
- * Per-OS field visibility — including the .needs-iso picker — is driven by
- * applyOsTypeUI(), which runs on both hosts. */
-if (hostBridge.isMac) {
-    var hide = document.querySelectorAll('.win-only, .win-host-only, .needs-linux-version');
-    for (var i = 0; i < hide.length; i++) hide[i].style.display = 'none';
-}
-
-/* OS Type dropdown: drop guest types that aren't available on this host.
- * Windows host: macOS unavailable (Apple Virtualization is Mac-only).
- * macOS host:   Linux unavailable (Windows IS supported — QEMU+ivshmem). */
-{
-    var unavailable = hostBridge.isMac ? ['Linux'] : ['macOS'];
-    unavailable.forEach(function(v) {
-        var opt = document.querySelector('#os-type option[value="' + v + '"]');
-        if (opt) opt.remove();
-    });
-}
-
 /* Apply Create-modal visibility rules for the currently selected OS type.
  *   Windows: .win-only shown, .needs-iso shown,             .needs-linux-version hidden
  *   Linux:   .win-only hidden, .needs-iso hidden,           .needs-linux-version shown
- *   macOS:   handled by the isMac branch above; this function is a no-op there.
  *
  * Linux is back to user-picks-an-ISO (Ubuntu Desktop ISO etc.), same as
  * Windows. The version-dropdown / cloud-image flow is preserved in
@@ -106,10 +72,9 @@ function applyOsTypeUI() {
     var winOnly = document.querySelectorAll('.win-only');
     var needsIso = document.querySelectorAll('.needs-iso');
     var needsLinuxVersion = document.querySelectorAll('.needs-linux-version');
-    /* .win-only = template/snapshot features that exist only on a Windows *host*;
-       never shown on a Mac host, even for a Windows guest. */
+    /* .win-only = template/snapshot features for Windows guests. */
     for (var i = 0; i < winOnly.length; i++)
-        winOnly[i].style.display = (!hostBridge.isMac && isWindows) ? '' : 'none';
+        winOnly[i].style.display = isWindows ? '' : 'none';
     /* ISO picker shows for both Windows and Linux now. */
     for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
     /* Linux distribution dropdown is dormant — kept in the DOM but always
@@ -363,14 +328,11 @@ function updateCreateButtons() {
     var osType = document.getElementById('os-type').value;
     var hasImage = (document.getElementById('image-path').value.trim() !== '');
     var hasTpl = document.getElementById('template-select').value !== '';
-    /* macOS guests auto-download their restore image (no path needed). Windows
-       and Linux guests build from a user-picked ISO — or, on a Windows host, a
-       saved template. Holds on both hosts: on a Mac the template UI is hidden so
-       hasTpl stays false and a Windows guest genuinely requires the ISO. */
-    var createOk = (osType === 'macOS') ? true : (hasImage || hasTpl);
+    /* Guests build from a user-picked ISO — or a saved Windows template. */
+    var createOk = hasImage || hasTpl;
     document.getElementById('btn-create').disabled = !createOk;
     /* Templates are Windows-only; disabling create-as-template for Linux
-       (and macOS) is fine since hasImage is the only signal we check. */
+       is fine since hasImage is the only signal we check. */
     document.getElementById('btn-create-template').disabled = (osType !== 'Windows') || !hasImage;
 }
 
@@ -492,15 +454,12 @@ function clearCreateForm() {
 }
 
 /* VM name / hostname validation. Per-guest-OS rules, keyed off the
-   selected OS Type (on a macOS host the dropdown is locked to 'macOS',
-   so osType is an accurate guest discriminator on all hosts). */
+   selected OS Type. */
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
     var osSelect = document.getElementById('os-type');
     var osType = osSelect ? osSelect.value : 'Windows';
-    if (osType === 'macOS') {
-        if (name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
-    } else if (osType === 'Linux') {
+    if (osType === 'Linux') {
         if (name.length > 63) return 'VM name cannot exceed 63 characters (Linux hostname limit).';
         if (/[A-Z]/.test(name)) return 'Linux hostname must be lowercase.';
     } else { /* Windows */
@@ -533,9 +492,7 @@ function validateUsername(name) {
             return 'Lowercase alphanumeric only.';
         return null;
     }
-    /* macOS and Windows: keep the existing Windows-account ruleset.
-       (macOS-specific shortname rules are not yet verified; treated the
-       same as Windows for now — see validatePassword note.) */
+    /* Windows account ruleset. */
     if (name.length > 20) return 'Username cannot exceed 20 characters.';
     if (/["\\/\[\]:;|=,+*?<>]/.test(name)) return 'Username contains invalid characters.';
     if (/^[.\s]+$/.test(name)) return 'Username cannot be only dots or spaces.';
@@ -551,7 +508,7 @@ function validateUsername(name) {
    - Linux: Ubuntu accepts ALL characters via the host's $6$ hash path
      (usermod -p bypasses pwquality), so the only limits are non-empty
      and a sane byte ceiling.
-   - macOS / Windows: no extra content rule enforced here today. */
+   - Windows: no extra content rule enforced here today. */
 function validatePassword(pass) {
     var osSelect = document.getElementById('os-type');
     var osType = osSelect ? osSelect.value : 'Windows';
@@ -562,7 +519,7 @@ function validatePassword(pass) {
         if (bytes > 255) return 'Password is too long (max 255 bytes).';
         return null;
     }
-    /* macOS / Windows: no additional constraints today. */
+    /* Windows: no additional constraints today. */
     return null;
 }
 
@@ -615,8 +572,7 @@ function openCreateModal() {
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
-    /* Reset OS type to Windows on each open. Valid on both hosts (a Mac host
-       supports Windows via QEMU); the user can switch to macOS on a Mac. */
+    /* Reset OS type to Windows on each open. */
     document.getElementById('os-type').value = 'Windows';
 
     /* Smart defaults (RAM/cores) from latest host info */
@@ -684,8 +640,7 @@ function updateStatusCell(td, vm) {
     } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
         needsSpinner = true;
         var defaultLabel;
-        if (vm.osType === 'macOS')      defaultLabel = 'Installing macOS ';
-        else if (vm.osType === 'Linux') defaultLabel = 'Installing Linux ';
+        if (vm.osType === 'Linux') defaultLabel = 'Installing Linux ';
         else                            defaultLabel = 'Installing Windows ';
         label = (vm.installStatus && vm.installStatus.length > 0)
             ? (vm.installStatus + ' ')
@@ -771,7 +726,7 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
-    if (!hostBridge.isMac) cells.push(makeCheckpointSummaryCell(vm, i));
+    cells.push(makeCheckpointSummaryCell(vm, i));
     cells.push(
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld && !vm.managementBusy, (function(vmIdx, sv, vmObj) { return function() {
             var p = parseSnapValue(sv);
@@ -813,7 +768,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 18;
+        td.colSpan = 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -1144,7 +1099,7 @@ function makeCheckpointSummaryCell(vm, vmIdx) {
 }
 
 function openManageVm(idx) {
-    if (hostBridge.isMac || !vms[idx]) return;
+    if (!vms[idx]) return;
     manageVmIndex = idx;
     managePending = false;
     document.getElementById('manage-vm-overlay').classList.add('active');
@@ -1250,7 +1205,7 @@ function renderManageSharedResources(vm) {
     if(vm.sharedResourceError){var err=document.createElement('span');err.className='field-warn';err.textContent=vm.sharedResourceError;box.appendChild(err);}
 }
 
-function openSettingsModal(){if(hostBridge.isMac)return;populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
+function openSettingsModal(){populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
 function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}
 function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-editor-title').textContent='Add shared resource';}

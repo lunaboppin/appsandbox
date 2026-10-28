@@ -1,22 +1,20 @@
 """
-asb.py -- Python client for the AppSandbox headless daemon (Windows + macOS).
+asb.py -- Python client for the AppSandbox headless daemon.
 
 Start the daemon with:
-    Windows:  appsandbox.exe --headless                     (elevated shell)
-    macOS:    AppSandbox.app/Contents/MacOS/AppSandbox --headless
+    appsandbox.exe --headless                     (elevated shell)
 Then:
 
     import asb
-    c = asb.connect()                 # reads the per-platform host.json
+    c = asb.connect()                 # reads host.json
     c.start("linux")
     c.wait("linux", {"booting", "online"})
     c.stop("linux")
 
 Stdlib only (urllib) -- no third-party dependencies. The daemon exposes a
 Docker-style local HTTP/JSON API over loopback; the discovery file gives us the
-port + bearer token so connect() takes no arguments. The API is IDENTICAL on
-both platforms; feature differences (snapshots/templates are Windows-only) are
-advertised in version()["capabilities"] and those routes return 501 on macOS.
+port + bearer token so connect() takes no arguments. Feature availability is
+advertised in version()["capabilities"]; unsupported routes return 501.
 """
 import json
 import os
@@ -27,9 +25,7 @@ import urllib.error
 
 
 def _support_dir():
-    """Per-platform AppSandbox data dir (discovery file, ssh keypair, logs)."""
-    if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/AppSandbox")
+    """AppSandbox data dir (discovery file, ssh keypair, logs)."""
     base = os.environ.get("ProgramData", r"C:\ProgramData")
     return os.path.join(base, "AppSandbox")
 
@@ -39,8 +35,6 @@ def _discovery_path():
 
 
 def daemon_launch_hint():
-    if sys.platform == "darwin":
-        return "AppSandbox.app/Contents/MacOS/AppSandbox --headless"
     return "appsandbox.exe --headless (from an elevated shell)"
 
 
