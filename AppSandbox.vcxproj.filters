@@ -30,6 +30,9 @@
     <ClCompile Include="src\backend_win\vm_display_idd.c">
       <Filter>Backend Win</Filter>
     </ClCompile>
+    <ClCompile Include="src\backend_win\vm_display_auto.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app_win\resource.h">
@@ -63,6 +66,9 @@
       <Filter>Backend Win</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\vm_display_idd.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\vm_display_auto.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
   </ItemGroup>
