@@ -31,6 +31,11 @@
 #define APPLIANCE_SERVICE_USER L"AppSandboxShare"
 #define APPLIANCE_IDLE_MS (5ull * 60ull * 1000ull)
 #define APPLIANCE_SETUP_TIMEOUT_MS (30ul * 60ul * 1000ul)
+/* How long a client VM start waits for a stopped appliance to boot and finish
+   its readiness handshake. A cold Server Core boot plus appliance_ready (up to
+   five minutes on its own) routinely exceeded the old two-minute budget, so a
+   VM started while the appliance was stopped failed with "unavailable". */
+#define APPLIANCE_CLIENT_START_TIMEOUT_MS (10ul * 60ul * 1000ul)
 #define HOST_MAPPING_ALREADY_PRESENT 100ul
 #define HOST_MAPPING_NOT_PRESENT 101ul
 
@@ -69,6 +74,14 @@ typedef struct {
     BOOL provisioning_boot;
     volatile LONG ready_worker_active;
     volatile LONG readiness_wait_active;
+    /* Client VM starts that are waiting for the appliance and have not yet
+       attached (active_clients). Keeps the idle stop off a starting appliance. */
+    volatile LONG pending_clients;
+    /* Result of the last readiness pass, for callers that only watched it. */
+    volatile LONG last_start_hr;
+    /* TRUE from the start of a fresh boot until its VM is running, so a driver
+       that joined early does not mistake "not running yet" for "exited". */
+    volatile LONG booting;
     LONG idle_generation;
     LONG restart_attempts;
     volatile LONG host_mount_mask;
@@ -994,13 +1007,23 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     HRESULT hr;
     ULONGLONG deadline, wait_started, last_report, last_vhdx_bytes;
     BOOL announced_agent, net_configured;
-    BOOL agent_seen;
+    BOOL agent_seen, driving = FALSE, booted_here = FALSE;
     int agent_connects, commands_sent;
     DWORD elapsed_seconds, saved_progress;
     char response[256] = "";
     const char *base;
 
-    EnterCriticalSection(&g_appliance.cs);
+    deadline = GetTickCount64() + (timeout_ms ? timeout_ms : 120000);
+    /* A stop in flight (idle stop, the user's Stop button) still owns the
+       runtime and is about to delete the share endpoint. Joining its wait would
+       just watch the appliance go away, so let it finish and start fresh. */
+    for (;;) {
+        EnterCriticalSection(&g_appliance.cs);
+        if (!g_appliance.stopping) break;
+        LeaveCriticalSection(&g_appliance.cs);
+        if (GetTickCount64() >= deadline) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        Sleep(250);
+    }
     if (!g_appliance.status.configured && !provisioning) {
         LeaveCriticalSection(&g_appliance.cs); return HRESULT_FROM_WIN32(ERROR_NOT_READY);
     }
@@ -1021,8 +1044,14 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     g_appliance.status.busy = TRUE;
     g_appliance.status.last_error[0] = L'\0';
     g_appliance.provisioning_boot = provisioning;
+    InterlockedExchange(&g_appliance.booting, 1);
+    booted_here = TRUE;
     LeaveCriticalSection(&g_appliance.cs);
 
+    /* A previous attempt that failed before its VM ran leaves its endpoints
+       behind, and a new endpoint with the same deterministic IP/MAC is then
+       refused. Nothing is running here, so they are safe to drop. */
+    cleanup_runtime_network();
     base = hcn_share_subnet_base();
     sprintf_s(server_ip, sizeof(server_ip), "%s.2", base);
     strcpy_s(server_mac, sizeof(server_mac), "02-15-5D-A5-B0-02");
@@ -1105,6 +1134,7 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
     if (FAILED(hr)) goto fail;
     hr = hcs_start_vm(&g_appliance.runtime);
     if (FAILED(hr)) goto fail;
+    InterlockedExchange(&g_appliance.booting, 0);
     HeapFree(GetProcessHeap(), 0, config);
     config = NULL;
     ui_log(L"Shared appliance: VM started; polling for the guest agent...");
@@ -1126,21 +1156,34 @@ wait_existing:
         }
         return S_OK;
     }
-    deadline = GetTickCount64() + (timeout_ms ? timeout_ms : 120000);
     /* Exactly one thread drives the handshake; anyone else just watches it.
        Two threads sending the same multi-minute commands serialize on
        command_cs, so the second one -- usually a VM start that needs the
        appliance -- sat blocked behind appliance_ready and looked like the app
-       had hung. */
+       had hung. A watcher follows the driver to the end rather than bailing on
+       a FAILED state left over from an earlier attempt the driver is retrying. */
     if (InterlockedCompareExchange(&g_appliance.readiness_wait_active, 1, 0) != 0) {
         while (GetTickCount64() < deadline) {
             if (g_appliance.status.ready) return S_OK;
-            if (g_appliance.status.state == ASB_APPLIANCE_STATE_FAILED)
-                return E_FAIL;
+            if (!g_appliance.readiness_wait_active && !g_appliance.booting) {
+                if (g_appliance.status.ready) return S_OK;
+                hr = (HRESULT)g_appliance.last_start_hr;
+                return FAILED(hr) ? hr : E_FAIL;
+            }
             Sleep(500);
         }
         return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     }
+    driving = TRUE;
+    EnterCriticalSection(&g_appliance.cs);
+    if (g_appliance.status.ready) {
+        LeaveCriticalSection(&g_appliance.cs);
+        InterlockedExchange(&g_appliance.readiness_wait_active, 0);
+        return S_OK;
+    }
+    g_appliance.status.state = ASB_APPLIANCE_STATE_STARTING;
+    g_appliance.status.busy = TRUE;
+    LeaveCriticalSection(&g_appliance.cs);
     wait_started = GetTickCount64();
     last_report = wait_started;
     announced_agent = FALSE;
@@ -1150,6 +1193,12 @@ wait_existing:
     commands_sent = 0;
     file_size_bytes(g_appliance.status.os_vhdx_path, &last_vhdx_bytes);
     while (GetTickCount64() < deadline) {
+        /* The appliance exited (crash, or a stop raced this start): no agent
+           is coming back, so report it now instead of at the deadline. */
+        if (!g_appliance.runtime.running && !g_appliance.booting && !provisioning) {
+            hr = HRESULT_FROM_WIN32(ERROR_SERVICE_NOT_ACTIVE);
+            goto fail;
+        }
         /* Unattended installs run 10-30+ minutes with no agent to talk to.
            Without the heartbeat below the UI sits frozen at 65% and any
            terminal request fails with ERROR_NOT_READY, looking like a hang.
@@ -1258,6 +1307,7 @@ wait_existing:
                 wcscpy_s(g_appliance.status.progress_text, 256, L"Ready");
                 g_appliance.restart_attempts = 0;
                 LeaveCriticalSection(&g_appliance.cs);
+                InterlockedExchange(&g_appliance.last_start_hr, S_OK);
                 InterlockedExchange(&g_appliance.readiness_wait_active, 0);
                 return S_OK;
             }
@@ -1274,9 +1324,15 @@ fail:
     set_error_locked(hr,
         hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
             ? L"The shared appliance did not become ready within the allotted time"
+            : hr == HRESULT_FROM_WIN32(ERROR_SERVICE_NOT_ACTIVE)
+            ? L"The shared appliance stopped before it became ready"
             : L"Failed to start or verify the shared appliance");
     LeaveCriticalSection(&g_appliance.cs);
-    InterlockedExchange(&g_appliance.readiness_wait_active, 0);
+    InterlockedExchange(&g_appliance.last_start_hr, hr);
+    if (booted_here) InterlockedExchange(&g_appliance.booting, 0);
+    /* Only the driver owns the handshake flag: a boot that fails while another
+       thread is already driving must not release that thread's claim. */
+    if (driving) InterlockedExchange(&g_appliance.readiness_wait_active, 0);
     return hr;
 }
 
@@ -1621,8 +1677,19 @@ HRESULT shared_appliance_prepare_client(const VmConfig *config,
     endpoint_guid[0] = L'\0';
     if (!config || config->shared_resource_count <= 0 ||
         _wcsicmp(config->os_type, L"Windows") != 0) return S_FALSE;
-    hr = shared_appliance_start(TRUE, 120000);
-    if (FAILED(hr)) return allow_missing ? S_FALSE : HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    /* Bring a stopped appliance up on demand. The pending count and the
+       generation bump keep an idle stop from firing while this start waits;
+       callers are background start threads, never the UI thread. */
+    InterlockedIncrement(&g_appliance.pending_clients);
+    InterlockedIncrement(&g_appliance.idle_generation);
+    if (!g_appliance.status.ready)
+        ui_log(L"Shared resources: starting the shared appliance for \"%s\"...",
+               config->name);
+    hr = shared_appliance_start(TRUE, APPLIANCE_CLIENT_START_TIMEOUT_MS);
+    if (FAILED(hr)) {
+        InterlockedDecrement(&g_appliance.pending_clients);
+        return allow_missing ? S_FALSE : HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    }
     base = hcn_share_subnet_base();
     for (p = config->name; *p; ++p) { hash ^= towlower(*p); hash *= 16777619u; }
     octet = 17 + (int)(hash % 230u);
@@ -1655,6 +1722,7 @@ HRESULT shared_appliance_prepare_client(const VmConfig *config,
         InterlockedIncrement(&g_appliance.status.active_clients);
         InterlockedIncrement(&g_appliance.idle_generation);
     }
+    InterlockedDecrement(&g_appliance.pending_clients);
     return hr;
 }
 
@@ -1667,7 +1735,8 @@ static DWORD WINAPI idle_stop_thread(LPVOID parameter)
         Sleep(1000);
     }
     if (generation == g_appliance.idle_generation &&
-        g_appliance.status.active_clients == 0 && g_appliance.status.host_mounts == 0)
+        g_appliance.status.active_clients == 0 && g_appliance.status.host_mounts == 0 &&
+        g_appliance.pending_clients == 0)
         shared_appliance_stop(FALSE);
     return 0;
 }

@@ -86,6 +86,8 @@ if RUN_STATIC:
     results["appliance-contract"] = [] if p.returncode == 0 else ["test_shared_appliance_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_appliance_retry_contract.py")], cwd=HERE)
     results["appliance-retry"] = [] if p.returncode == 0 else ["test_shared_appliance_retry_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_appliance_autostart_contract.py")], cwd=HERE)
+    results["appliance-autostart"] = [] if p.returncode == 0 else ["test_shared_appliance_autostart_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_release_shared_resource_artifacts.py")], cwd=HERE)
     results["appliance-artifacts"] = [] if p.returncode == 0 else ["test_release_shared_resource_artifacts.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_and_validation.py")], cwd=HERE)

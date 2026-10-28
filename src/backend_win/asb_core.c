@@ -1392,8 +1392,18 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         hr = prepare_shared_transport(&args->config, vm, share_endpoint_guid,
                                       _countof(share_endpoint_guid));
         if (FAILED(hr)) {
+            SharedApplianceStatus appliance;
+            wchar_t alert[768];
+            shared_appliance_get_status(&appliance);
             asb_log(L"Shared appliance unavailable for \"%s\" (0x%08X).", vm->name, hr);
-            asb_alert(L"The shared-storage appliance is unavailable. Retry or start without shared resources.");
+            /* Name the appliance's own failure: the VM itself is fine, and a
+               bare "unavailable" read as if this VM were misconfigured. */
+            swprintf_s(alert, _countof(alert),
+                       L"The shared-storage appliance could not be started for \"%s\"%s%s. "
+                       L"Retry or start without shared resources.",
+                       vm->name, appliance.last_error[0] ? L": " : L"",
+                       appliance.last_error);
+            asb_alert(alert);
             asb_vm_cleanup_network(vm);
             InterlockedExchange(&vm->management_busy, 0);
             if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
