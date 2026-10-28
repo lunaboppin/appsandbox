@@ -1075,17 +1075,20 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"}", vmgs_esc, vmrs_esc);
     }
 
-    /* VideoMonitor is REQUIRED for all OSes — vmwp.exe crashes (0xC0000005)
-       without it. For the shared appliance we also attach ConnectionOptions
-       so vmwp.exe serves the console framebuffer on \\.\pipe\<name>.BasicSession.
-       That pipe is what the UI's basic-session viewer (vm_display.c) attaches
-       to -- the only way to watch unattended provisioning, where no guest
-       agent exists yet. Client VMs stay pipe-less and use the IDD/agent
-       display path. */
-    if (config->is_appliance) {
+    /* VideoMonitor is REQUIRED for all OSes -- vmwp.exe crashes (0xC0000005)
+       without it. ConnectionOptions makes vmwp.exe serve the synthetic video
+       framebuffer on \\.\pipe\<name>.BasicSession, restricted to the current
+       user. That pipe is what the basic-session viewer (vm_display.c)
+       attaches to: the appliance console during unattended provisioning, and
+       every client VM's display while it boots (vm_display_auto shows it
+       until the guest agent and IDD are up). Without ConnectionOptions no
+       pipe exists and the viewer stays blank. */
+    {
         wchar_t user_sid[128];
+        wchar_t name_esc[MAX_PATH * 2];
+        escape_json_path(config->name, name_esc, MAX_PATH * 2);
         if (get_current_user_sid_string(user_sid, _countof(user_sid))) {
-            swprintf_s(video_section, 1024,
+            swprintf_s(video_section, _countof(video_section),
                 L"\"VideoMonitor\":{"
                     L"\"HorizontalResolution\":1024,"
                     L"\"VerticalResolution\":768,"
@@ -1094,21 +1097,16 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                         L"\"AccessSids\":[\"%s\"]"
                     L"}"
                 L"},",
-                config->name, user_sid);
+                name_esc, user_sid);
         } else {
-            ui_log(L"Warning: could not resolve user SID; appliance console pipe disabled");
-            wcscpy_s(video_section, 1024,
+            ui_log(L"Warning: could not resolve user SID; Hyper-V console pipe disabled for \"%s\"",
+                   config->name);
+            wcscpy_s(video_section, _countof(video_section),
                 L"\"VideoMonitor\":{"
                     L"\"HorizontalResolution\":1024,"
                     L"\"VerticalResolution\":768"
                 L"},");
         }
-    } else {
-        wcscpy_s(video_section, 1024,
-            L"\"VideoMonitor\":{"
-                L"\"HorizontalResolution\":1024,"
-                L"\"VerticalResolution\":768"
-            L"},");
     }
 
     /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
