@@ -1,8 +1,7 @@
 /*
  * asb_types.h -- Platform-neutral VM descriptor types and error codes.
  *
- * Shared by both platform orchestrators (asb_core on Windows,
- * asb_core_mac on macOS) and their UI layers.
+ * Shared by the orchestrator (asb_core) and its UI layer.
  */
 
 #ifndef ASB_TYPES_H
@@ -33,8 +32,8 @@ extern "C" {
 
 typedef struct CoreVmConfig {
     const char *name;
-    const char *os_type;        /* "macOS", "Windows", "Linux" */
-    const char *image_path;     /* installer .ipsw/.iso, or NULL */
+    const char *os_type;        /* "Windows", "Linux" */
+    const char *image_path;     /* installer .iso, or NULL */
     const char *template_name;  /* template to clone, or NULL */
     int         ram_mb;
     int         hdd_gb;

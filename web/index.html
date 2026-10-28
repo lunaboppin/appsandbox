@@ -6,10 +6,8 @@
 <title>App Sandbox</title>
 <link rel="stylesheet" href="style.css">
 </head>
-<!-- spellcheck="false" inherits to all descendants; the per-field
-     autocorrect/autocapitalize attrs (WebKit/Safari extensions) stop macOS from
-     rewriting VM names, usernames, paths, and checkpoint names as you type. -->
-<body spellcheck="false" autocorrect="off" autocapitalize="off">
+<!-- spellcheck="false" inherits to all descendants. -->
+<body spellcheck="false">
 
 <!-- Virtual Machines -->
 <section id="vm-section">
@@ -75,19 +73,18 @@
                 <select id="os-type" onchange="applyOsTypeUI()">
                     <option value="Windows" selected>Windows</option>
                     <option value="Linux">Linux</option>
-                    <option value="macOS">macOS</option>
                 </select>
             </div>
 
             <label for="vm-name">VM Name:</label>
             <div class="form-row">
-                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" spellcheck="false">
                 <span class="field-warn" id="vm-name-warn"></span>
             </div>
 
             <label class="needs-iso">OS Image:</label>
             <div class="image-row needs-iso">
-                <input type="text" id="image-path" placeholder="Path to ISO or VHDX..." autocorrect="off" autocapitalize="off" spellcheck="false">
+                <input type="text" id="image-path" placeholder="Path to ISO or VHDX..." spellcheck="false">
                 <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
                 <span class="or-separator win-only">OR</span>
                 <label class="win-only" style="text-align:left">Template:</label>
@@ -114,7 +111,7 @@
 
             <label for="storage-parent" class="win-only">Storage Parent:</label>
             <div class="image-row win-only">
-                <input type="text" id="storage-parent" placeholder="Default: %ProgramData%\\AppSandbox" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <input type="text" id="storage-parent" placeholder="Default: %ProgramData%\\AppSandbox" spellcheck="false">
                 <button type="button" onclick="sendCmd('browseCreateStorage')">Browse...</button>
             </div>
 
@@ -156,7 +153,7 @@
 
             <label>Username:</label>
             <div class="cred-row">
-                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" spellcheck="false">
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
@@ -192,7 +189,7 @@
         <fieldset>
             <legend>Installer ISO</legend>
             <div class="manage-row">
-                <input type="text" id="manage-iso-path" placeholder="No installer ISO attached" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <input type="text" id="manage-iso-path" placeholder="No installer ISO attached" spellcheck="false">
                 <button onclick="sendCmd('browseManageIso')">Browse...</button>
                 <button id="manage-iso-attach" class="primary" onclick="attachManageIso()">Attach</button>
                 <button id="manage-iso-eject" onclick="ejectManageIso()">Eject</button>
@@ -206,7 +203,7 @@
             <input type="text" id="manage-storage-current" readonly>
             <label>Destination parent</label>
             <div class="manage-row">
-                <input type="text" id="manage-storage-parent" placeholder="Choose a parent folder" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <input type="text" id="manage-storage-parent" placeholder="Choose a parent folder" spellcheck="false">
                 <button onclick="sendCmd('browseManageStorage')">Browse...</button>
                 <button id="manage-storage-move" class="primary" onclick="moveManageStorage()">Move</button>
             </div>
@@ -312,7 +309,7 @@
         </label>
         <div id="modal-input-row" style="display:none; margin-bottom:12px;">
             <label style="font-size:12px; color:var(--text-dim);" id="modal-input-label">Name:</label>
-            <input type="text" id="modal-input" style="width:100%; margin-top:4px;" autocorrect="off" autocapitalize="off" spellcheck="false">
+            <input type="text" id="modal-input" style="width:100%; margin-top:4px;" spellcheck="false">
         </div>
         <div class="modal-buttons">
             <button onclick="modalResolve(false)" id="modal-cancel-btn">Cancel</button>

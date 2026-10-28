@@ -1,12 +1,10 @@
 """
 The full per-VM test sequence, parametrized by a create-spec. The master harness
-(run_all.py) runs this CONCURRENTLY across several specs (Linux + Windows on a
-Windows host; a macOS guest on a macOS host) -- so multi-VM concurrency is
-inherent where the platform has multiple guest types, and every path is proven
-on each OS. Each call creates its own VM, runs everything against it, and
+(run_all.py) runs this CONCURRENTLY across several specs (Linux + Windows) -- so
+multi-VM concurrency is inherent, and every path is proven on each guest OS. Each call creates its own VM, runs everything against it, and
 deletes it. There is no separate multi-VM test. Feature differences are
-capability-gated via version()["capabilities"] (snapshots/templates are
-Windows-only; those routes assert 501 on macOS).
+capability-gated via version()["capabilities"] (routes for
+unsupported features assert 501).
 
 Lifecycle discipline (mirrors the GUI):
   * Every VM start boots all the way to ONLINE (agent connected) before the VM is
@@ -38,12 +36,7 @@ def run_vm_lifecycle(spec):
     cores = spec.get("cores", 2)
     image = spec.get("image")            # explicit per-spec override (may be "")
     if image is None:
-        if os_type == "Linux":
-            image = helpers.ISO_LIN
-        elif os_type == "Windows":
-            image = helpers.ISO_WIN
-        else:                            # macOS: IPSW; "" = cached/auto-fetched
-            image = helpers.IPSW_MAC
+        image = helpers.ISO_LIN if os_type == "Linux" else helpers.ISO_WIN
     ONLINE_T = 600 if os_type == "Linux" else 1800   # boot-to-online budget
     GRACE_T  = 240 if os_type == "Linux" else 600    # graceful-shutdown budget
     # The build/install/download phase is stall-based -- it fails only after
@@ -53,7 +46,7 @@ def run_vm_lifecycle(spec):
     # stays "Installing Windows" (indeterminate) until the guest agent connects,
     # exactly like Windows-on-Windows -- so that phase is a legitimately
     # signal-less window. It can run 10+ minutes (longer under concurrent
-    # multi-VM load), so give Windows a real budget; Linux/macOS stream live
+    # multi-VM load), so give Windows a real budget; Linux streams live
     # progress and keep the tight 600 s stall.
     BUILD_STALL = 3600 if os_type == "Windows" else 600
 
@@ -119,7 +112,7 @@ def run_vm_lifecycle(spec):
     cfg = dict(name=name, osType=os_type, ramMb=ram, hddGb=hdd, cpuCores=cores,
                gpuMode=1, networkMode=1, testMode=True, sshEnabled=True, sshDeployKey=True,
                adminUser="user", adminPass="test123")
-    if image:   # macOS may omit it (cached/auto-fetched restore image)
+    if image:
         cfg["imagePath"] = image
     try:
         # --- create (validates the create path) ---
@@ -127,8 +120,8 @@ def run_vm_lifecycle(spec):
         check("create -> 202", code in (200, 202), "%s %s" % (code, body))
 
         # --- delete/edit-during-build guards: the ONLY paths that act before the
-        #     guest finishes installing (deliberately pre-online). Windows
-        #     surfaces this as building=true; macOS as state=="installing". ---
+        #     guest finishes installing (deliberately pre-online), surfaced as
+        #     building=true. ---
         deadline = time.time() + 90
         caught_building = False
         while time.time() < deadline:
@@ -143,10 +136,8 @@ def run_vm_lifecycle(spec):
             check("edit during build -> 409", c.edit(name, ramMb=ram)[0] == 409)
             check("still present after refused delete", name in {v["name"] for v in c.list()})
 
-        # --- wait until built/installed. Create auto-starts on both platforms
-        #     (the macOS install briefly parks at "stopped" before the core
-        #     auto-boots it once the disk is released), so this just waits past
-        #     building/installing; boot_online is idempotent if it's already up.
+        # --- wait until built/installed. Create auto-starts, so this just waits
+        #     past building/installing; boot_online is idempotent if it's already up.
         #     Stall-based: live progress keeps the wait alive; a hung build
         #     fails after BUILD_STALL seconds of no movement. ---
         try:
@@ -167,16 +158,13 @@ def run_vm_lifecycle(spec):
 
         # --- display: a quick programmatic open + close now that the VM is online.
         #     Readiness (running + agentOnline + the display driver up) is a latched,
-        #     passive flag -- never a frame-channel probe. On macOS there is no frame
-        #     channel/driver (VZVirtualMachineView binds the in-process framebuffer),
-        #     so readiness is just running + agentOnline. SKIPped (not failed) so CI
+        #     passive flag -- never a frame-channel probe. SKIPped (not failed) so CI
         #     stays green in two cases:
         #       * Linux guest whose deployed agent predates the idd_status push, so
         #         readiness never latches -- exercised once a fresh Linux VM auto-builds
         #         the updated agent;
         #       * a daemon in a non-interactive session that can't show a window
-        #         (409 no_display) -- e.g. a sudo/launchd daemon with no console Aqua
-        #         session, on either Windows or macOS. ---
+        #         (409 no_display). ---
         check("display not open before open", son.get("displayOpen") is False)
         deadline = time.time() + 90
         while time.time() < deadline and not c.display_ready(name):
@@ -209,7 +197,7 @@ def run_vm_lifecycle(spec):
         #     Once online the guest agent writes the AppSandbox public key into the
         #     guest's authorized_keys and reports it back: sshState becomes 4 and
         #     keyDeployed flips true. We then prove a key-only BatchMode login works
-        #     (no password). NOTE: the Linux/macOS agent is built from the pushed
+        #     (no password). NOTE: the Linux agent is built from the pushed
         #     GitHub branch, so keyDeployed stays false -- and these checks stay red --
         #     until `headless-api` is pushed; the Windows agent is built locally. ---
         si = c.ssh_info(name)

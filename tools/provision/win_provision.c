@@ -13,8 +13,8 @@ static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 /* Decode one UTF-8 sequence at s (NUL-terminated); returns the Unicode code point and
    sets *adv to the bytes consumed. Malformed -> U+FFFD, *adv=1. The continuation-byte
    checks short-circuit on the first non-continuation byte (NUL included), so it never
-   reads past the terminator. The input is UTF-8 on both hosts (macOS passes
-   NSString.UTF8String; Windows passes WideCharToMultiByte(CP_UTF8,...)). */
+   reads past the terminator. The input is UTF-8 (Windows passes
+   WideCharToMultiByte(CP_UTF8,...)). */
 static unsigned asb_utf8_next(const unsigned char *s, int *adv) {
     unsigned char c = s[0];
     if (c < 0x80) { *adv = 1; return c; }

@@ -145,9 +145,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 button:disabled:hover { background: var(--ctrl-bg); border-color: var(--ctrl-border); }
 
 /* Disabled checkboxes (e.g. "Deploy SSH key" until "SSH Server" is ticked).
-   Chromium/WebView2 dims a disabled native checkbox automatically, but WebKit
-   (the macOS WKWebView host) does not -- so dim it, and the whole label, here
-   to make the unavailable affordance obvious on both engines. */
+   Dim it, and the whole label, to make the unavailable affordance obvious. */
 input[type="checkbox"]:disabled { opacity: 0.4; cursor: default; }
 label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 
