@@ -157,7 +157,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, networkMode, displayOpen, displayView`.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -214,43 +214,73 @@ connection can never make you miss a transition.
 
 ### Display
 
-Open the VM's **display window** — the same IDD/Connect view the GUI shows — on
-the **daemon's local desktop**. It renders on demand; the daemon never auto-opens
-it (good in the GUI, wrong for a CLI).
+Open the VM's **display window** — the same view the GUI's monitor button shows —
+on the **daemon's local desktop**. It renders on demand; the daemon never
+auto-opens it (good in the GUI, wrong for a CLI).
+
+The window shows one of two sources and switches between them by itself:
+
+- **Hyper-V console** (`"console"`) — the VM's synthetic video framebuffer, served
+  by `vmwp.exe` on `\\.\pipe\<vm>.BasicSession` (the "basic session" Hyper-V's
+  own VMConnect uses), rendered with the RDP client control. It works from
+  firmware / boot loader onward with no guest cooperation, so it is what a
+  **booting** VM shows: UEFI, the boot loader, Windows setup/OOBE, kernel and
+  cloud-init output.
+- **IDD stream** (`"idd"`) — the guest's virtual monitor (the IddCx driver on
+  Windows, `asb_drm` on Linux) over the frame channel, with input, clipboard and
+  audio. Needs the guest agent and display driver up.
 
 | Method | Returns |
 |---|---|
-| `display_status(name)` | `{open, ready}` — poll this; **no window is opened by polling** |
-| `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
-| `open_display(name)` | `(status, body)` — open (or focus) the window |
+| `display_status(name)` | `{open, ready, canOpen, view, following}` — poll this; **no window is opened by polling** |
+| `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` (IDD stream available) |
+| `open_display(name, view=None)` | `(status, body)` — open (or focus / switch) the window; `body` has `view` and `following` |
 | `close_display(name)` | `(status, body)` — close it |
-
-The pattern is **poll-then-open**:
 
 ```python
 c.start("dev")
-while not c.display_ready("dev"):    # running + agentOnline + agent says display driver up
-    time.sleep(1)
-c.open_display("dev")                # a window appears on the daemon's desktop
-...
+c.open_display("dev")                # booting: the Hyper-V console (boot screen) appears ...
+c.wait_online("dev")
+# ... and the same window switches itself to the IDD stream once the agent
+# reports the display driver up: display_status("dev")["view"] -> "idd"
+c.open_display("dev", view="console")  # manual switch back to the Hyper-V console
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
 
-- **`ready` gates the open.** It is `running && agentOnline &&
+- **`POST /v1/vms/{name}/display`** takes an optional body `{"view": "auto" |
+  "console" | "idd"}`:
+  - `auto` (default): IDD if `ready`, otherwise the Hyper-V console, which then
+    **follows** the boot — it switches to IDD on its own as soon as `ready` turns
+    true, opening the IDD window where the console was.
+  - `console`: the Hyper-V console, staying there.
+  - `idd`: the IDD stream; refused with `409 display_not_ready` until `ready`.
+  On an already-open window, `console` / `idd` switch it (applied within a
+  fraction of a second) and `auto` just focuses it. The response is
+  `{"ok":true,"displayOpen":true,"view":"console"|"idd","following":bool}`.
+  An unknown `view` is `400 bad_view`.
+- **`ready` means the IDD stream is available.** It is `running && agentOnline &&
   idd_ready`, where `idd_ready` is the **guest agent's own report** that the display
   driver is up (`idd_status:ok`) — a latched flag, **not** a probe: reading it touches no
   window and no frame channel, so polling can't disturb the display. (Connecting to the
   frame channel to "check" would itself become the display's single consumer.)
-  Opening before `ready` would show a black window, so
-  `open_display` returns `409 display_not_ready`.
-- **`displayOpen`** (in every status object) reflects the *live* window, however
-  it closed — `close_display`, the window's `[X]`, VM delete, and daemon exit all
-  drive it false. `open_display` on an already-open VM just focuses the window
-  (foregrounding it).
+  `canOpen` is just `running` — a booting VM can be opened before `ready` and
+  shows the console. `view` is what an open window shows (`null` when closed);
+  `following` is true while it is on the console waiting to switch to IDD.
+- **In the window itself** the user can switch too: the console window's toolbar
+  has **Switch to VM Display** (if the guest display isn't up yet, the window
+  switches as soon as it is), and the IDD window's system menu (right-click the
+  title bar) has **Show Hyper-V Screen (boot console)**.
+- **`displayOpen` / `displayView`** (in every status object) reflect the *live*
+  window, however it closed — `close_display`, the window's `[X]`, VM delete, and
+  daemon exit all drive them to `false` / `null`. `open_display` on an
+  already-open VM just focuses the window (foregrounding it).
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an
   invisible window. Multiple VMs' displays can be open at once.
+- The Hyper-V console only shows what the guest draws on the synthetic video
+  adapter: once the Windows agent disables that adapter in favour of the IDD
+  monitor, the console stays dark, so use the IDD view for a running desktop.
 - Serves both Windows and Linux guests.
 
 ---
@@ -316,7 +346,7 @@ subprocess.run(["ssh", "-i", asb.key_path(), "-p", str(i["port"]),
 | `401 Unauthorized` | missing/bad bearer token (only `version` is open) |
 | `404 Not Found` | unknown VM/route |
 | `405 Method Not Allowed` | wrong verb for the route |
-| `409 Conflict` | state conflict: edit/snapshot while running (`vm_running`), delete while building (`vm_building`), daemon shutdown with active VMs (`vms_active`, lists them), or open-display refused (`no_display` no interactive desktop · `not_running` · `display_not_ready` agent hasn't reported the display driver up yet) |
+| `409 Conflict` | state conflict: edit/snapshot while running (`vm_running`), delete while building (`vm_building`), daemon shutdown with active VMs (`vms_active`, lists them), or open-display refused (`no_display` no interactive desktop · `not_running` · `display_not_ready` `view: "idd"` requested before the agent reported the display driver up) |
 | `500 Internal Server Error` | the core returned a failure (`error.hr`) |
 | `501 Not Implemented` | the feature isn't supported on this host (`not_supported`); mirror of `capabilities` |
 

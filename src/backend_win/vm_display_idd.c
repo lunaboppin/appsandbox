@@ -213,6 +213,12 @@ struct VmDisplayIdd {
     volatile BOOL open;
     volatile BOOL stop;
 
+    /* Owned by vm_display_auto: open at init_pos, offer "Show Hyper-V Screen" */
+    BOOL          switchable;
+    BOOL          has_init_pos;
+    POINT         init_pos;
+    volatile LONG switch_requested;
+
     /* D3D11 */
     ID3D11Device            *device;
     ID3D11DeviceContext     *ctx;
@@ -296,6 +302,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_SHOW_CONSOLE   0x1030
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -1920,7 +1927,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
         d->hwnd = CreateWindowExW(
             exstyle, IDD_DISPLAY_CLASS, title, style,
-            CW_USEDEFAULT, CW_USEDEFAULT,
+            d->has_init_pos ? d->init_pos.x : CW_USEDEFAULT,
+            d->has_init_pos ? d->init_pos.y : CW_USEDEFAULT,
             wr.right - wr.left, wr.bottom - wr.top,
             NULL, NULL, d->hInstance, d);
     }
@@ -1945,6 +1953,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            if (d->switchable)
+                AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_CONSOLE,
+                            L"Show Hyper-V Screen (boot console)");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
@@ -2113,6 +2124,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 BringWindowToTop(d->log_hwnd);
                 SetForegroundWindow(d->log_hwnd);
             }
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_SHOW_CONSOLE) {
+            /* vm_display_auto picks this up and swaps this window for the
+               Hyper-V console. */
+            InterlockedExchange(&d->switch_requested, 1);
             return 0;
         }
         break;
@@ -2407,7 +2424,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * Public API
  * ================================================================== */
 
-VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+static VmDisplayIdd *idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd,
+                                BOOL switchable, const POINT *pos)
 {
     VmDisplayIdd *d;
 
@@ -2426,6 +2444,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     wcscpy_s(d->os_type, 32, vm->os_type);
     d->hInstance    = hInstance;
     d->main_hwnd   = main_hwnd;
+    d->switchable   = switchable;
+    if (pos) { d->init_pos = *pos; d->has_init_pos = TRUE; }
     d->open         = TRUE;
     d->stop         = FALSE;
     d->input_socket       = INVALID_SOCKET;
@@ -2461,6 +2481,32 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     return d;
+}
+
+VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+{
+    return idd_create(vm, hInstance, main_hwnd, FALSE, NULL);
+}
+
+VmDisplayIdd *vm_display_idd_create_switchable(VmInstance *vm, HINSTANCE hInstance,
+                                               HWND main_hwnd, const POINT *pos)
+{
+    return idd_create(vm, hInstance, main_hwnd, TRUE, pos);
+}
+
+BOOL vm_display_idd_take_switch_request(VmDisplayIdd *display)
+{
+    return display && InterlockedExchange(&display->switch_requested, 0) != 0;
+}
+
+BOOL vm_display_idd_get_pos(VmDisplayIdd *display, POINT *pos)
+{
+    RECT rc;
+    if (!display || !pos || !display->hwnd || !GetWindowRect(display->hwnd, &rc))
+        return FALSE;
+    pos->x = rc.left;
+    pos->y = rc.top;
+    return TRUE;
 }
 
 void vm_display_idd_destroy(VmDisplayIdd *display)

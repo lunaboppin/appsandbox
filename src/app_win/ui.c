@@ -13,6 +13,7 @@
 #include "snapshot.h"
 #include "vm_display.h"
 #include "vm_display_idd.h"
+#include "vm_display_auto.h"
 #include "vm_agent.h"
 #include "webview2_bridge.h"
 #include "prereq.h"
@@ -44,9 +45,9 @@ static int g_selected_vm = -1;
 static int g_min_width = 0;
 static int g_min_height = 0;
 
-/* Display windows (indexed parallel to the library's VM array) */
-static VmDisplay *g_displays[ASB_MAX_VMS];
-static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
+/* Display windows (indexed parallel to the library's VM array). Each shows
+   the Hyper-V console while the VM boots and the IDD stream once it is up. */
+static VmDisplayAuto *g_vm_displays[ASB_MAX_VMS];
 
 /* Console window for the hidden shared-storage appliance (not in the VM array) */
 static VmDisplay *g_appliance_display = NULL;
@@ -141,22 +142,12 @@ static void send_templates(void);
 
 /* ---- Safe display teardown ---- */
 
-static void safe_destroy_rdp(int idx)
+static void safe_destroy_display(int idx)
 {
-    if (idx >= 0 && idx < ASB_MAX_VMS && g_displays[idx]) {
-        VmDisplay *d = g_displays[idx];
-        g_displays[idx] = NULL;
-        vm_display_disconnect(d);
-        vm_display_destroy(d);
-    }
-}
-
-static void safe_destroy_idd(int idx)
-{
-    if (idx >= 0 && idx < ASB_MAX_VMS && g_idd_displays[idx]) {
-        VmDisplayIdd *d = g_idd_displays[idx];
-        g_idd_displays[idx] = NULL;
-        vm_display_idd_destroy(d);
+    if (idx >= 0 && idx < ASB_MAX_VMS && g_vm_displays[idx]) {
+        VmDisplayAuto *d = g_vm_displays[idx];
+        g_vm_displays[idx] = NULL;
+        vm_display_auto_destroy(d);
     }
 }
 
@@ -649,67 +640,35 @@ static void ui_show_alert(const wchar_t *message)
 
 /* ---- Display connections ---- */
 
-/* Linux / legacy display path: connects to vmwp.exe's Basic Session named
-   pipe (\\.\pipe\<vm-name>.BasicSession) and renders via MsRdpClient10
-   ActiveX. Reads the synthetic Hyper-V Video adapter framebuffer — works
-   for any guest from BIOS / GRUB onward, no guest cooperation required.
-   Used as a side-debug window during install: while cloud-init is still
-   bringing up the desktop and our IDD agent isn't up yet, this is the
-   only way to see what the VM is actually doing. Coexists with IDD —
-   they render from independent sources so both can stay open. */
-static void do_connect_rdp(int idx)
+/* Open (or focus) the VM's display window. view = VDA_VIEW_AUTO shows the
+   Hyper-V console (vmwp.exe's BasicSession pipe: the synthetic video
+   framebuffer from firmware / boot loader onward, no guest cooperation)
+   while the guest agent and IDD driver are not up, and switches the same
+   window to the IDD stream once asb_vm_idd_ready turns TRUE. CONSOLE / IDD
+   pick a source explicitly; on an open window they switch it. */
+static void do_connect_vm(int idx, VdaView view)
 {
-    VmInstance *v;
-    wchar_t pipe[300];
-    int tries;
-    if (idx < 0 || idx >= asb_vm_count()) return;
-    v = asb_vm_instance(asb_vm_get(idx));
-    if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
-    if (g_displays[idx] && vm_display_is_open(g_displays[idx])) {
-        ui_log(L"RDP display already open."); return;
-    }
-    safe_destroy_rdp(idx);
-
-    /* vmwp.exe creates the pipe a couple of seconds after the VM starts;
-       poll briefly so the first Connect click doesn't race the worker. */
-    swprintf_s(pipe, 300, L"\\\\.\\pipe\\%s.BasicSession", v->name);
-    for (tries = 0; tries < 50; tries++) {
-        if (WaitNamedPipeW(pipe, 0)) break;
-        {
-            DWORD err = GetLastError();
-            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_SEM_TIMEOUT) break;
-        }
-        Sleep(100);
-    }
-
-    ui_log(L"Opening RDP basic-session display for \"%s\"...", v->name);
-    g_displays[idx] = vm_display_create(v, g_hInstance, g_hwnd_main);
-    if (!g_displays[idx]) ui_log(L"Error: Failed to create RDP display window.");
-}
-
-static void do_connect_idd(int idx)
-{
+    AsbVm vm;
     VmInstance *v;
     if (idx < 0 || idx >= asb_vm_count()) return;
-    v = asb_vm_instance(asb_vm_get(idx));
+    vm = asb_vm_get(idx);
+    v = asb_vm_instance(vm);
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
-    /* The frame service is a single-consumer channel.  Do not create a
-       window until the guest has reported that AppSandboxVDD is running;
-       otherwise auto-open races the guest setup and leaves a permanent
-       black window with no useful diagnostic. */
-    if (!asb_vm_idd_ready(asb_vm_get(idx))) {
+    /* The frame service is a single-consumer channel; only an explicit IDD
+       request is refused before the guest reports AppSandboxVDD running. */
+    if (view == VDA_VIEW_IDD && !asb_vm_idd_ready(vm)) {
         ui_log(L"IDD display for \"%s\" is not ready (guest VDD driver is not running).",
                v->name);
         return;
     }
-    if (g_idd_displays[idx] && vm_display_idd_is_open(g_idd_displays[idx])) {
-        vm_display_idd_focus(g_idd_displays[idx]);
+    if (g_vm_displays[idx] && vm_display_auto_is_open(g_vm_displays[idx])) {
+        if (view != VDA_VIEW_AUTO) vm_display_auto_set_view(g_vm_displays[idx], view);
+        vm_display_auto_focus(g_vm_displays[idx]);
         return;
     }
-    safe_destroy_idd(idx);
-    ui_log(L"Opening IDD display for \"%s\"...", v->name);
-    g_idd_displays[idx] = vm_display_idd_create(v, g_hInstance, g_hwnd_main);
-    if (!g_idd_displays[idx]) ui_log(L"Error: Failed to create IDD display window.");
+    safe_destroy_display(idx);
+    g_vm_displays[idx] = vm_display_auto_create(v, g_hInstance, g_hwnd_main, view);
+    if (!g_vm_displays[idx]) ui_log(L"Error: Failed to create the display window.");
 }
 
 /* Console viewer for the hidden shared-storage appliance. Uses the RDP
@@ -743,30 +702,6 @@ static void do_connect_appliance_console(void)
     ui_log(L"Opening console display for the shared appliance...");
     g_appliance_display = vm_display_create(v, g_hInstance, g_hwnd_main);
     if (!g_appliance_display) ui_log(L"Error: Failed to create the appliance console window.");
-}
-
-/* User-initiated Connect: open BOTH the IDD display and the RDP
-   basic-session display side-by-side.
-     - IDD renders the in-VM agent's captured framebuffer (Windows: VDD,
-       Linux: appsandbox-display via vsock :2). Empty until the agent
-       comes online.
-     - RDP renders the Hyper-V Video adapter framebuffer via vmwp.exe's
-       BasicSession named pipe. Works from BIOS / GRUB onward, no guest
-       cooperation needed. Crucial for debugging install / first boot —
-       you can watch cloud-init, kernel messages, GDM coming up.
-   Both windows are independent; either can be closed manually. The
-   automatic RDP -> IDD switching handlers (WM_VM_AGENT_ONLINE,
-   WM_VM_HYPERV_VIDEO_OFF) keep using the per-display functions so they
-   can close one without re-opening the other. */
-static void do_connect_vm(int idx)
-{
-    /* Direct ISO->VHDX flow boots straight into the configured rootfs with
-       IDD live from the start, so the RDP fallback window is no longer
-       needed. do_connect_rdp() + vm_display.c stay on disk as reference
-       for the RDP-over-named-pipe pattern but are no longer invoked.
-       The g_displays[]/safe_destroy_rdp cleanup paths remain inert
-       because nothing populates the slots. */
-    do_connect_idd(idx);
 }
 
 /* ---- System tray ---- */
@@ -994,15 +929,14 @@ static void tray_show_menu(HWND hwnd)
         DestroyWindow(hwnd);
     } else if (cmd >= TRAY_CMD_STOP_BASE) {
         int vi = cmd - TRAY_CMD_STOP_BASE;
-        safe_destroy_rdp(vi);
-        safe_destroy_idd(vi);
+        safe_destroy_display(vi);
         asb_vm_stop(asb_vm_get(vi));
         send_vm_list();
     } else if (cmd >= TRAY_CMD_SHUTDOWN_BASE) {
         asb_vm_shutdown(asb_vm_get(cmd - TRAY_CMD_SHUTDOWN_BASE));
         send_vm_list();
     } else if (cmd >= TRAY_CMD_CONNECT_BASE) {
-        do_connect_vm(cmd - TRAY_CMD_CONNECT_BASE);
+        do_connect_vm(cmd - TRAY_CMD_CONNECT_BASE, VDA_VIEW_AUTO);
     }
 }
 
@@ -1204,8 +1138,7 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &idx)) {
             VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
             if (inst) inst->shutdown_requested = TRUE;
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
+            safe_destroy_display(idx);
             asb_vm_shutdown(asb_vm_get(idx));
             send_vm_list();
         }
@@ -1214,13 +1147,19 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &idx)) {
             VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
             if (inst) inst->shutdown_requested = TRUE;
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
+            safe_destroy_display(idx);
             asb_vm_stop(asb_vm_get(idx));
             send_vm_list();
         }
     } else if (wcscmp(action, L"connectIddVm") == 0) {
-        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_vm(idx);
+        /* optional "view": "auto" (default) | "console" | "idd" */
+        int idx;
+        wchar_t view[16] = L"";
+        json_get_string(json, L"view", view, 16);
+        if (json_get_int(json, L"vmIndex", &idx))
+            do_connect_vm(idx, wcscmp(view, L"console") == 0 ? VDA_VIEW_CONSOLE
+                             : wcscmp(view, L"idd") == 0     ? VDA_VIEW_IDD
+                                                             : VDA_VIEW_AUTO);
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
@@ -1271,16 +1210,13 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
             int j;
             ui_log(L"Deleting VM \"%s\"...", asb_vm_name(asb_vm_get(idx)));
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
+            safe_destroy_display(idx);
             asb_vm_delete(asb_vm_get(idx));
             /* Compact display arrays */
             for (j = idx; j < asb_vm_count(); j++) {
-                g_displays[j] = g_displays[j + 1];
-                g_idd_displays[j] = g_idd_displays[j + 1];
+                g_vm_displays[j] = g_vm_displays[j + 1];
             }
-            g_displays[asb_vm_count()] = NULL;
-            g_idd_displays[asb_vm_count()] = NULL;
+            g_vm_displays[asb_vm_count()] = NULL;
             g_selected_vm = -1;
             send_vm_list();
             ui_log(L"VM deleted.");
@@ -1736,8 +1672,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int idx = asb_vm_index(vm);
 
         if (idx >= 0 && !running) {
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
+            safe_destroy_display(idx);
         }
 
         send_vm_list();
@@ -1750,14 +1685,11 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int idx = (int)wp;
         int count = asb_vm_count();
         int j;
-        safe_destroy_rdp(idx);
-        safe_destroy_idd(idx);
+        safe_destroy_display(idx);
         for (j = idx; j < count; j++) {
-            g_displays[j] = g_displays[j + 1];
-            g_idd_displays[j] = g_idd_displays[j + 1];
+            g_vm_displays[j] = g_vm_displays[j + 1];
         }
-        g_displays[count] = NULL;
-        g_idd_displays[count] = NULL;
+        g_vm_displays[count] = NULL;
         send_vm_list();
         send_templates();
         return 0;
@@ -1770,14 +1702,11 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
+                /* An open window switches from the Hyper-V console to IDD
+                   by itself (vm_display_auto); this only auto-opens one. */
                 if (inst->auto_open_display && asb_vm_idd_ready(asb_vm_get(i)) &&
-                    g_displays[i] && vm_display_is_open(g_displays[i])) {
-                    ui_log(L"Agent online - switching \"%s\" from RDP to IDD.", inst->name);
-                    safe_destroy_rdp(i);
-                    do_connect_idd(i);
-                } else if (inst->auto_open_display && asb_vm_idd_ready(asb_vm_get(i)) &&
-                           !g_idd_displays[i] && !inst->shutdown_requested) {
-                    do_connect_idd(i);
+                    !g_vm_displays[i] && !inst->shutdown_requested) {
+                    do_connect_vm(i, VDA_VIEW_IDD);
                 }
                 break;
             }
@@ -1796,9 +1725,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (asb_vm_idd_ready(asb_vm_get(i)) && !g_idd_displays[i]) {
+                if (asb_vm_idd_ready(asb_vm_get(i)) && !g_vm_displays[i]) {
                     ui_log(L"VDD ready - opening IDD display for \"%s\".", inst->name);
-                    do_connect_idd(i);
+                    do_connect_vm(i, VDA_VIEW_IDD);
                 }
                 break;
             }
@@ -1831,20 +1760,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_VM_HYPERV_VIDEO_OFF:
     {
         VmInstance *inst = (VmInstance *)lp;
-        if (inst && inst->running) {
-            int i, count = asb_vm_count();
+        /* An open Hyper-V console window follows the guest to IDD on its
+           own (vm_display_auto), so there is nothing to switch here. */
+        if (inst && inst->running)
             inst->hyperv_video_off = TRUE;
-            for (i = 0; i < count; i++) {
-                if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (asb_vm_idd_ready(asb_vm_get(i)) &&
-                    g_displays[i] && vm_display_is_open(g_displays[i])) {
-                    ui_log(L"Hyper-V Video disabled - switching to IDD.");
-                    safe_destroy_rdp(i);
-                    do_connect_idd(i);
-                }
-                break;
-            }
-        }
         send_vm_list();
         return 0;
     }
@@ -1860,8 +1779,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (wp == 0) safe_destroy_rdp(i);
-                if (wp == 1) safe_destroy_idd(i);
+                /* wp 0 = Hyper-V console, 1 = IDD: either way the window is gone */
+                safe_destroy_display(i);
                 break;
             }
         }
@@ -1884,8 +1803,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             vm_agent_stop(inst);
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                safe_destroy_rdp(i);
-                safe_destroy_idd(i);
+                safe_destroy_display(i);
                 break;
             }
             asb_vm_cleanup_network(inst);
@@ -1912,9 +1830,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (g_displays[i]) {
-                    safe_destroy_rdp(i);
-                    ui_log(L"RDP display torn down for \"%s\" (GPU driver activation).", inst->name);
+                if (g_vm_displays[i] &&
+                    vm_display_auto_view(g_vm_displays[i]) == VDA_VIEW_CONSOLE) {
+                    safe_destroy_display(i);
+                    ui_log(L"Hyper-V screen torn down for \"%s\" (GPU driver activation).", inst->name);
                 }
                 break;
             }
@@ -2027,8 +1946,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         tray_remove();
         webview2_cleanup();
         for (i = 0; i < ASB_MAX_VMS; i++) {
-            safe_destroy_rdp(i);
-            safe_destroy_idd(i);
+            safe_destroy_display(i);
         }
         safe_destroy_appliance_display();
         asb_cleanup();

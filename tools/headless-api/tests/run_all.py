@@ -48,7 +48,8 @@ COVERAGE = [
     ("delete-during-build guard (409)",         "per-VM (each thread, mid-build)"),
     ("GET .../sshInfo",                         "per-VM"),
     ("SSH key auto-deploy + key-only login",    "per-VM (sshEnabled+sshDeployKey, each OS)"),
-    ("GET/POST/DELETE .../display open+close",   "per-VM when online (Win+mac); skip on no-desktop / Linux-pre-push"),
+    ("GET/POST/DELETE .../display open+close",   "per-VM when online (Win+Linux); skip on no-desktop / Linux-pre-push"),
+    ("display boot screen -> auto IDD switch",   "per-VM at the config-applied boot; skip on no-desktop"),
     ("snapshots take/rename/delete + GET tree", "per-VM"),
     ("branches: start-from-snapshot + delete",  "per-VM"),
     ("GET /events (SSE) per VM",                "per-VM (each thread, concurrent SSE)"),
@@ -90,6 +91,8 @@ if RUN_STATIC:
     results["appliance-autostart"] = [] if p.returncode == 0 else ["test_shared_appliance_autostart_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_release_shared_resource_artifacts.py")], cwd=HERE)
     results["appliance-artifacts"] = [] if p.returncode == 0 else ["test_release_shared_resource_artifacts.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_display_boot_screen_contract.py")], cwd=HERE)
+    results["display-boot-screen"] = [] if p.returncode == 0 else ["test_display_boot_screen_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_and_validation.py")], cwd=HERE)
     results["static"] = [] if p.returncode == 0 else ["test_host_and_validation.py exit %d" % p.returncode]
 

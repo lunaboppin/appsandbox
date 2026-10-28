@@ -13,6 +13,21 @@ typedef struct VmDisplay VmDisplay;
    Returns a display context, or NULL on failure. */
 VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd);
 
+/* Like vm_display_create, for a window owned by vm_display_auto: opens at
+   *pos when non-NULL and adds a "Switch to VM Display" toolbar button whose
+   clicks are collected with vm_display_take_switch_request. */
+VmDisplay *vm_display_create_switchable(VmInstance *vm, HINSTANCE hInstance,
+                                        HWND main_hwnd, const POINT *pos);
+
+/* TRUE (once per click) if the user pressed the switch button. */
+BOOL vm_display_take_switch_request(VmDisplay *display);
+
+/* Top-left corner of the window in screen coordinates. */
+BOOL vm_display_get_pos(VmDisplay *display, POINT *pos);
+
+/* Restore (if minimized) and bring the window to the foreground. */
+void vm_display_focus(VmDisplay *display);
+
 /* Close the display window and free resources. */
 void vm_display_destroy(VmDisplay *display);
 

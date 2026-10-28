@@ -174,19 +174,28 @@ class Client:
                          {"enabled": bool(enabled)})
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
-    def open_display(self, name):
+    def open_display(self, name, view=None):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
         interactive session that can show a window (a headless/SSH/service daemon
-        returns 409 "no_display"). Returns (status, body); status() reports
-        displayOpen, which also goes false if the user closes the window."""
-        return self._req("POST", "/vms/%s/display" % name)
+        returns 409 "no_display"). While the guest's display driver is not up yet
+        (booting), the window shows the Hyper-V console -- the boot screen -- and
+        switches itself to the IDD stream once it is. view: None/"auto" (that
+        behaviour), "console" (stay on the Hyper-V console) or "idd" (409
+        "display_not_ready" until display_ready()); on an open window it switches
+        the source. Returns (status, body) with body["view"] = "console" | "idd"
+        and body["following"] (on the console, will switch to IDD by itself);
+        status() reports displayOpen/displayView, which also clear if the user
+        closes the window."""
+        return self._req("POST", "/vms/%s/display" % name, {"view": view} if view else None)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
     def display_status(self, name):
-        """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
-        display driver is up (running + agentOnline + idd_status) -- a passive flag,
-        NOT a probe: polling it touches no window and no frame channel, so it can't
-        disturb the display. Wait for ready, then call open_display()."""
+        """{'open', 'ready', 'canOpen', 'view', 'following'}. 'ready' is the agent's
+        own report that the display driver is up (running + agentOnline +
+        idd_status), i.e. the IDD stream is available -- a passive flag, NOT a
+        probe: polling it touches no window and no frame channel, so it can't
+        disturb the display. 'canOpen' is just "running": before 'ready' the window
+        shows the Hyper-V console. 'view' is "console" / "idd" / None (closed)."""
         return self._req("GET", "/vms/%s/display" % name)[1]
     def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])

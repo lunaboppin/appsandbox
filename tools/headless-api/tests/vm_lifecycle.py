@@ -156,7 +156,9 @@ def run_vm_lifecycle(spec):
         son = boot_online("post-install")
         check("guest installComplete", bool(son) and son["installComplete"], "state=%s" % (son and son["state"]))
 
-        # --- display: a quick programmatic open + close now that the VM is online.
+        # --- display: a quick programmatic open + close now that the VM is online,
+        #     which opens straight onto the IDD stream. (The boot-time Hyper-V
+        #     console path is exercised at the "config applied" boot below.)
         #     Readiness (running + agentOnline + the display driver up) is a latched,
         #     passive flag -- never a frame-channel probe. SKIPped (not failed) so CI
         #     stays green in two cases:
@@ -179,6 +181,7 @@ def run_vm_lifecycle(spec):
                 print("  SKIP  [%s] display open/close -- no interactive desktop on daemon session" % name, flush=True)
             else:
                 check("display open -> 200", oc == 200, "%s %s" % (oc, ob))
+                check("display opens on IDD when ready", ob.get("view") == "idd", "%s" % ob)
                 check("displayOpen true after open", bool(st()) and st().get("displayOpen") is True)
                 cc, cb = c.close_display(name)
                 check("display close -> 200", cc == 200, "%s %s" % (cc, cb))
@@ -235,7 +238,47 @@ def run_vm_lifecycle(spec):
         for field, val in fields:
             check("edit %s=%s (stopped) -> 200" % (field, val), c.edit(name, **{field: val})[0] == 200)
             check("%s persisted = %s" % (field, val), st()[field] == val, "got=%s" % st()[field])
+        # --- boot screen: opening the display on a BOOTING VM shows the Hyper-V
+        #     console (the synthetic video framebuffer), and the same window
+        #     switches itself to the IDD stream once the agent reports the
+        #     display driver up. An explicit view=idd is still refused while the
+        #     driver is down. ---
+        c.start(name)
+        deadline = time.time() + 60
+        while time.time() < deadline and not (st() and st()["running"]):
+            time.sleep(1)
+        boot_display = False
+        oc, ob = c.open_display(name, view="idd")
+        if oc == 409 and ob.get("error", {}).get("code") == "no_display":
+            print("  SKIP  [%s] boot-screen display -- no interactive desktop on daemon session" % name, flush=True)
+        else:
+            check("display view=idd while booting -> 409 display_not_ready",
+                  oc == 409 and ob.get("error", {}).get("code") == "display_not_ready", "%s %s" % (oc, ob))
+            oc, ob = c.open_display(name)
+            check("display open while booting -> 200", oc == 200, "%s %s" % (oc, ob))
+            check("booting display shows the Hyper-V console",
+                  ob.get("view") == "console" and ob.get("following") is True, "%s" % ob)
+            check("displayView console while booting", bool(st()) and st().get("displayView") == "console")
+            boot_display = oc == 200
         sv = boot_online("config applied")
+        if boot_display:
+            deadline = time.time() + 90
+            while time.time() < deadline and c.display_status(name).get("view") != "idd":
+                time.sleep(2)
+            ds = c.display_status(name)
+            if ds.get("view") != "idd" and not ds.get("ready") and os_type == "Linux":
+                print("  SKIP  [%s] console -> IDD switch -- Linux guest readiness needs the pushed agent" % name, flush=True)
+            else:
+                check("booting display switched itself to IDD", ds.get("open") and ds.get("view") == "idd", "%s" % ds)
+            oc, ob = c.open_display(name, view="console")
+            check("manual switch to console -> 200", oc == 200 and ob.get("view") == "console", "%s %s" % (oc, ob))
+            deadline = time.time() + 15
+            while time.time() < deadline and c.display_status(name).get("view") != "console":
+                time.sleep(1)
+            check("display shows console after manual switch", c.display_status(name).get("view") == "console")
+            cc, cb = c.close_display(name)
+            check("boot display close -> 200", cc == 200, "%s %s" % (cc, cb))
+            check("displayView null after close", bool(st()) and st().get("displayView") is None)
         for field, val in fields:
             check("running reports %s=%s" % (field, val), sv[field] == val, "got=%s" % sv[field])
         graceful_down("after config")

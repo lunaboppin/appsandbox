@@ -340,6 +340,7 @@ static const IDispatchVtbl g_sink_vtbl = {
 
 #define IDC_BTN_SESSION_TOGGLE 5001
 #define IDC_BTN_CTRL_ALT_DEL   5002
+#define IDC_BTN_SWITCH_IDD     5003
 #define TOOLBAR_HEIGHT 30
 /* Private messages for display thread */
 #define WM_DISPLAY_ENHANCE    (WM_USER + 1)
@@ -362,6 +363,13 @@ struct VmDisplay {
     VmInstance         *vm;
     HINSTANCE           hInstance;
     BOOL                ole_inited;
+
+    /* Owned by vm_display_auto: open at init_pos, show the switch button */
+    BOOL                switchable;
+    BOOL                has_init_pos;
+    POINT               init_pos;
+    HWND                btn_switch;    /* "VM Display" toolbar button    */
+    volatile LONG       switch_requested;
 
     /* Display thread */
     HANDLE              thread;        /* dedicated thread handle       */
@@ -845,14 +853,16 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
     }
     ensure_class(d->hInstance);
 
-    swprintf_s(title, 300, L"%s - Display", d->vm->name);
+    swprintf_s(title, 300, d->switchable ? L"%s - Hyper-V Screen" : L"%s - Display",
+               d->vm->name);
 
     /* ---- Create main display window ---- */
 
     d->hwnd = CreateWindowExW(
         0, DISPLAY_CLASS, title,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1280, 860,
+        d->has_init_pos ? d->init_pos.x : CW_USEDEFAULT,
+        d->has_init_pos ? d->init_pos.y : CW_USEDEFAULT, 1280, 860,
         NULL, NULL, d->hInstance, d);
 
     if (!d->hwnd) {
@@ -872,6 +882,14 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         158, 2, 130, TOOLBAR_HEIGHT - 4,
         d->hwnd, (HMENU)(INT_PTR)IDC_BTN_CTRL_ALT_DEL, d->hInstance, NULL);
+
+    /* Hand the window over to the guest's IDD stream (vm_display_auto
+       does the actual swap; it switches by itself once the agent is up). */
+    if (d->switchable)
+        d->btn_switch = CreateWindowExW(0, L"BUTTON", L"Switch to VM Display",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            292, 2, 170, TOOLBAR_HEIGHT - 4,
+            d->hwnd, (HMENU)(INT_PTR)IDC_BTN_SWITCH_IDD, d->hInstance, NULL);
 
     /* ---- Child window to host the ActiveX RDP control ---- */
 
@@ -999,7 +1017,8 @@ fail:
  * Public API
  * ================================================================== */
 
-VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+static VmDisplay *display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd,
+                                 BOOL switchable, const POINT *pos)
 {
     VmDisplay *d;
 
@@ -1013,6 +1032,8 @@ VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd
     d->hInstance  = hInstance;
     d->main_hwnd  = main_hwnd;
     d->running    = TRUE;
+    d->switchable = switchable;
+    if (pos) { d->init_pos = *pos; d->has_init_pos = TRUE; }
 
     d->thread = CreateThread(NULL, 0, display_thread_proc, d, 0, NULL);
     if (!d->thread) {
@@ -1022,6 +1043,42 @@ VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd
     }
 
     return d;
+}
+
+VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+{
+    return display_create(vm, hInstance, main_hwnd, FALSE, NULL);
+}
+
+VmDisplay *vm_display_create_switchable(VmInstance *vm, HINSTANCE hInstance,
+                                        HWND main_hwnd, const POINT *pos)
+{
+    return display_create(vm, hInstance, main_hwnd, TRUE, pos);
+}
+
+BOOL vm_display_take_switch_request(VmDisplay *display)
+{
+    return display && InterlockedExchange(&display->switch_requested, 0) != 0;
+}
+
+BOOL vm_display_get_pos(VmDisplay *display, POINT *pos)
+{
+    RECT rc;
+    if (!display || !pos || !display->hwnd || !GetWindowRect(display->hwnd, &rc))
+        return FALSE;
+    pos->x = rc.left;
+    pos->y = rc.top;
+    return TRUE;
+}
+
+void vm_display_focus(VmDisplay *display)
+{
+    HWND h;
+    if (!display || !display->running) return;
+    h = display->hwnd;
+    if (!h || !IsWindow(h)) return;
+    if (IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
+    SetForegroundWindow(h);
 }
 
 void vm_display_destroy(VmDisplay *display)
@@ -1211,6 +1268,10 @@ static LRESULT CALLBACK display_wnd_proc(
         }
         if (d && LOWORD(wp) == IDC_BTN_CTRL_ALT_DEL) {
             send_ctrl_alt_del(d);
+            return 0;
+        }
+        if (d && LOWORD(wp) == IDC_BTN_SWITCH_IDD) {
+            InterlockedExchange(&d->switch_requested, 1);
             return 0;
         }
         break;

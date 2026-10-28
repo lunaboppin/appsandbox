@@ -32,7 +32,7 @@
 #include "asb_core.h"          /* full API incl. internal VmInstance */
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
-#include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
+#include "vm_display_auto.h"   /* display window (Hyper-V console while booting, then IDD) */
 
 #pragma comment(lib, "httpapi.lib")
 
@@ -61,14 +61,16 @@ static char              *g_ev_ring[EV_CAP];   /* recent event JSON (ring) */
 static LONG               g_ev_seq = 0;        /* total events ever produced */
 static volatile LONG      g_stop_all = 0;      /* signals SSE threads to exit */
 
-/* ---- IDD display windows (POST/DELETE /v1/vms/{name}/display) ---- */
-static HINSTANCE g_hinst;   /* captured in run_headless; passed to vm_display_idd */
+/* ---- Display windows (POST/DELETE /v1/vms/{name}/display) ---- */
+static HINSTANCE g_hinst;   /* captured in run_headless; passed to vm_display_auto */
 
-/* Per-VM display handles, keyed by VM unique_id (survives g_vms[] compaction). The
-   window runs on its own thread inside vm_display_idd, so it never blocks the
+/* Per-VM display handles, keyed by VM unique_id (survives g_vms[] compaction). Each
+   shows the Hyper-V console while the VM boots and switches itself to the IDD
+   stream once the agent reports the display driver up (vm_display_auto). The
+   windows and the switch run on their own threads, so they never block the
    single-threaded request loop. Sized to ASB_MAX_VMS; concurrent VMs are capped at
    16 by the agent table, so this never fills. */
-typedef struct { UINT64 vm_id; VmDisplayIdd *disp; } DisplayEntry;
+typedef struct { UINT64 vm_id; VmDisplayAuto *disp; } DisplayEntry;
 static DisplayEntry g_displays[ASB_MAX_VMS];
 
 static DisplayEntry *display_find(UINT64 vm_id)
@@ -82,22 +84,29 @@ static DisplayEntry *display_find(UINT64 vm_id)
 static void display_drop(DisplayEntry *e)   /* destroy the window + free the slot */
 {
     if (!e) return;
-    if (e->disp) vm_display_idd_destroy(e->disp);
+    if (e->disp) vm_display_auto_destroy(e->disp);
     e->disp = NULL; e->vm_id = 0;
 }
 /* TRUE if this VM has a live (not user-closed) display window. */
 static BOOL display_is_open(UINT64 vm_id)
 {
     DisplayEntry *e = display_find(vm_id);
-    return e && e->disp && vm_display_idd_is_open(e->disp);
+    return e && e->disp && vm_display_auto_is_open(e->disp);
 }
-/* If the user closed the window (X), vm_display_idd has already stopped its threads
-   and freed the vsock frame connection (WM_CLOSE handler); drop our now-dead handle
-   so the slot frees. Called before acting on any display request. */
+/* JSON value for the source an open display shows: "console" / "idd" / null. */
+static const char *display_view_json(UINT64 vm_id)
+{
+    DisplayEntry *e = display_find(vm_id);
+    if (!e || !e->disp || !vm_display_auto_is_open(e->disp)) return "null";
+    return vm_display_auto_view(e->disp) == VDA_VIEW_IDD ? "\"idd\"" : "\"console\"";
+}
+/* If the user closed the window (X), its display thread has already stopped and
+   freed its connection (WM_CLOSE handler); drop our now-dead handle so the slot
+   frees. Called before acting on any display request. */
 static void display_reap_stale(UINT64 vm_id)
 {
     DisplayEntry *e = display_find(vm_id);
-    if (e && e->disp && !vm_display_idd_is_open(e->disp))
+    if (e && e->disp && !vm_display_auto_is_open(e->disp))
         display_drop(e);
 }
 /* A-gate: can this process put a window on a visible desktop? FALSE in a service /
@@ -251,7 +260,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
         "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
-        "\"displayOpen\":%s,\"sharedResourcePending\":%s,\"sharedResourceTransport\":",
+        "\"displayOpen\":%s,\"displayView\":%s,\"sharedResourcePending\":%s,\"sharedResourceTransport\":",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
         v->install_complete ? "true" : "false", v->building_vhdx ? "true" : "false",
@@ -261,6 +270,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
         v->gpu_mode, v->network_mode,
         display_is_open(v->unique_id) ? "true" : "false",
+        display_view_json(v->unique_id),
         v->shared_resource_pending ? "true" : "false");
     pos = append_wstr(out, cap, pos, v->shared_resource_transport);
     pos += sprintf_s(out + pos, cap - pos, ",\"sharedResourceError\":");
@@ -1029,7 +1039,25 @@ static int handle_request(PHTTP_REQUEST req)
             if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
             display_reap_stale(v->unique_id);   /* drop a self-closed (X) display first */
             if (verb == HttpVerbPOST) {
+                /* Optional body {"view": "auto" | "console" | "idd"}. auto (default)
+                   shows the Hyper-V console -- vmwp.exe's synthetic video, visible
+                   from firmware / boot loader on -- while the guest display driver is
+                   not up, and switches the same window to the IDD stream once it is.
+                   On an open window, view switches it. */
                 DisplayEntry *e;
+                wchar_t body[512], vw[16] = L"";
+                VdaView view = VDA_VIEW_AUTO;
+                BOOL ready;
+                char b[160];
+                body_to_wide(req, body, _countof(body));
+                json_get_string(body, L"view", vw, _countof(vw));
+                if (wcscmp(vw, L"console") == 0)  view = VDA_VIEW_CONSOLE;
+                else if (wcscmp(vw, L"idd") == 0) view = VDA_VIEW_IDD;
+                else if (vw[0] && wcscmp(vw, L"auto") != 0) {
+                    send_err(req->RequestId, 400, "Bad Request", "bad_view",
+                             "view must be \"auto\", \"console\" or \"idd\"");
+                    return 0;
+                }
                 if (!host_can_show_window()) {
                     send_err(req->RequestId, 409, "Conflict", "no_display",
                              "no local interactive desktop is available to show the window "
@@ -1041,18 +1069,21 @@ static int handle_request(PHTTP_REQUEST req)
                              "VM is not running; start it before opening the display");
                     return 0;
                 }
-                /* Gate on display readiness -- a passive read of agent-online + the
-                   agent's latched idd_status (display driver up). It never probes the
-                   frame channel, so the check itself can't steal the single consumer
-                   slot or blank the display the way a connect-test would. */
-                if (!asb_vm_idd_ready(vm)) {
+                /* Only an explicit IDD request needs the display driver. Readiness is a
+                   passive read of agent-online + the agent's latched idd_status; it
+                   never probes the frame channel, so the check itself can't steal the
+                   single consumer slot or blank the display the way a connect-test would. */
+                ready = asb_vm_idd_ready(vm);
+                if (view == VDA_VIEW_IDD && !ready) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_ready",
-                             "the VM's virtual display driver is not up yet; retry shortly");
+                             "the VM's virtual display driver is not up yet; open with view "
+                             "\"auto\" to watch the boot on the Hyper-V console meanwhile");
                     return 0;
                 }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
                 if (e) {
-                    vm_display_idd_focus(e->disp);            /* already open -> bring to front */
+                    if (view != VDA_VIEW_AUTO) vm_display_auto_set_view(e->disp, view);
+                    vm_display_auto_focus(e->disp);           /* already open -> bring to front */
                 } else {
                     int slot; for (slot = 0; slot < ASB_MAX_VMS && g_displays[slot].vm_id; slot++) {}
                     if (slot == ASB_MAX_VMS) {
@@ -1061,7 +1092,7 @@ static int handle_request(PHTTP_REQUEST req)
                         return 0;
                     }
                     e = &g_displays[slot];
-                    e->disp = vm_display_idd_create(v, g_hinst, NULL);
+                    e->disp = vm_display_auto_create(v, g_hinst, NULL, view);
                     if (!e->disp) {
                         e->vm_id = 0;
                         send_err(req->RequestId, 500, "Internal Server Error", "display_failed",
@@ -1070,7 +1101,17 @@ static int handle_request(PHTTP_REQUEST req)
                     }
                     e->vm_id = v->unique_id;
                 }
-                send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":true}");
+                /* "view" is what the window shows (an explicit switch on an open window
+                   is applied within a poll tick); "following" means it is on the console
+                   and will switch to IDD by itself once the guest display is up. */
+                {
+                    VdaView shown = view != VDA_VIEW_AUTO ? view : vm_display_auto_view(e->disp);
+                    BOOL following = view == VDA_VIEW_AUTO && vm_display_auto_following(e->disp);
+                    sprintf_s(b, sizeof(b),
+                              "{\"ok\":true,\"displayOpen\":true,\"view\":\"%s\",\"following\":%s}",
+                              vm_display_auto_view_name(shown), following ? "true" : "false");
+                }
+                send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }
             if (verb == HttpVerbDELETE) {
@@ -1081,13 +1122,19 @@ static int handle_request(PHTTP_REQUEST req)
             if (verb == HttpVerbGET) {
                 /* Pollable state -- NO window, and NO frame-channel contact. "ready" is
                    asb_vm_idd_ready: running + agent-online + the agent's latched
-                   idd_status flag, so a client can poll this on an interval (it disturbs
-                   nothing) and POST to open once ready. */
-                char b[160];
+                   idd_status flag, i.e. the IDD stream is available; a running VM can be
+                   opened before that (it shows the Hyper-V console). "view" is what an
+                   open window shows: "console" or "idd" (null when closed). */
+                char b[200];
                 BOOL open = display_is_open(v->unique_id);
-                BOOL ready = open || asb_vm_idd_ready(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s}",
-                          open ? "true" : "false", ready ? "true" : "false");
+                BOOL ready = asb_vm_idd_ready(vm);
+                DisplayEntry *e = display_find(v->unique_id);
+                sprintf_s(b, sizeof(b),
+                          "{\"open\":%s,\"ready\":%s,\"canOpen\":%s,\"view\":%s,\"following\":%s}",
+                          open ? "true" : "false", ready ? "true" : "false",
+                          v->running ? "true" : "false",
+                          display_view_json(v->unique_id),
+                          (open && e && vm_display_auto_following(e->disp)) ? "true" : "false");
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }
