@@ -2411,6 +2411,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
+        /* A key only reaches this thread when our window has focus. If the
+           activation that sets input_focused was missed (another of our
+           windows being destroyed can take it), recover from the actual
+           foreground window instead of dropping keys until a re-activate. */
+        if (!d->input_focused && GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd)
+            d->input_focused = TRUE;
         if (d->input_focused)
             idd_forward_key(d, (DWORD)wp, scan, ext, up);
         return 0;

@@ -99,6 +99,18 @@ static BOOL swap_to_idd(VmDisplayAuto *d)
     VmDisplayIdd *idd;
 
     ui_log(L"\"%s\": guest display is up - switching to the IDD display.", d->vm->name);
+    /* Close the Hyper-V screen first. Destroying its RDP control after the
+       IDD window had come up moved activation away from the IDD window, so
+       it never saw the WM_ACTIVATE that enables keyboard forwarding and the
+       user couldn't type until switching views by hand. */
+    EnterCriticalSection(&d->cs);
+    old = d->con;
+    d->con = NULL;
+    LeaveCriticalSection(&d->cs);
+    if (old) {
+        vm_display_disconnect(old);
+        vm_display_destroy(old);
+    }
     idd = vm_display_idd_create_switchable(d->vm, d->hinst, d->main_hwnd,
                                            has_pos ? &pos : NULL);
     if (!idd) {
@@ -106,17 +118,11 @@ static BOOL swap_to_idd(VmDisplayAuto *d)
         return FALSE;
     }
     EnterCriticalSection(&d->cs);
-    old = d->con;
-    d->con = NULL;
     d->idd = idd;
     d->view = VDA_VIEW_IDD;
     d->follow = FALSE;
     mark_new_window(d);
     LeaveCriticalSection(&d->cs);
-    if (old) {
-        vm_display_disconnect(old);
-        vm_display_destroy(old);
-    }
     return TRUE;
 }
 
