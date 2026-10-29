@@ -877,6 +877,37 @@ static void remember_storage_parent(const wchar_t *root)
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
 
+/* The session helpers the agent spawns live beside it in the guest. They are
+   refreshed with it, best-effort and only where the guest already has them,
+   so a fix to one (e.g. the input helper) reaches existing VMs too. */
+static void refresh_guest_helpers(wchar_t drive, const wchar_t *source_dir)
+{
+    static const wchar_t *helpers[] = {
+        L"appsandbox-input.exe", L"appsandbox-clipboard.exe",
+        L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe",
+        L"appsandbox-displays.exe", NULL
+    };
+    wchar_t source[MAX_PATH], dest[MAX_PATH], temp[MAX_PATH];
+    BYTE a[32], b[32];
+    int i;
+    for (i = 0; helpers[i]; i++) {
+        swprintf_s(source, MAX_PATH, L"%s\\%s", source_dir, helpers[i]);
+        swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\%s", drive, helpers[i]);
+        if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) continue;
+        if (SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
+            memcmp(a, b, 32) == 0) continue;
+        swprintf_s(temp, MAX_PATH, L"%s.new", dest);
+        if (!CopyFileW(source, temp, FALSE) ||
+            !MoveFileExW(temp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            asb_log(L"Guest helper refresh: %s failed (%lu).", helpers[i], GetLastError());
+            DeleteFileW(temp);
+            continue;
+        }
+        asb_log(L"Guest helper refresh: updated %s.", helpers[i]);
+    }
+}
+
 /* Update the guest agent on the active writable VHDX before attaching SMB.
    Only the active disk is mounted; checkpoint parents remain frozen. */
 static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
@@ -915,6 +946,7 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
     for(bit=0;bit<26;bit++)if(after&(1u<<bit)){
         wchar_t windows[MAX_PATH];swprintf_s(windows,MAX_PATH,L"%c:\\Windows",L'A'+bit);
         if(GetFileAttributesW(windows)==INVALID_FILE_ATTRIBUTES)continue;
+        refresh_guest_helpers(L'A'+(wchar_t)bit,dir);
         swprintf_s(dest,MAX_PATH,L"%c:\\Windows\\AppSandbox\\appsandbox-agent.exe",L'A'+bit);
         swprintf_s(temp,MAX_PATH,L"%s.new",dest);
         if(SUCCEEDED(sha256_file(source,a))&&SUCCEEDED(sha256_file(dest,b))&&memcmp(a,b,32)==0){hr=S_OK;break;}
