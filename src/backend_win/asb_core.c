@@ -564,6 +564,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"InstallComplete=1\n");
         if (g_vms[i].auto_open_display)
             fwprintf(f, L"AutoOpenDisplay=1\n");
+        if (g_vms[i].secure_boot_off)
+            fwprintf(f, L"SecureBootOff=1\n");
         if (g_vms[i].guest_grow_target_gb)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
@@ -697,6 +699,8 @@ static void load_vm_list(void)
             vm->install_complete = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"AutoOpenDisplay=", 16) == 0)
             vm->auto_open_display = (_wtoi(line + 16) != 0);
+        else if (wcsncmp(line, L"SecureBootOff=", 14) == 0)
+            vm->secure_boot_off = (_wtoi(line + 14) != 0);
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
@@ -3968,6 +3972,7 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         args->config.network_mode = inst->network_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
+        args->config.secure_boot_off = inst->secure_boot_off;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         args->config.shared_resource_count = shared_resources_build_attachments(
             inst->os_type, inst->shared_resource_exclusions,
@@ -4405,6 +4410,23 @@ ASB_API HRESULT asb_vm_set_auto_open_display(AsbVm vm, BOOL enabled)
     inst = &g_vms[idx];
     inst->auto_open_display = enabled ? TRUE : FALSE;
     if (!enabled) idd_probe_stop(inst);
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* Takes effect on the next start. Windows VMs only: Linux guests and the
+   appliance never get the Secure Boot template anyway. */
+ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled)
+{
+    VmInstance *inst;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    if (_wcsicmp(inst->os_type, L"Windows") != 0) return E_INVALIDARG;
+    inst->secure_boot_off = enabled ? FALSE : TRUE;
+    asb_log(L"Secure Boot %s for \"%s\"; applies on the next start.",
+            enabled ? L"on" : L"off", inst->name);
     if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
     if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
     return S_OK;

@@ -256,6 +256,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"imagePath", v->image_path);
     jb_string(jb, L"vhdxPath", v->vhdx_path);
     jb_bool(jb, L"autoOpenDisplay", v->auto_open_display);
+    jb_bool(jb, L"secureBoot", !v->secure_boot_off);
     jb_bool(jb, L"managementBusy", asb_vm_management_busy(asb_vm_get(i)));
     jb_int(jb, L"guestGrowTargetGb", (int)v->guest_grow_target_gb);
     jb_string(jb, L"sharedResourceExclusions", v->shared_resource_exclusions);
@@ -1585,6 +1586,11 @@ static void on_webview2_message(const wchar_t *json)
         int vi; BOOL enabled = FALSE; HRESULT hr = E_INVALIDARG;
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
             hr = asb_vm_set_auto_open_display(asb_vm_get(vi), enabled);
+        send_manage_result(0, hr); send_vm_list();
+    } else if (wcscmp(action, L"setVmSecureBoot") == 0) {
+        int vi; BOOL enabled = TRUE; HRESULT hr = E_INVALIDARG;
+        if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
+            hr = asb_vm_set_secure_boot(asb_vm_get(vi), enabled);
         send_manage_result(0, hr); send_vm_list();
     } else if (wcscmp(action, L"moveVmStorage") == 0) {
         int vi; wchar_t parent[MAX_PATH] = { 0 };

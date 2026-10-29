@@ -1004,12 +1004,17 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        The appliance skips it too: its Server Core image gains nothing from
        Secure Boot, and applying the template into a fresh vm.gs under
        GuestStateOnly was observed to break DVD boot ("SCSI DVD boot loader
-       failed") with older Server ISOs. */
+       failed") with older Server ISOs.
+       A Windows VM can opt out per VM (Manage > Secure Boot) so test-signed
+       kernel drivers such as the audio driver load; the guest already runs
+       bcdedit /set testsigning on, which Secure Boot otherwise overrides. */
     secureboot_section[0] = L'\0';
     if (!is_windows || config->is_appliance) {
         /* No Secure Boot section at all. Unsigned boot chains and the
            appliance's fresh vm.gs both depend on the template being absent
            rather than merely skipped. */
+    } else if (config->secure_boot_off) {
+        /* Same as above: no template, so the firmware boots without it. */
     } else {
         wcscpy_s(secureboot_section, 512,
             L",\"ApplySecureBootTemplate\":\"Apply\""
