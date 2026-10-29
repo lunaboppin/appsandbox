@@ -56,6 +56,13 @@ def main() -> None:
     assert 'strncmp(command, "vpn_set:", 8) == 0' in vm_agent, "host log must redact vpn_set"
     assert "net.ipv6.conf.all.disable_ipv6 = 1" in disk, "the gateway must not route IPv6"
     assert "restore_bindings_locked(" in gateway, "a restarted gateway must rebind running VMs"
+    # A VPN VM never waits on the gateway: prepare only makes the endpoint,
+    # a worker brings the gateway up and routes the VM.
+    prepare = gateway[gateway.index("HRESULT vpn_gateway_prepare_client("):]
+    prepare = prepare[:prepare.index("\n}\n")]
+    assert "ensure_running_locked" not in prepare and "start_connect_worker();" in prepare
+    assert "#define GATEWAY_RAM_MB      1024" in gateway, "512 MB OOM-kills setup"
+    assert "vpn_gateway_setup_in_background();" in core, "set the gateway up when a config exists"
 
     # ---- VMs: NET_VPN endpoint from the gateway, guest gets gateway + VPN DNS ----
     assert core.count("vpn_gateway_prepare_client(") == 4, "every network setup path handles NET_VPN"

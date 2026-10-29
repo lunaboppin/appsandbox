@@ -3103,6 +3103,7 @@ ASB_API HRESULT asb_init(void)
     shared_appliance_init();
     vpn_configs_init();
     vpn_gateway_init();
+    if (vpn_configs_count() > 0) vpn_gateway_setup_in_background();
     {
         int ri;
         for(ri=0;ri<g_vm_count;ri++){
@@ -4999,7 +5000,9 @@ ASB_API BOOL asb_vpn_config_get(int index, AsbVpnConfigInfo *out)
 ASB_API HRESULT asb_vpn_config_import(const wchar_t *name, const wchar_t *text,
                                       wchar_t *error, size_t error_chars)
 {
-    return vpn_configs_import(name, text, NULL, 0, error, error_chars);
+    HRESULT hr = vpn_configs_import(name, text, NULL, 0, error, error_chars);
+    if (SUCCEEDED(hr)) vpn_gateway_setup_in_background();
+    return hr;
 }
 
 ASB_API HRESULT asb_vpn_config_delete(const wchar_t *id)

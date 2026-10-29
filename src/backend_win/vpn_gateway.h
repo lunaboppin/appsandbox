@@ -43,6 +43,8 @@ const char *vpn_gateway_lan_ip(void);
 /* Drop a config's tunnel from the running gateway (after it is deleted). */
 void vpn_gateway_unload_config(const wchar_t *config_id);
 HRESULT vpn_gateway_stop(void);
+/* Set the gateway up now (if it isn't) so the first VPN VM need not wait. */
+void vpn_gateway_setup_in_background(void);
 
 BOOL vpn_gateway_handle_hcs_state(VmInstance *instance, DWORD event);
 VmInstance *vpn_gateway_instance_by_id(UINT64 id);

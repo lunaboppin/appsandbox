@@ -23,7 +23,8 @@
 #define GATEWAY_UPLINK_MAC_COLON "02:15:5d:a5:b1:fe"
 #define GATEWAY_LAN_MAC     "02-15-5D-A5-B1-02"
 #define GATEWAY_LAN_MAC_COLON "02:15:5d:a5:b1:02"
-#define GATEWAY_RAM_MB      512
+/* 512 MB OOM-killed cloud-init during setup (apt + locale generation). */
+#define GATEWAY_RAM_MB      1024
 #define GATEWAY_IDLE_MS     (5ull * 60ull * 1000ull)
 #define GATEWAY_SETUP_TIMEOUT_MS  (20ull * 60ull * 1000ull)
 #define GATEWAY_START_TIMEOUT_MS  (3ull * 60ull * 1000ull)
@@ -399,7 +400,9 @@ static void restore_bindings_locked(const VmInstance *except)
     int i;
     for (i = 0; i < asb_vm_count(); i++) {
         VmInstance *vm = asb_vm_instance(asb_vm_get(i));
-        if (!vm || vm == except || !vm->running || vm->network_mode != NET_VPN || !vm->vpn_ip[0])
+        /* vpn_ip is set from prepare until release, which also covers a VM
+           whose start is still in progress. */
+        if (!vm || vm == except || vm->network_mode != NET_VPN || !vm->vpn_ip[0])
             continue;
         if (FAILED(bind_locked(vm)))
             ui_log(L"VPN gateway: \"%s\" stays offline until it is restarted.", vm->name);
@@ -416,6 +419,53 @@ static BOOL vpn_ip_in_use(const VmInstance *self, const char *ip)
             return TRUE;
     }
     return FALSE;
+}
+
+/* Bring the gateway up (setting it up first if needed) and route every
+   prepared VPN VM into its tunnel. Runs off the VM start path: a VPN VM
+   boots straight away and is simply offline until this finishes. */
+static DWORD WINAPI connect_worker(LPVOID parameter)
+{
+    HRESULT hr;
+    (void)parameter;
+    EnterCriticalSection(&g_gw.lifecycle);
+    hr = ensure_running_locked();
+    if (SUCCEEDED(hr)) restore_bindings_locked(NULL);
+    else ui_log(L"VPN gateway: VPN VMs stay offline until it is running (0x%08X).", hr);
+    LeaveCriticalSection(&g_gw.lifecycle);
+    return 0;
+}
+
+static void start_connect_worker(void)
+{
+    HANDLE thread = CreateThread(NULL, 0, connect_worker, NULL, 0, NULL);
+    if (thread) CloseHandle(thread);
+}
+
+/* Set the gateway up ahead of time, so the first VPN VM doesn't wait for
+   it. Leaves it stopped when no VPN VM needs it. */
+static DWORD WINAPI setup_worker(LPVOID parameter)
+{
+    (void)parameter;
+    EnterCriticalSection(&g_gw.lifecycle);
+    if (!g_gw.status.configured && SUCCEEDED(ensure_running_locked())) {
+        restore_bindings_locked(NULL);
+        if (g_gw.status.active_clients == 0) {
+            stop_vm(FALSE);
+            set_progress(L"Set up; starts when a VPN VM starts");
+        }
+    }
+    LeaveCriticalSection(&g_gw.lifecycle);
+    return 0;
+}
+
+void vpn_gateway_setup_in_background(void)
+{
+    HANDLE thread;
+    if (!g_gw.initialized) vpn_gateway_init();
+    if (g_gw.status.configured || g_gw.status.busy) return;
+    thread = CreateThread(NULL, 0, setup_worker, NULL, 0, NULL);
+    if (thread) CloseHandle(thread);
 }
 
 HRESULT vpn_gateway_prepare_client(VmInstance *vm, GUID *network_id, GUID *endpoint_id,
@@ -436,9 +486,9 @@ HRESULT vpn_gateway_prepare_client(VmInstance *vm, GUID *network_id, GUID *endpo
         return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     }
     InterlockedIncrement(&g_gw.idle_generation);
-    EnterCriticalSection(&g_gw.lifecycle);
-    hr = ensure_running_locked();
-    if (FAILED(hr)) goto done;
+    /* Only the endpoint is made here; the gateway is brought up and the VM
+       routed by connect_worker, so the VM never waits on the gateway. */
+    EnterCriticalSection(&g_gw.state);
 
     for (p = vm->name; *p; ++p) { hash ^= towlower(*p); hash *= 16777619u; }
     octet = 10 + (int)(hash % 240u);
@@ -459,21 +509,12 @@ HRESULT vpn_gateway_prepare_client(VmInstance *vm, GUID *network_id, GUID *endpo
         strcpy_s(vm->vpn_mac, sizeof(vm->vpn_mac), actual_mac);
     else
         strcpy_s(vm->vpn_mac, sizeof(vm->vpn_mac), mac);
-
-    hr = bind_locked(vm);
-    if (FAILED(hr)) {
-        hcn_delete_endpoint(endpoint_id);
-        endpoint_guid[0] = L'\0';
-        vm->vpn_ip[0] = '\0';
-        goto done;
-    }
-    restore_bindings_locked(vm);
-    EnterCriticalSection(&g_gw.state);
     g_gw.status.active_clients++;
-    LeaveCriticalSection(&g_gw.state);
-    ui_log(L"VPN: \"%s\" routes through \"%s\" at %S.", vm->name, info.name, vm->vpn_ip);
+    ui_log(L"VPN: \"%s\" will route through \"%s\" at %S%s.", vm->name, info.name, vm->vpn_ip,
+           g_gw.status.ready ? L"" : L"; it stays offline until the VPN gateway is up");
 done:
-    LeaveCriticalSection(&g_gw.lifecycle);
+    LeaveCriticalSection(&g_gw.state);
+    if (SUCCEEDED(hr)) start_connect_worker();
     InterlockedIncrement(&g_gw.idle_generation);
     return hr;
 }
@@ -549,10 +590,10 @@ HRESULT vpn_gateway_stop(void)
 {
     HRESULT hr;
     if (!g_gw.initialized) return S_OK;
-    EnterCriticalSection(&g_gw.lifecycle);
+    /* No lifecycle lock: a start or setup holds it while it waits for the
+       agent, and stopping the VM is what ends that wait. */
     hr = stop_vm(FALSE);
     set_progress(g_gw.status.configured ? L"Stopped" : L"Not set up");
-    LeaveCriticalSection(&g_gw.lifecycle);
     return hr;
 }
 
