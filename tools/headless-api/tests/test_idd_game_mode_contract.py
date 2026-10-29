@@ -43,7 +43,7 @@ def main() -> None:
 
     # Driver: one packed send per frame
     assert "static int VddPackFrame(" in vdd
-    assert "VddSendAll(proc->hClientConn, (const char*)proc->pSendBuf, len)" in vdd
+    assert "VddSendAll(proc->sendConn, (const char*)proc->pSendBufOut, proc->sendLen)" in vdd
     assert "mapped.pData + row * mapped.RowPitch),\n" not in vdd, "no per-row sends"
 
     # Driver updates reach existing VMs
