@@ -5089,6 +5089,10 @@ ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id)
 { return shared_appliance_mount_host_resource(id); }
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id)
 { return shared_appliance_unmount_host_resource(id); }
+ASB_API BOOL asb_shared_resource_host_mounted(const wchar_t *id)
+{ return shared_appliance_host_mounted(id); }
+ASB_API HRESULT asb_shared_resource_assign_host_letter(const wchar_t *id)
+{ return shared_appliance_assign_host_letter(id); }
 ASB_API HRESULT asb_shared_resource_unc_path(const wchar_t *id, wchar_t *out, size_t chars)
 { return shared_appliance_resource_unc_path(id, out, chars); }
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id)
