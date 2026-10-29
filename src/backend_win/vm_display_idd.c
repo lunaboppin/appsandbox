@@ -1656,8 +1656,18 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    /* Frame pipeline timing, logged every 2 s: how long each frame takes to
+       arrive once it starts (transfer) against how often frames start (the
+       guest's rate). Slow transfer points at the link, slow starts at the
+       guest (game, readback). */
+    LARGE_INTEGER perf_freq, perf_window, perf_t0, perf_t1;
+    double perf_recv_ms = 0.0;
+    UINT64 perf_bytes = 0;
+    UINT perf_frames = 0, perf_full = 0;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
+    QueryPerformanceFrequency(&perf_freq);
+    QueryPerformanceCounter(&perf_window);
 
     /* Allocate receive buffer for frame pixel data */
     recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
@@ -1815,6 +1825,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
 
             /* Read rest of frame header (already read magic) */
+            QueryPerformanceCounter(&perf_t0);
             hdr.magic = magic;
             if (!recv_exact(s, (BYTE *)&hdr + sizeof(UINT32),
                             sizeof(FrameHeader) - sizeof(UINT32)))
@@ -1854,6 +1865,27 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))
                     break;
+            }
+
+            QueryPerformanceCounter(&perf_t1);
+            perf_recv_ms += (double)(perf_t1.QuadPart - perf_t0.QuadPart) * 1000.0 /
+                            (double)perf_freq.QuadPart;
+            perf_bytes += data_size;
+            perf_frames++;
+            if (rect_count == 0) perf_full++;
+            {
+                double window_ms = (double)(perf_t1.QuadPart - perf_window.QuadPart) * 1000.0 /
+                                   (double)perf_freq.QuadPart;
+                if (window_ms >= 2000.0) {
+                    idd_log(d, L"Frames: %.1f fps (%u full), transfer %.1f ms/frame, %.0f MB/s while sending.",
+                            perf_frames * 1000.0 / window_ms, perf_full,
+                            perf_recv_ms / perf_frames,
+                            perf_recv_ms > 0 ? (double)perf_bytes / 1048.576 / perf_recv_ms : 0.0);
+                    perf_window = perf_t1;
+                    perf_recv_ms = 0.0;
+                    perf_bytes = 0;
+                    perf_frames = perf_full = 0;
+                }
             }
 
             /* Update CPU-side frame buffer */

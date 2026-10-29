@@ -563,6 +563,13 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
     UINT cachedRowPitch = VDD_STRIDE;
+    /* Per-frame timing, logged every 2 s: readback (copy + map), packing and
+       sending. With the frame rate this shows which stage limits it. */
+    LARGE_INTEGER perfFreq, perfWindow, perfA, perfB;
+    double perfReadMs = 0.0, perfPackMs = 0.0, perfSendMs = 0.0;
+    UINT perfFrames = 0, perfFull = 0;
+    QueryPerformanceFrequency(&perfFreq);
+    QueryPerformanceCounter(&perfWindow);
 
 
     /* Main frame acquisition loop */
@@ -659,10 +666,13 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = pSurface->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
                 if (SUCCEEDED(hr) && pTexture)
                 {
+                    QueryPerformanceCounter(&perfA);
                     proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
 
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
                     hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                    QueryPerformanceCounter(&perfB);
+                    perfReadMs += (double)(perfB.QuadPart - perfA.QuadPart) * 1000.0 / (double)perfFreq.QuadPart;
                     if (SUCCEEDED(hr))
                     {
                         bHasFrame = TRUE;
@@ -705,12 +715,33 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                     if (dirtyRects[i].bottom > (LONG)VDD_HEIGHT) dirtyRects[i].bottom = VDD_HEIGHT;
                                 }
                             }
+                            QueryPerformanceCounter(&perfA);
                             len = VddPackFrame(proc, &mapped, dirtyRects, sendFull ? 0 : rectCount);
+                            QueryPerformanceCounter(&perfB);
+                            perfPackMs += (double)(perfB.QuadPart - perfA.QuadPart) * 1000.0 / (double)perfFreq.QuadPart;
                             /* All rects empty after clamping: nothing to send. */
                             if (len == 0 && !sendFull) goto skip_send;
+                            perfA = perfB;
                             send_ok = len > 0 &&
                                 VddSendAll(proc->hClientConn, (const char*)proc->pSendBuf, len) == 0;
+                            QueryPerformanceCounter(&perfB);
+                            perfSendMs += (double)(perfB.QuadPart - perfA.QuadPart) * 1000.0 / (double)perfFreq.QuadPart;
+                            perfFrames++;
+                            if (sendFull || rectCount == 0) perfFull++;
                             if (send_ok && sendFull) bSentFullFrame = TRUE;
+                            {
+                                double windowMs = (double)(perfB.QuadPart - perfWindow.QuadPart) * 1000.0 /
+                                                  (double)perfFreq.QuadPart;
+                                if (windowMs >= 2000.0 && perfFrames) {
+                                    VddLog("Perf: %.1f fps sent (%u full), readback %.1f ms, pack %.1f ms, send %.1f ms per frame",
+                                           perfFrames * 1000.0 / windowMs, perfFull,
+                                           perfReadMs / perfFrames, perfPackMs / perfFrames,
+                                           perfSendMs / perfFrames);
+                                    perfWindow = perfB;
+                                    perfReadMs = perfPackMs = perfSendMs = 0.0;
+                                    perfFrames = perfFull = 0;
+                                }
+                            }
 
                             if (!send_ok) {
                                 VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
