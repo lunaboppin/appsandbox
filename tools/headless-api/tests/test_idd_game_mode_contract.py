@@ -53,10 +53,22 @@ def main() -> None:
     upd = agent[agent.index("static void apply_staged_driver_update("):]
     upd = upd[:upd.index("\n}\n")]
     assert upd.index('L"disable %s"') < upd.index('run_devcon_inf(L"update"') < upd.index('L"enable %s"')
+    # ...also when no marker is left but the staged build isn't the installed one.
+    assert "if (!pending && strcmp(stamp, installed) == 0) return;" in upd
+    assert 'L"AppSandboxVDD.dll", L"vdd-installed.stamp"' in agent
+    # Runs from the driver store, so an update never overwrites a loaded DLL.
+    inf = read("tools/vdd/AppSandboxVDD.inf")
+    assert "ServiceBinary = %13%\\AppSandboxVDD.dll" in inf
+    assert "UMDriverCopy = 13" in inf and "%12%\\UMDF\\AppSandboxVDD.dll" not in inf.split("ServiceBinary")[1]
     assert "refresh_guest_display_driver(drive, source_dir);" in core
     assert "guest_payload_current(vm->vhdx_path, stamp)" in core
     # Drivers are built beside the app, not in resources\ with the helpers.
     assert "static void guest_drivers_dir(" in core
+    # Any changed file of a package (an INF-only change too) restages it.
+    refresh = core[core.index("static void refresh_guest_driver("):]
+    refresh = refresh[:refresh.index("\n}\n")]
+    assert "memcmp(a, b, 32) != 0) break;" in refresh and "if (!files[i]) return;" in refresh
+    assert 'L"*AppSandboxVDD.inf", L"*AppSandboxVAD.inf"' in core
     assert "guest_drivers_dir(source_dir, drivers_dir, MAX_PATH);" in core
     assert "guest_drivers_dir(dir, drivers_dir, MAX_PATH);" in core
     print("[ok] IDD game mode (relative mouse capture, packed frames) contract")

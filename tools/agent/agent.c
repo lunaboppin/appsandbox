@@ -1684,16 +1684,49 @@ static DWORD run_devcon_inf(const wchar_t *verb, const wchar_t *inf, const wchar
     return run_devcon_wait(args);
 }
 
-static void apply_staged_driver_update(const wchar_t *marker_name, const wchar_t *inf,
-                                       const wchar_t *hwid)
+/* "<size>-<last write>" of drivers\<binary>; CopyFile keeps the write time,
+   so it changes exactly when the host stages a different build. */
+static BOOL staged_driver_stamp(const wchar_t *binary, char *out, size_t chars)
 {
-    wchar_t dir[MAX_PATH], marker[MAX_PATH];
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    agent_dir(dir, MAX_PATH);
+    swprintf_s(path, MAX_PATH, L"%s\\drivers\\%s", dir, binary);
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return FALSE;
+    sprintf_s(out, chars, "%lu-%lu-%lu", fa.nFileSizeLow,
+              fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime);
+    return TRUE;
+}
+
+/* Install drivers\<inf> when the host left drivers\<marker_name>, or when
+   the staged binary isn't the build this agent last installed (recorded in
+   drivers\<record_name>). The record covers a marker consumed by an attempt
+   that didn't take, and VMs from before the record existed. */
+static void apply_staged_driver_update(const wchar_t *marker_name, const wchar_t *inf,
+                                       const wchar_t *hwid, const wchar_t *binary,
+                                       const wchar_t *record_name)
+{
+    wchar_t dir[MAX_PATH], marker[MAX_PATH], record[MAX_PATH];
+    char stamp[64] = "", installed[64] = "";
+    BOOL pending;
     DWORD exit_code;
+    FILE *f;
     agent_dir(dir, MAX_PATH);
     swprintf_s(marker, MAX_PATH, L"%s\\drivers\\%s", dir, marker_name);
-    if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
-    /* One attempt per staging, so a package that won't install can't loop. */
+    swprintf_s(record, MAX_PATH, L"%s\\drivers\\%s", dir, record_name);
+    pending = GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES;
+    if (!staged_driver_stamp(binary, stamp, sizeof(stamp))) return;
+    if (_wfopen_s(&f, record, L"r") == 0 && f) {
+        if (!fgets(installed, sizeof(installed), f)) installed[0] = '\0';
+        fclose(f);
+    }
+    if (!pending && strcmp(stamp, installed) == 0) return;
+    /* One attempt per staged build, so a package that won't install can't loop. */
     DeleteFileW(marker);
+    if (_wfopen_s(&f, record, L"w") == 0 && f) {
+        fputs(stamp, f);
+        fclose(f);
+    }
     /* The device is already running by service start, so its binary is in
        use and an update only swaps it at the next reboot. Disabling it first
        unloads the binary; the update then applies now, on this boot. */
@@ -1708,8 +1741,10 @@ static void apply_staged_driver_update(const wchar_t *marker_name, const wchar_t
 
 static void apply_staged_vdd_update(void)
 {
-    apply_staged_driver_update(L"vdd-update.pending", L"AppSandboxVDD.inf", L"Root\\AppSandboxVDD");
-    apply_staged_driver_update(L"vad-update.pending", L"AppSandboxVAD.inf", L"Root\\AppSandboxVAD");
+    apply_staged_driver_update(L"vdd-update.pending", L"AppSandboxVDD.inf", L"Root\\AppSandboxVDD",
+                               L"AppSandboxVDD.dll", L"vdd-installed.stamp");
+    apply_staged_driver_update(L"vad-update.pending", L"AppSandboxVAD.inf", L"Root\\AppSandboxVAD",
+                               L"AppSandboxVAD.sys", L"vad-installed.stamp");
 }
 
 /* ---- Virtual audio device check ----

@@ -59,11 +59,15 @@ UmdfKernelModeClientPolicy = AllowKernelModeClients
 
 [AppSandboxVDD_WdfInstall]
 UmdfLibraryVersion = $UMDFVERSION$
-ServiceBinary = %12%\UMDF\AppSandboxVDD.dll
+; Run from the driver store (DIRID 13): each package installs to its own
+; folder, so an update never has to overwrite a DLL WUDFHost has loaded. The
+; old fixed %12%\UMDF copy kept the same version every build and was never
+; replaced, leaving VMs on their first build of the driver.
+ServiceBinary = %13%\AppSandboxVDD.dll
 UmdfExtensions = IddCx0102
 
 [DestinationDirs]
-UMDriverCopy = 12,UMDF ; copy to drivers\umdf
+UMDriverCopy = 13 ; the package's driver store folder
 
 [UMDriverCopy]
 AppSandboxVDD.dll
