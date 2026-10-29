@@ -1555,7 +1555,8 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         L"      printf '%%s\\n%%s\\n' '%s' '%s' | smbpasswd -s -a %s\n"
         L"      mkdir -p /mnt/appsandbox-seed; mount -o ro /dev/sr0 /mnt/appsandbox-seed || true\n"
         L"      gcc -O2 -pthread -D_GNU_SOURCE -o /usr/local/sbin/appsandbox-agent /mnt/appsandbox-seed/appsandbox-agent.c\n"
-        L"      cp /mnt/appsandbox-seed/appsandbox-agent.service /etc/systemd/system/\n"
+        /* ISO files are read-only and executable; systemd warns on that. */
+        L"      install -m 0644 /mnt/appsandbox-seed/appsandbox-agent.service /etc/systemd/system/\n"
         L"      systemctl daemon-reload; systemctl enable appsandbox-agent\n"
         L"      systemctl enable --now smbd\n"
         L"      umount /mnt/appsandbox-seed || true\n"
