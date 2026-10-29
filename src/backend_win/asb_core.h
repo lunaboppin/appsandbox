@@ -297,6 +297,9 @@ ASB_API const wchar_t *asb_vm_vpn_id(AsbVm vm);
 
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
+ASB_API BOOL asb_shared_resource_host_mounted(const wchar_t *id);
+/* Pick and save a free host drive letter for a resource that has none. */
+ASB_API HRESULT asb_shared_resource_assign_host_letter(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_unc_path(const wchar_t *id, wchar_t *out, size_t chars);
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
 

@@ -1277,7 +1277,7 @@ function renderSettingsResources(){
         name.textContent=r.driveLetter+': '+r.name;
         var meta=document.createElement('span');
         meta.className='settings-resource-meta';
-        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.enabled?'':' · Disabled')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
+        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.enabled?'':' · Disabled')+(r.hostMounted?' · Mounted on host'+(r.hostDriveLetter?' as '+r.hostDriveLetter+':':''):'')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
         details.append(name,meta);
         var actions=document.createElement('div');
         actions.className='settings-resource-actions';
@@ -1285,14 +1285,17 @@ function renderSettingsResources(){
         edit.type='button';edit.textContent='Edit';edit.title='Edit this shared resource definition.';
         edit.onclick=function(){editResource(r.id);};
         var mount=document.createElement('button');
-        mount.type='button';mount.textContent='Mount Host';mount.title='Mount this resource on the host using its configured host drive letter.';
-        mount.onclick=function(){mountHostResource(r.id);};
+        mount.type='button';mount.textContent='Mount Host';
+        mount.title=r.hostDriveLetter?'Map this resource as drive '+r.hostDriveLetter+': in File Explorer.':'Map this resource as a drive in File Explorer (a free letter is picked).';
+        mount.onclick=function(){mountHostResource(r.id,mount);};
         var open=document.createElement('button');
         open.type='button';open.textContent='Open Share';open.title='Open this resource in File Explorer on the host.';
         open.onclick=function(){sendCmd('openHostResource',{id:r.id});};
         var unmount=document.createElement('button');
-        unmount.type='button';unmount.textContent='Unmount';unmount.title='Unmount this resource from the host.';
-        unmount.onclick=function(){sendCmd('unmountHostResource',{id:r.id});};
+        unmount.type='button';unmount.textContent='Unmount';unmount.title='Disconnect this resource\'s drive from File Explorer.';
+        unmount.onclick=function(){unmount.disabled=true;unmount.textContent='Unmounting…';sendCmd('unmountHostResource',{id:r.id});};
+        /* Mount and Unmount swap: only the one that applies is shown. */
+        if(r.hostMounted)mount.style.display='none';else unmount.style.display='none';
         var purge=document.createElement('button');
         purge.type='button';purge.className='danger';purge.textContent='Purge Data';purge.title='Permanently delete all data stored in this resource.';
         purge.onclick=function(){showModal('Permanently purge data','Permanently delete all appliance data for '+r.name+'? This cannot be undone.','Purge').then(function(ok){if(ok)sendCmd('purgeSharedResource',{id:r.id});});};
@@ -1316,7 +1319,7 @@ function stopSharedAppliance(){sendCmd('stopSharedAppliance');}
 function updateSharedAppliance(){sendCmd('updateSharedAppliance');}
 function growSharedAppliance(){sendCmd('growSharedAppliance',{dataSizeGb:Number(document.getElementById('appliance-data-size').value)});}
 function rebuildSharedAppliance(){var p=appliancePayload();p.switchBackend=!!sharedAppliance.backend&&sharedAppliance.backend!==p.backend;showModal('Rebuild appliance',p.switchBackend?'Changing backend archives the old data VHDX and creates a new empty disk. Continue?':'Rebuild the appliance OS disk while preserving its data disk?','Rebuild').then(function(ok){if(ok)sendCmd('rebuildSharedAppliance',p);});}
-function mountHostResource(id){sendCmd('mountHostResource',{id:id});}
+function mountHostResource(id,button){if(button){button.disabled=true;button.textContent='Mounting…';}sendCmd('mountHostResource',{id:id});}
 function deleteSharedAppliance(){showModal('Delete shared appliance','Delete the shared appliance? Its OS disk and data disk are permanently deleted, including every shared resource\'s files. Shared resource definitions are kept and publish again after a new Setup.\n\nThis cannot be undone.','Delete').then(function(ok){if(ok)sendCmd('deleteSharedAppliance');});}
 /* ---- WireGuard VPN ---- */
 

@@ -79,6 +79,8 @@ void shared_appliance_release_client(VmInstance *runtime);
 
 HRESULT shared_appliance_mount_host_resource(const wchar_t *resource_id);
 HRESULT shared_appliance_unmount_host_resource(const wchar_t *resource_id);
+BOOL shared_appliance_host_mounted(const wchar_t *resource_id);
+HRESULT shared_appliance_assign_host_letter(const wchar_t *resource_id);
 /* \\<appliance>\<share> for a resource, as the host opens it. */
 HRESULT shared_appliance_resource_unc_path(const wchar_t *resource_id,
                                            wchar_t *out, size_t chars);

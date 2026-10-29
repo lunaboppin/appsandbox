@@ -14,6 +14,9 @@
 #include <aclapi.h>
 #include <shlwapi.h>
 #include <virtdisk.h>
+#include <winnetwk.h>
+#include <shlobj.h>
+#include <dbt.h>
 #include <stdio.h>
 #include <io.h>
 #include <share.h>
@@ -26,6 +29,8 @@
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "virtdisk.lib")
+#pragma comment(lib, "mpr.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define APPLIANCE_VM_NAME L"AppSandbox.SharedAppliance"
 #define APPLIANCE_UNIQUE_ID ((UINT64)0xFFFFFFFFFFFFFF00ull)
@@ -2117,9 +2122,158 @@ static DWORD host_mount_bit(const AsbSharedResourceInfo *resource)
     return offset >= 0 && offset < 26 ? (DWORD)1u << offset : 0;
 }
 
+/* Explorer runs unelevated in its own logon session, and a drive mapped by
+   this elevated process lands in ours, where Explorer never sees it (a global
+   SMB mapping shows up only after Explorer restarts). Drive letters are
+   therefore mapped as the shell's user: the calling thread impersonates the
+   token of the process that owns the shell window around the WNet calls. */
+static HANDLE shell_user_token(void)
+{
+    HWND shell = GetShellWindow();
+    DWORD pid = 0;
+    HANDLE process, token = NULL, impersonation = NULL;
+    if (!shell || !GetWindowThreadProcessId(shell, &pid) || !pid) return NULL;
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return NULL;
+    if (OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &token)) {
+        if (!DuplicateTokenEx(token, TOKEN_QUERY | TOKEN_IMPERSONATE, NULL,
+                              SecurityImpersonation, TokenImpersonation, &impersonation))
+            impersonation = NULL;
+        CloseHandle(token);
+    }
+    CloseHandle(process);
+    return impersonation;
+}
+
+static HRESULT impersonate_shell_user(HANDLE *token)
+{
+    *token = shell_user_token();
+    if (!*token) return HRESULT_FROM_WIN32(ERROR_NO_TOKEN);
+    if (!SetThreadToken(NULL, *token)) {
+        DWORD err = GetLastError();
+        CloseHandle(*token);
+        *token = NULL;
+        return HRESULT_FROM_WIN32(err);
+    }
+    return S_OK;
+}
+
+static void revert_shell_user(HANDLE token)
+{
+    RevertToSelf();
+    if (token) CloseHandle(token);
+}
+
+/* Drives in use in the shell user's session (its own mappings included). */
+static DWORD shell_user_drives(void)
+{
+    HANDLE token;
+    DWORD drives;
+    if (FAILED(impersonate_shell_user(&token))) return GetLogicalDrives();
+    drives = GetLogicalDrives();
+    revert_shell_user(token);
+    return drives | GetLogicalDrives();
+}
+
+/* Tell Explorer the drive came or went, so it shows up without a restart. */
+static void notify_explorer_drive(wchar_t letter, BOOL added)
+{
+    wchar_t root[4] = { letter, L':', L'\\', L'\0' };
+    DEV_BROADCAST_VOLUME volume = {0};
+    DWORD recipients = BSM_APPLICATIONS;
+    volume.dbcv_size = sizeof(volume);
+    volume.dbcv_devicetype = DBT_DEVTYP_VOLUME;
+    volume.dbcv_unitmask = 1u << (letter - L'A');
+    volume.dbcv_flags = DBTF_NET;
+    SHChangeNotify(added ? SHCNE_DRIVEADD : SHCNE_DRIVEREMOVED,
+                   SHCNF_PATHW | SHCNF_FLUSHNOWAIT, root, NULL);
+    BroadcastSystemMessageW(BSF_IGNORECURRENTTASK | BSF_NOHANG | BSF_FORCEIFHUNG,
+                            &recipients, WM_DEVICECHANGE,
+                            added ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE,
+                            (LPARAM)&volume);
+}
+
+/* Older builds mapped letters with New-SmbGlobalMapping. Such a mapping sits
+   in the global namespace, holds the letter, and Explorer may not show it, so
+   it is dropped before the letter is mapped or unmapped as the shell's user. */
+static void remove_legacy_global_mapping(wchar_t letter)
+{
+    wchar_t local[3] = { letter, L':', L'\0' }, device[512], ip[32], command[1024];
+    if (!QueryDosDeviceW(local, device, _countof(device))) return;
+    swprintf_s(ip, _countof(ip), L"%S", shared_appliance_server_ip());
+    if (!wcsstr(device, ip)) return;
+    swprintf_s(command, _countof(command),
+      L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+      L"$ErrorActionPreference='SilentlyContinue';$l='%c:';"
+      L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction SilentlyContinue;"
+      L"for($i=0;$i -lt 20 -and (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue);$i++){"
+      L"Start-Sleep -Milliseconds 250};exit 0\"",
+      letter);
+    run_hidden_process(command, 60000);
+    WNetCancelConnection2W(local, 0, TRUE);
+}
+
+/* Map or unmap the resource's host letter in the shell user's session.
+   S_FALSE: it was already in the requested state. */
+static HRESULT host_letter_mapping(wchar_t letter, const wchar_t *target,
+                                   const wchar_t *user, const wchar_t *password,
+                                   BOOL mount)
+{
+    wchar_t local[3] = { letter, L':', L'\0' }, root[4] = { letter, L':', L'\\', L'\0' };
+    wchar_t current[256];
+    DWORD chars = _countof(current), err;
+    HANDLE token;
+    HRESULT hr;
+    int attempt;
+    remove_legacy_global_mapping(letter);
+    hr = impersonate_shell_user(&token);
+    if (FAILED(hr)) return hr;
+    if (!mount) {
+        err = WNetCancelConnection2W(local, 0, TRUE);
+        revert_shell_user(token);
+        if (err == ERROR_NOT_CONNECTED) return S_FALSE;
+        if (err != NO_ERROR) return HRESULT_FROM_WIN32(err);
+        notify_explorer_drive(letter, FALSE);
+        return S_OK;
+    }
+    err = WNetGetConnectionW(local, current, &chars);
+    if (err == NO_ERROR || err == ERROR_CONNECTION_UNAVAIL) {
+        if (_wcsicmp(current, target) != 0) {
+            revert_shell_user(token);
+            return HRESULT_FROM_WIN32(ERROR_ALREADY_ASSIGNED);
+        }
+        if (err == NO_ERROR && GetFileAttributesW(root) != INVALID_FILE_ATTRIBUTES) {
+            revert_shell_user(token);
+            notify_explorer_drive(letter, TRUE);
+            return S_FALSE;
+        }
+        /* Ours but stale (the appliance restarted): map it again. */
+        WNetCancelConnection2W(local, 0, TRUE);
+    } else if (GetLogicalDrives() & (1u << (letter - L'A'))) {
+        revert_shell_user(token);
+        return HRESULT_FROM_WIN32(ERROR_ALREADY_ASSIGNED);
+    }
+    /* The share may still be coming up right after the appliance started. */
+    for (attempt = 0; attempt < 10; ++attempt) {
+        NETRESOURCEW resource = {0};
+        resource.dwType = RESOURCETYPE_DISK;
+        resource.lpLocalName = local;
+        resource.lpRemoteName = (LPWSTR)target;
+        err = WNetAddConnection2W(&resource, password, user, CONNECT_TEMPORARY);
+        if (err == NO_ERROR || err == ERROR_ALREADY_ASSIGNED ||
+            err == ERROR_SESSION_CREDENTIAL_CONFLICT || err == ERROR_LOGON_FAILURE)
+            break;
+        Sleep(1000);
+    }
+    revert_shell_user(token);
+    if (err != NO_ERROR) return HRESULT_FROM_WIN32(err);
+    notify_explorer_drive(letter, TRUE);
+    return S_OK;
+}
+
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount)
 {
-    wchar_t admin[256] = {0}, password[256] = {0};
+    wchar_t admin[256] = {0}, password[256] = {0}, qualified[192] = {0};
     wchar_t command[4096], share[64], target[256];
     DWORD exit_code;
     HRESULT hr;
@@ -2127,7 +2281,6 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     if (mount) {
         hr = load_credentials(admin, _countof(admin), password, _countof(password));
         if (FAILED(hr)) return hr;
-        wchar_t qualified[192];
         swprintf_s(qualified, _countof(qualified), L"%S\\%s",
                    shared_appliance_server_ip(), APPLIANCE_SERVICE_USER);
         SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
@@ -2135,9 +2288,14 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     }
     shared_resources_share_name(resource->id, share, _countof(share));
     swprintf_s(target, _countof(target), L"\\\\%S\\%s", shared_appliance_server_ip(), share);
-    if (!resource->host_drive_letter) {
-        /* No host letter: a global mapping of the UNC path alone, which gives
-           Explorer (running unelevated) the share's credentials. */
+    if (resource->host_drive_letter) {
+        hr = host_letter_mapping((wchar_t)towupper(resource->host_drive_letter), target,
+                                 qualified, password, mount);
+        goto done;
+    }
+    /* No host letter: a global mapping of the UNC path alone, which gives
+       Explorer (running unelevated) the share's credentials. */
+    {
         if (mount)
             swprintf_s(command, _countof(command),
               L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
@@ -2164,41 +2322,13 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
               L"Remove-SmbGlobalMapping -RemotePath $r -Force -ErrorAction SilentlyContinue;"
               L"if(Get-SmbGlobalMapping -RemotePath $r -ErrorAction SilentlyContinue){exit 1};exit 0\"",
               target);
-    } else if (mount) {
-        swprintf_s(command, _countof(command),
-          L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
-          L"$ErrorActionPreference='Stop';$l='%c:';$r='%s';"
-          L"for($a=0;$a -lt 8;$a++){"
-          L"try{$m=Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue;"
-          L"if($m){if($m.RemotePath -ieq $r){"
-          L"try{$null=Get-Item -LiteralPath ($l+'\\') -Force -ErrorAction Stop;exit 100}catch{}"
-          L"};exit 85};"
-          L"$p=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force;"
-          L"$c=[pscredential]::new($env:ASB_SMB_USER,$p);"
-          L"New-SmbGlobalMapping -LocalPath $l -RemotePath $r -Credential $c "
-          L"-Persistent $false -RequireIntegrity $true -ErrorAction Stop|Out-Null;"
-          L"for($i=0;$i -lt 20;$i++){"
-          L"try{$null=Get-Item -LiteralPath ($l+'\\') -Force -ErrorAction Stop;exit 0}catch{}"
-          L"Start-Sleep -Milliseconds 250};"
-          L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction SilentlyContinue"
-          L"}catch{if($a -eq 7){exit 1}};Start-Sleep -Milliseconds 500};exit 1\"",
-          resource->host_drive_letter, target);
-    } else {
-        swprintf_s(command, _countof(command),
-          L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
-          L"$ErrorActionPreference='SilentlyContinue';$l='%c:';"
-          L"if(-not (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue)){exit 101};"
-          L"Remove-SmbGlobalMapping -LocalPath $l -Force -ErrorAction SilentlyContinue;"
-          L"for($i=0;$i -lt 20 -and (Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue);$i++){"
-          L"Start-Sleep -Milliseconds 250};"
-          L"if(Get-SmbGlobalMapping -LocalPath $l -ErrorAction SilentlyContinue){exit 1};exit 0\"",
-          resource->host_drive_letter);
     }
     hr = run_hidden_process(command, 60000);
     exit_code = HRESULT_CODE(hr);
     if ((mount && exit_code == HOST_MAPPING_ALREADY_PRESENT) ||
         (!mount && exit_code == HOST_MAPPING_NOT_PRESENT))
         hr = S_FALSE;
+done:
     SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", NULL);
     SetEnvironmentVariableW(L"ASB_SMB_USER", NULL);
     SecureZeroMemory(password, sizeof(password));
@@ -2226,6 +2356,47 @@ HRESULT shared_appliance_mount_host_resource(const wchar_t *resource_id)
         InterlockedIncrement(&g_appliance.status.host_mounts);
     }
     return hr;
+}
+
+BOOL shared_appliance_host_mounted(const wchar_t *resource_id)
+{
+    const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
+    DWORD bit;
+    int i;
+    BOOL mounted = FALSE;
+    if (!resource) return FALSE;
+    bit = host_mount_bit(resource);
+    if (bit) return (g_appliance.host_mount_mask & (LONG)bit) != 0;
+    EnterCriticalSection(&g_appliance.cs);
+    for (i = 0; i < ASB_MAX_SHARED_RESOURCES && !mounted; ++i)
+        mounted = g_unc_host_mounts[i][0] && _wcsicmp(g_unc_host_mounts[i], resource->id) == 0;
+    LeaveCriticalSection(&g_appliance.cs);
+    return mounted;
+}
+
+/* Give a resource with no host letter the highest letter free both here and
+   in the shell user's session, and save it. S_FALSE: it already had one. */
+HRESULT shared_appliance_assign_host_letter(const wchar_t *resource_id)
+{
+    const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
+    AsbSharedResourceInfo info;
+    DWORD used;
+    wchar_t letter;
+    int i;
+    if (!resource) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (resource->host_drive_letter) return S_FALSE;
+    used = shell_user_drives();
+    for (i = 0; i < shared_resources_count(); ++i) {
+        const AsbSharedResourceInfo *other = shared_resources_get(i);
+        if (other && other->host_drive_letter)
+            used |= 1u << (towupper(other->host_drive_letter) - L'A');
+    }
+    for (letter = L'Z'; letter >= L'D'; --letter)
+        if (!(used & (1u << (letter - L'A')))) break;
+    if (letter < L'D') return HRESULT_FROM_WIN32(ERROR_NO_MORE_DEVICES);
+    info = *resource;
+    info.host_drive_letter = letter;
+    return shared_resources_update(resource->id, &info, FALSE);
 }
 
 HRESULT shared_appliance_resource_unc_path(const wchar_t *resource_id,

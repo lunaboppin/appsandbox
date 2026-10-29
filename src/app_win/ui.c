@@ -575,6 +575,7 @@ static void send_full_state(void)
               jb_string(&jb, L"hostDriveLetter", letter); }
             jb_bool(&jb, L"enabled", r.enabled);
             jb_bool(&jb, L"readOnly", r.read_only);
+            jb_bool(&jb, L"hostMounted", asb_shared_resource_host_mounted(r.id));
             jb_string(&jb, L"availability", appliance.ready ? L"available" : L"unavailable");
             jb_int(&jb, L"applianceState", appliance.state);
             jb_object_end(&jb);
@@ -1502,8 +1503,12 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t id[ASB_SHARED_ID_CHARS] = {0};
         HRESULT hr = E_INVALIDARG;
         if (json_get_string(json, L"id", id, _countof(id))) {
-            if (wcscmp(action, L"mountHostResource") == 0 ||
-                wcscmp(action, L"openHostResource") == 0)
+            if (wcscmp(action, L"mountHostResource") == 0) {
+                /* Mount Host maps a drive letter, so a resource without one
+                   gets a free letter first. Open Share can do without. */
+                hr = asb_shared_resource_assign_host_letter(id);
+                if (SUCCEEDED(hr)) hr = asb_shared_resource_host_mount(id);
+            } else if (wcscmp(action, L"openHostResource") == 0)
                 hr = asb_shared_resource_host_mount(id);
             else if (wcscmp(action, L"unmountHostResource") == 0)
                 hr = asb_shared_resource_host_unmount(id);
@@ -1528,6 +1533,14 @@ static void on_webview2_message(const wchar_t *json)
         { wchar_t out[1024]; JsonBuilder sj; jb_init(&sj,out,_countof(out));
           jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");
           jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);
+          if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_ASSIGNED))
+              jb_string(&sj,L"message",L"That host drive letter is already in use on this PC. Pick another host drive letter with Edit.");
+          else if (hr == HRESULT_FROM_WIN32(ERROR_SESSION_CREDENTIAL_CONFLICT))
+              jb_string(&sj,L"message",L"Windows already has a connection to the appliance under other credentials. Disconnect it (net use) and try again.");
+          else if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_DEVICES))
+              jb_string(&sj,L"message",L"No free drive letter is left on this PC.");
+          else if (hr == HRESULT_FROM_WIN32(ERROR_NO_TOKEN))
+              jb_string(&sj,L"message",L"Explorer isn't running, so the drive can't be mapped for your session.");
           jb_object_end(&sj);webview2_post(out); }
         send_full_state();
     } else if (wcscmp(action, L"setVmInstallerIso") == 0) {
