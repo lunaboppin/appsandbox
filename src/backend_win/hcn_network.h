@@ -81,6 +81,13 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
                             wchar_t *endpoint_guid_str, size_t str_len,
                             const char *nat_ip);
 
+/* hcn_create_endpoint plus a requested MAC ("XX-XX-.." form, or NULL for an
+   HNS-assigned one). Like every MacAddress in a create document it is only a
+   request; read the result back with hcn_get_endpoint_mac. */
+HRESULT hcn_create_endpoint_with_mac(const GUID *network_id, GUID *endpoint_id,
+                                     wchar_t *endpoint_guid_str, size_t str_len,
+                                     const char *nat_ip, const char *mac_address);
+
 /* Delete a network by GUID. */
 ASB_API HRESULT hcn_delete_network(const GUID *network_id);
 
