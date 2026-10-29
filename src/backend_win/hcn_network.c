@@ -109,6 +109,11 @@ static const GUID APPSANDBOX_SHARE_GUID = {
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x99 }
 };
 
+static const GUID APPSANDBOX_VPN_GUID = {
+    0xA5B01234, 0x5678, 0x9ABC,
+    { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0xAA }
+};
+
 /* Find the adapter that carries the default route (0.0.0.0/0). */
 /* Find a physical adapter that is UP, has a default gateway, and isn't virtual.
    Prefers Ethernet (IF_TYPE_ETHERNET_CSMACD) over Wi-Fi (IF_TYPE_IEEE80211). */
@@ -216,6 +221,8 @@ void hcn_cleanup_stale_networks(void)
     pfnDeleteNet(&APPSANDBOX_EXTERNAL_GUID, &er);
     if (er) { CoTaskMemFree(er); er = NULL; }
     pfnDeleteNet(&APPSANDBOX_SHARE_GUID, &er);
+    if (er) { CoTaskMemFree(er); er = NULL; }
+    pfnDeleteNet(&APPSANDBOX_VPN_GUID, &er);
     if (er) { CoTaskMemFree(er); er = NULL; }
 }
 
@@ -374,6 +381,90 @@ const char *hcn_share_subnet_base(void)
 {
     pick_share_base_once();
     return g_share_base;
+}
+
+/* The VPN network is Private: it has no host adapter, so its subnet never
+   meets the host's routes. It only has to stay clear of the NAT and share
+   subnets, which the gateway also sits on or next to. */
+const char *hcn_vpn_subnet_base(void)
+{
+    static const char *CANDIDATES[] = { "192.168.177", "192.168.178", "172.29.177", NULL };
+    static char base[16];
+    int i;
+    if (base[0]) return base;
+    pick_share_base_once();   /* also picks the NAT base */
+    for (i = 0; CANDIDATES[i]; i++) {
+        if (strcmp(CANDIDATES[i], g_nat_base) != 0 &&
+            strcmp(CANDIDATES[i], g_share_base) != 0) break;
+    }
+    strcpy_s(base, sizeof(base), CANDIDATES[i] ? CANDIDATES[i] : CANDIDATES[0]);
+    return base;
+}
+
+/* Network for VPN-routed VMs and the VPN gateway at <base>.2. It is a NAT
+   network because HNS endpoints on a Private network passed no traffic
+   between VMs at all; the host's NAT on it is removed afterwards
+   (vpn_gateway.c), so the gateway stays the only way off it. */
+HRESULT hcn_create_vpn_network(GUID *network_id)
+{
+    wchar_t settings[1024];
+    void *network = NULL;
+    PWSTR error_record = NULL;
+    HRESULT hr;
+    const char *base = hcn_vpn_subnet_base();
+
+    if (!g_hcn_dll || !pfnCreateNet) return E_NOT_VALID_STATE;
+    *network_id = APPSANDBOX_VPN_GUID;
+    if (hcn_network_exists(&APPSANDBOX_VPN_GUID)) return S_OK;
+    swprintf_s(settings, _countof(settings),
+        L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+        L"\"Name\":\"AppSandboxVPN\",\"Type\":\"NAT\","
+        L"\"Ipams\":[{\"Type\":\"Static\",\"Subnets\":[{"
+        L"\"IpAddressPrefix\":\"%S.0/24\","
+        L"\"Routes\":[{\"NextHop\":\"%S.1\",\"DestinationPrefix\":\"0.0.0.0/0\"}]"
+        L"}]}]}", base, base);
+    hr = pfnCreateNet(network_id, settings, &network, &error_record);
+    if (error_record) {
+        if (FAILED(hr)) ui_log(L"HCN VPN network error: %s", error_record);
+        CoTaskMemFree(error_record);
+    }
+    if (network && pfnCloseNet) pfnCloseNet(network);
+    return hr;
+}
+
+/* Endpoint with a fixed IP and requested MAC on any network, no policies. */
+HRESULT hcn_create_static_endpoint(const GUID *network_id, GUID *endpoint_id,
+                                   wchar_t *endpoint_guid_str, size_t str_len,
+                                   const char *ip, const char *mac_address)
+{
+    wchar_t net_guid_str[64], ep_guid_str[64], settings[1024];
+    void *network = NULL, *endpoint = NULL;
+    PWSTR error_record = NULL;
+    HRESULT hr;
+
+    if (!g_hcn_dll || !pfnCreateEp || !pfnOpenNet || !ip || !mac_address)
+        return E_INVALIDARG;
+    hr = pfnOpenNet(network_id, &network, &error_record);
+    if (error_record) { CoTaskMemFree(error_record); error_record = NULL; }
+    if (FAILED(hr)) return hr;
+    CoCreateGuid(endpoint_id);
+    guid_to_string(network_id, net_guid_str, _countof(net_guid_str));
+    guid_to_string(endpoint_id, ep_guid_str, _countof(ep_guid_str));
+    swprintf_s(settings, _countof(settings),
+        L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+        L"\"HostComputeNetwork\":\"%s\",\"MacAddress\":\"%S\","
+        L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}]}",
+        net_guid_str, mac_address, ip);
+    hr = pfnCreateEp(network, endpoint_id, settings, &endpoint, &error_record);
+    if (SUCCEEDED(hr) && endpoint_guid_str)
+        wcscpy_s(endpoint_guid_str, str_len, ep_guid_str);
+    if (error_record) {
+        if (FAILED(hr)) ui_log(L"HCN static endpoint error: %s", error_record);
+        CoTaskMemFree(error_record);
+    }
+    if (endpoint && pfnCloseEp) pfnCloseEp(endpoint);
+    if (network && pfnCloseNet) pfnCloseNet(network);
+    return hr;
 }
 
 HRESULT hcn_create_share_network(GUID *network_id)

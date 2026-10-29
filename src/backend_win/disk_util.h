@@ -67,6 +67,16 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
                                         const char *nat_ip,
                                         const char *nat_gateway,
                                         const char *nat_mac);
+/* NoCloud seed (label CIDATA) for the VPN gateway appliance. */
+HRESULT iso_create_vpn_gateway_cloud_init(const wchar_t *iso_path,
+                                          const wchar_t *admin_user,
+                                          const wchar_t *ssh_public_key,
+                                          const wchar_t *res_dir,
+                                          const char *uplink_ip,
+                                          const char *uplink_gateway,
+                                          const char *uplink_mac,
+                                          const char *lan_ip,
+                                          const char *lan_mac);
 HRESULT iso_create_server_core_resources(const wchar_t *iso_path,
                                          const wchar_t *vm_name,
                                          const wchar_t *admin_user,

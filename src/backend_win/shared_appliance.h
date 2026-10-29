@@ -99,4 +99,10 @@ BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,
                                           wchar_t *password, size_t password_chars);
 const char *shared_appliance_server_ip(void);
 
+/* Shared with the VPN gateway, the other Ubuntu appliance VM. */
+HRESULT appliance_download_ubuntu_image(wchar_t *image_path, size_t image_chars);
+HRESULT appliance_run_hidden_process(wchar_t *command, DWORD timeout_ms);
+void appliance_start_serial_capture(const wchar_t *vm_name, const wchar_t *label,
+                                    const wchar_t *log_path);
+
 #endif

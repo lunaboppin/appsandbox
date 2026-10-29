@@ -93,6 +93,8 @@ if RUN_STATIC:
     results["appliance-lan-only"] = [] if p.returncode == 0 else ["test_shared_appliance_lan_only_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_shared_appliance_setup_network_contract.py")], cwd=HERE)
     results["appliance-setup-network"] = [] if p.returncode == 0 else ["test_shared_appliance_setup_network_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_vpn_contract.py")], cwd=HERE)
+    results["vpn"] = [] if p.returncode == 0 else ["test_vpn_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_release_shared_resource_artifacts.py")], cwd=HERE)
     results["appliance-artifacts"] = [] if p.returncode == 0 else ["test_release_shared_resource_artifacts.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_display_boot_screen_contract.py")], cwd=HERE)

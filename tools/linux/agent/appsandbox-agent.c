@@ -501,7 +501,8 @@ static void *heartbeat_thread(void *arg)
  * Reply: "ok" on success, "error:..." on failure. */
 static void handle_set_ip(int fd, const char *tag, const char *args)
 {
-    char ip[64], prefix[8], gw[64];
+    char ip[64], prefix[8], gw[64], dns[160];
+    char *field;
     const char *slash  = strchr(args, '/');
     const char *colon2 = slash ? strchr(slash, ':') : NULL;
     size_t ip_len, pfx_len;
@@ -521,6 +522,26 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
     memcpy(ip,     args,        ip_len);  ip[ip_len]   = '\0';
     memcpy(prefix, slash + 1,   pfx_len); prefix[pfx_len] = '\0';
     snprintf(gw, sizeof(gw), "%s", colon2 + 1);
+    /* set_ip:IP/PREFIX:GATEWAY[:MAC[:DNS,DNS]]. netplan matches the NIC by
+       name here, so the MAC is skipped; DNS defaults to the gateway. */
+    snprintf(dns, sizeof(dns), "%s, 8.8.8.8", gw);
+    field = strchr(gw, ':');
+    if (field) {
+        char *dns_field;
+        *field++ = '\0';
+        snprintf(dns, sizeof(dns), "%s, 8.8.8.8", gw);
+        dns_field = strchr(field, ':');
+        if (dns_field && dns_field[1]) {
+            const char *p;
+            for (p = dns_field + 1; *p; p++)
+                if (!((*p >= '0' && *p <= '9') || *p == '.' || *p == ',')) break;
+            if (*p || strlen(dns_field + 1) >= sizeof(dns)) {
+                send_reply(fd, tag, "error:bad_format");
+                return;
+            }
+            snprintf(dns, sizeof(dns), "%s", dns_field + 1);
+        }
+    }
 
     n = snprintf(cmd, sizeof(cmd),
         /* Pick the renderer by probing whether the NetworkManager service
@@ -558,7 +579,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "        - to: default\n"
         "          via: %s\n"
         "      nameservers:\n"
-        "        addresses: [%s, 8.8.8.8]\n"
+        "        addresses: [%s]\n"
         "EOF\n"
         /* Apply, then restart the renderer to drop stale leases / state
          * left behind by cloud-init or a previous run. netplan apply
@@ -591,7 +612,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "  sleep 0.5; "
         "done; "
         "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
-        ip, prefix, gw, gw, ip);
+        ip, prefix, gw, dns, ip);
     if (n < 0 || n >= (int)sizeof(cmd)) {
         send_reply(fd, tag, "error:cmd_too_long");
         return;
@@ -1214,6 +1235,145 @@ static int appliance_remove_share(const char *share)
     return run_sync("systemctl reload smbd");
 }
 
+/* ---- VPN gateway ----
+   Used only on the VPN gateway appliance. Each WireGuard config runs as
+   interface asbvpn<slot> with its own routing table (100 + slot); a VM's
+   source IP is bound to one table with an ip rule. Everything from the VPN
+   LAN that no rule claims falls to table 99, which is unreachable, and the
+   ASBVPN chain only forwards LAN traffic into asbvpn interfaces: if a tunnel
+   is down, its VMs have no route out at all. */
+
+static int vpn_valid_chars(const char *s, const char *allowed, size_t max_len)
+{
+    size_t n = 0;
+    if (!s || !*s) return 0;
+    for (; *s; s++, n++) {
+        if (n >= max_len) return 0;
+        if (!((*s >= '0' && *s <= '9') || strchr(allowed, *s))) return 0;
+    }
+    return 1;
+}
+
+static int vpn_slot(const char *s)
+{
+    int slot;
+    if (!vpn_valid_chars(s, "", 2)) return -1;
+    slot = atoi(s);
+    return slot >= 0 && slot < 16 ? slot : -1;
+}
+
+static int vpn_init(const char *arguments)
+{
+    char command[2600], lan[24], self[24] = "";
+    const char *colon = strchr(arguments, ':');
+    size_t n = colon ? (size_t)(colon - arguments) : strlen(arguments);
+    if (n == 0 || n >= sizeof(lan)) return EINVAL;
+    memcpy(lan, arguments, n); lan[n] = '\0';
+    if (colon) snprintf(self, sizeof(self), "%s", colon + 1);
+    if (!vpn_valid_chars(lan, "./", 18) || (self[0] && !vpn_valid_chars(self, ".", 15)))
+        return EINVAL;
+    snprintf(command, sizeof(command),
+        /* Loose reverse-path filtering: replies arrive on an asbvpn
+           interface, while the main table routes the internet via the
+           uplink, so strict mode would drop them. */
+        "sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.default.rp_filter=2; "
+        "iptables -N ASBVPN 2>/dev/null; iptables -F ASBVPN && "
+        "{ iptables -C FORWARD -j ASBVPN 2>/dev/null || iptables -I FORWARD 1 -j ASBVPN; } && "
+        "iptables -A ASBVPN -s %s -o asbvpn+ -j ACCEPT && "
+        "iptables -A ASBVPN -d %s -i asbvpn+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT && "
+        "iptables -A ASBVPN -s %s -j DROP && iptables -A ASBVPN -d %s -j DROP && "
+        "{ iptables -C INPUT -s %s -j DROP 2>/dev/null || iptables -I INPUT 1 -s %s -j DROP; } && "
+        "{ iptables -t nat -C POSTROUTING -o asbvpn+ -j MASQUERADE 2>/dev/null || "
+        "iptables -t nat -A POSTROUTING -o asbvpn+ -j MASQUERADE; } && "
+        "{ iptables -t mangle -C FORWARD -o asbvpn+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || "
+        "iptables -t mangle -A FORWARD -o asbvpn+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; } && "
+        "ip route replace unreachable default table 99 && "
+        "{ ip rule show | grep -q 'from %s lookup 99' || ip rule add from %s lookup 99 priority 32000; }",
+        lan, lan, lan, lan, lan, lan, lan, lan);
+    if (run_sync(command) != 0) return EIO;
+    /* The gateway's own LAN address is inside the LAN range, so without
+       this its replies (ICMP errors, ARP-driven traffic) hit table 99 too. */
+    if (self[0]) {
+        snprintf(command, sizeof(command),
+            "ip rule show | grep -q 'from %s lookup main' || ip rule add from %s lookup main priority 31000",
+            self, self);
+        if (run_sync(command) != 0) return EIO;
+    }
+    return 0;
+}
+
+/* vpn_set:<slot>:<base64 config>. Replies ok once the tunnel has a handshake,
+   or no_handshake if the interface is up but the peer hasn't answered yet. */
+static const char *vpn_set(const char *arguments)
+{
+    char slot_text[4], command[4096];
+    const char *colon = strchr(arguments, ':');
+    int slot, rc;
+    size_t n;
+    if (!colon) return "error:bad_format";
+    n = (size_t)(colon - arguments);
+    if (n == 0 || n >= sizeof(slot_text)) return "error:bad_format";
+    memcpy(slot_text, arguments, n); slot_text[n] = '\0';
+    slot = vpn_slot(slot_text);
+    if (slot < 0 || !vpn_valid_chars(colon + 1,
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+/=", 3000))
+        return "error:bad_format";
+    snprintf(command, sizeof(command),
+        "mkdir -p /etc/wireguard && umask 077 && "
+        "echo '%s' | base64 -d > /etc/wireguard/asbvpn%d.conf && "
+        "{ wg-quick down asbvpn%d >/dev/null 2>&1 || true; } && "
+        "wg-quick up asbvpn%d && ip route replace default dev asbvpn%d table %d || exit 1; "
+        "for i in $(seq 1 30); do "
+        "  t=$(wg show asbvpn%d latest-handshakes | awk '{print $2}'); "
+        "  [ -n \"$t\" ] && [ \"$t\" -gt 0 ] && exit 0; sleep 0.5; "
+        "done; exit 3",
+        colon + 1, slot, slot, slot, slot, 100 + slot, slot);
+    rc = run_sync(command);
+    memset(command, 0, sizeof(command));
+    return rc == 0 ? "ok" : rc == 3 ? "ok:no_handshake" : "error:wg_up";
+}
+
+static int vpn_bind(const char *arguments)
+{
+    char slot_text[4], ip[20], command[512];
+    const char *colon = strchr(arguments, ':');
+    int slot;
+    size_t n;
+    if (!colon) return EINVAL;
+    n = (size_t)(colon - arguments);
+    if (n == 0 || n >= sizeof(slot_text)) return EINVAL;
+    memcpy(slot_text, arguments, n); slot_text[n] = '\0';
+    slot = vpn_slot(slot_text);
+    if (slot < 0 || !vpn_valid_chars(colon + 1, ".", 15)) return EINVAL;
+    snprintf(ip, sizeof(ip), "%s", colon + 1);
+    snprintf(command, sizeof(command),
+        "while ip rule del from %s/32 2>/dev/null; do :; done; "
+        "ip rule add from %s/32 lookup %d priority 10000",
+        ip, ip, 100 + slot);
+    return run_sync(command) == 0 ? 0 : EIO;
+}
+
+static int vpn_unbind(const char *ip)
+{
+    char command[256];
+    if (!vpn_valid_chars(ip, ".", 15)) return EINVAL;
+    snprintf(command, sizeof(command),
+        "while ip rule del from %s/32 2>/dev/null; do :; done", ip);
+    return run_sync(command) == 0 ? 0 : EIO;
+}
+
+static int vpn_down(const char *slot_text)
+{
+    char command[256];
+    int slot = vpn_slot(slot_text);
+    if (slot < 0) return EINVAL;
+    snprintf(command, sizeof(command),
+        "wg-quick down asbvpn%d >/dev/null 2>&1; rm -f /etc/wireguard/asbvpn%d.conf; "
+        "ip route flush table %d 2>/dev/null; exit 0",
+        slot, slot, 100 + slot);
+    return run_sync(command) == 0 ? 0 : EIO;
+}
+
 /* ---- Per-client command dispatch ---- */
 
 static void handle_client(int fd)
@@ -1263,6 +1423,8 @@ static void handle_client(int fd)
 
         if (strncmp(cmd, "appliance_account:", 18) == 0)
             agent_log("cmd: appliance_account:<redacted>");
+        else if (strncmp(cmd, "vpn_set:", 8) == 0)
+            agent_log("cmd: vpn_set:<redacted>");
         else
             agent_log("cmd: %s", line);
 
@@ -1280,6 +1442,21 @@ static void handle_client(int fd)
         }
         else if (strncmp(cmd, "appliance_purge:", 16) == 0) {
             send_reply(fd, tag, appliance_purge_share(cmd + 16) == 0 ? "ok" : "error:purge");
+        }
+        else if (strncmp(cmd, "vpn_init:", 9) == 0) {
+            send_reply(fd, tag, vpn_init(cmd + 9) == 0 ? "ok" : "error:vpn_init");
+        }
+        else if (strncmp(cmd, "vpn_set:", 8) == 0) {
+            send_reply(fd, tag, vpn_set(cmd + 8));
+        }
+        else if (strncmp(cmd, "vpn_bind:", 9) == 0) {
+            send_reply(fd, tag, vpn_bind(cmd + 9) == 0 ? "ok" : "error:vpn_bind");
+        }
+        else if (strncmp(cmd, "vpn_unbind:", 11) == 0) {
+            send_reply(fd, tag, vpn_unbind(cmd + 11) == 0 ? "ok" : "error:vpn_unbind");
+        }
+        else if (strncmp(cmd, "vpn_down:", 9) == 0) {
+            send_reply(fd, tag, vpn_down(cmd + 9) == 0 ? "ok" : "error:vpn_down");
         }
         else if (strncmp(cmd, "appliance_remove:", 17) == 0) {
             send_reply(fd, tag, appliance_remove_share(cmd + 17) == 0 ? "ok" : "error:remove");

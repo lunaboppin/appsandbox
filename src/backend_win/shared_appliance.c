@@ -634,6 +634,12 @@ static HRESULT run_hidden_process(wchar_t *command, DWORD timeout_ms)
     return exit_code == 0 ? S_OK : HRESULT_FROM_WIN32(exit_code);
 }
 
+HRESULT appliance_download_ubuntu_image(wchar_t *image_path, size_t image_chars)
+{ return download_ubuntu_image(image_path, image_chars); }
+
+HRESULT appliance_run_hidden_process(wchar_t *command, DWORD timeout_ms)
+{ return run_hidden_process(command, timeout_ms); }
+
 static HRESULT launch_process(wchar_t *command)
 {
     STARTUPINFOW startup;
@@ -1011,25 +1017,25 @@ void shared_appliance_collect_guest_log(void)
    the storage root; cloud-init's own lines and failures also reach the UI log. */
 typedef struct {
     wchar_t log_path[MAX_PATH];
+    wchar_t pipe[MAX_PATH];
+    wchar_t label[64];
 } SerialCaptureArgs;
 
-#define APPLIANCE_COM1_PIPE L"\\\\.\\pipe\\" APPLIANCE_VM_NAME L".com1"
-
 /* Connect to the VM's COM1 pipe, retrying while the worker brings it up. */
-static HANDLE open_serial_pipe(void)
+static HANDLE open_serial_pipe(const SerialCaptureArgs *args)
 {
     ULONGLONG deadline = GetTickCount64() + 60000;
     for (;;) {
-        HANDLE pipe = CreateFileW(APPLIANCE_COM1_PIPE, GENERIC_READ, 0, NULL,
+        HANDLE pipe = CreateFileW(args->pipe, GENERIC_READ, 0, NULL,
                                   OPEN_EXISTING, 0, NULL);
         DWORD error;
         if (pipe != INVALID_HANDLE_VALUE) return pipe;
         error = GetLastError();
         if (GetTickCount64() >= deadline) {
-            ui_log(L"Shared appliance: could not attach to the appliance console (%lu).", error);
+            ui_log(L"Could not attach to the %s console (%lu).", args->label, error);
             return INVALID_HANDLE_VALUE;
         }
-        if (error == ERROR_PIPE_BUSY) WaitNamedPipeW(APPLIANCE_COM1_PIPE, 1000);
+        if (error == ERROR_PIPE_BUSY) WaitNamedPipeW(args->pipe, 1000);
         else Sleep(250);
     }
 }
@@ -1042,7 +1048,7 @@ static BOOL serial_line_is_interesting(const char *line)
            strstr(line, "E: ") || strstr(line, "W: ");
 }
 
-static void serial_emit_line(FILE *file, char *line)
+static void serial_emit_line(FILE *file, char *line, const wchar_t *label)
 {
     char clean[1024];
     size_t r, w = 0;
@@ -1064,7 +1070,7 @@ static void serial_emit_line(FILE *file, char *line)
     if (!w) return;
     if (file) { fputs(clean, file); fputc('\n', file); fflush(file); }
     if (serial_line_is_interesting(clean))
-        ui_log(L"[appliance console] %S", clean);
+        ui_log(L"[%s console] %S", label, clean);
 }
 
 static DWORD WINAPI serial_capture_worker(LPVOID parameter)
@@ -1074,28 +1080,28 @@ static DWORD WINAPI serial_capture_worker(LPVOID parameter)
     char buffer[4096], line[1024];
     size_t used = 0;
     DWORD got, i;
-    HANDLE pipe = open_serial_pipe();
+    HANDLE pipe = open_serial_pipe(args);
     if (pipe != INVALID_HANDLE_VALUE) {
         SYSTEMTIME now;
         GetLocalTime(&now);
         /* Shared so the log can be read while the VM is still running. */
         file = _wfsopen(args->log_path, L"ab", _SH_DENYNO);
         if (file)
-            fprintf(file, "\n==== appliance boot %04u-%02u-%02u %02u:%02u:%02u ====\n",
-                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+            fprintf(file, "\n==== %S boot %04u-%02u-%02u %02u:%02u:%02u ====\n",
+                    args->label, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
         while (ReadFile(pipe, buffer, sizeof(buffer), &got, NULL) && got) {
             for (i = 0; i < got; ++i) {
                 char c = buffer[i];
                 if (c == '\n' || used + 1 >= sizeof(line)) {
                     line[used] = '\0';
-                    serial_emit_line(file, line);
+                    serial_emit_line(file, line, args->label);
                     used = 0;
                     if (c == '\n') continue;
                 }
                 line[used++] = c;
             }
         }
-        if (used) { line[used] = '\0'; serial_emit_line(file, line); }
+        if (used) { line[used] = '\0'; serial_emit_line(file, line, args->label); }
         if (file) fclose(file);
         CloseHandle(pipe);
     }
@@ -1103,19 +1109,29 @@ static DWORD WINAPI serial_capture_worker(LPVOID parameter)
     return 0;
 }
 
-/* Start reading the appliance's COM1 into console.log; call right after the
-   VM starts so the worker attaches before cloud-init runs. */
-static void start_serial_capture(void)
+/* Start reading a Linux appliance VM's COM1 into log_path; call right after
+   the VM starts so the worker attaches before cloud-init runs. */
+void appliance_start_serial_capture(const wchar_t *vm_name, const wchar_t *label,
+                                    const wchar_t *log_path)
 {
     SerialCaptureArgs *args;
     HANDLE thread;
     args = (SerialCaptureArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*args));
     if (!args) return;
-    swprintf_s(args->log_path, _countof(args->log_path), L"%s\\console.log",
-               g_appliance.status.storage_root);
+    wcscpy_s(args->log_path, _countof(args->log_path), log_path);
+    swprintf_s(args->pipe, _countof(args->pipe), L"\\\\.\\pipe\\%s.com1", vm_name);
+    wcscpy_s(args->label, _countof(args->label), label);
     thread = CreateThread(NULL, 0, serial_capture_worker, args, 0, NULL);
     if (thread) CloseHandle(thread);
     else HeapFree(GetProcessHeap(), 0, args);
+}
+
+static void start_serial_capture(void)
+{
+    wchar_t log_path[MAX_PATH];
+    swprintf_s(log_path, _countof(log_path), L"%s\\console.log",
+               g_appliance.status.storage_root);
+    appliance_start_serial_capture(APPLIANCE_VM_NAME, L"appliance", log_path);
 }
 
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms);

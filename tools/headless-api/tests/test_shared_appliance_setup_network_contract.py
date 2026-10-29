@@ -49,7 +49,9 @@ def main() -> None:
         assert needle in disk, "network-config missing " + needle
     # The Ubuntu appliance's COM1 is captured: the VM owns the pipe server and
     # the host connects to it as a client once the VM is started.
-    assert "CreateNamedPipeW(" not in appliance and "APPLIANCE_VM_NAME L\".com1\"" in appliance
+    assert "CreateNamedPipeW(" not in appliance and ".com1\", vm_name)" in appliance
+    assert "CreateFileW(args->pipe, GENERIC_READ" in appliance
+    assert "appliance_start_serial_capture(APPLIANCE_VM_NAME" in appliance
     assert re.search(r"hcs_start_vm\(&g_appliance\.runtime\);\s*if \(FAILED\(hr\)\) goto fail;\s*"
                      r"if \(g_appliance\.status\.backend == ASB_APPLIANCE_BACKEND_UBUNTU\)\s*"
                      r"start_serial_capture\(\);", appliance), "capture must start after the VM starts"

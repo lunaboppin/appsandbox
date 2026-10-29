@@ -146,9 +146,12 @@
                     <option value="1" selected>NAT</option>
                     <option value="2">External</option>
                     <option value="3">Internal</option>
+                    <option value="4">VPN</option>
                 </select>
                 <label id="net-adapter-label" style="text-align:left">Adapter:</label>
                 <select id="net-adapter"></select>
+                <label id="vpn-config-label" style="text-align:left">VPN:</label>
+                <select id="vpn-config" onchange="updateCreateButtons()" title="WireGuard config this VM's traffic is routed through. Add configs in Settings."></select>
             </div>
 
             <label>Username:</label>
@@ -221,6 +224,15 @@
         </fieldset>
 
         <fieldset>
+            <legend>Network</legend>
+            <div class="manage-row">
+                <select id="manage-network" title="How this VM reaches the network. VPN routes all of its traffic through a WireGuard config from Settings."></select>
+                <button id="manage-network-apply" class="primary" onclick="applyManageNetwork()">Apply</button>
+            </div>
+            <small>With a VPN, all of this VM's traffic goes through the tunnel; if the tunnel drops, the VM goes offline instead of using your own connection. Applies on the next start.</small>
+        </fieldset>
+
+        <fieldset>
             <legend>Display</legend>
             <label class="manage-check"><input type="checkbox" id="manage-auto-display" onchange="saveManageDisplay()"> Auto-open the IDD virtual monitor when this VM boots</label>
         </fieldset>
@@ -279,6 +291,21 @@
                 <button type="button" onclick="startSharedAppliance()" title="Start the shared appliance VM.">Start</button><button type="button" onclick="stopSharedAppliance()" title="Stop the shared appliance VM.">Stop</button>
                 <button type="button" onclick="updateSharedAppliance()" title="Apply the appliance's current configuration.">Update</button><button type="button" onclick="growSharedAppliance()" title="Increase the size of the appliance data disk.">Grow Disk</button>
                 <button type="button" onclick="sendCmd('openSharedApplianceScreen')" title="Open the shared appliance console screen.">Screen</button><button type="button" onclick="sendCmd('openSharedApplianceTerminal')" title="Open a terminal connected to the shared appliance.">Terminal</button><button type="button" onclick="rebuildSharedAppliance()" title="Rebuild the appliance OS while preserving its data disk.">Rebuild</button><button type="button" class="danger" onclick="deleteSharedAppliance()" title="Delete the shared appliance, its disks and all shared resource data.">Delete</button><button type="button" class="primary" onclick="setupSharedAppliance()" title="Create and configure the shared appliance from these settings.">Setup</button>
+            </div>
+        </fieldset>
+        <fieldset id="vpn-card">
+            <legend>WireGuard VPN</legend>
+            <p>Import a WireGuard <code>.conf</code> from your VPN provider, then pick it as a VM's network. VPN VMs reach the internet only through their tunnel: if it drops, they go offline instead of leaking.</p>
+            <p id="vpn-gateway-status">VPN gateway: not set up</p>
+            <div id="vpn-config-list" class="settings-resource-list"></div>
+            <div class="form-grid resource-editor">
+                <label for="vpn-import-name">Name:</label><input id="vpn-import-name" maxlength="63" placeholder="e.g. Surfshark London">
+                <label for="vpn-import-file">Config file:</label><input id="vpn-import-file" type="file" accept=".conf,text/plain" onchange="onVpnFilePicked(this)">
+                <label for="vpn-import-text">Or paste:</label><textarea id="vpn-import-text" rows="6" spellcheck="false" autocomplete="off" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = ...&#10;DNS = ...&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = host:51820"></textarea>
+            </div>
+            <div class="modal-buttons">
+                <button type="button" onclick="sendCmd('stopVpnGateway')" title="Stop the VPN gateway. VMs using a VPN go offline until one is started again.">Stop Gateway</button>
+                <button type="button" class="primary" onclick="importVpnConfig()" title="Save this WireGuard config. Its keys are stored encrypted on this PC.">Import</button>
             </div>
         </fieldset>
         <h3>Shared Resources</h3>

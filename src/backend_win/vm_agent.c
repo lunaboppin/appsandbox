@@ -4,6 +4,7 @@
 #include "asb_core.h"
 #include "hcn_network.h"
 #include "shared_appliance.h"
+#include "vpn_gateway.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -403,12 +404,25 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
 static BOOL configure_guest_nat(SOCKET s, VmInstance *vm, AgentConn *conn,
                                 char *response, int response_max)
 {
-    char ip_cmd[160], nat_mac[32] = "";
+    char ip_cmd[320], nat_mac[32] = "";
     HRESULT mac_hr;
     int n;
 
-    if (!vm || !conn || !response || response_max <= 0 ||
-        vm->network_mode != NET_NAT || vm->nat_ip[0] == '\0')
+    if (!vm || !conn || !response || response_max <= 0) return TRUE;
+    if (vm->network_mode == NET_VPN && vm->vpn_ip[0]) {
+        /* VPN network: route through the gateway and use the VPN's own DNS,
+           which the guest reaches through the tunnel. */
+        char dns[160];
+        vpn_gateway_client_dns(vm, dns, sizeof(dns));
+        sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s:%s:%s",
+                  vm->vpn_ip, vpn_gateway_lan_ip(), vm->vpn_mac, dns);
+        n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd,
+                            response, response_max, 60000);
+        if (n <= 0) return FALSE;
+        ui_log(L"VPN network config for \"%s\": %S", vm->name, response);
+        return TRUE;
+    }
+    if (vm->network_mode != NET_NAT || vm->nat_ip[0] == '\0')
         return TRUE;
 
     mac_hr = hcn_get_endpoint_mac(&vm->endpoint_id, nat_mac, sizeof(nat_mac));
@@ -815,7 +829,8 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     BOOL ok;
     BOOL redact = command &&
         (strncmp(command, "appliance_account:", 18) == 0 ||
-         strncmp(command, "shared_smb_map:", 15) == 0);
+         strncmp(command, "shared_smb_map:", 15) == 0 ||
+         strncmp(command, "vpn_set:", 8) == 0);
 
     if (!conn || !instance->agent_online) {
         ui_log(L"Agent: not connected to \"%s\"", instance->name);

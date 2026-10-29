@@ -13,6 +13,7 @@
 #include <windows.h>
 #include "shared_resources.h"
 #include "shared_appliance.h"
+#include "vpn_configs.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -44,6 +45,7 @@ typedef struct AsbDisplay AsbDisplay;
 #define ASB_NET_NAT      1
 #define ASB_NET_EXTERNAL 2
 #define ASB_NET_INTERNAL 3
+#define ASB_NET_VPN      4   /* routed through a WireGuard config by the VPN gateway */
 
 /* ---- VM configuration (for creating a new VM) ---- */
 
@@ -65,6 +67,7 @@ typedef struct {
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
+    const wchar_t *vpn_id;         /* WireGuard config for ASB_NET_VPN */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -280,6 +283,18 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 /* Stop the appliance and delete its disks, data and saved config (unconfigured
    afterwards). ERROR_BUSY while clients or host mounts use it. */
 ASB_API HRESULT asb_shared_appliance_delete(void);
+/* ---- WireGuard VPN configs ---- */
+ASB_API int asb_vpn_config_count(void);
+ASB_API BOOL asb_vpn_config_get(int index, AsbVpnConfigInfo *out);
+/* error receives a reason when the text is not a usable WireGuard config. */
+ASB_API HRESULT asb_vpn_config_import(const wchar_t *name, const wchar_t *text,
+                                      wchar_t *error, size_t error_chars);
+/* ERROR_BUSY while a VM is set to use the config. */
+ASB_API HRESULT asb_vpn_config_delete(const wchar_t *id);
+/* Select the VM's VPN config (empty = none); the VM must be stopped. */
+ASB_API HRESULT asb_vm_set_vpn(AsbVm vm, const wchar_t *vpn_id);
+ASB_API const wchar_t *asb_vm_vpn_id(AsbVm vm);
+
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_unc_path(const wchar_t *id, wchar_t *out, size_t chars);
@@ -314,6 +329,10 @@ HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path);
 #include "hcs_vm.h"
 #include "snapshot.h"
 #include "gpu_enum.h"
+#include "vpn_gateway.h"
+
+ASB_API void asb_vpn_gateway_get_status(VpnGatewayStatus *out);
+ASB_API HRESULT asb_vpn_gateway_stop(void);
 
 ASB_API VmInstance   *asb_vm_instance(AsbVm vm);
 
