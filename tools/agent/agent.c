@@ -1632,44 +1632,108 @@ static void ensure_vdd_running(void)
     agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
 }
 
-/* ---- Display driver update staged by the host ----
-   The host refreshes the display driver files beside the agent while the VM
-   is off and leaves drivers\vdd-update.pending. Installing them at service
-   start gets driver fixes to VMs created before them. */
+/* ---- Driver updates staged by the host ----
+   The host refreshes driver files beside the agent while the VM is off and
+   leaves drivers\<name>-update.pending. Installing them at service start gets
+   driver fixes to VMs created before them. devcon install/update can take
+   far longer than run_devcon's 2 s, so these wait up to two minutes. */
 
-static void apply_staged_vdd_update(void)
+static void agent_dir(wchar_t *dir, size_t chars)
 {
-    wchar_t dir[MAX_PATH], marker[MAX_PATH], cmd[MAX_PATH * 2], *slash;
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    DWORD exit_code = 0;
-
-    GetModuleFileNameW(NULL, dir, MAX_PATH);
+    wchar_t *slash;
+    GetModuleFileNameW(NULL, dir, (DWORD)chars);
     slash = wcsrchr(dir, L'\\');
     if (slash) *slash = L'\0';
-    swprintf_s(marker, MAX_PATH, L"%s\\drivers\\vdd-update.pending", dir);
-    if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
-    /* One attempt per staging, so a package that won't install can't loop. */
-    DeleteFileW(marker);
-    swprintf_s(cmd, _countof(cmd),
-               L"\"%s\\drivers\\devcon.exe\" update \"%s\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD",
-               dir, dir);
+}
+
+/* devcon <verb> "<dir>\drivers\<inf>" <hwid>; returns its exit code, or
+   (DWORD)-1 when it could not be run. */
+static DWORD run_devcon_inf(const wchar_t *verb, const wchar_t *inf, const wchar_t *hwid)
+{
+    wchar_t dir[MAX_PATH], cmd[MAX_PATH * 3];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = (DWORD)-1;
+
+    agent_dir(dir, MAX_PATH);
+    swprintf_s(cmd, _countof(cmd), L"\"%s\\drivers\\devcon.exe\" %s \"%s\\drivers\\%s\" %s",
+               dir, verb, dir, inf, hwid);
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
     if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        agent_log("VDD update: devcon failed to launch (%lu).", GetLastError());
-        return;
+        agent_log("devcon %ls %ls: failed to launch (%lu).", verb, inf, GetLastError());
+        return exit_code;
     }
     if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_TIMEOUT) {
-        agent_log("VDD update: devcon timed out, killing.");
+        agent_log("devcon %ls %ls: timed out, killing.", verb, inf);
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 3000);
     }
     GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    agent_log("VDD update: devcon update exit=%lu (0 = installed, 1 = after reboot).", exit_code);
+    return exit_code;
+}
+
+static void apply_staged_driver_update(const wchar_t *marker_name, const wchar_t *inf,
+                                       const wchar_t *hwid)
+{
+    wchar_t dir[MAX_PATH], marker[MAX_PATH];
+    DWORD exit_code;
+    agent_dir(dir, MAX_PATH);
+    swprintf_s(marker, MAX_PATH, L"%s\\drivers\\%s", dir, marker_name);
+    if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
+    /* One attempt per staging, so a package that won't install can't loop. */
+    DeleteFileW(marker);
+    exit_code = run_devcon_inf(L"update", inf, hwid);
+    agent_log("Driver update %ls: devcon update exit=%lu (0 = installed, 1 = after reboot).",
+              inf, exit_code);
+}
+
+static void apply_staged_vdd_update(void)
+{
+    apply_staged_driver_update(L"vdd-update.pending", L"AppSandboxVDD.inf", L"Root\\AppSandboxVDD");
+    apply_staged_driver_update(L"vad-update.pending", L"AppSandboxVAD.inf", L"Root\\AppSandboxVAD");
+}
+
+/* ---- Virtual audio device check ----
+   With no AppSandboxVAD the audio helper finds no "App Sandbox Virtual Audio"
+   endpoint and the VM has no sound (seen on VMs whose first install of the
+   driver failed). Install it from the package beside the agent when it is
+   missing, enable it when disabled, restart it when it has a problem. */
+static void ensure_vad_installed(void)
+{
+    wchar_t dir[MAX_PATH], inf[MAX_PATH];
+    char output[4096];
+    DWORD exit_code = 0;
+
+    if (!run_devcon(L"status Root\\AppSandboxVAD", output, sizeof(output), &exit_code)) {
+        agent_log("ensure_vad_installed: devcon failed to launch (%lu).", GetLastError());
+        return;
+    }
+    if (strstr(output, "running")) return;
+    if (strstr(output, "No matching")) {
+        agent_dir(dir, MAX_PATH);
+        swprintf_s(inf, MAX_PATH, L"%s\\drivers\\AppSandboxVAD.inf", dir);
+        if (GetFileAttributesW(inf) == INVALID_FILE_ATTRIBUTES) {
+            agent_log("VAD: not installed and no package beside the agent.");
+            return;
+        }
+        agent_log("VAD: not installed - installing.");
+        exit_code = run_devcon_inf(L"install", L"AppSandboxVAD.inf", L"Root\\AppSandboxVAD");
+        agent_log("VAD install: devcon exit=%lu (0 = installed, 1 = after reboot).", exit_code);
+        return;
+    }
+    if (strstr(output, "disabled")) {
+        agent_log("VAD: disabled - enabling.");
+        run_devcon(L"enable Root\\AppSandboxVAD", output, sizeof(output), &exit_code);
+        agent_log("VAD enable (exit=%lu): %.400s", exit_code, output);
+        return;
+    }
+    agent_log("VAD: %s - restarting.", strstr(output, "problem") ? "problem" : "unknown state");
+    run_devcon(L"restart Root\\AppSandboxVAD", output, sizeof(output), &exit_code);
+    agent_log("VAD restart (exit=%lu): %.400s", exit_code, output);
 }
 
 /* ---- Hyper-V Video device check: disable if running ---- */
@@ -3410,6 +3474,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Ensure VDD device is running (may need restart after logout teardown) */
     ensure_vdd_running();
+
+    /* Ensure the virtual audio device exists and runs */
+    ensure_vad_installed();
 
     /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
     ensure_hyperv_video_disabled(NULL);

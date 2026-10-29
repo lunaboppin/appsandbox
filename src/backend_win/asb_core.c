@@ -884,26 +884,26 @@ static void remember_storage_parent(const wchar_t *root)
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
 
-/* The display driver package beside the agent (drivers\) is refreshed the
-   same way when its DLL differs; the agent installs it at its next start,
-   prompted by drivers\vdd-update.pending. Only guests that already have the
-   package (and devcon) are touched. */
-static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_dir)
+/* A driver package beside the agent (drivers\) is refreshed the same way
+   when its binary differs, and drivers\<marker> asks the agent to install it
+   at its next start. A package the guest lacks entirely is copied in too, so
+   the agent can install a driver whose first install failed. Only guests
+   with devcon beside the agent are touched. */
+static void refresh_guest_driver(wchar_t drive, const wchar_t *source_dir,
+                                 const wchar_t *const *files, const wchar_t *marker_name)
 {
-    static const wchar_t *files[] = {
-        L"AppSandboxVDD.inf", L"AppSandboxVDD.cat", L"AppSandboxVDD.dll", NULL
-    };
     wchar_t source[MAX_PATH], dest[MAX_PATH], temp[MAX_PATH];
     BYTE a[32], b[32];
     HANDLE marker;
     int i;
-    swprintf_s(source, MAX_PATH, L"%s\\drivers\\AppSandboxVDD.dll", source_dir);
-    swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\AppSandboxVDD.dll", drive);
-    if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES ||
-        GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) return;
+    const wchar_t *binary = files[2];   /* inf, cat, then the binary */
+    swprintf_s(source, MAX_PATH, L"%s\\drivers\\%s", source_dir, binary);
+    swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, binary);
+    if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES) return;
     swprintf_s(temp, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\devcon.exe", drive);
     if (GetFileAttributesW(temp) == INVALID_FILE_ATTRIBUTES) return;
-    if (SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
+    if (GetFileAttributesW(dest) != INVALID_FILE_ATTRIBUTES &&
+        SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
         memcmp(a, b, 32) == 0) return;
     for (i = 0; files[i]; i++) {
         swprintf_s(source, MAX_PATH, L"%s\\drivers\\%s", source_dir, files[i]);
@@ -911,15 +911,27 @@ static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_di
         swprintf_s(temp, MAX_PATH, L"%s.new", dest);
         if (!CopyFileW(source, temp, FALSE) ||
             !MoveFileExW(temp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            asb_log(L"Guest display driver refresh: %s failed (%lu).", files[i], GetLastError());
+            asb_log(L"Guest driver refresh: %s failed (%lu).", files[i], GetLastError());
             DeleteFileW(temp);
             return;
         }
     }
-    swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\vdd-update.pending", drive);
+    swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, marker_name);
     marker = CreateFileW(dest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (marker != INVALID_HANDLE_VALUE) CloseHandle(marker);
-    asb_log(L"Guest display driver refresh: staged the new driver; the agent installs it at boot.");
+    asb_log(L"Guest driver refresh: staged %s; the agent installs it at boot.", binary);
+}
+
+static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_dir)
+{
+    static const wchar_t *vdd[] = {
+        L"AppSandboxVDD.inf", L"AppSandboxVDD.cat", L"AppSandboxVDD.dll", NULL
+    };
+    static const wchar_t *vad[] = {
+        L"AppSandboxVAD.inf", L"AppSandboxVAD.cat", L"AppSandboxVAD.sys", NULL
+    };
+    refresh_guest_driver(drive, source_dir, vdd, L"vdd-update.pending");
+    refresh_guest_driver(drive, source_dir, vad, L"vad-update.pending");
 }
 
 /* The session helpers the agent spawns live beside it in the guest. They are
@@ -1017,7 +1029,8 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
 static void guest_payload_stamp(wchar_t *out, size_t chars)
 {
     static const wchar_t *files[] = {
-        L"appsandbox-agent.exe", L"appsandbox-input.exe", L"drivers\\AppSandboxVDD.dll", NULL
+        L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-audio.exe",
+        L"drivers\\AppSandboxVDD.dll", L"drivers\\AppSandboxVAD.sys", NULL
     };
     wchar_t module[MAX_PATH], dir[MAX_PATH], path[MAX_PATH], *slash;
     BYTE digest[32];
