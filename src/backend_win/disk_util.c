@@ -1540,7 +1540,14 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         L"    permissions: '0700'\n    content: |\n"
         L"      #!/bin/sh\n      set -eu\n"
         L"      disk=$(lsblk -dpno NAME,TYPE | awk '$2==\"disk\"{print $1}' | tail -1)\n"
-        L"      part=${disk}1\n      if ! blkid $part >/dev/null 2>&1; then parted -s $disk mklabel gpt mkpart primary ext4 1MiB 100%%; mkfs.ext4 -F -L ASBSHARED $part; fi\n"
+        L"      part=${disk}1\n      if ! blkid $part >/dev/null 2>&1; then\n"
+        L"        parted -s $disk mklabel gpt mkpart primary ext4 1MiB 100%%\n"
+        /* parted returns before udev creates the partition node, so mkfs
+           can race it ("The file /dev/sdb1 does not exist"). */
+        L"        partprobe $disk || true; udevadm settle || true\n"
+        L"        i=0; while [ ! -b $part ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done\n"
+        L"        mkfs.ext4 -F -L ASBSHARED $part\n"
+        L"      fi\n"
         L"      mkdir -p /srv/appsandbox\n      grep -q ASBSHARED /etc/fstab || echo 'LABEL=ASBSHARED /srv/appsandbox ext4 defaults,nofail 0 2' >> /etc/fstab\n"
         L"      mount /srv/appsandbox || true\n"
         L"      grep -q '^server signing = mandatory' /etc/samba/smb.conf || sed -i '/^\\[global\\]/a server signing = mandatory' /etc/samba/smb.conf\n"
