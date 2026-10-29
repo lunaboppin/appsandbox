@@ -68,6 +68,7 @@ static VmDisplay *g_appliance_display = NULL;
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
 #define WM_VM_MANAGE_DONE     (WM_APP + 19)
+#define WM_HOST_RESOURCE_DONE (WM_APP + 20)
 
 #define MANAGE_OP_MOVE_STORAGE 1
 #define MANAGE_OP_RESIZE_DISK  2
@@ -1080,6 +1081,66 @@ static void start_manage_work(int vm_index, int operation,
     CloseHandle(thread);
 }
 
+/* Mount, open, unmount and purge can start the appliance and wait minutes
+   for it, so they run on a worker and finish on the UI thread. */
+typedef struct {
+    wchar_t action[32];
+    wchar_t id[ASB_SHARED_ID_CHARS];
+    HRESULT result;
+} HostResourceWork;
+
+static DWORD WINAPI host_resource_work_thread(LPVOID param)
+{
+    HostResourceWork *work = (HostResourceWork *)param;
+    if (wcscmp(work->action, L"mountHostResource") == 0) {
+        /* Mount Host maps a drive letter, so a resource without one
+           gets a free letter first. Open Share can do without. */
+        work->result = asb_shared_resource_assign_host_letter(work->id);
+        if (SUCCEEDED(work->result)) work->result = asb_shared_resource_host_mount(work->id);
+    } else if (wcscmp(work->action, L"openHostResource") == 0)
+        work->result = asb_shared_resource_host_mount(work->id);
+    else if (wcscmp(work->action, L"unmountHostResource") == 0)
+        work->result = asb_shared_resource_host_unmount(work->id);
+    else
+        work->result = asb_shared_resource_purge(work->id);
+    if (!PostMessageW(g_hwnd_main, WM_HOST_RESOURCE_DONE, 0, (LPARAM)work))
+        free(work);
+    return 0;
+}
+
+static void finish_host_resource_work(const wchar_t *action, const wchar_t *id, HRESULT hr)
+{
+    AsbSharedResourceInfo resource = {0};
+    int resource_count = asb_shared_resource_count(), resource_index;
+    BOOL found = FALSE;
+    for (resource_index = 0; resource_index < resource_count && !found; ++resource_index)
+        found = asb_shared_resource_get(resource_index, &resource) &&
+                _wcsicmp(resource.id, id) == 0;
+    if (found && SUCCEEDED(hr) && wcscmp(action, L"openHostResource") == 0) {
+        wchar_t path[MAX_PATH] = { resource.host_drive_letter, L':', L'\\', L'\0' };
+        /* No host letter: the mapping is UNC-only, so open that. */
+        if (resource.host_drive_letter ||
+            SUCCEEDED(asb_shared_resource_unc_path(id, path, _countof(path))))
+            ShellExecuteW(g_hwnd_main, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+    }
+    { wchar_t out[1024], message[256]; JsonBuilder sj; jb_init(&sj,out,_countof(out));
+      jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");jb_string(&sj,L"id",id);
+      jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);
+      if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_ASSIGNED)) {
+          swprintf_s(message, _countof(message),
+                     L"Drive %c: is already in use on this PC. Pick another host drive letter with Edit.",
+                     found && resource.host_drive_letter ? resource.host_drive_letter : L'?');
+          jb_string(&sj,L"message",message);
+      } else if (hr == HRESULT_FROM_WIN32(ERROR_SESSION_CREDENTIAL_CONFLICT))
+          jb_string(&sj,L"message",L"Windows already has a connection to the appliance under other credentials. Disconnect it (net use) and try again.");
+      else if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_DEVICES))
+          jb_string(&sj,L"message",L"No free drive letter is left on this PC.");
+      else if (hr == HRESULT_FROM_WIN32(ERROR_NO_TOKEN))
+          jb_string(&sj,L"message",L"Explorer isn't running, so the drive can't be mapped for your session.");
+      jb_object_end(&sj);webview2_post(out); }
+    send_full_state();
+}
+
 /* ---- WebView2 message dispatch ---- */
 
 static void on_webview2_message(const wchar_t *json)
@@ -1500,49 +1561,19 @@ static void on_webview2_message(const wchar_t *json)
                wcscmp(action, L"openHostResource") == 0 ||
                wcscmp(action, L"unmountHostResource") == 0 ||
                wcscmp(action, L"purgeSharedResource") == 0) {
-        wchar_t id[ASB_SHARED_ID_CHARS] = {0};
-        HRESULT hr = E_INVALIDARG;
-        if (json_get_string(json, L"id", id, _countof(id))) {
-            if (wcscmp(action, L"mountHostResource") == 0) {
-                /* Mount Host maps a drive letter, so a resource without one
-                   gets a free letter first. Open Share can do without. */
-                hr = asb_shared_resource_assign_host_letter(id);
-                if (SUCCEEDED(hr)) hr = asb_shared_resource_host_mount(id);
-            } else if (wcscmp(action, L"openHostResource") == 0)
-                hr = asb_shared_resource_host_mount(id);
-            else if (wcscmp(action, L"unmountHostResource") == 0)
-                hr = asb_shared_resource_host_unmount(id);
-            else hr = asb_shared_resource_purge(id);
-            if (SUCCEEDED(hr) && wcscmp(action, L"openHostResource") == 0) {
-                AsbSharedResourceInfo resource;
-                int resource_count = asb_shared_resource_count();
-                int resource_index;
-                for (resource_index = 0; resource_index < resource_count; ++resource_index) {
-                    if (asb_shared_resource_get(resource_index, &resource) &&
-                        _wcsicmp(resource.id, id) == 0) {
-                        wchar_t path[MAX_PATH] = { resource.host_drive_letter, L':', L'\\', L'\0' };
-                        /* No host letter: the mapping is UNC-only, so open that. */
-                        if (resource.host_drive_letter ||
-                            SUCCEEDED(asb_shared_resource_unc_path(id, path, _countof(path))))
-                            ShellExecuteW(g_hwnd_main, L"open", path, NULL, NULL, SW_SHOWNORMAL);
-                        break;
-                    }
-                }
-            }
+        HostResourceWork *work = (HostResourceWork *)calloc(1, sizeof(*work));
+        HANDLE thread = NULL;
+        HRESULT hr = work ? E_INVALIDARG : E_OUTOFMEMORY;
+        if (work && json_get_string(json, L"id", work->id, _countof(work->id))) {
+            wcscpy_s(work->action, _countof(work->action), action);
+            thread = CreateThread(NULL, 0, host_resource_work_thread, work, 0, NULL);
+            if (!thread) hr = HRESULT_FROM_WIN32(GetLastError());
         }
-        { wchar_t out[1024]; JsonBuilder sj; jb_init(&sj,out,_countof(out));
-          jb_object_begin(&sj);jb_string(&sj,L"type",L"sharedResourceResult");
-          jb_bool(&sj,L"success",SUCCEEDED(hr));jb_int(&sj,L"hr",(int)hr);
-          if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_ASSIGNED))
-              jb_string(&sj,L"message",L"That host drive letter is already in use on this PC. Pick another host drive letter with Edit.");
-          else if (hr == HRESULT_FROM_WIN32(ERROR_SESSION_CREDENTIAL_CONFLICT))
-              jb_string(&sj,L"message",L"Windows already has a connection to the appliance under other credentials. Disconnect it (net use) and try again.");
-          else if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_DEVICES))
-              jb_string(&sj,L"message",L"No free drive letter is left on this PC.");
-          else if (hr == HRESULT_FROM_WIN32(ERROR_NO_TOKEN))
-              jb_string(&sj,L"message",L"Explorer isn't running, so the drive can't be mapped for your session.");
-          jb_object_end(&sj);webview2_post(out); }
-        send_full_state();
+        if (thread) CloseHandle(thread);
+        else {
+            finish_host_resource_work(action, work ? work->id : L"", hr);
+            free(work);
+        }
     } else if (wcscmp(action, L"setVmInstallerIso") == 0) {
         int vi; wchar_t path[MAX_PATH] = { 0 }; HRESULT hr = E_INVALIDARG;
         if (json_get_int(json, L"vmIndex", &vi)) {
@@ -1842,6 +1873,15 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_HOST_RESOURCE_DONE:
+    {
+        HostResourceWork *work = (HostResourceWork *)lp;
+        if (work) {
+            finish_host_resource_work(work->action, work->id, work->result);
+            free(work);
+        }
+        return 0;
+    }
     case WM_VM_MANAGE_DONE:
     {
         ManageWorkArgs *args = (ManageWorkArgs *)lp;

@@ -1287,29 +1287,28 @@ function renderSettingsResources(){
         var mount=document.createElement('button');
         mount.type='button';mount.textContent='Mount Host';
         mount.title=r.hostDriveLetter?'Map this resource as drive '+r.hostDriveLetter+': in File Explorer.':'Map this resource as a drive in File Explorer (a free letter is picked).';
-        mount.onclick=function(){mountHostResource(r.id,mount);};
-        var open=document.createElement('button');
-        open.type='button';open.textContent='Open Share';open.title='Open this resource in File Explorer on the host.';
-        open.onclick=function(){sendCmd('openHostResource',{id:r.id});};
+        mount.onclick=function(){mountHostResource(r.id);};
         var unmount=document.createElement('button');
         unmount.type='button';unmount.textContent='Unmount';unmount.title='Disconnect this resource\'s drive from File Explorer.';
-        unmount.onclick=function(){unmount.disabled=true;unmount.textContent='Unmounting…';sendCmd('unmountHostResource',{id:r.id});};
+        unmount.onclick=function(){hostResourceBusy[r.id]='Unmounting…';renderSettingsResources();sendCmd('unmountHostResource',{id:r.id});};
         /* Mount and Unmount swap: only the one that applies is shown. */
         if(r.hostMounted)mount.style.display='none';else unmount.style.display='none';
+        /* Mounting can wait on the appliance to start; state refreshes keep the button busy. */
+        if(hostResourceBusy[r.id]){mount.disabled=unmount.disabled=true;(r.hostMounted?unmount:mount).textContent=hostResourceBusy[r.id];}
         var purge=document.createElement('button');
         purge.type='button';purge.className='danger';purge.textContent='Purge Data';purge.title='Permanently delete all data stored in this resource.';
         purge.onclick=function(){showModal('Permanently purge data','Permanently delete all appliance data for '+r.name+'? This cannot be undone.','Purge').then(function(ok){if(ok)sendCmd('purgeSharedResource',{id:r.id});});};
         var del=document.createElement('button');
         del.type='button';del.className='danger';del.textContent='Remove';del.title='Remove this resource definition while retaining its appliance data.';
         del.onclick=function(){showModal('Remove shared resource','Unpublish '+r.name+'? Its appliance directory will be retained.','Remove').then(function(ok){if(ok)sendCmd('deleteSharedResource',{id:r.id});});};
-        actions.append(edit,mount,open,unmount,purge,del);
+        actions.append(edit,mount,unmount,purge,del);
         row.append(details,actions);
         box.appendChild(row);
     });
     if(!box.children.length)box.textContent='No shared resources configured.';
 }
 function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked};if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
-function onSharedResourceResult(msg){if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
+function onSharedResourceResult(msg){if(msg.id&&hostResourceBusy[msg.id]){delete hostResourceBusy[msg.id];renderSettingsResources();}if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 
 function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?(s.backend||'appliance'):'Not configured')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;}
 function appliancePayload(){return{backend:document.getElementById('appliance-backend').value,storageParent:document.getElementById('appliance-storage-parent').value.trim(),dataSizeGb:Number(document.getElementById('appliance-data-size').value),adminUser:document.getElementById('appliance-admin-user').value.trim(),adminPassword:document.getElementById('appliance-admin-pass').value,ramMb:Number(document.getElementById('appliance-ram').value),cpuCores:Number(document.getElementById('appliance-cpu').value),windowsIsoPath:document.getElementById('appliance-server-iso').value.trim(),windowsImageName:document.getElementById('appliance-server-image').value.trim(),productKey:document.getElementById('appliance-product-key').value};}
@@ -1319,7 +1318,8 @@ function stopSharedAppliance(){sendCmd('stopSharedAppliance');}
 function updateSharedAppliance(){sendCmd('updateSharedAppliance');}
 function growSharedAppliance(){sendCmd('growSharedAppliance',{dataSizeGb:Number(document.getElementById('appliance-data-size').value)});}
 function rebuildSharedAppliance(){var p=appliancePayload();p.switchBackend=!!sharedAppliance.backend&&sharedAppliance.backend!==p.backend;showModal('Rebuild appliance',p.switchBackend?'Changing backend archives the old data VHDX and creates a new empty disk. Continue?':'Rebuild the appliance OS disk while preserving its data disk?','Rebuild').then(function(ok){if(ok)sendCmd('rebuildSharedAppliance',p);});}
-function mountHostResource(id,button){if(button){button.disabled=true;button.textContent='Mounting…';}sendCmd('mountHostResource',{id:id});}
+var hostResourceBusy={};
+function mountHostResource(id){hostResourceBusy[id]='Mounting…';renderSettingsResources();sendCmd('mountHostResource',{id:id});}
 function deleteSharedAppliance(){showModal('Delete shared appliance','Delete the shared appliance? Its OS disk and data disk are permanently deleted, including every shared resource\'s files. Shared resource definitions are kept and publish again after a new Setup.\n\nThis cannot be undone.','Delete').then(function(ok){if(ok)sendCmd('deleteSharedAppliance');});}
 /* ---- WireGuard VPN ---- */
 

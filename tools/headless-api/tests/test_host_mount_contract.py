@@ -36,9 +36,13 @@ def main() -> None:
     assert "New-SmbGlobalMapping -LocalPath" not in appliance, "letters are no longer global mappings"
     assert "SHCNE_DRIVEADD" in appliance and "DBT_DEVICEARRIVAL" in appliance
 
-    assert "asb_shared_resource_assign_host_letter(id)" in ui
+    assert "asb_shared_resource_assign_host_letter(work->id)" in ui
     assert 'L"hostMounted", asb_shared_resource_host_mounted(r.id)' in ui
     assert "if(r.hostMounted)mount.style.display='none';else unmount.style.display='none';" in app
+    # Mounting can wait minutes on the appliance: it runs off the UI thread.
+    assert "CreateThread(NULL, 0, host_resource_work_thread, work, 0, NULL)" in ui
+    assert "case WM_HOST_RESOURCE_DONE:" in ui
+    assert "Open Share" not in app, "Mount Host already opens the drive in Explorer"
     print("[ok] host mount maps an Explorer-visible drive contract")
 
 
