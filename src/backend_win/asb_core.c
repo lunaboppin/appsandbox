@@ -889,7 +889,7 @@ static void remember_storage_parent(const wchar_t *root)
    at its next start. A package the guest lacks entirely is copied in too, so
    the agent can install a driver whose first install failed. Only guests
    with devcon beside the agent are touched. */
-static void refresh_guest_driver(wchar_t drive, const wchar_t *source_dir,
+static void refresh_guest_driver(wchar_t drive, const wchar_t *drivers_dir,
                                  const wchar_t *const *files, const wchar_t *marker_name)
 {
     wchar_t source[MAX_PATH], dest[MAX_PATH], temp[MAX_PATH];
@@ -897,7 +897,7 @@ static void refresh_guest_driver(wchar_t drive, const wchar_t *source_dir,
     HANDLE marker;
     int i;
     const wchar_t *binary = files[2];   /* inf, cat, then the binary */
-    swprintf_s(source, MAX_PATH, L"%s\\drivers\\%s", source_dir, binary);
+    swprintf_s(source, MAX_PATH, L"%s\\%s", drivers_dir, binary);
     swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, binary);
     if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES) return;
     swprintf_s(temp, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\devcon.exe", drive);
@@ -906,7 +906,7 @@ static void refresh_guest_driver(wchar_t drive, const wchar_t *source_dir,
         SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
         memcmp(a, b, 32) == 0) return;
     for (i = 0; files[i]; i++) {
-        swprintf_s(source, MAX_PATH, L"%s\\drivers\\%s", source_dir, files[i]);
+        swprintf_s(source, MAX_PATH, L"%s\\%s", drivers_dir, files[i]);
         swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, files[i]);
         swprintf_s(temp, MAX_PATH, L"%s.new", dest);
         if (!CopyFileW(source, temp, FALSE) ||
@@ -922,6 +922,19 @@ static void refresh_guest_driver(wchar_t drive, const wchar_t *source_dir,
     asb_log(L"Guest driver refresh: staged %s; the agent installs it at boot.", binary);
 }
 
+/* The built driver packages sit in drivers\ beside the app, not in the
+   resources\ folder the guest helpers come from, so look in both. */
+static void guest_drivers_dir(const wchar_t *source_dir, wchar_t *out, size_t chars)
+{
+    wchar_t module[MAX_PATH], *slash;
+    swprintf_s(out, chars, L"%s\\drivers", source_dir);
+    if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return;
+    GetModuleFileNameW(g_dll_module, module, MAX_PATH);
+    slash = wcsrchr(module, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(out, chars, L"%s\\drivers", module);
+}
+
 static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_dir)
 {
     static const wchar_t *vdd[] = {
@@ -930,8 +943,10 @@ static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_di
     static const wchar_t *vad[] = {
         L"AppSandboxVAD.inf", L"AppSandboxVAD.cat", L"AppSandboxVAD.sys", NULL
     };
-    refresh_guest_driver(drive, source_dir, vdd, L"vdd-update.pending");
-    refresh_guest_driver(drive, source_dir, vad, L"vad-update.pending");
+    wchar_t drivers_dir[MAX_PATH];
+    guest_drivers_dir(source_dir, drivers_dir, MAX_PATH);
+    refresh_guest_driver(drive, drivers_dir, vdd, L"vdd-update.pending");
+    refresh_guest_driver(drive, drivers_dir, vad, L"vad-update.pending");
 }
 
 /* The session helpers the agent spawns live beside it in the guest. They are
@@ -1030,9 +1045,9 @@ static void guest_payload_stamp(wchar_t *out, size_t chars)
 {
     static const wchar_t *files[] = {
         L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-audio.exe",
-        L"drivers\\AppSandboxVDD.dll", L"drivers\\AppSandboxVAD.sys", NULL
+        L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys", NULL   /* '*' = in the drivers folder */
     };
-    wchar_t module[MAX_PATH], dir[MAX_PATH], path[MAX_PATH], *slash;
+    wchar_t module[MAX_PATH], dir[MAX_PATH], drivers_dir[MAX_PATH], path[MAX_PATH], *slash;
     BYTE digest[32];
     size_t used = 0;
     int i, j;
@@ -1042,8 +1057,12 @@ static void guest_payload_stamp(wchar_t *out, size_t chars)
     if (slash) *slash = L'\0';
     swprintf_s(dir, MAX_PATH, L"%s\\resources", module);
     if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) wcscpy_s(dir, MAX_PATH, module);
+    guest_drivers_dir(dir, drivers_dir, MAX_PATH);
     for (i = 0; files[i]; i++) {
-        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, files[i]);
+        if (files[i][0] == L'*')
+            swprintf_s(path, MAX_PATH, L"%s\\%s", drivers_dir, files[i] + 1);
+        else
+            swprintf_s(path, MAX_PATH, L"%s\\%s", dir, files[i]);
         if (FAILED(sha256_file(path, digest))) continue;
         for (j = 0; j < 8 && used + 3 < chars; j++, used += 2)
             swprintf_s(out + used, chars - used, L"%02x", digest[j]);
