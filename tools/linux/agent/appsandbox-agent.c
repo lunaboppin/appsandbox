@@ -17,6 +17,7 @@
  * Run as:   systemd system service (root).
  */
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -921,7 +922,7 @@ static int mount_plan9_share(const char *share_name, const char *target)
 {
     int v;
     struct sockaddr_vm sa = {0};
-    char opts[512];
+    char opts[LINE_BUF_MAX + 128];   /* share_name can be a whole command line */
 
     /* mkdir -p target first — mount(2) requires it to exist. */
     if (mkpath_p(target) < 0) {
@@ -1118,7 +1119,7 @@ static int appliance_prepare_storage(void)
 
 static int appliance_set_account(const char *arguments)
 {
-    char copy[512], *separator, command[512], temp[] = "/run/appsandbox-smb-XXXXXX";
+    char copy[512], *separator, command[1152], temp[] = "/run/appsandbox-smb-XXXXXX";
     FILE *file;
     int fd, rc;
     snprintf(copy, sizeof(copy), "%s", arguments);
@@ -1161,7 +1162,7 @@ static int appliance_rebuild_share_include(void)
 
 static int appliance_reconcile_share(const char *arguments)
 {
-    char copy[256], *mode, directory[128], path[256], command[512];
+    char copy[256], *mode, directory[256], path[320], command[768];
     FILE *file;
     snprintf(copy, sizeof(copy), "%s", arguments);
     mode = strchr(copy, ':');

@@ -1748,6 +1748,12 @@ HRESULT shared_appliance_reconcile(void)
         return HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
     if (!g_appliance.status.ready)
         return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    /* A maintenance boot (setup, Update) is about to be stopped and replaced
+       by a normal boot, whose startup pass publishes the whole set. Sending
+       here raced that stop: the account command landed mid-shutdown and was
+       reported as a publish failure. */
+    if (g_appliance.provisioning_boot || g_appliance.stopping)
+        return HRESULT_FROM_WIN32(ERROR_NOT_READY);
     return reconcile_internal();
 }
 
