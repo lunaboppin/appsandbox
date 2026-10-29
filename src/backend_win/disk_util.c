@@ -181,8 +181,10 @@ HRESULT vhdx_resize_grow(const wchar_t *path, ULONGLONG new_size_gb,
     ZeroMemory(&open_params, sizeof(open_params));
     open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
 
+    /* OPEN_VIRTUAL_DISK_VERSION_2 requires VIRTUAL_DISK_ACCESS_NONE; any other
+       mask fails with ERROR_INVALID_PARAMETER. */
     result = OpenVirtualDisk(&storage_type, path,
-        VIRTUAL_DISK_ACCESS_GET_INFO | VIRTUAL_DISK_ACCESS_METAOPS,
+        VIRTUAL_DISK_ACCESS_NONE,
         OPEN_VIRTUAL_DISK_FLAG_NONE, &open_params, &handle);
     if (result != ERROR_SUCCESS)
         return HRESULT_FROM_WIN32(result);
@@ -236,7 +238,7 @@ HRESULT vhdx_set_parent_path(const wchar_t *child_path, const wchar_t *parent_pa
     ZeroMemory(&open_params, sizeof(open_params));
     open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
     result = OpenVirtualDisk(&storage_type, child_path,
-        VIRTUAL_DISK_ACCESS_METAOPS,
+        VIRTUAL_DISK_ACCESS_NONE,   /* VERSION_2 requires ACCESS_NONE */
         OPEN_VIRTUAL_DISK_FLAG_NO_PARENTS, &open_params, &handle);
     if (result != ERROR_SUCCESS)
         return HRESULT_FROM_WIN32(result);
