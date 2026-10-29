@@ -463,8 +463,37 @@ static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
    ~1000 socket calls per frame, which held the frame rate well under 60.
    rectCount 0 = full frame. Returns the packed length, or 0 when there is
    nothing to send (every rect empty) or no buffer. */
+/* BGRA -> NV12, full-range BT.601, one 2x2 block at a time (chroma is the
+   block average). The host's idd_nv12_to_bgra is the exact inverse. */
+static void VddPackNv12(const D3D11_MAPPED_SUBRESOURCE* mapped, PBYTE out)
+{
+    PBYTE yPlane = out, uvPlane = out + VDD_WIDTH * VDD_HEIGHT;
+    for (UINT y = 0; y < VDD_HEIGHT; y += 2) {
+        const BYTE* r0 = (const BYTE*)mapped->pData + y * mapped->RowPitch;
+        const BYTE* r1 = r0 + mapped->RowPitch;
+        PBYTE y0 = yPlane + y * VDD_WIDTH, y1 = y0 + VDD_WIDTH;
+        PBYTE uv = uvPlane + (y / 2) * VDD_WIDTH;
+        for (UINT x = 0; x < VDD_WIDTH; x += 2) {
+            const BYTE* p[4] = { r0 + x * 4, r0 + x * 4 + 4, r1 + x * 4, r1 + x * 4 + 4 };
+            int sr = 0, sg = 0, sb = 0;
+            for (int k = 0; k < 4; k++) {
+                int b = p[k][0], g = p[k][1], r = p[k][2];
+                BYTE lum = (BYTE)((77 * r + 150 * g + 29 * b + 128) >> 8);
+                if (k == 0) y0[x] = lum; else if (k == 1) y0[x + 1] = lum;
+                else if (k == 2) y1[x] = lum; else y1[x + 1] = lum;
+                sr += r; sg += g; sb += b;
+            }
+            sr >>= 2; sg >>= 2; sb >>= 2;
+            int u = ((-43 * sr - 85 * sg + 128 * sb + 128) >> 8) + 128;
+            int v = ((128 * sr - 107 * sg - 21 * sb + 128) >> 8) + 128;
+            uv[x]     = (BYTE)(u < 0 ? 0 : u > 255 ? 255 : u);
+            uv[x + 1] = (BYTE)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    }
+}
+
 static int VddPackFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* mapped,
-                        const RECT* rects, UINT32 rectCount)
+                        const RECT* rects, UINT32 rectCount, BOOL nv12)
 {
     const SIZE_T cap = sizeof(VDD_WIRE_FRAME_HEADER) + VDD_MAX_DIRTY_RECTS * sizeof(RECT) +
                        sizeof(UINT32) + VDD_PIXEL_BYTES;
@@ -483,7 +512,15 @@ static int VddPackFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* map
     }
     sizePtr = p;
     p += sizeof(UINT32);
-    if (!rectCount) {
+    if (nv12) {
+        rectCount = 0;
+        p = proc->pSendBuf + sizeof(whdr);
+        sizePtr = p;
+        p += sizeof(UINT32);
+        VddPackNv12(mapped, p);
+        p += VDD_NV12_BYTES;
+        dataSize = VDD_NV12_BYTES;
+    } else if (!rectCount) {
         for (UINT row = 0; row < VDD_HEIGHT; row++) {
             memcpy(p, (const BYTE*)mapped->pData + row * mapped->RowPitch, VDD_STRIDE);
             p += VDD_STRIDE;
@@ -504,10 +541,10 @@ static int VddPackFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* map
         if (dataSize == 0) return 0;
     }
     proc->frameSeq++;
-    whdr.magic            = VDD_FRAME_MAGIC;
+    whdr.magic            = nv12 ? VDD_FRAME_NV12_MAGIC : VDD_FRAME_MAGIC;
     whdr.width            = VDD_WIDTH;
     whdr.height           = VDD_HEIGHT;
-    whdr.stride           = VDD_STRIDE;
+    whdr.stride           = nv12 ? VDD_WIDTH : VDD_STRIDE;
     whdr.frame_seq        = proc->frameSeq;
     whdr.dirty_rect_count = rectCount;
     memcpy(proc->pSendBuf, &whdr, sizeof(whdr));
@@ -639,7 +676,8 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
                 if (SUCCEEDED(hr))
                 {
-                    int len = VddPackFrame(proc, &mapped, NULL, 0);
+                    /* Lossless, so a still screen sharpens after NV12 frames. */
+                    int len = VddPackFrame(proc, &mapped, NULL, 0, FALSE);
                     BOOL send_ok = len > 0 &&
                         VddSendAll(proc->hClientConn, (const char*)proc->pSendBuf, len) == 0;
 
@@ -715,8 +753,24 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                     if (dirtyRects[i].bottom > (LONG)VDD_HEIGHT) dirtyRects[i].bottom = VDD_HEIGHT;
                                 }
                             }
+                            /* Most of the screen changed (a game, video): NV12. The
+                               first frame after connecting stays lossless BGRA. */
+                            BOOL nv12 = FALSE;
+                            if (bSentFullFrame) {
+                                if (sendFull) {
+                                    nv12 = TRUE;
+                                } else {
+                                    UINT64 area = 0;
+                                    for (UINT32 i = 0; i < rectCount; i++)
+                                        if (dirtyRects[i].right > dirtyRects[i].left &&
+                                            dirtyRects[i].bottom > dirtyRects[i].top)
+                                            area += (UINT64)(dirtyRects[i].right - dirtyRects[i].left) *
+                                                    (UINT64)(dirtyRects[i].bottom - dirtyRects[i].top);
+                                    nv12 = area * 100 >= (UINT64)VDD_WIDTH * VDD_HEIGHT * VDD_NV12_AREA_PCT;
+                                }
+                            }
                             QueryPerformanceCounter(&perfA);
-                            len = VddPackFrame(proc, &mapped, dirtyRects, sendFull ? 0 : rectCount);
+                            len = VddPackFrame(proc, &mapped, dirtyRects, sendFull ? 0 : rectCount, nv12);
                             QueryPerformanceCounter(&perfB);
                             perfPackMs += (double)(perfB.QuadPart - perfA.QuadPart) * 1000.0 / (double)perfFreq.QuadPart;
                             /* All rects empty after clamping: nothing to send. */
@@ -727,7 +781,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                             QueryPerformanceCounter(&perfB);
                             perfSendMs += (double)(perfB.QuadPart - perfA.QuadPart) * 1000.0 / (double)perfFreq.QuadPart;
                             perfFrames++;
-                            if (sendFull || rectCount == 0) perfFull++;
+                            if (sendFull || rectCount == 0 || nv12) perfFull++;
                             if (send_ok && sendFull) bSentFullFrame = TRUE;
                             {
                                 double windowMs = (double)(perfB.QuadPart - perfWindow.QuadPart) * 1000.0 /

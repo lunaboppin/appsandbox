@@ -100,6 +100,7 @@ typedef struct AudioFrameHeader {
 /* ---- Frame protocol constants ---- */
 
 #define FRAME_MAGIC         0x52465341  /* "ASFR" little-endian */
+#define FRAME_NV12_MAGIC    0x3231564E  /* "NV12": same header, full frame as NV12 */
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
@@ -875,6 +876,33 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     *vy = (UINT)local_y;
     if (*vx >= vm_w) *vx = vm_w - 1;
     if (*vy >= vm_h) *vy = vm_h - 1;
+}
+
+/* NV12 (Y plane, then interleaved UV; full-range BT.601) -> BGRA. The
+   inverse of VddPackNv12 in the guest driver. width and height are even. */
+static void idd_nv12_to_bgra(const BYTE *src, UINT w, UINT h, BYTE *dst, UINT dst_stride)
+{
+    const BYTE *uv_plane = src + (size_t)w * h;
+    UINT x, y;
+    for (y = 0; y < h; y++) {
+        const BYTE *yrow = src + (size_t)y * w;
+        const BYTE *uv = uv_plane + (size_t)(y / 2) * w;
+        BYTE *out = dst + (size_t)y * dst_stride;
+        for (x = 0; x < w; x += 2) {
+            int u = uv[x] - 128, v = uv[x + 1] - 128;
+            int dr = 359 * v, dg = -88 * u - 183 * v, db = 454 * u;
+            int k;
+            for (k = 0; k < 2; k++) {
+                int l = yrow[x + k] << 8;
+                int r = (l + dr + 128) >> 8, g = (l + dg + 128) >> 8, b = (l + db + 128) >> 8;
+                out[0] = (BYTE)(b < 0 ? 0 : b > 255 ? 255 : b);
+                out[1] = (BYTE)(g < 0 ? 0 : g > 255 ? 255 : g);
+                out[2] = (BYTE)(r < 0 ? 0 : r > 255 ? 255 : r);
+                out[3] = 255;
+                out += 4;
+            }
+        }
+    }
 }
 
 /* ---- Reliable recv: read exactly `len` bytes ---- */
@@ -1663,7 +1691,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     LARGE_INTEGER perf_freq, perf_window, perf_t0, perf_t1;
     double perf_recv_ms = 0.0;
     UINT64 perf_bytes = 0;
-    UINT perf_frames = 0, perf_full = 0;
+    UINT perf_frames = 0, perf_full = 0, perf_nv12 = 0;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
     QueryPerformanceFrequency(&perf_freq);
@@ -1762,6 +1790,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             UINT32 rect_count;
             UINT32 i;
             UINT32 magic;
+            BOOL nv12;
 
             /* Peek at magic to determine message type */
             if (!recv_exact(s, &magic, sizeof(magic)))
@@ -1819,10 +1848,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 continue;  /* back to message loop */
             }
 
-            if (magic != FRAME_MAGIC) {
+            if (magic != FRAME_MAGIC && magic != FRAME_NV12_MAGIC) {
                 idd_log(d, L"Bad magic 0x%08X, reconnecting.", magic);
                 break;
             }
+            nv12 = (magic == FRAME_NV12_MAGIC);
 
             /* Read rest of frame header (already read magic) */
             QueryPerformanceCounter(&perf_t0);
@@ -1834,7 +1864,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Sanity checks */
             if (hdr.width == 0 || hdr.height == 0 ||
                 hdr.width > 7680 || hdr.height > 4320 ||
-                hdr.stride < hdr.width * 4) {
+                hdr.stride < hdr.width * (nv12 ? 1 : 4) ||
+                (nv12 && ((hdr.width | hdr.height) & 1 || hdr.dirty_rect_count != 0))) {
                 idd_log(d, L"Invalid frame dimensions %ux%u stride %u.",
                        hdr.width, hdr.height, hdr.stride);
                 break;
@@ -1856,8 +1887,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (!recv_exact(s, &data_size, 4))
                 break;
 
-            if (data_size > MAX_FRAME_DATA_SIZE) {
-                idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
+            if (data_size > MAX_FRAME_DATA_SIZE ||
+                (nv12 && data_size != hdr.width * hdr.height / 2 * 3)) {
+                idd_log(d, L"Frame data size %u bytes is wrong, reconnecting.", data_size);
                 break;
             }
 
@@ -1873,18 +1905,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             perf_bytes += data_size;
             perf_frames++;
             if (rect_count == 0) perf_full++;
+            if (nv12) perf_nv12++;
             {
                 double window_ms = (double)(perf_t1.QuadPart - perf_window.QuadPart) * 1000.0 /
                                    (double)perf_freq.QuadPart;
                 if (window_ms >= 2000.0) {
-                    idd_log(d, L"Frames: %.1f fps (%u full), transfer %.1f ms/frame, %.0f MB/s while sending.",
-                            perf_frames * 1000.0 / window_ms, perf_full,
+                    idd_log(d, L"Frames: %.1f fps (%u full, %u NV12), transfer %.1f ms/frame, %.0f MB/s while sending.",
+                            perf_frames * 1000.0 / window_ms, perf_full, perf_nv12,
                             perf_recv_ms / perf_frames,
                             perf_recv_ms > 0 ? (double)perf_bytes / 1048.576 / perf_recv_ms : 0.0);
                     perf_window = perf_t1;
                     perf_recv_ms = 0.0;
                     perf_bytes = 0;
-                    perf_frames = perf_full = 0;
+                    perf_frames = perf_full = perf_nv12 = 0;
                 }
             }
 
@@ -1913,7 +1946,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 }
             }
 
-            if (rect_count == 0) {
+            if (nv12) {
+                if (hdr.width == d->frame_width && hdr.height == d->frame_height)
+                    idd_nv12_to_bgra(recv_buf, hdr.width, hdr.height,
+                                     d->frame_buf, d->frame_stride);
+            } else if (rect_count == 0) {
                 /* Full frame update */
                 UINT row;
                 UINT copy_w = hdr.width * 4;
