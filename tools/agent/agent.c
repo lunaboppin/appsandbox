@@ -1646,9 +1646,9 @@ static void agent_dir(wchar_t *dir, size_t chars)
     if (slash) *slash = L'\0';
 }
 
-/* devcon <verb> "<dir>\drivers\<inf>" <hwid>; returns its exit code, or
+/* devcon <args> with up to two minutes to finish; returns its exit code, or
    (DWORD)-1 when it could not be run. */
-static DWORD run_devcon_inf(const wchar_t *verb, const wchar_t *inf, const wchar_t *hwid)
+static DWORD run_devcon_wait(const wchar_t *args)
 {
     wchar_t dir[MAX_PATH], cmd[MAX_PATH * 3];
     STARTUPINFOW si;
@@ -1656,17 +1656,16 @@ static DWORD run_devcon_inf(const wchar_t *verb, const wchar_t *inf, const wchar
     DWORD exit_code = (DWORD)-1;
 
     agent_dir(dir, MAX_PATH);
-    swprintf_s(cmd, _countof(cmd), L"\"%s\\drivers\\devcon.exe\" %s \"%s\\drivers\\%s\" %s",
-               dir, verb, dir, inf, hwid);
+    swprintf_s(cmd, _countof(cmd), L"\"%s\\drivers\\devcon.exe\" %s", dir, args);
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
     if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        agent_log("devcon %ls %ls: failed to launch (%lu).", verb, inf, GetLastError());
+        agent_log("devcon %ls: failed to launch (%lu).", args, GetLastError());
         return exit_code;
     }
     if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_TIMEOUT) {
-        agent_log("devcon %ls %ls: timed out, killing.", verb, inf);
+        agent_log("devcon %ls: timed out, killing.", args);
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 3000);
     }
@@ -1674,6 +1673,15 @@ static DWORD run_devcon_inf(const wchar_t *verb, const wchar_t *inf, const wchar
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return exit_code;
+}
+
+/* devcon <verb> "<dir>\drivers\<inf>" <hwid> */
+static DWORD run_devcon_inf(const wchar_t *verb, const wchar_t *inf, const wchar_t *hwid)
+{
+    wchar_t dir[MAX_PATH], args[MAX_PATH * 2];
+    agent_dir(dir, MAX_PATH);
+    swprintf_s(args, _countof(args), L"%s \"%s\\drivers\\%s\" %s", verb, dir, inf, hwid);
+    return run_devcon_wait(args);
 }
 
 static void apply_staged_driver_update(const wchar_t *marker_name, const wchar_t *inf,
@@ -1686,9 +1694,16 @@ static void apply_staged_driver_update(const wchar_t *marker_name, const wchar_t
     if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
     /* One attempt per staging, so a package that won't install can't loop. */
     DeleteFileW(marker);
+    /* The device is already running by service start, so its binary is in
+       use and an update only swaps it at the next reboot. Disabling it first
+       unloads the binary; the update then applies now, on this boot. */
+    swprintf_s(marker, MAX_PATH, L"disable %s", hwid);
+    agent_log("Driver update %ls: devcon disable exit=%lu.", inf, run_devcon_wait(marker));
     exit_code = run_devcon_inf(L"update", inf, hwid);
     agent_log("Driver update %ls: devcon update exit=%lu (0 = installed, 1 = after reboot).",
               inf, exit_code);
+    swprintf_s(marker, MAX_PATH, L"enable %s", hwid);
+    agent_log("Driver update %ls: devcon enable exit=%lu.", inf, run_devcon_wait(marker));
 }
 
 static void apply_staged_vdd_update(void)

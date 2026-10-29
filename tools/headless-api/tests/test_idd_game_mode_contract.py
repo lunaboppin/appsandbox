@@ -48,6 +48,11 @@ def main() -> None:
 
     # Driver updates reach existing VMs
     assert "apply_staged_vdd_update();" in agent and "vdd-update.pending" in agent
+    # ...on this boot: the running device is disabled around the update, so
+    # its binary isn't in use and isn't left for the next reboot.
+    upd = agent[agent.index("static void apply_staged_driver_update("):]
+    upd = upd[:upd.index("\n}\n")]
+    assert upd.index('L"disable %s"') < upd.index('run_devcon_inf(L"update"') < upd.index('L"enable %s"')
     assert "refresh_guest_display_driver(drive, source_dir);" in core
     assert "guest_payload_current(vm->vhdx_path, stamp)" in core
     # Drivers are built beside the app, not in resources\ with the helpers.
