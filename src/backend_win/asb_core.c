@@ -906,9 +906,16 @@ static void refresh_guest_driver(wchar_t drive, const wchar_t *drivers_dir,
     if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES) return;
     swprintf_s(temp, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\devcon.exe", drive);
     if (GetFileAttributesW(temp) == INVALID_FILE_ATTRIBUTES) return;
-    if (GetFileAttributesW(dest) != INVALID_FILE_ATTRIBUTES &&
-        SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
-        memcmp(a, b, 32) == 0) return;
+    /* Any file of the package, not just the binary: an INF-only change (such
+       as where the driver installs to) has to reach the guest too. */
+    for (i = 0; files[i]; i++) {
+        swprintf_s(source, MAX_PATH, L"%s\\%s", drivers_dir, files[i]);
+        swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, files[i]);
+        if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES ||
+            FAILED(sha256_file(source, a)) || FAILED(sha256_file(dest, b)) ||
+            memcmp(a, b, 32) != 0) break;
+    }
+    if (!files[i]) return;
     for (i = 0; files[i]; i++) {
         swprintf_s(source, MAX_PATH, L"%s\\%s", drivers_dir, files[i]);
         swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, files[i]);
@@ -1049,7 +1056,8 @@ static void guest_payload_stamp(wchar_t *out, size_t chars)
 {
     static const wchar_t *files[] = {
         L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-audio.exe",
-        L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys", NULL   /* '*' = in the drivers folder */
+        L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys",
+        L"*AppSandboxVDD.inf", L"*AppSandboxVAD.inf", NULL   /* '*' = in the drivers folder */
     };
     wchar_t module[MAX_PATH], dir[MAX_PATH], drivers_dir[MAX_PATH], path[MAX_PATH], *slash;
     BYTE digest[32];
