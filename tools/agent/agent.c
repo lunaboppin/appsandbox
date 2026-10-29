@@ -2081,6 +2081,69 @@ static int run_agent_powershell(const wchar_t *script_path, DWORD timeout_ms)
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return (int)ec;
 }
 
+/* ---- VB-CABLE fallback audio device ----
+   Secure Boot blocks the test-signed AppSandboxVAD, so a VM booted with it on
+   has no speaker for the audio helper to capture. VB-CABLE (VB-Audio,
+   donationware, Microsoft-signed) loads under Secure Boot, so install it from
+   vb-audio.com in that case. The script skips the install when Secure Boot is
+   off or our driver runs, checks the setup's signature before running it, and
+   exits 0 installed, 2 present, 3 not needed, 4/5 bad package, else failed. */
+#define VBCABLE_TRIES 5
+
+static DWORD WINAPI vbcable_thread(LPVOID param)
+{
+    static const char script[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "$sb=$false; try { $sb=Confirm-SecureBootUEFI } catch {}\r\n"
+        "if(-not $sb){ Write-Output 'Secure Boot is off'; exit 3 }\r\n"
+        "if(Get-PnpDevice -FriendlyName '*App Sandbox Virtual Audio*' -Status OK -ErrorAction SilentlyContinue){ Write-Output 'AppSandbox audio driver runs'; exit 3 }\r\n"
+        "if(Get-PnpDevice -FriendlyName '*VB-Audio Virtual Cable*' -ErrorAction SilentlyContinue){ exit 2 }\r\n"
+        "$dir='C:\\ProgramData\\AppSandbox\\vbcable'\r\n"
+        "New-Item -ItemType Directory -Force -Path $dir | Out-Null\r\n"
+        "$zip=Join-Path $dir 'VBCABLE_Driver_Pack45.zip'\r\n"
+        "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12\r\n"
+        "Invoke-WebRequest -UseBasicParsing -Uri 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip' -OutFile $zip\r\n"
+        "$pack=Join-Path $dir 'pack'\r\n"
+        "Expand-Archive -Force -LiteralPath $zip -DestinationPath $pack\r\n"
+        "$setup=Get-ChildItem -LiteralPath $pack -Recurse -Filter 'VBCABLE_Setup_x64.exe' | Select-Object -First 1\r\n"
+        "if(-not $setup){ Write-Output 'VBCABLE_Setup_x64.exe is not in the pack'; exit 4 }\r\n"
+        "$sig=Get-AuthenticodeSignature -LiteralPath $setup.FullName\r\n"
+        "if($sig.Status -ne 'Valid'){ Write-Output ('setup signature: ' + $sig.Status); exit 5 }\r\n"
+        "$p=Start-Process -FilePath $setup.FullName -ArgumentList '-i','-h' -Wait -PassThru\r\n"
+        "Write-Output ('setup exit ' + $p.ExitCode)\r\n"
+        "if(Get-PnpDevice -FriendlyName '*VB-Audio Virtual Cable*' -ErrorAction SilentlyContinue){ exit 0 }\r\n"
+        "exit 6\r\n";
+    const wchar_t *path = L"C:\\ProgramData\\AppSandbox\\vbcable-install.ps1";
+    char output[2048];
+    int ec, attempt;
+    (void)param;
+
+    if (write_agent_script(path, script)) return 0;
+    for (attempt = 1; attempt <= VBCABLE_TRIES; attempt++) {
+        ec = run_agent_powershell_out(path, 300000, output, sizeof(output));
+        if (ec == 0) {
+            agent_log("VB-CABLE: installed. %.300s", output);
+            agent_log_to_host("No AppSandbox audio driver under Secure Boot, so installed VB-CABLE "
+                              "(VB-Audio donationware, vb-cable.com) for sound. "
+                              "Restart the VM if there is no sound yet.");
+            return 0;
+        }
+        if (ec == 2 || ec == 3) return 0;
+        agent_log("VB-CABLE install attempt %d/%d failed (exit=%d): %.300s",
+                  attempt, VBCABLE_TRIES, ec, output);
+        if (ec == 4 || ec == 5) return 0;
+        /* Most failures are the network not being up yet. */
+        if (WaitForSingleObject(g_stop_event, 60000) == WAIT_OBJECT_0) return 0;
+    }
+    return 0;
+}
+
+static void ensure_fallback_audio(void)
+{
+    HANDLE t = CreateThread(NULL, 0, vbcable_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
 static int configure_shared_nic(const char *mac_a, const char *ip_a)
 {
     static const char script[] =
@@ -3477,6 +3540,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Ensure the virtual audio device exists and runs */
     ensure_vad_installed();
+
+    /* Under Secure Boot it can't; give the VM VB-CABLE instead */
+    ensure_fallback_audio();
 
     /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
     ensure_hyperv_video_disabled(NULL);
