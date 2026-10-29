@@ -1047,13 +1047,18 @@ session_cleanup:
         }
 
         if (d->stop) break;
-        /* Back off when the guest keeps rejecting us (VAD not ready) */
-        Sleep(header_misses > 3 ? 5000 : 500);
+        /* Back off when the guest keeps rejecting us (VAD not ready), in
+           short slices so a stop is seen within 100 ms. */
+        {
+            int wait, backoff = header_misses > 3 ? 5000 : 500;
+            for (wait = 0; wait < backoff && !d->stop; wait += 100)
+                Sleep(100);
+        }
     }
 
     if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
     if (com_ok)  CoUninitialize();
-    d->audio_recv_thread = NULL;
+    /* The handle stays set: teardown waits on it before freeing d. */
     return 0;
 }
 
@@ -2160,9 +2165,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     closesocket(d->audio_socket);
                     d->audio_socket = INVALID_SOCKET;
                 }
-                WaitForSingleObject(d->audio_recv_thread, 2000);
-                CloseHandle(d->audio_recv_thread);
-                d->audio_recv_thread = NULL;
+                /* Leave the handle for vm_display_idd_destroy if the thread
+                   hasn't exited yet: it must not free d under the thread. */
+                if (WaitForSingleObject(d->audio_recv_thread, 2000) == WAIT_OBJECT_0) {
+                    CloseHandle(d->audio_recv_thread);
+                    d->audio_recv_thread = NULL;
+                }
             }
 
             /* Wait briefly for recv thread to exit */
@@ -2411,6 +2419,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
+        /* A key only reaches this thread when our window has focus. If the
+           activation that sets input_focused was missed (another of our
+           windows being destroyed can take it), recover from the actual
+           foreground window instead of dropping keys until a re-activate. */
+        if (!d->input_focused && GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd)
+            d->input_focused = TRUE;
         if (d->input_focused)
             idd_forward_key(d, (DWORD)wp, scan, ext, up);
         return 0;
@@ -2511,6 +2525,7 @@ BOOL vm_display_idd_get_pos(VmDisplayIdd *display, POINT *pos)
 
 void vm_display_idd_destroy(VmDisplayIdd *display)
 {
+    BOOL threads_alive = FALSE;
     if (!display) return;
 
     /* Signal stop */
@@ -2540,7 +2555,8 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 
     /* recv_thread is cleaned up by WM_CLOSE handler, but guard just in case */
     if (display->recv_thread) {
-        WaitForSingleObject(display->recv_thread, 3000);
+        if (WaitForSingleObject(display->recv_thread, 10000) != WAIT_OBJECT_0)
+            threads_alive = TRUE;
         CloseHandle(display->recv_thread);
     }
 
@@ -2556,8 +2572,16 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
             closesocket(display->audio_socket);
             display->audio_socket = INVALID_SOCKET;
         }
-        WaitForSingleObject(display->audio_recv_thread, 3000);
+        if (WaitForSingleObject(display->audio_recv_thread, 10000) != WAIT_OBJECT_0)
+            threads_alive = TRUE;
         CloseHandle(display->audio_recv_thread);
+    }
+
+    /* A worker still running would read the struct after it is freed (the
+       audio thread did exactly that and crashed the app). Leak it instead. */
+    if (threads_alive) {
+        ui_log(L"IDD: a display worker thread did not stop; keeping its state allocated.");
+        return;
     }
 
     DeleteCriticalSection(&display->frame_cs);
