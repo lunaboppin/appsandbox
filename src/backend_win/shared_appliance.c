@@ -16,6 +16,7 @@
 #include <virtdisk.h>
 #include <stdio.h>
 #include <io.h>
+#include <share.h>
 #include <wchar.h>
 #include <wctype.h>
 #include <stdlib.h>
@@ -1070,7 +1071,8 @@ static DWORD WINAPI serial_capture_worker(LPVOID parameter)
     if (pipe != INVALID_HANDLE_VALUE) {
         SYSTEMTIME now;
         GetLocalTime(&now);
-        _wfopen_s(&file, args->log_path, L"ab");
+        /* Shared so the log can be read while the VM is still running. */
+        file = _wfsopen(args->log_path, L"ab", _SH_DENYNO);
         if (file)
             fprintf(file, "\n==== appliance boot %04u-%02u-%02u %02u:%02u:%02u ====\n",
                     now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
