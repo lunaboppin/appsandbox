@@ -1435,6 +1435,41 @@ static BOOL copy_appliance_source(const wchar_t *staging, const wchar_t *res_dir
     return CopyFileW(source, destination, FALSE);
 }
 
+/* Write a cloud-init seed file as UTF-8 with LF line endings and no BOM.
+   cloud-init picks the user-data handler from the first line, so a BOM or a
+   trailing \r turns "#cloud-config" into unrecognised text and the whole
+   file is skipped ("Unhandled non-multipart userdata"). */
+static BOOL write_seed_file(const wchar_t *path, const wchar_t *format, ...)
+{
+    va_list args;
+    wchar_t *text = NULL;
+    char *utf8 = NULL;
+    int chars, bytes;
+    FILE *file = NULL;
+    BOOL ok = FALSE;
+
+    va_start(args, format);
+    chars = _vscwprintf(format, args);
+    va_end(args);
+    if (chars < 0) return FALSE;
+    text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, (chars + 1) * sizeof(wchar_t));
+    if (!text) return FALSE;
+    va_start(args, format);
+    _vsnwprintf_s(text, chars + 1, _TRUNCATE, format, args);
+    va_end(args);
+    bytes = WideCharToMultiByte(CP_UTF8, 0, text, chars, NULL, 0, NULL, NULL);
+    if (bytes > 0) utf8 = (char *)HeapAlloc(GetProcessHeap(), 0, bytes);
+    if (utf8 && WideCharToMultiByte(CP_UTF8, 0, text, chars, utf8, bytes, NULL, NULL) == bytes &&
+        _wfopen_s(&file, path, L"wb") == 0 && file) {
+        ok = fwrite(utf8, 1, bytes, file) == (size_t)bytes;
+        ok = (fclose(file) == 0) && ok;
+    }
+    if (utf8) { SecureZeroMemory(utf8, bytes); HeapFree(GetProcessHeap(), 0, utf8); }
+    SecureZeroMemory(text, (chars + 1) * sizeof(wchar_t));
+    HeapFree(GetProcessHeap(), 0, text);
+    return ok;
+}
+
 HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
                                         const wchar_t *admin_user,
                                         const wchar_t *admin_password,
@@ -1463,9 +1498,9 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         return HRESULT_FROM_WIN32(GetLastError());
 
     swprintf_s(path, _countof(path), L"%s\\meta-data", staging);
-    if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
-    fwprintf(file, L"instance-id: appsandbox-shared-appliance\nlocal-hostname: appsandbox-share\n");
-    fclose(file); file = NULL;
+    if (!write_seed_file(path, L"instance-id: appsandbox-shared-appliance\nlocal-hostname: appsandbox-share\n")) {
+        hr = E_FAIL; goto cleanup;
+    }
 
     /* The maintenance NAT network has static IPAM and no DHCP server, so the
        image's default DHCP-everything config leaves the guest with no address
@@ -1476,7 +1511,7 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
        setup, so the Update maintenance boot gets the same address. optional
        keeps normal boots, which have no maintenance adapter, from waiting. */
     swprintf_s(path, _countof(path), L"%s\\network-config", staging);
-    if (_wfopen_s(&file, path, L"w") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
     fprintf(file,
         "version: 2\n"
         "ethernets:\n"
@@ -1491,8 +1526,7 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
     fclose(file); file = NULL;
 
     swprintf_s(path, _countof(path), L"%s\\user-data", staging);
-    if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
-    fwprintf(file,
+    if (!write_seed_file(path,
         L"#cloud-config\n"
         L"users:\n  - default\n  - name: %s\n    groups: [adm, sudo]\n"
         L"    shell: /bin/bash\n    lock_passwd: false\n    passwd: '%S'\n"
@@ -1522,8 +1556,9 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         L"runcmd:\n  - [/usr/local/sbin/appsandbox-appliance-firstboot]\n"
         L"final_message: 'AppSandbox appliance provisioned'\n",
         admin_user, password_hash, ssh_public_key, smb_user, smb_user,
-        smb_password, smb_password, smb_user);
-    fclose(file); file = NULL;
+        smb_password, smb_password, smb_user)) {
+        hr = E_FAIL; goto cleanup;
+    }
     SecureZeroMemory(password_hash, sizeof(password_hash));
 
     if (!copy_appliance_source(staging, res_dir, L"appsandbox-agent.c",
@@ -1531,7 +1566,7 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
         hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); goto cleanup;
     }
     swprintf_s(path, _countof(path), L"%s\\appsandbox-agent.service", staging);
-    if (_wfopen_s(&file, path, L"w") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
     fputs("[Unit]\nDescription=AppSandbox Appliance Agent\nAfter=network.target\n"
           "[Service]\nType=simple\nExecStart=/usr/local/sbin/appsandbox-agent\nRestart=always\n"
           "[Install]\nWantedBy=multi-user.target\n", file);
