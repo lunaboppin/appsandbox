@@ -1249,6 +1249,7 @@ ASB_API void asb_vm_cleanup_network(VmInstance *vm)
        still attached to it. The VPN network also carries the gateway,
        which deletes it when it stops. */
     if (vm->network_mode != NET_VPN &&
+        !(vm->network_mode == NET_NAT && vpn_gateway_uses_nat_network()) &&
         !another_vm_uses_network_mode(vm, vm->network_mode))
         hcn_delete_network(&vm->network_id);
     vm->network_cleaned = TRUE;

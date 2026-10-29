@@ -29,6 +29,9 @@
 #define GATEWAY_SETUP_TIMEOUT_MS  (20ull * 60ull * 1000ull)
 #define GATEWAY_START_TIMEOUT_MS  (3ull * 60ull * 1000ull)
 #define GATEWAY_SLOTS       16
+/* Bump when the gateway's seed or agent changes in a way an existing gateway
+   must pick up: a gateway set up under an older layout is rebuilt. */
+#define GATEWAY_LAYOUT      2
 /* Used when a config names no DNS server. Reached through the tunnel. */
 #define GATEWAY_FALLBACK_DNS "1.1.1.1,1.0.0.1"
 
@@ -45,6 +48,7 @@ static struct {
     volatile LONG idle_generation;
     wchar_t root[MAX_PATH], os_vhdx[MAX_PATH], seed_iso[MAX_PATH], state_path[MAX_PATH];
     char lan_ip[32];
+    volatile LONG network_hardened;
 } g_gw;
 
 static void set_progress(const wchar_t *text)
@@ -68,7 +72,8 @@ static void save_state(void)
 {
     FILE *f = NULL;
     if (_wfopen_s(&f, g_gw.state_path, L"w,ccs=UTF-8") != 0 || !f) return;
-    fwprintf(f, L"Version=1\nConfigured=%d\n", g_gw.status.configured ? 1 : 0);
+    fwprintf(f, L"Version=1\nConfigured=%d\nLayout=%d\n",
+             g_gw.status.configured ? 1 : 0, GATEWAY_LAYOUT);
     fclose(f);
 }
 
@@ -76,6 +81,7 @@ void vpn_gateway_init(void)
 {
     wchar_t base[MAX_PATH], line[128];
     FILE *f = NULL;
+    int layout = 0;
     if (g_gw.initialized) return;
     InitializeCriticalSection(&g_gw.lifecycle);
     InitializeCriticalSection(&g_gw.state);
@@ -88,7 +94,12 @@ void vpn_gateway_init(void)
     if (_wfopen_s(&f, g_gw.state_path, L"r,ccs=UTF-8") == 0 && f) {
         while (fgetws(line, _countof(line), f))
             if (wcsncmp(line, L"Configured=1", 12) == 0) g_gw.status.configured = TRUE;
+            else if (wcsncmp(line, L"Layout=", 7) == 0) layout = _wtoi(line + 7);
         fclose(f);
+    }
+    if (g_gw.status.configured && layout != GATEWAY_LAYOUT) {
+        ui_log(L"VPN gateway: set up by an older version; it will be rebuilt.");
+        g_gw.status.configured = FALSE;
     }
     if (g_gw.status.configured && GetFileAttributesW(g_gw.os_vhdx) == INVALID_FILE_ATTRIBUTES)
         g_gw.status.configured = FALSE;
@@ -163,6 +174,39 @@ static HRESULT build_os_disk(void)
 
 /* ---- Start / stop ---- */
 
+/* The VPN network is an HNS NAT network (Private passed no VM-to-VM
+   traffic). Remove the host's NAT on it and turn off forwarding on its host
+   adapter, so a guest that points its route at the host instead of the
+   gateway reaches nothing. Once per network creation; a failure is logged
+   and the gateway's own kill switch still applies. */
+static void harden_vpn_network(void)
+{
+    wchar_t command[1024];
+    HRESULT hr;
+    if (InterlockedCompareExchange(&g_gw.network_hardened, 1, 0) != 0) return;
+    swprintf_s(command, _countof(command),
+        L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+        L"$p='%S.0/24';"
+        L"Get-NetNat -ErrorAction SilentlyContinue | Where-Object {$_.InternalIPInterfaceAddressPrefix -eq $p} | "
+        L"Remove-NetNat -Confirm:$false -ErrorAction SilentlyContinue;"
+        L"Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        L"Where-Object {$_.InterfaceAlias -eq 'vEthernet (AppSandboxVPN)'} | "
+        L"Set-NetIPInterface -Forwarding Disabled -ErrorAction SilentlyContinue;"
+        L"if (Get-NetNat -ErrorAction SilentlyContinue | Where-Object {$_.InternalIPInterfaceAddressPrefix -eq $p}) {exit 1};exit 0\"",
+        hcn_vpn_subnet_base());
+    hr = appliance_run_hidden_process(command, 60000);
+    if (FAILED(hr)) {
+        InterlockedExchange(&g_gw.network_hardened, 0);
+        ui_log(L"VPN: could not remove the host's NAT from the VPN network (0x%08X); "
+               L"a guest that reroutes to the host could bypass its tunnel.", hr);
+    }
+}
+
+BOOL vpn_gateway_uses_nat_network(void)
+{
+    return g_gw.initialized && g_gw.uplink_created;
+}
+
 static HRESULT start_vm(BOOL provisioning)
 {
     VmConfig *config;
@@ -180,6 +224,7 @@ static HRESULT start_vm(BOOL provisioning)
     if (FAILED(hr)) { set_error(L"Could not create the gateway's uplink endpoint", hr); return hr; }
     g_gw.uplink_created = TRUE;
     hr = hcn_create_vpn_network(&g_gw.lan_network_id);
+    if (SUCCEEDED(hr)) harden_vpn_network();
     if (SUCCEEDED(hr))
         hr = hcn_create_static_endpoint(&g_gw.lan_network_id, &g_gw.lan_endpoint_id,
             lan_guid, _countof(lan_guid), vpn_gateway_lan_ip(), GATEWAY_LAN_MAC);
@@ -271,7 +316,8 @@ static HRESULT wait_ready(ULONGLONG timeout_ms)
         }
         Sleep(500);
     }
-    sprintf_s(command, sizeof(command), "vpn_init:%s.0/24", hcn_vpn_subnet_base());
+    sprintf_s(command, sizeof(command), "vpn_init:%s.0/24:%s",
+              hcn_vpn_subnet_base(), vpn_gateway_lan_ip());
     if (!gateway_send(command, response, sizeof(response), 60000) ||
         strcmp(response, "ok") != 0) {
         ui_log(L"VPN gateway: routing setup failed (%S).", response[0] ? response : "no reply");
@@ -501,6 +547,7 @@ HRESULT vpn_gateway_prepare_client(VmInstance *vm, GUID *network_id, GUID *endpo
     sprintf_s(mac, sizeof(mac), "02-15-5E-%02X-%02X-%02X",
               (hash >> 16) & 0xff, (hash >> 8) & 0xff, hash & 0xff);
     hr = hcn_create_vpn_network(network_id);
+    if (SUCCEEDED(hr)) harden_vpn_network();
     if (SUCCEEDED(hr))
         hr = hcn_create_static_endpoint(network_id, endpoint_id, endpoint_guid,
                                         endpoint_guid_chars, vm->vpn_ip, mac);

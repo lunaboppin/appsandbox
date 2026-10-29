@@ -1,7 +1,8 @@
 """Contract: WireGuard VPN configs and VPN-routed VMs.
 
-A VPN VM sits on a Private HCN network (no host adapter, no NAT) whose only
-way out is the VPN gateway appliance at <base>.2. The gateway runs one
+A VPN VM sits on the AppSandboxVPN network, an HNS NAT network whose host NAT
+is removed, so its only way out is the VPN gateway appliance at <base>.2.
+The gateway runs one
 WireGuard interface per config and routes each VM's source IP into its
 tunnel; anything unclaimed falls to an unreachable table, and the forward
 chain only allows LAN traffic into asbvpn interfaces, so a dropped tunnel
@@ -32,12 +33,18 @@ def main() -> None:
     html = read("web/index.html")
     project = read("AppSandboxCore.vcxproj")
 
-    # ---- Network: Private, gateway-only ----
+    # ---- Network: NAT (Private passed no VM-to-VM traffic), host NAT removed ----
     vpn_net = hcn[hcn.index("HRESULT hcn_create_vpn_network("):]
     vpn_net = vpn_net[:vpn_net.index("\n}\n")]
-    assert '\\"Type\\":\\"Private\\"' in vpn_net, "VPN network must be Private (no host adapter)"
-    assert "Routes" not in vpn_net, "VPN network must not route via the host"
+    assert '\\"Type\\":\\"NAT\\"' in vpn_net
     assert "APPSANDBOX_VPN_GUID" in hcn[hcn.index("void hcn_cleanup_stale_networks"):]
+    harden = gateway[gateway.index("static void harden_vpn_network(void)"):]
+    harden = harden[:harden.index("\n}\n")]
+    assert "Remove-NetNat" in harden and "-Forwarding Disabled" in harden
+    assert gateway.count("harden_vpn_network();") == 2, "every VPN network creation is hardened"
+    assert "vpn_gateway_uses_nat_network()" in core, "the gateway's uplink must outlive the last NAT VM"
+    assert "lookup main priority 31000" in linux_agent, "the gateway's own address is exempt from table 99"
+    assert "#define GATEWAY_LAYOUT" in gateway and "Layout=" in gateway
 
     # ---- Configs: keys protected, IPv4 only, validated ----
     assert "CryptProtectData(" in configs and "CRYPTPROTECT_LOCAL_MACHINE" in configs

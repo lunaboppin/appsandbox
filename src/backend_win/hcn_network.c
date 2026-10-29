@@ -401,9 +401,10 @@ const char *hcn_vpn_subnet_base(void)
     return base;
 }
 
-/* Private network for VPN-routed VMs and the VPN gateway. With no host vNIC
-   and no NAT, a VM on it can reach nothing but the gateway, so a guest that
-   changes its own route can't get around the tunnel. */
+/* Network for VPN-routed VMs and the VPN gateway at <base>.2. It is a NAT
+   network because HNS endpoints on a Private network passed no traffic
+   between VMs at all; the host's NAT on it is removed afterwards
+   (vpn_gateway.c), so the gateway stays the only way off it. */
 HRESULT hcn_create_vpn_network(GUID *network_id)
 {
     wchar_t settings[1024];
@@ -417,9 +418,11 @@ HRESULT hcn_create_vpn_network(GUID *network_id)
     if (hcn_network_exists(&APPSANDBOX_VPN_GUID)) return S_OK;
     swprintf_s(settings, _countof(settings),
         L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-        L"\"Name\":\"AppSandboxVPN\",\"Type\":\"Private\","
+        L"\"Name\":\"AppSandboxVPN\",\"Type\":\"NAT\","
         L"\"Ipams\":[{\"Type\":\"Static\",\"Subnets\":[{"
-        L"\"IpAddressPrefix\":\"%S.0/24\"}]}]}", base);
+        L"\"IpAddressPrefix\":\"%S.0/24\","
+        L"\"Routes\":[{\"NextHop\":\"%S.1\",\"DestinationPrefix\":\"0.0.0.0/0\"}]"
+        L"}]}]}", base, base);
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN VPN network error: %s", error_record);

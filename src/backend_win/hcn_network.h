@@ -53,8 +53,8 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
 HRESULT hcn_create_share_network(GUID *network_id);
 const char *hcn_share_subnet_base(void);
 
-/* Private network (no host adapter, no NAT) for VPN-routed VMs; the VPN
-   gateway is at <base>.2 and is the only way off it. */
+/* Network for VPN-routed VMs; the VPN gateway is at <base>.2. Created as a
+   NAT network, whose host NAT the VPN gateway then removes. */
 HRESULT hcn_create_vpn_network(GUID *network_id);
 const char *hcn_vpn_subnet_base(void);
 

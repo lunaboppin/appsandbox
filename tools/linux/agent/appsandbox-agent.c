@@ -1262,10 +1262,16 @@ static int vpn_slot(const char *s)
     return slot >= 0 && slot < 16 ? slot : -1;
 }
 
-static int vpn_init(const char *lan)
+static int vpn_init(const char *arguments)
 {
-    char command[2048];
-    if (!vpn_valid_chars(lan, "./", 18)) return EINVAL;
+    char command[2600], lan[24], self[24] = "";
+    const char *colon = strchr(arguments, ':');
+    size_t n = colon ? (size_t)(colon - arguments) : strlen(arguments);
+    if (n == 0 || n >= sizeof(lan)) return EINVAL;
+    memcpy(lan, arguments, n); lan[n] = '\0';
+    if (colon) snprintf(self, sizeof(self), "%s", colon + 1);
+    if (!vpn_valid_chars(lan, "./", 18) || (self[0] && !vpn_valid_chars(self, ".", 15)))
+        return EINVAL;
     snprintf(command, sizeof(command),
         /* Loose reverse-path filtering: replies arrive on an asbvpn
            interface, while the main table routes the internet via the
@@ -1284,7 +1290,16 @@ static int vpn_init(const char *lan)
         "ip route replace unreachable default table 99 && "
         "{ ip rule show | grep -q 'from %s lookup 99' || ip rule add from %s lookup 99 priority 32000; }",
         lan, lan, lan, lan, lan, lan, lan, lan);
-    return run_sync(command) == 0 ? 0 : EIO;
+    if (run_sync(command) != 0) return EIO;
+    /* The gateway's own LAN address is inside the LAN range, so without
+       this its replies (ICMP errors, ARP-driven traffic) hit table 99 too. */
+    if (self[0]) {
+        snprintf(command, sizeof(command),
+            "ip rule show | grep -q 'from %s lookup main' || ip rule add from %s lookup main priority 31000",
+            self, self);
+        if (run_sync(command) != 0) return EIO;
+    }
+    return 0;
 }
 
 /* vpn_set:<slot>:<base64 config>. Replies ok once the tunnel has a handshake,
