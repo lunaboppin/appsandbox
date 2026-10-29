@@ -4942,6 +4942,8 @@ ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id)
 { return shared_appliance_mount_host_resource(id); }
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id)
 { return shared_appliance_unmount_host_resource(id); }
+ASB_API HRESULT asb_shared_resource_unc_path(const wchar_t *id, wchar_t *out, size_t chars)
+{ return shared_appliance_resource_unc_path(id, out, chars); }
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id)
 { return shared_appliance_purge_resource(id); }
 ASB_API HRESULT asb_shared_appliance_open_terminal(void)

@@ -282,6 +282,7 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 ASB_API HRESULT asb_shared_appliance_delete(void);
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
+ASB_API HRESULT asb_shared_resource_unc_path(const wchar_t *id, wchar_t *out, size_t chars);
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
 
 /* Internal: retry appliance-backed mappings after a guest agent reaches steady state. */

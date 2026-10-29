@@ -106,6 +106,13 @@ static const GUID ASB_VHDX_VENDOR = {
 };
 
 static SharedApplianceGlobal g_appliance;
+
+/* Resources with no host drive letter are mapped by UNC path only. They can't
+   use host_mount_mask (keyed on the letter), so their ids are kept here; each
+   one counts as a host mount so the appliance doesn't idle-stop under it.
+   Guarded by g_appliance.cs. */
+static wchar_t g_unc_host_mounts[ASB_MAX_SHARED_RESOURCES][ASB_SHARED_ID_CHARS];
+
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
 static HRESULT reconcile_internal(void);
 static volatile LONG g_setup_invalid_parameter;
@@ -1601,10 +1608,11 @@ void shared_appliance_cleanup(void)
     if (!g_appliance.initialized) return;
     for (i = 0; i < shared_resources_count(); ++i) {
         const AsbSharedResourceInfo *resource = shared_resources_get(i);
-        if (resource && resource->host_drive_letter)
+        if (resource)
             host_mapping_command(resource, FALSE);
     }
     InterlockedExchange(&g_appliance.host_mount_mask, 0);
+    ZeroMemory(g_unc_host_mounts, sizeof(g_unc_host_mounts));
     g_appliance.status.host_mounts = 0;
     shared_appliance_stop(FALSE);
     cleanup_runtime_network();
@@ -2064,6 +2072,27 @@ HRESULT shared_appliance_delete(void)
     return S_OK;
 }
 
+/* Add or drop a UNC host mount; returns TRUE when the set changed. */
+static BOOL track_unc_host_mount(const wchar_t *id, BOOL mounted)
+{
+    int i, free_slot = -1;
+    BOOL changed = FALSE;
+    EnterCriticalSection(&g_appliance.cs);
+    for (i = 0; i < ASB_MAX_SHARED_RESOURCES; ++i) {
+        if (!g_unc_host_mounts[i][0]) { if (free_slot < 0) free_slot = i; continue; }
+        if (_wcsicmp(g_unc_host_mounts[i], id) != 0) continue;
+        if (!mounted) { g_unc_host_mounts[i][0] = L'\0'; changed = TRUE; }
+        LeaveCriticalSection(&g_appliance.cs);
+        return changed;
+    }
+    if (mounted && free_slot >= 0) {
+        wcscpy_s(g_unc_host_mounts[free_slot], ASB_SHARED_ID_CHARS, id);
+        changed = TRUE;
+    }
+    LeaveCriticalSection(&g_appliance.cs);
+    return changed;
+}
+
 static DWORD host_mount_bit(const AsbSharedResourceInfo *resource)
 {
     int offset;
@@ -2078,7 +2107,7 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     wchar_t command[4096], share[64], target[256];
     DWORD exit_code;
     HRESULT hr;
-    if (!resource || !resource->host_drive_letter) return E_INVALIDARG;
+    if (!resource) return E_INVALIDARG;
     if (mount) {
         hr = load_credentials(admin, _countof(admin), password, _countof(password));
         if (FAILED(hr)) return hr;
@@ -2090,7 +2119,36 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     }
     shared_resources_share_name(resource->id, share, _countof(share));
     swprintf_s(target, _countof(target), L"\\\\%S\\%s", shared_appliance_server_ip(), share);
-    if (mount) {
+    if (!resource->host_drive_letter) {
+        /* No host letter: a global mapping of the UNC path alone, which gives
+           Explorer (running unelevated) the share's credentials. */
+        if (mount)
+            swprintf_s(command, _countof(command),
+              L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+              L"$ErrorActionPreference='Stop';$r='%s';"
+              L"for($a=0;$a -lt 8;$a++){"
+              L"try{$m=Get-SmbGlobalMapping -RemotePath $r -ErrorAction SilentlyContinue;"
+              L"if($m){try{$null=Get-Item -LiteralPath $r -Force -ErrorAction Stop;exit 100}catch{}"
+              L"Remove-SmbGlobalMapping -RemotePath $r -Force -ErrorAction SilentlyContinue};"
+              L"$p=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force;"
+              L"$c=[pscredential]::new($env:ASB_SMB_USER,$p);"
+              L"New-SmbGlobalMapping -RemotePath $r -Credential $c "
+              L"-Persistent $false -RequireIntegrity $true -ErrorAction Stop|Out-Null;"
+              L"for($i=0;$i -lt 20;$i++){"
+              L"try{$null=Get-Item -LiteralPath $r -Force -ErrorAction Stop;exit 0}catch{}"
+              L"Start-Sleep -Milliseconds 250};"
+              L"Remove-SmbGlobalMapping -RemotePath $r -Force -ErrorAction SilentlyContinue"
+              L"}catch{if($a -eq 7){exit 1}};Start-Sleep -Milliseconds 500};exit 1\"",
+              target);
+        else
+            swprintf_s(command, _countof(command),
+              L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+              L"$ErrorActionPreference='SilentlyContinue';$r='%s';"
+              L"if(-not (Get-SmbGlobalMapping -RemotePath $r -ErrorAction SilentlyContinue)){exit 101};"
+              L"Remove-SmbGlobalMapping -RemotePath $r -Force -ErrorAction SilentlyContinue;"
+              L"if(Get-SmbGlobalMapping -RemotePath $r -ErrorAction SilentlyContinue){exit 1};exit 0\"",
+              target);
+    } else if (mount) {
         swprintf_s(command, _countof(command),
           L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
           L"$ErrorActionPreference='Stop';$l='%c:';$r='%s';"
@@ -2147,8 +2205,22 @@ HRESULT shared_appliance_mount_host_resource(const wchar_t *resource_id)
         previous = InterlockedOr(&g_appliance.host_mount_mask, (LONG)bit);
         if (!(previous & (LONG)bit))
             InterlockedIncrement(&g_appliance.status.host_mounts);
+    } else if (SUCCEEDED(hr) && !resource->host_drive_letter &&
+               track_unc_host_mount(resource->id, TRUE)) {
+        InterlockedIncrement(&g_appliance.status.host_mounts);
     }
     return hr;
+}
+
+HRESULT shared_appliance_resource_unc_path(const wchar_t *resource_id,
+                                           wchar_t *out, size_t chars)
+{
+    const AsbSharedResourceInfo *resource = shared_resources_find(resource_id);
+    wchar_t share[64];
+    if (!resource || !out || !chars) return E_INVALIDARG;
+    shared_resources_share_name(resource->id, share, _countof(share));
+    swprintf_s(out, chars, L"\\\\%S\\%s", shared_appliance_server_ip(), share);
+    return S_OK;
 }
 
 HRESULT shared_appliance_unmount_host_resource(const wchar_t *resource_id)
@@ -2165,6 +2237,10 @@ HRESULT shared_appliance_unmount_host_resource(const wchar_t *resource_id)
         previous = InterlockedAnd(&g_appliance.host_mount_mask, ~(LONG)bit);
         if ((previous & (LONG)bit) && g_appliance.status.host_mounts > 0)
             InterlockedDecrement(&g_appliance.status.host_mounts);
+    } else if (SUCCEEDED(hr) && !resource->host_drive_letter &&
+               track_unc_host_mount(resource->id, FALSE) &&
+               g_appliance.status.host_mounts > 0) {
+        InterlockedDecrement(&g_appliance.status.host_mounts);
     }
     InterlockedIncrement(&g_appliance.idle_generation);
     return hr;
