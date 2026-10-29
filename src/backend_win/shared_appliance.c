@@ -995,16 +995,36 @@ void shared_appliance_collect_guest_log(void)
 }
 
 /* ---- Serial console capture ----
-   hcs_vm.c wires a Linux guest's COM1 to \\.\pipe\<vm>.com1, but with HCS the
-   VM worker is the pipe *client*: nothing appears unless the host creates the
-   server end first. Ubuntu sends systemd and cloud-init output (the network
+   hcs_vm.c wires a Linux guest's COM1 to \\.\pipe\<vm>.com1. The VM worker
+   owns the server end and buffers nothing, so output only reaches a client
+   that is connected while the guest writes it. Ubuntu sends systemd and cloud-init output (the network
    table, apt and runcmd errors) to ttyS0, so it is the only view into an
    appliance that never brings its agent up. Everything goes to console.log in
    the storage root; cloud-init's own lines and failures also reach the UI log. */
 typedef struct {
-    HANDLE pipe;
     wchar_t log_path[MAX_PATH];
 } SerialCaptureArgs;
+
+#define APPLIANCE_COM1_PIPE L"\\\\.\\pipe\\" APPLIANCE_VM_NAME L".com1"
+
+/* Connect to the VM's COM1 pipe, retrying while the worker brings it up. */
+static HANDLE open_serial_pipe(void)
+{
+    ULONGLONG deadline = GetTickCount64() + 60000;
+    for (;;) {
+        HANDLE pipe = CreateFileW(APPLIANCE_COM1_PIPE, GENERIC_READ, 0, NULL,
+                                  OPEN_EXISTING, 0, NULL);
+        DWORD error;
+        if (pipe != INVALID_HANDLE_VALUE) return pipe;
+        error = GetLastError();
+        if (GetTickCount64() >= deadline) {
+            ui_log(L"Shared appliance: could not attach to the appliance console (%lu).", error);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (error == ERROR_PIPE_BUSY) WaitNamedPipeW(APPLIANCE_COM1_PIPE, 1000);
+        else Sleep(250);
+    }
+}
 
 static BOOL serial_line_is_interesting(const char *line)
 {
@@ -1046,16 +1066,15 @@ static DWORD WINAPI serial_capture_worker(LPVOID parameter)
     char buffer[4096], line[1024];
     size_t used = 0;
     DWORD got, i;
-    BOOL connected = ConnectNamedPipe(args->pipe, NULL) ||
-                     GetLastError() == ERROR_PIPE_CONNECTED;
-    if (connected) {
+    HANDLE pipe = open_serial_pipe();
+    if (pipe != INVALID_HANDLE_VALUE) {
         SYSTEMTIME now;
         GetLocalTime(&now);
         _wfopen_s(&file, args->log_path, L"ab");
         if (file)
             fprintf(file, "\n==== appliance boot %04u-%02u-%02u %02u:%02u:%02u ====\n",
                     now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
-        while (ReadFile(args->pipe, buffer, sizeof(buffer), &got, NULL) && got) {
+        while (ReadFile(pipe, buffer, sizeof(buffer), &got, NULL) && got) {
             for (i = 0; i < got; ++i) {
                 char c = buffer[i];
                 if (c == '\n' || used + 1 >= sizeof(line)) {
@@ -1069,43 +1088,25 @@ static DWORD WINAPI serial_capture_worker(LPVOID parameter)
         }
         if (used) { line[used] = '\0'; serial_emit_line(file, line); }
         if (file) fclose(file);
+        CloseHandle(pipe);
     }
-    CloseHandle(args->pipe);
     HeapFree(GetProcessHeap(), 0, args);
     return 0;
 }
 
-/* Create the COM1 pipe server for the next appliance boot and start reading it.
-   Only SYSTEM, Administrators and the Virtual Machines group may connect. */
+/* Start reading the appliance's COM1 into console.log; call right after the
+   VM starts so the worker attaches before cloud-init runs. */
 static void start_serial_capture(void)
 {
-    SECURITY_ATTRIBUTES sa;
-    PSECURITY_DESCRIPTOR sd = NULL;
     SerialCaptureArgs *args;
     HANDLE thread;
-    ZeroMemory(&sa, sizeof(sa));
-    sa.nLength = sizeof(sa);
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-83-0)",
-            SDDL_REVISION_1, &sd, NULL))
-        sa.lpSecurityDescriptor = sd;
     args = (SerialCaptureArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*args));
-    if (!args) { if (sd) LocalFree(sd); return; }
+    if (!args) return;
     swprintf_s(args->log_path, _countof(args->log_path), L"%s\\console.log",
                g_appliance.status.storage_root);
-    args->pipe = CreateNamedPipeW(L"\\\\.\\pipe\\" APPLIANCE_VM_NAME L".com1",
-        PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        PIPE_UNLIMITED_INSTANCES, 0, 64 * 1024, 0, &sa);
-    if (sd) LocalFree(sd);
-    if (args->pipe == INVALID_HANDLE_VALUE) {
-        ui_log(L"Shared appliance: could not create the console capture pipe (%lu).",
-               GetLastError());
-        HeapFree(GetProcessHeap(), 0, args);
-        return;
-    }
     thread = CreateThread(NULL, 0, serial_capture_worker, args, 0, NULL);
     if (thread) CloseHandle(thread);
-    else { CloseHandle(args->pipe); HeapFree(GetProcessHeap(), 0, args); }
+    else HeapFree(GetProcessHeap(), 0, args);
 }
 
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms);
@@ -1279,10 +1280,10 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         maintenance_endpoint[0] ? maintenance_endpoint : NULL,
         share_endpoint, &g_appliance.runtime);
     if (FAILED(hr)) goto fail;
-    if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU)
-        start_serial_capture();
     hr = hcs_start_vm(&g_appliance.runtime);
     if (FAILED(hr)) goto fail;
+    if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU)
+        start_serial_capture();
     InterlockedExchange(&g_appliance.booting, 0);
     HeapFree(GetProcessHeap(), 0, config);
     config = NULL;

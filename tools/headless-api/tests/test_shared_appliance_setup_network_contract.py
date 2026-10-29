@@ -47,8 +47,12 @@ def main() -> None:
                    '"    optional: true\\n"', '"    addresses: [%s/24]\\n"',
                    "- to: default", "nameservers:"):
         assert needle in disk, "network-config missing " + needle
-    # The Ubuntu appliance's COM1 is captured: the host owns the pipe server.
-    assert "CreateNamedPipeW(" in appliance and "APPLIANCE_VM_NAME L\".com1\"" in appliance
+    # The Ubuntu appliance's COM1 is captured: the VM owns the pipe server and
+    # the host connects to it as a client once the VM is started.
+    assert "CreateNamedPipeW(" not in appliance and "APPLIANCE_VM_NAME L\".com1\"" in appliance
+    assert re.search(r"hcs_start_vm\(&g_appliance\.runtime\);\s*if \(FAILED\(hr\)\) goto fail;\s*"
+                     r"if \(g_appliance\.status\.backend == ASB_APPLIANCE_BACKEND_UBUNTU\)\s*"
+                     r"start_serial_capture\(\);", appliance), "capture must start after the VM starts"
     assert "start_serial_capture();" in appliance and "console.log" in appliance
     print("[ok] shared appliance setup network (maintenance NAT address) contract")
 
