@@ -1210,6 +1210,8 @@ function refreshManageVm(forceFields) {
     sizeInput.min = vm.hddGb + 1;
     if (forceFields || document.activeElement !== sizeInput) sizeInput.value = vm.hddGb + 1;
     document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
+    document.getElementById('manage-secure-boot-section').style.display = vm.osType === 'Windows' ? '' : 'none';
+    document.getElementById('manage-secure-boot').checked = vm.secureBoot !== false;
     var netSel = document.getElementById('manage-network');
     if (forceFields || document.activeElement !== netSel) {
         netSel.innerHTML = networkOptionsHtml();
@@ -1224,6 +1226,7 @@ function refreshManageVm(forceFields) {
         .forEach(function(id) { setManageDisabled(id, !stoppedIdle); });
     setManageDisabled('manage-disk-grow', !stoppedIdle || hasChildren);
     setManageDisabled('manage-auto-display', managePending);
+    setManageDisabled('manage-secure-boot', managePending);
     onManageCheckpointSelection();
 }
 
@@ -1485,6 +1488,20 @@ function growManageDisk() {
         if (!ok) return;
         managePending = true; refreshManageVm(false);
         sendCmd('resizeVmDisk', {vmIndex: manageVmIndex, sizeGb: size});
+    });
+}
+
+function saveManageSecureBoot() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-secure-boot');
+    function send(enabled) {
+        managePending = true; refreshManageVm(false);
+        sendCmd('setVmSecureBoot', {vmIndex: manageVmIndex, enabled: enabled});
+    }
+    if (box.checked) { send(true); return; }
+    box.checked = true;
+    showModal('Turn off Secure Boot', 'Start this VM without Secure Boot from its next start? Test-signed drivers such as the audio driver can then load. A Windows install set up with Secure Boot on may not boot reliably without it, so take a checkpoint first.', 'Turn off', {confirmClass:'primary'}).then(function(ok) {
+        if (ok) send(false);
     });
 }
 
