@@ -994,6 +994,120 @@ void shared_appliance_collect_guest_log(void)
     CloseHandle(disk);
 }
 
+/* ---- Serial console capture ----
+   hcs_vm.c wires a Linux guest's COM1 to \\.\pipe\<vm>.com1, but with HCS the
+   VM worker is the pipe *client*: nothing appears unless the host creates the
+   server end first. Ubuntu sends systemd and cloud-init output (the network
+   table, apt and runcmd errors) to ttyS0, so it is the only view into an
+   appliance that never brings its agent up. Everything goes to console.log in
+   the storage root; cloud-init's own lines and failures also reach the UI log. */
+typedef struct {
+    HANDLE pipe;
+    wchar_t log_path[MAX_PATH];
+} SerialCaptureArgs;
+
+static BOOL serial_line_is_interesting(const char *line)
+{
+    return strstr(line, "ci-info") || strstr(line, "cloud-init") ||
+           strstr(line, "Cloud-init") || strstr(line, "FAILED") ||
+           strstr(line, "Failed") || strstr(line, "rror") ||
+           strstr(line, "E: ") || strstr(line, "W: ");
+}
+
+static void serial_emit_line(FILE *file, char *line)
+{
+    char clean[1024];
+    size_t r, w = 0;
+    /* Drop ANSI escapes and control characters (systemd colours its status). */
+    for (r = 0; line[r] && w + 1 < sizeof(clean); ++r) {
+        unsigned char c = (unsigned char)line[r];
+        if (c == 0x1B) {
+            if (line[r + 1] == '[') {
+                r += 2;
+                while (line[r] && !(line[r] >= '@' && line[r] <= '~')) ++r;
+                if (!line[r]) break;
+            }
+            continue;
+        }
+        if (c < 0x20 && c != '\t') continue;
+        clean[w++] = (char)c;
+    }
+    clean[w] = '\0';
+    if (!w) return;
+    if (file) { fputs(clean, file); fputc('\n', file); fflush(file); }
+    if (serial_line_is_interesting(clean))
+        ui_log(L"[appliance console] %S", clean);
+}
+
+static DWORD WINAPI serial_capture_worker(LPVOID parameter)
+{
+    SerialCaptureArgs *args = (SerialCaptureArgs *)parameter;
+    FILE *file = NULL;
+    char buffer[4096], line[1024];
+    size_t used = 0;
+    DWORD got, i;
+    BOOL connected = ConnectNamedPipe(args->pipe, NULL) ||
+                     GetLastError() == ERROR_PIPE_CONNECTED;
+    if (connected) {
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        _wfopen_s(&file, args->log_path, L"ab");
+        if (file)
+            fprintf(file, "\n==== appliance boot %04u-%02u-%02u %02u:%02u:%02u ====\n",
+                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+        while (ReadFile(args->pipe, buffer, sizeof(buffer), &got, NULL) && got) {
+            for (i = 0; i < got; ++i) {
+                char c = buffer[i];
+                if (c == '\n' || used + 1 >= sizeof(line)) {
+                    line[used] = '\0';
+                    serial_emit_line(file, line);
+                    used = 0;
+                    if (c == '\n') continue;
+                }
+                line[used++] = c;
+            }
+        }
+        if (used) { line[used] = '\0'; serial_emit_line(file, line); }
+        if (file) fclose(file);
+    }
+    CloseHandle(args->pipe);
+    HeapFree(GetProcessHeap(), 0, args);
+    return 0;
+}
+
+/* Create the COM1 pipe server for the next appliance boot and start reading it.
+   Only SYSTEM, Administrators and the Virtual Machines group may connect. */
+static void start_serial_capture(void)
+{
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    SerialCaptureArgs *args;
+    HANDLE thread;
+    ZeroMemory(&sa, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-83-0)",
+            SDDL_REVISION_1, &sd, NULL))
+        sa.lpSecurityDescriptor = sd;
+    args = (SerialCaptureArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*args));
+    if (!args) { if (sd) LocalFree(sd); return; }
+    swprintf_s(args->log_path, _countof(args->log_path), L"%s\\console.log",
+               g_appliance.status.storage_root);
+    args->pipe = CreateNamedPipeW(L"\\\\.\\pipe\\" APPLIANCE_VM_NAME L".com1",
+        PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, 0, 64 * 1024, 0, &sa);
+    if (sd) LocalFree(sd);
+    if (args->pipe == INVALID_HANDLE_VALUE) {
+        ui_log(L"Shared appliance: could not create the console capture pipe (%lu).",
+               GetLastError());
+        HeapFree(GetProcessHeap(), 0, args);
+        return;
+    }
+    thread = CreateThread(NULL, 0, serial_capture_worker, args, 0, NULL);
+    if (thread) CloseHandle(thread);
+    else { CloseHandle(args->pipe); HeapFree(GetProcessHeap(), 0, args); }
+}
+
 static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_ms);
 
 /* Runs the readiness handshake for a caller that asked not to block. Re-enters
@@ -1107,9 +1221,16 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         g_appliance.maintenance_endpoint_created = TRUE;
         {
             char actual_mac[32] = "";
-            if (SUCCEEDED(hcn_get_endpoint_mac(&g_appliance.maintenance_endpoint_id,
-                                               actual_mac, sizeof(actual_mac))) &&
-                actual_mac[0] && _stricmp(actual_mac, APPLIANCE_MAINTENANCE_MAC) != 0)
+            HRESULT mac_hr = hcn_get_endpoint_mac(&g_appliance.maintenance_endpoint_id,
+                                                  actual_mac, sizeof(actual_mac));
+            if (FAILED(mac_hr) || !actual_mac[0])
+                ui_log(L"Shared appliance: could not read the maintenance endpoint MAC (0x%08X).",
+                       mac_hr);
+            else
+                ui_log(L"Shared appliance: maintenance endpoint %S, MAC %S (requested %S).",
+                       nat_ip, actual_mac, APPLIANCE_MAINTENANCE_MAC);
+            if (SUCCEEDED(mac_hr) && actual_mac[0] &&
+                _stricmp(actual_mac, APPLIANCE_MAINTENANCE_MAC) != 0)
                 ui_log(L"Shared appliance: WARNING: maintenance endpoint got MAC %S, not %S; "
                        L"an Ubuntu guest will have no internet for this boot.",
                        actual_mac, APPLIANCE_MAINTENANCE_MAC);
@@ -1158,6 +1279,8 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         maintenance_endpoint[0] ? maintenance_endpoint : NULL,
         share_endpoint, &g_appliance.runtime);
     if (FAILED(hr)) goto fail;
+    if (g_appliance.status.backend == ASB_APPLIANCE_BACKEND_UBUNTU)
+        start_serial_capture();
     hr = hcs_start_vm(&g_appliance.runtime);
     if (FAILED(hr)) goto fail;
     InterlockedExchange(&g_appliance.booting, 0);
