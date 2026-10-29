@@ -240,7 +240,7 @@
         <fieldset id="manage-secure-boot-section">
             <legend>Secure Boot</legend>
             <label class="manage-check"><input type="checkbox" id="manage-secure-boot" onchange="saveManageSecureBoot()"> Start this VM with Secure Boot</label>
-            <small>Turn off to let test-signed kernel drivers such as the audio driver load. A Windows install set up with Secure Boot on may not boot reliably without it, so take a checkpoint first. Applies on the next start.</small>
+            <small>New VMs start with it off so test-signed kernel drivers such as the audio driver load. A Windows install set up with Secure Boot on may not boot reliably once it is turned off, so take a checkpoint first. Applies on the next start.</small>
         </fieldset>
 
         <fieldset>
