@@ -135,7 +135,7 @@ def main():
           "shared appliance fields and resource rows use the shared control theme")
     for tooltip in ("Start the shared appliance VM.",
                     "Choose the parent folder where the shared appliance files are stored.",
-                    "Open this resource in File Explorer on the host.",
+                    "in File Explorer.",
                     "Permanently delete all data stored in this resource."):
         check(tooltip in html + js,
               f"shared settings button tooltip missing: {tooltip}")

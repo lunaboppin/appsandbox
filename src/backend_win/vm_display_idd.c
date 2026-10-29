@@ -112,11 +112,15 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_MOUSE_REL     4   /* param1/param2: signed dx/dy (raw mouse counts) */
+#define INPUT_MOUSE_HWHEEL  5
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
 #define INPUT_BTN_MIDDLE    2
+#define INPUT_BTN_X1        3
+#define INPUT_BTN_X2        4
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 
@@ -135,6 +139,7 @@ typedef struct InputPacket {
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
+#define WM_IDD_CURSOR_VIS       (WM_USER + 102)   /* wp = guest cursor visible */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -251,6 +256,17 @@ struct VmDisplayIdd {
     DWORD          last_mouse_move_tick;
     BOOL           have_last_mouse_move_tick;
 
+    /* Game mode (Parsec-style mouse capture). While captured the host cursor
+       is hidden and clipped to the render area, and raw mouse deltas are sent
+       as relative moves, which is what games reading raw input expect.
+       Ctrl+Alt or losing activation releases it. */
+    volatile BOOL  game_mode;        /* capture automatically when the guest hides its cursor */
+    BOOL           captured;
+    BOOL           capture_auto;     /* captured by game mode, so a visible cursor releases it */
+    DWORD          title_tick;
+    UINT           title_frames;
+    UINT           fps;
+
     /* Keyboard hotkey handling */
     wchar_t        vhdx_path[MAX_PATH]; /* copy of vm->vhdx_path for settings file */
     volatile BOOL  transmit_hotkeys; /* TRUE = capture host hotkeys + send to guest */
@@ -303,6 +319,8 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
 #define IDM_SHOW_CONSOLE   0x1030
+#define IDM_GAME_MODE      0x1040
+#define IDM_CAPTURE_MOUSE  0x1050
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -413,7 +431,9 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     case WM_LBUTTONDOWN: case WM_LBUTTONUP:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
     case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
     case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
     case WM_MOUSELEAVE:
     case WM_KEYDOWN: case WM_KEYUP:
     case WM_SYSKEYDOWN: case WM_SYSKEYUP:
@@ -541,11 +561,11 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     g_input_send_count++;
 
     /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
+    if (type != INPUT_MOUSE_MOVE && type != INPUT_MOUSE_REL) {
         static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
+            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY", L"MOUSE_REL", L"MOUSE_HWHEEL"
         };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
+        const wchar_t *name = type < 6 ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
 }
@@ -588,37 +608,43 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
     swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
 }
 
-static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
+                                      BOOL game_mode)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"gameMode\":%d}\n",
+            transmit_hotkeys ? 1 : 0, game_mode ? 1 : 0);
     fclose(f);
 }
 
-/* Read the persisted setting; if the file is absent, create it with the
-   default (off) and return FALSE. Returns the transmit-hotkeys value. */
-static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
+/* Read the persisted settings; if the file is absent, create it with the
+   defaults (hotkeys off, game mode on). Returns the transmit-hotkeys value;
+   game mode is on unless the file turns it off. */
+static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path, BOOL *game_mode)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     char buf[256];
     BOOL transmit = FALSE;
 
+    *game_mode = TRUE;
     if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE);
+        idd_display_settings_save(vhdx_path, FALSE, TRUE);
         return FALSE;
     }
     if (fgets(buf, sizeof(buf), f)) {
         if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
             transmit = TRUE;
+        if (strstr(buf, "\"gameMode\":0"))
+            *game_mode = FALSE;
     }
     fclose(f);
     return transmit;
@@ -700,7 +726,7 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
     VmDisplayIdd *d = t_hook_display;
 
     if (code == HC_ACTION && d && !d->stop &&
-        d->input_focused && d->transmit_hotkeys) {
+        d->input_focused && (d->transmit_hotkeys || d->captured)) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
         BOOL up  = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
         BOOL alt = (k->flags & LLKHF_ALTDOWN) != 0;
@@ -733,6 +759,72 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
         idd_log(d, L"Hotkey capture disabled.");
     }
     t_hook_display = NULL;
+}
+
+/* ==================================================================
+ * Game mode: mouse capture with relative movement
+ * ================================================================== */
+
+static void idd_update_title(VmDisplayIdd *d)
+{
+    wchar_t title[320];
+    if (!d || !d->hwnd) return;
+    swprintf_s(title, _countof(title), L"%s%s Display %ux%u - %u fps%s",
+               d->audio_muted ? L"\U0001F507 " : L"",
+               d->vm_name, d->frame_width, d->frame_height, d->fps,
+               d->captured ? L" - Mouse captured (Ctrl+Alt releases)" : L"");
+    SetWindowTextW(d->hwnd, title);
+}
+
+/* Keep the (hidden) cursor inside the render area so clicks land on it. */
+static void idd_clip_cursor(VmDisplayIdd *d)
+{
+    RECT rc;
+    if (!d->captured || !d->render_hwnd) return;
+    GetClientRect(d->render_hwnd, &rc);
+    MapWindowPoints(d->render_hwnd, NULL, (POINT *)&rc, 2);
+    ClipCursor(&rc);
+}
+
+static void idd_begin_capture(VmDisplayIdd *d, BOOL automatic)
+{
+    RAWINPUTDEVICE rid;
+    if (!d || d->captured || !d->hwnd || !d->render_hwnd || !d->input_focused) return;
+    rid.usUsagePage = 0x01;   /* generic desktop */
+    rid.usUsage     = 0x02;   /* mouse */
+    rid.dwFlags     = 0;
+    rid.hwndTarget  = d->hwnd;
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        idd_log(d, L"Mouse capture: raw input registration failed (%lu).", GetLastError());
+        return;
+    }
+    d->captured = TRUE;
+    d->capture_auto = automatic;
+    d->pending_mouse = FALSE;
+    KillTimer(d->hwnd, IDT_INPUT);
+    idd_clip_cursor(d);
+    SetCursor(NULL);
+    /* Win, Alt+Tab and friends go to the game while captured. */
+    if (!d->transmit_hotkeys) idd_install_kbd_hook(d);
+    idd_log(d, automatic ? L"Mouse captured (game hid the cursor). Ctrl+Alt releases."
+                         : L"Mouse captured. Ctrl+Alt releases.");
+    idd_update_title(d);
+}
+
+static void idd_end_capture(VmDisplayIdd *d)
+{
+    RAWINPUTDEVICE rid;
+    if (!d || !d->captured) return;
+    d->captured = FALSE;
+    rid.usUsagePage = 0x01;
+    rid.usUsage     = 0x02;
+    rid.dwFlags     = RIDEV_REMOVE;
+    rid.hwndTarget  = NULL;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    ClipCursor(NULL);
+    if (!d->transmit_hotkeys) idd_remove_kbd_hook(d);
+    idd_log(d, L"Mouse released.");
+    idd_update_title(d);
 }
 
 /* Compute letterboxed/pillarboxed viewport within client rect */
@@ -1305,13 +1397,18 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    /* Refresh the title once per uploaded frame (~frame rate). */
-    if (frame_uploaded && d->hwnd) {
-        wchar_t title[256];
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
-                   d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
-        SetWindowTextW(d->hwnd, title);
+    /* Count uploaded frames and refresh the title (with the frame rate)
+       twice a second; retitling every frame costs the window a redraw. */
+    if (frame_uploaded) {
+        DWORD now = GetTickCount();
+        d->title_frames++;
+        if ((DWORD)(now - d->title_tick) >= 500) {
+            DWORD elapsed = (DWORD)(now - d->title_tick);
+            d->fps = d->title_tick ? (d->title_frames * 1000 + elapsed / 2) / elapsed : 0;
+            d->title_frames = 0;
+            d->title_tick = now;
+            idd_update_title(d);
+        }
     }
     d->render_count++;
 
@@ -1668,6 +1765,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                                 sizeof(CursorHeader) - sizeof(UINT32)))
                     break;
 
+                if ((d->cursor_visible != 0) != (chdr.visible != 0) && d->hwnd)
+                    PostMessageW(d->hwnd, WM_IDD_CURSOR_VIS, chdr.visible ? 1 : 0, 0);
                 d->cursor_visible = chdr.visible;
 
                 if (chdr.shape_updated && chdr.shape_data_size > 0) {
@@ -1957,12 +2056,18 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING, IDM_GAME_MODE,
+                        L"Game Mode (capture mouse when the VM hides it)");
+            AppendMenuW(sysmenu, MF_STRING, IDM_CAPTURE_MOUSE,
+                        L"Capture Mouse Now (Ctrl+Alt releases)");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             if (d->switchable)
                 AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_CONSOLE,
                             L"Show Hyper-V Screen (boot console)");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(sysmenu, IDM_GAME_MODE,
+                          MF_BYCOMMAND | (d->game_mode ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -2083,17 +2188,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSCOMMAND:
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
-            wchar_t title[300];
             d->audio_muted = !d->audio_muted;
             if (sysmenu) {
                 CheckMenuItem(sysmenu, IDM_AUDIO_MUTE,
                               MF_BYCOMMAND | (d->audio_muted ? MF_CHECKED : MF_UNCHECKED));
             }
-            if (d->audio_muted)
-                swprintf_s(title, 300, L"\U0001F507 %s - IDD Display", d->vm_name);
-            else
-                swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
-            SetWindowTextW(hwnd, title);
+            idd_update_title(d);
             idd_log(d, d->audio_muted ? L"Audio muted." : L"Audio unmuted.");
             return 0;
         }
@@ -2106,15 +2206,31 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             if (d->transmit_hotkeys) {
                 idd_install_kbd_hook(d);
-            } else {
+            } else if (!d->captured) {
                 idd_remove_kbd_hook(d);
                 /* Release anything the guest may be holding from this mode. */
                 idd_flush_held_keys(d);
             }
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->game_mode);
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
                         : L"Transmit Keyboard Hotkeys: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_GAME_MODE) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->game_mode = !d->game_mode;
+            if (sysmenu)
+                CheckMenuItem(sysmenu, IDM_GAME_MODE,
+                              MF_BYCOMMAND | (d->game_mode ? MF_CHECKED : MF_UNCHECKED));
+            if (!d->game_mode && d->capture_auto) idd_end_capture(d);
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys, d->game_mode);
+            idd_log(d, d->game_mode ? L"Game Mode: ON." : L"Game Mode: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_CAPTURE_MOUSE) {
+            d->input_focused = TRUE;   /* the menu was just used on this window */
+            idd_begin_capture(d, FALSE);
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
@@ -2147,6 +2263,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Remove the hotkey hook and release any keys still held in the
                guest before tearing the window down. */
+            idd_end_capture(d);
             idd_remove_kbd_hook(d);
             idd_flush_held_keys(d);
 
@@ -2208,6 +2325,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
         KillTimer(hwnd, IDT_INPUT);
+        if (d && d->captured) ClipCursor(NULL);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
@@ -2242,7 +2360,37 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            idd_clip_cursor(d);
         }
+        return 0;
+
+    case WM_MOVE:
+        if (d) idd_clip_cursor(d);
+        break;
+
+    /* Raw mouse deltas while captured: sent as relative moves, unthrottled,
+       so games get every count at the mouse's own polling rate. */
+    case WM_INPUT:
+        if (d && d->captured) {
+            RAWINPUT ri;
+            UINT size = sizeof(ri);
+            if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size,
+                                sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+                ri.header.dwType == RIM_TYPEMOUSE &&
+                !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+                (ri.data.mouse.lLastX || ri.data.mouse.lLastY))
+                send_input(d, INPUT_MOUSE_REL, (UINT32)ri.data.mouse.lLastX,
+                           (UINT32)ri.data.mouse.lLastY, 0);
+        }
+        break;   /* DefWindowProc cleans up the raw input buffer */
+
+    /* The guest showed or hid its cursor. A game hiding it means mouse-look:
+       game mode captures on the next click in the window (not right away,
+       since Windows also hides the pointer while you type). Showing it again
+       (a menu, alt-tab in the guest) releases an automatic capture. */
+    case WM_IDD_CURSOR_VIS:
+        if (d && wp && d->captured && d->capture_auto)
+            idd_end_capture(d);
         return 0;
 
     case WM_PAINT:
@@ -2313,8 +2461,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (!d->input_focused)
+            if (!d->input_focused) {
+                idd_end_capture(d);
                 idd_flush_held_keys(d);
+            }
         }
         break;
 
@@ -2323,6 +2473,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     /* ---- Mouse tracking (events forwarded from render child) ---- */
     case WM_MOUSEMOVE:
+        if (d && d->captured) return 0;   /* relative moves come from WM_INPUT */
         if (d) {
             if (!d->tracking && d->render_hwnd) {
                 TRACKMOUSEEVENT tme;
@@ -2362,7 +2513,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && d->guest_cursor)
+            if (d && d->captured)
+                SetCursor(NULL);
+            else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -2372,32 +2525,42 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     /* ---- Mouse button/wheel forwarding (only when cursor is in render area) ---- */
     case WM_LBUTTONDOWN:
-        if (d && d->mouse_in) {
-            if (d->render_hwnd) SetCapture(d->render_hwnd);
-            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
-        }
-        return 0;
-    case WM_LBUTTONUP:
-        ReleaseCapture();
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
-        return 0;
-
     case WM_RBUTTONDOWN:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
-        return 0;
-    case WM_RBUTTONUP:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
-        return 0;
-
     case WM_MBUTTONDOWN:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
-        return 0;
+    case WM_XBUTTONDOWN:
+        if (d && d->mouse_in && !d->captured && d->game_mode && !d->cursor_visible)
+            idd_begin_capture(d, TRUE);
+        if (d && (d->mouse_in || d->captured)) {
+            UINT32 button = msg == WM_LBUTTONDOWN ? INPUT_BTN_LEFT :
+                            msg == WM_RBUTTONDOWN ? INPUT_BTN_RIGHT :
+                            msg == WM_MBUTTONDOWN ? INPUT_BTN_MIDDLE :
+                            GET_XBUTTON_WPARAM(wp) == XBUTTON2 ? INPUT_BTN_X2 : INPUT_BTN_X1;
+            if (msg == WM_LBUTTONDOWN && !d->captured && d->render_hwnd)
+                SetCapture(d->render_hwnd);
+            send_input(d, INPUT_MOUSE_BUTTON, button, 1, 0);
+        }
+        return msg == WM_XBUTTONDOWN ? TRUE : 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
     case WM_MBUTTONUP:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
-        return 0;
+    case WM_XBUTTONUP:
+        if (msg == WM_LBUTTONUP) ReleaseCapture();
+        if (d && (d->mouse_in || d->captured)) {
+            UINT32 button = msg == WM_LBUTTONUP ? INPUT_BTN_LEFT :
+                            msg == WM_RBUTTONUP ? INPUT_BTN_RIGHT :
+                            msg == WM_MBUTTONUP ? INPUT_BTN_MIDDLE :
+                            GET_XBUTTON_WPARAM(wp) == XBUTTON2 ? INPUT_BTN_X2 : INPUT_BTN_X1;
+            send_input(d, INPUT_MOUSE_BUTTON, button, 0, 0);
+        }
+        return msg == WM_XBUTTONUP ? TRUE : 0;
 
     case WM_MOUSEWHEEL:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
+        if (d && (d->mouse_in || d->captured))
+            send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
+        return 0;
+    case WM_MOUSEHWHEEL:
+        if (d && (d->mouse_in || d->captured))
+            send_input(d, INPUT_MOUSE_HWHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
         return 0;
 
     /* ---- Keyboard input forwarding (gated on window activation) ----
@@ -2416,7 +2579,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
-        if (!d->transmit_hotkeys &&
+        /* Ctrl+Alt releases a captured mouse. The keys already sent are
+           released in the guest so neither sticks down there. */
+        if (d->captured && !up && (wp == VK_CONTROL || wp == VK_MENU) &&
+            (GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_MENU) & 0x8000)) {
+            idd_end_capture(d);
+            idd_flush_held_keys(d);
+            return 0;
+        }
+        if (!d->transmit_hotkeys && !d->captured &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
         /* A key only reaches this thread when our window has focus. If the
@@ -2469,7 +2640,12 @@ static VmDisplayIdd *idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_h
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is
        installed later, on the window thread, once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    {
+        BOOL game_mode = TRUE;
+        d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path, &game_mode);
+        d->game_mode = game_mode;
+    }
+    d->cursor_visible = TRUE;
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

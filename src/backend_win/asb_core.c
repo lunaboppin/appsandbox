@@ -884,6 +884,44 @@ static void remember_storage_parent(const wchar_t *root)
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
 
+/* The display driver package beside the agent (drivers\) is refreshed the
+   same way when its DLL differs; the agent installs it at its next start,
+   prompted by drivers\vdd-update.pending. Only guests that already have the
+   package (and devcon) are touched. */
+static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_dir)
+{
+    static const wchar_t *files[] = {
+        L"AppSandboxVDD.inf", L"AppSandboxVDD.cat", L"AppSandboxVDD.dll", NULL
+    };
+    wchar_t source[MAX_PATH], dest[MAX_PATH], temp[MAX_PATH];
+    BYTE a[32], b[32];
+    HANDLE marker;
+    int i;
+    swprintf_s(source, MAX_PATH, L"%s\\drivers\\AppSandboxVDD.dll", source_dir);
+    swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\AppSandboxVDD.dll", drive);
+    if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) return;
+    swprintf_s(temp, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\devcon.exe", drive);
+    if (GetFileAttributesW(temp) == INVALID_FILE_ATTRIBUTES) return;
+    if (SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
+        memcmp(a, b, 32) == 0) return;
+    for (i = 0; files[i]; i++) {
+        swprintf_s(source, MAX_PATH, L"%s\\drivers\\%s", source_dir, files[i]);
+        swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\%s", drive, files[i]);
+        swprintf_s(temp, MAX_PATH, L"%s.new", dest);
+        if (!CopyFileW(source, temp, FALSE) ||
+            !MoveFileExW(temp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            asb_log(L"Guest display driver refresh: %s failed (%lu).", files[i], GetLastError());
+            DeleteFileW(temp);
+            return;
+        }
+    }
+    swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\drivers\\vdd-update.pending", drive);
+    marker = CreateFileW(dest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (marker != INVALID_HANDLE_VALUE) CloseHandle(marker);
+    asb_log(L"Guest display driver refresh: staged the new driver; the agent installs it at boot.");
+}
+
 /* The session helpers the agent spawns live beside it in the guest. They are
    refreshed with it, best-effort and only where the guest already has them,
    so a fix to one (e.g. the input helper) reaches existing VMs too. */
@@ -913,6 +951,7 @@ static void refresh_guest_helpers(wchar_t drive, const wchar_t *source_dir)
         }
         asb_log(L"Guest helper refresh: updated %s.", helpers[i]);
     }
+    refresh_guest_display_driver(drive, source_dir);
 }
 
 /* Update the guest agent on the active writable VHDX before attaching SMB.
@@ -968,6 +1007,64 @@ static HRESULT upgrade_windows_agent_offline(const wchar_t *vhdx_path)
     if(result!=ERROR_SUCCESS)asb_log(L"Warning: shared-resource agent upgrade detach failed (%lu).",result);
     CloseHandle(disk);
     return hr;
+}
+
+/* Fingerprint of the guest payload this host would install (agent, input
+   helper, display driver), kept beside a VM's disk once installed there. A
+   Windows VM that gets no refresh for shared resources or VPN is refreshed
+   once whenever this changes, so input and display fixes reach every VM
+   without attaching its disk on each start. */
+static void guest_payload_stamp(wchar_t *out, size_t chars)
+{
+    static const wchar_t *files[] = {
+        L"appsandbox-agent.exe", L"appsandbox-input.exe", L"drivers\\AppSandboxVDD.dll", NULL
+    };
+    wchar_t module[MAX_PATH], dir[MAX_PATH], path[MAX_PATH], *slash;
+    BYTE digest[32];
+    size_t used = 0;
+    int i, j;
+    out[0] = L'\0';
+    GetModuleFileNameW(g_dll_module, module, MAX_PATH);
+    slash = wcsrchr(module, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(dir, MAX_PATH, L"%s\\resources", module);
+    if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) wcscpy_s(dir, MAX_PATH, module);
+    for (i = 0; files[i]; i++) {
+        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, files[i]);
+        if (FAILED(sha256_file(path, digest))) continue;
+        for (j = 0; j < 8 && used + 3 < chars; j++, used += 2)
+            swprintf_s(out + used, chars - used, L"%02x", digest[j]);
+    }
+}
+
+static void guest_payload_stamp_path(const wchar_t *vhdx_path, wchar_t *out, size_t chars)
+{
+    wchar_t *slash;
+    wcscpy_s(out, chars, vhdx_path);
+    slash = wcsrchr(out, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(out, chars, L"guest_payload.stamp");
+}
+
+static BOOL guest_payload_current(const wchar_t *vhdx_path, const wchar_t *stamp)
+{
+    wchar_t path[MAX_PATH], saved[128] = L"";
+    FILE *f;
+    guest_payload_stamp_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return FALSE;
+    fgetws(saved, _countof(saved), f);
+    fclose(f);
+    return wcscmp(saved, stamp) == 0;
+}
+
+static void guest_payload_mark_current(const wchar_t *vhdx_path, const wchar_t *stamp)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    guest_payload_stamp_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fputws(stamp, f);
+    fclose(f);
 }
 
 HRESULT asb_upgrade_windows_agent_offline(const wchar_t *vhdx_path)
@@ -1424,6 +1521,17 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             prepare_gl_layers_share(&args->config.gpu_shares);
     }
 
+    if (args->config.shared_resource_count == 0 && args->network_mode != NET_VPN &&
+        vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
+        wchar_t stamp[128];
+        guest_payload_stamp(stamp, _countof(stamp));
+        if (stamp[0] && !guest_payload_current(vm->vhdx_path, stamp)) {
+            hr = upgrade_windows_agent_offline(vm->vhdx_path);
+            if (SUCCEEDED(hr)) guest_payload_mark_current(vm->vhdx_path, stamp);
+            else asb_log(L"Could not refresh the guest agent and helpers on \"%s\" (0x%08X).",
+                         vm->name, hr);
+        }
+    }
     if (args->config.shared_resource_count == 0 && args->network_mode == NET_VPN &&
         vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
         /* A VPN VM's network config carries its DNS servers, which agents

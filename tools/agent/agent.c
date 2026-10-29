@@ -1632,6 +1632,46 @@ static void ensure_vdd_running(void)
     agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
 }
 
+/* ---- Display driver update staged by the host ----
+   The host refreshes the display driver files beside the agent while the VM
+   is off and leaves drivers\vdd-update.pending. Installing them at service
+   start gets driver fixes to VMs created before them. */
+
+static void apply_staged_vdd_update(void)
+{
+    wchar_t dir[MAX_PATH], marker[MAX_PATH], cmd[MAX_PATH * 2], *slash;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = 0;
+
+    GetModuleFileNameW(NULL, dir, MAX_PATH);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(marker, MAX_PATH, L"%s\\drivers\\vdd-update.pending", dir);
+    if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
+    /* One attempt per staging, so a package that won't install can't loop. */
+    DeleteFileW(marker);
+    swprintf_s(cmd, _countof(cmd),
+               L"\"%s\\drivers\\devcon.exe\" update \"%s\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD",
+               dir, dir);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        agent_log("VDD update: devcon failed to launch (%lu).", GetLastError());
+        return;
+    }
+    if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_TIMEOUT) {
+        agent_log("VDD update: devcon timed out, killing.");
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 3000);
+    }
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    agent_log("VDD update: devcon update exit=%lu (0 = installed, 1 = after reboot).", exit_code);
+}
+
 /* ---- Hyper-V Video device check: disable if running ---- */
 
 #define HYPERV_VIDEO_HWID L"*DA0A7802*"
@@ -3364,6 +3404,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
        from the log alone, whether the VM is running the agent you just built
        or one baked into its disk by an earlier install. */
     agent_log("Service started (built " __DATE__ " " __TIME__ ").");
+
+    /* Install a display driver update the host staged, before checking it */
+    apply_staged_vdd_update();
 
     /* Ensure VDD device is running (may need restart after logout teardown) */
     ensure_vdd_running();
