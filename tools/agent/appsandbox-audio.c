@@ -126,6 +126,10 @@ static BOOL send_all(AsbConn *c, const void *buf, int len)
 
 /* ---- Find the VAD render endpoint by friendly name ---- */
 
+/* Capture what apps actually play to: the default speaker. That is our VAD,
+   or VB-CABLE ("CABLE Input") on a VM where Secure Boot blocks the VAD and
+   the agent installed VB-CABLE instead. With no default, fall back to the
+   VAD by name. */
 static IMMDevice *find_vad_device(void)
 {
     IMMDeviceEnumerator *pEnum = NULL;
@@ -141,6 +145,24 @@ static IMMDevice *find_vad_device(void)
         audio_log("CoCreateInstance(MMDeviceEnumerator) failed (0x%08lx).", hr);
         return NULL;
     }
+
+    hr = pEnum->lpVtbl->GetDefaultAudioEndpoint(pEnum, eRender, eConsole, &pFound);
+    if (SUCCEEDED(hr) && pFound) {
+        IPropertyStore *pProps = NULL;
+        PROPVARIANT name;
+        PropVariantInit(&name);
+        if (SUCCEEDED(pFound->lpVtbl->OpenPropertyStore(pFound, STGM_READ, &pProps))) {
+            if (SUCCEEDED(pProps->lpVtbl->GetValue(pProps, &PKEY_Device_FriendlyName, &name)) &&
+                name.vt == VT_LPWSTR && name.pwszVal != NULL)
+                audio_log("Capturing the default speaker: %ls", name.pwszVal);
+            PropVariantClear(&name);
+            pProps->lpVtbl->Release(pProps);
+        }
+        pEnum->lpVtbl->Release(pEnum);
+        return pFound;
+    }
+    pFound = NULL;
+    audio_log("No default speaker (0x%08lx); looking for the VAD by name.", hr);
 
     hr = pEnum->lpVtbl->EnumAudioEndpoints(pEnum, eRender, DEVICE_STATE_ACTIVE, &pColl);
     if (FAILED(hr)) {
