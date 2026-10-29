@@ -457,6 +457,64 @@ static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
     }
 }
 
+
+/* Pack one frame (header, dirty rects, size, pixels) into proc->pSendBuf so it
+   goes to the host in a single send. Sending a 1080p frame row by row took
+   ~1000 socket calls per frame, which held the frame rate well under 60.
+   rectCount 0 = full frame. Returns the packed length, or 0 when there is
+   nothing to send (every rect empty) or no buffer. */
+static int VddPackFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* mapped,
+                        const RECT* rects, UINT32 rectCount)
+{
+    const SIZE_T cap = sizeof(VDD_WIRE_FRAME_HEADER) + VDD_MAX_DIRTY_RECTS * sizeof(RECT) +
+                       sizeof(UINT32) + VDD_PIXEL_BYTES;
+    VDD_WIRE_FRAME_HEADER whdr;
+    PBYTE p, sizePtr;
+    UINT32 dataSize = 0;
+    if (rectCount > VDD_MAX_DIRTY_RECTS) rectCount = 0;   /* too many: send it all */
+    if (!proc->pSendBuf) {
+        proc->pSendBuf = (PBYTE)malloc(cap);
+        if (!proc->pSendBuf) return 0;
+    }
+    p = proc->pSendBuf + sizeof(whdr);
+    if (rectCount) {
+        memcpy(p, rects, rectCount * sizeof(RECT));
+        p += rectCount * sizeof(RECT);
+    }
+    sizePtr = p;
+    p += sizeof(UINT32);
+    if (!rectCount) {
+        for (UINT row = 0; row < VDD_HEIGHT; row++) {
+            memcpy(p, (const BYTE*)mapped->pData + row * mapped->RowPitch, VDD_STRIDE);
+            p += VDD_STRIDE;
+        }
+        dataSize = VDD_PIXEL_BYTES;
+    } else {
+        for (UINT32 i = 0; i < rectCount; i++) {
+            const RECT* r = &rects[i];
+            if (r->left >= r->right || r->top >= r->bottom) continue;
+            UINT rw = (UINT)(r->right - r->left), rh = (UINT)(r->bottom - r->top);
+            for (UINT row = 0; row < rh; row++) {
+                memcpy(p, (const BYTE*)mapped->pData + ((UINT)r->top + row) * mapped->RowPitch +
+                          (UINT)r->left * 4, rw * 4);
+                p += rw * 4;
+            }
+            dataSize += rw * 4 * rh;
+        }
+        if (dataSize == 0) return 0;
+    }
+    proc->frameSeq++;
+    whdr.magic            = VDD_FRAME_MAGIC;
+    whdr.width            = VDD_WIDTH;
+    whdr.height           = VDD_HEIGHT;
+    whdr.stride           = VDD_STRIDE;
+    whdr.frame_seq        = proc->frameSeq;
+    whdr.dirty_rect_count = rectCount;
+    memcpy(proc->pSendBuf, &whdr, sizeof(whdr));
+    memcpy(sizePtr, &dataSize, sizeof(dataSize));
+    return (int)(p - proc->pSendBuf);
+}
+
 static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 {
     IDXGIDevice* pDxgiDevice = NULL;
@@ -574,32 +632,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
                 if (SUCCEEDED(hr))
                 {
-                    VDD_WIRE_FRAME_HEADER whdr;
-                    UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
-                    BOOL send_ok = TRUE;
-                    AsbConn* s = proc->hClientConn;
-
-                    proc->frameSeq++;
-                    whdr.magic            = VDD_FRAME_MAGIC;
-                    whdr.width            = VDD_WIDTH;
-                    whdr.height           = VDD_HEIGHT;
-                    whdr.stride           = VDD_STRIDE;
-                    whdr.frame_seq        = proc->frameSeq;
-                    whdr.dirty_rect_count = 0;
-
-                    if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                        VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0) {
-                        send_ok = FALSE;
-                    }
-                    if (send_ok) {
-                        for (UINT row = 0; row < VDD_HEIGHT; row++) {
-                            if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                           VDD_STRIDE) != 0) {
-                                send_ok = FALSE;
-                                break;
-                            }
-                        }
-                    }
+                    int len = VddPackFrame(proc, &mapped, NULL, 0);
+                    BOOL send_ok = len > 0 &&
+                        VddSendAll(proc->hClientConn, (const char*)proc->pSendBuf, len) == 0;
 
                     proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
 
@@ -658,85 +693,24 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 }
                             }
 
-                            VDD_WIRE_FRAME_HEADER whdr;
                             BOOL send_ok = TRUE;
-                            AsbConn* s = proc->hClientConn;
+                            int len;
 
-                            proc->frameSeq++;
-                            whdr.magic            = VDD_FRAME_MAGIC;
-                            whdr.width            = VDD_WIDTH;
-                            whdr.height           = VDD_HEIGHT;
-                            whdr.stride           = VDD_STRIDE;
-                            whdr.frame_seq        = proc->frameSeq;
-
-                            if (sendFull) {
-                                /* Full frame */
-                                UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
-                                whdr.dirty_rect_count = 0;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                if (send_ok) {
-                                    for (UINT row = 0; row < VDD_HEIGHT; row++) {
-                                        if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                                       VDD_STRIDE) != 0) {
-                                            send_ok = FALSE;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (send_ok) bSentFullFrame = TRUE;
-                            } else {
-                                /* Dirty rects only */
-                                UINT32 data_size = 0;
-                                UINT32 i;
-
-                                /* Clamp rects to frame bounds and calculate total data size */
-                                for (i = 0; i < rectCount; i++) {
+                            if (!sendFull) {
+                                /* Clamp rects to the frame; empty ones carry no pixels. */
+                                for (UINT32 i = 0; i < rectCount; i++) {
                                     if (dirtyRects[i].left < 0) dirtyRects[i].left = 0;
                                     if (dirtyRects[i].top  < 0) dirtyRects[i].top  = 0;
                                     if (dirtyRects[i].right  > (LONG)VDD_WIDTH)  dirtyRects[i].right  = VDD_WIDTH;
                                     if (dirtyRects[i].bottom > (LONG)VDD_HEIGHT) dirtyRects[i].bottom = VDD_HEIGHT;
-                                    if (dirtyRects[i].left < dirtyRects[i].right &&
-                                        dirtyRects[i].top < dirtyRects[i].bottom) {
-                                        UINT rw = (UINT)(dirtyRects[i].right - dirtyRects[i].left);
-                                        UINT rh = (UINT)(dirtyRects[i].bottom - dirtyRects[i].top);
-                                        data_size += rw * 4 * rh;
-                                    }
-                                }
-
-                                /* All rects zero area after clamping — skip send */
-                                if (data_size == 0) goto skip_send;
-
-                                whdr.dirty_rect_count = rectCount;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)dirtyRects, rectCount * sizeof(RECT)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                /* Send per-rect pixel rows */
-                                if (send_ok) {
-                                    for (i = 0; i < rectCount && send_ok; i++) {
-                                        LONG left = dirtyRects[i].left;
-                                        LONG top  = dirtyRects[i].top;
-                                        UINT rw   = (UINT)(dirtyRects[i].right - left);
-                                        UINT rh   = (UINT)(dirtyRects[i].bottom - top);
-                                        if (rw == 0 || rh == 0) continue;
-                                        for (UINT row = 0; row < rh; row++) {
-                                            const BYTE *src = (const BYTE*)mapped.pData
-                                                              + ((UINT)top + row) * mapped.RowPitch
-                                                              + (UINT)left * 4;
-                                            if (VddSendAll(s, (const char*)src, rw * 4) != 0) {
-                                                send_ok = FALSE;
-                                                break;
-                                            }
-                                        }
-                                    }
                                 }
                             }
+                            len = VddPackFrame(proc, &mapped, dirtyRects, sendFull ? 0 : rectCount);
+                            /* All rects empty after clamping: nothing to send. */
+                            if (len == 0 && !sendFull) goto skip_send;
+                            send_ok = len > 0 &&
+                                VddSendAll(proc->hClientConn, (const char*)proc->pSendBuf, len) == 0;
+                            if (send_ok && sendFull) bSentFullFrame = TRUE;
 
                             if (!send_ok) {
                                 VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
@@ -843,6 +817,8 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
         CloseHandle(proc->hCursorEvent);
     if (proc->pCursorShapeBuffer)
         free(proc->pCursorShapeBuffer);
+    if (proc->pSendBuf)
+        free(proc->pSendBuf);
 
     /* Only release the per-swap-chain staging texture.  The D3D device and
        context are cached in VDD_DEVICE_CONTEXT and intentionally NOT released

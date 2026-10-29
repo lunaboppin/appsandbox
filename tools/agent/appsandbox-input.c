@@ -24,9 +24,13 @@
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_MOUSE_REL     4   /* param1/param2: signed dx/dy (game mode) */
+#define INPUT_MOUSE_HWHEEL  5
 #define INPUT_BTN_LEFT      0
 #define INPUT_BTN_RIGHT     1
 #define INPUT_BTN_MIDDLE    2
+#define INPUT_BTN_X1        3
+#define INPUT_BTN_X2        4
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
 
 #pragma pack(push, 1)
@@ -134,6 +138,11 @@ static void inject_input(const InputPacket *pkt)
         case INPUT_BTN_MIDDLE:
             inp.mi.dwFlags = pkt->param2 ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
             break;
+        case INPUT_BTN_X1:
+        case INPUT_BTN_X2:
+            inp.mi.dwFlags = pkt->param2 ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+            inp.mi.mouseData = pkt->param1 == INPUT_BTN_X1 ? XBUTTON1 : XBUTTON2;
+            break;
         default:
             return;
         }
@@ -150,6 +159,28 @@ static void inject_input(const InputPacket *pkt)
         result = SendInput(1, &inp, sizeof(INPUT));
         if (result == 0)
             input_log("SendInput(MOUSE_WHEEL delta=%d) failed: %lu",
+                       (INT32)pkt->param1, GetLastError());
+        break;
+    }
+    case INPUT_MOUSE_REL: {
+        /* Relative motion, as a physical mouse reports it: games reading raw
+           input get these counts directly. */
+        inp.type = INPUT_MOUSE;
+        inp.mi.dx = (LONG)(INT32)pkt->param1;
+        inp.mi.dy = (LONG)(INT32)pkt->param2;
+        inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+        result = SendInput(1, &inp, sizeof(INPUT));
+        if (result == 0)
+            input_log("SendInput(MOUSE_REL) failed: %lu", GetLastError());
+        break;
+    }
+    case INPUT_MOUSE_HWHEEL: {
+        inp.type = INPUT_MOUSE;
+        inp.mi.dwFlags = MOUSEEVENTF_HWHEEL;
+        inp.mi.mouseData = (DWORD)(INT32)pkt->param1;
+        result = SendInput(1, &inp, sizeof(INPUT));
+        if (result == 0)
+            input_log("SendInput(MOUSE_HWHEEL delta=%d) failed: %lu",
                        (INT32)pkt->param1, GetLastError());
         break;
     }

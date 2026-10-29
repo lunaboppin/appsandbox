@@ -201,6 +201,7 @@ typedef struct _VDD_SWAP_PROC {
     AsbConn * volatile  hPendingConn;       /* new client from network thread, picked up by swap chain */
     volatile BOOL       bStopNetwork;
     UINT64              frameSeq;
+    PBYTE               pSendBuf;           /* one packed frame: header, rects, size, pixels */
 
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */
