@@ -3482,6 +3482,13 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
                   _countof(inst->shared_resource_exclusions),
                   config->shared_resource_exclusions, _TRUNCATE);
 
+    /* New Windows VMs boot without Secure Boot from the first boot, so the
+       guest's testsigning on takes effect and the test-signed audio driver
+       loads. Installing with it off avoids switching it on an existing
+       install; Manage > Secure Boot can still turn it on. */
+    cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);
+    inst->secure_boot_off = cfg.secure_boot_off;
+
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
         wcscmp(config->net_adapter, L"(Auto)") != 0)

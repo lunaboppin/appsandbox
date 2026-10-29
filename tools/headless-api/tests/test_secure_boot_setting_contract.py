@@ -1,8 +1,8 @@
 """Contract: a Windows VM can be started without Secure Boot.
 
 Secure Boot makes Windows ignore test signing, so a test-signed kernel driver
-(the audio driver) is blocked as unsigned. Manage > Secure Boot turns it off
-per VM: vms.cfg keeps SecureBootOff=1, the next start leaves the Secure Boot
+(the audio driver) is blocked as unsigned. New Windows VMs start with it off
+from their first boot; Manage > Secure Boot changes it per VM: vms.cfg keeps SecureBootOff=1, the next start leaves the Secure Boot
 template out of the firmware config, and the UI asks before turning it off
 because an install set up with Secure Boot on may not boot without it.
 """
@@ -32,6 +32,10 @@ def main() -> None:
     assert 'fwprintf(f, L"SecureBootOff=1\\n");' in core
     assert 'wcsncmp(line, L"SecureBootOff=", 14) == 0' in core
     assert "args->config.secure_boot_off = inst->secure_boot_off;" in core
+    # New Windows VMs (every create path) start with it off from the first boot.
+    assert 'cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);' in core
+    assert "inst->secure_boot_off = cfg.secure_boot_off;" in core
+    assert hcs.count("instance->secure_boot_off = config->secure_boot_off;") == 2
     setter = core[core.index("ASB_API HRESULT asb_vm_set_secure_boot("):]
     setter = setter[:setter.index("\n}\n")]
     assert '_wcsicmp(inst->os_type, L"Windows") != 0' in setter, "Windows VMs only"
