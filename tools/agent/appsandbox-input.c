@@ -62,13 +62,41 @@ static void input_log(const char *fmt, ...)
 
 /* ---- Desktop switching ---- */
 
+static HDESK g_thread_desktop;
+static wchar_t g_thread_desktop_name[64];
+static DWORD g_desktop_checked_tick;
+
+/* Attach this thread to whichever desktop receives input now. SendInput
+   only reaches the thread's own desktop, and signing in moves input from
+   Winlogon to Default (locking moves it back), so this is re-checked while
+   injecting, not just once per connection. */
 static void switch_to_input_desktop(void)
 {
+    wchar_t name[64] = L"";
     HDESK desk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (desk) {
-        SetThreadDesktop(desk);
+    if (!desk) return;
+    GetUserObjectInformationW(desk, UOI_NAME, name, sizeof(name), NULL);
+    if (g_thread_desktop && _wcsicmp(name, g_thread_desktop_name) == 0) {
         CloseDesktop(desk);
+        return;
     }
+    if (!SetThreadDesktop(desk)) {
+        input_log("SetThreadDesktop(%ls) failed: %lu", name, GetLastError());
+        CloseDesktop(desk);
+        return;
+    }
+    input_log("Input desktop: %ls", name);
+    if (g_thread_desktop) CloseDesktop(g_thread_desktop);
+    g_thread_desktop = desk;
+    wcscpy_s(g_thread_desktop_name, _countof(g_thread_desktop_name), name);
+}
+
+static void follow_input_desktop(void)
+{
+    DWORD now = GetTickCount();
+    if (now - g_desktop_checked_tick < 250) return;
+    g_desktop_checked_tick = now;
+    switch_to_input_desktop();
 }
 
 /* ---- Input injection ---- */
@@ -186,6 +214,7 @@ static void handle_conn(AsbConn *c)
         if (pkt_count == 1)
             input_log("First packet: type=%u p1=%u p2=%u p3=%u",
                        pkt.type, pkt.param1, pkt.param2, pkt.param3);
+        follow_input_desktop();
         inject_input(&pkt);
     }
 }
