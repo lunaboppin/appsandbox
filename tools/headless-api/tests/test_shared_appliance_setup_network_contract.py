@@ -47,6 +47,9 @@ def main() -> None:
                    '"    optional: true\\n"', '"    addresses: [%s/24]\\n"',
                    "- to: default", "nameservers:"):
         assert needle in disk, "network-config missing " + needle
+    # The Ubuntu appliance's COM1 is captured: the host owns the pipe server.
+    assert "CreateNamedPipeW(" in appliance and "APPLIANCE_VM_NAME L\".com1\"" in appliance
+    assert "start_serial_capture();" in appliance and "console.log" in appliance
     print("[ok] shared appliance setup network (maintenance NAT address) contract")
 
 
