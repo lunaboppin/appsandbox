@@ -532,9 +532,18 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
                             wchar_t *endpoint_guid_str, size_t str_len,
                             const char *nat_ip)
 {
+    return hcn_create_endpoint_with_mac(network_id, endpoint_id,
+                                        endpoint_guid_str, str_len, nat_ip, NULL);
+}
+
+HRESULT hcn_create_endpoint_with_mac(const GUID *network_id, GUID *endpoint_id,
+                                     wchar_t *endpoint_guid_str, size_t str_len,
+                                     const char *nat_ip, const char *mac_address)
+{
     wchar_t net_guid_str[64];
     wchar_t ep_guid_str[64];
     wchar_t settings[1024];
+    wchar_t mac_field[64] = L"";
     void *network = NULL;
     void *endpoint = NULL;
     PWSTR error_record = NULL;
@@ -551,15 +560,17 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     CoCreateGuid(endpoint_id);
     guid_to_string(network_id, net_guid_str, 64);
     guid_to_string(endpoint_id, ep_guid_str, 64);
+    if (mac_address && mac_address[0])
+        swprintf_s(mac_field, _countof(mac_field), L"\"MacAddress\":\"%S\",", mac_address);
 
     /* Static IP for NAT; DHCP for Internal (ICS) and External (Transparent) */
     if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID) && nat_ip && nat_ip[0]) {
         swprintf_s(settings, 1024,
             L"{"
             L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-            L"\"HostComputeNetwork\":\"%s\","
+            L"\"HostComputeNetwork\":\"%s\",%s"
             L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}]"
-            L"}", net_guid_str, nat_ip);
+            L"}", net_guid_str, mac_field, nat_ip);
     } else if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID)) {
         pick_nat_base_once();
         swprintf_s(settings, 1024,

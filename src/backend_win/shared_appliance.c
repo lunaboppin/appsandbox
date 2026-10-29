@@ -47,6 +47,10 @@
 #define UBUNTU_IMAGE_BUILD L"20260814"
 #define UBUNTU_IMAGE_BASE L"https://cloud-images.ubuntu.com/noble/" UBUNTU_IMAGE_BUILD L"/"
 /* iso_create_appliance_cloud_init emits a NoCloud seed with label CIDATA. */
+/* Requested for the temporary maintenance NAT adapter. The Ubuntu seed's
+   netplan finds that adapter by this MAC, so it has to be fixed up front. */
+#define APPLIANCE_MAINTENANCE_MAC "02-15-5D-A5-B0-FE"
+#define APPLIANCE_MAINTENANCE_MAC_COLON "02:15:5d:a5:b0:fe"
 
 typedef struct {
     DWORD magic;
@@ -641,6 +645,7 @@ static HRESULT build_ubuntu_os(const SharedApplianceConfig *config)
     wchar_t image[MAX_PATH], exe[MAX_PATH], command[2048], resource_dir[MAX_PATH];
     wchar_t admin_password[256], smb_password[256], ssh_public_key[512];
     wchar_t *slash;
+    char nat_ip[32], nat_gateway[32];
     HRESULT hr;
     hr = download_ubuntu_image(image, _countof(image)); if (FAILED(hr)) return hr;
     set_progress(20, L"Converting Ubuntu cloud image to VHDX...");
@@ -658,9 +663,13 @@ static HRESULT build_ubuntu_os(const SharedApplianceConfig *config)
     }
     swprintf_s(resource_dir, _countof(resource_dir), L"%s\\resources", exe);
     set_progress(55, L"Creating Ubuntu cloud-init seed...");
+    /* Must match the maintenance endpoint start_internal creates. */
+    sprintf_s(nat_ip, sizeof(nat_ip), "%s.254", hcn_nat_subnet_base());
+    sprintf_s(nat_gateway, sizeof(nat_gateway), "%s.1", hcn_nat_subnet_base());
     hr = iso_create_appliance_cloud_init(g_appliance.seed_iso_path,
             config->admin_user, admin_password, APPLIANCE_SERVICE_USER,
-            smb_password, ssh_public_key, resource_dir);
+            smb_password, ssh_public_key, resource_dir,
+            nat_ip, nat_gateway, APPLIANCE_MAINTENANCE_MAC_COLON);
     SecureZeroMemory(admin_password, sizeof(admin_password));
     SecureZeroMemory(smb_password, sizeof(smb_password));
     return hr;
@@ -1090,12 +1099,21 @@ static HRESULT start_internal(BOOL provisioning, BOOL wait_ready, DWORD timeout_
         hr = hcn_create_nat_network(&g_appliance.maintenance_network_id);
         if (SUCCEEDED(hr)) {
             sprintf_s(nat_ip, sizeof(nat_ip), "%s.254", hcn_nat_subnet_base());
-            hr = hcn_create_endpoint(&g_appliance.maintenance_network_id,
+            hr = hcn_create_endpoint_with_mac(&g_appliance.maintenance_network_id,
                 &g_appliance.maintenance_endpoint_id, maintenance_endpoint,
-                _countof(maintenance_endpoint), nat_ip);
+                _countof(maintenance_endpoint), nat_ip, APPLIANCE_MAINTENANCE_MAC);
         }
         if (FAILED(hr)) goto fail;
         g_appliance.maintenance_endpoint_created = TRUE;
+        {
+            char actual_mac[32] = "";
+            if (SUCCEEDED(hcn_get_endpoint_mac(&g_appliance.maintenance_endpoint_id,
+                                               actual_mac, sizeof(actual_mac))) &&
+                actual_mac[0] && _stricmp(actual_mac, APPLIANCE_MAINTENANCE_MAC) != 0)
+                ui_log(L"Shared appliance: WARNING: maintenance endpoint got MAC %S, not %S; "
+                       L"an Ubuntu guest will have no internet for this boot.",
+                       actual_mac, APPLIANCE_MAINTENANCE_MAC);
+        }
     }
 
     ZeroMemory(&g_appliance.runtime, sizeof(g_appliance.runtime));

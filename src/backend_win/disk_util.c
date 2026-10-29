@@ -1441,14 +1441,18 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
                                         const wchar_t *smb_user,
                                         const wchar_t *smb_password,
                                         const wchar_t *ssh_public_key,
-                                        const wchar_t *res_dir)
+                                        const wchar_t *res_dir,
+                                        const char *nat_ip,
+                                        const char *nat_gateway,
+                                        const char *nat_mac)
 {
     wchar_t dir[MAX_PATH], staging[MAX_PATH], path[MAX_PATH], *slash;
     char password_hash[256];
     FILE *file = NULL;
     HRESULT hr;
     if (!iso_path || !admin_user || !admin_password || !smb_user ||
-        !smb_password || !ssh_public_key || !ssh_public_key[0] || !res_dir) return E_INVALIDARG;
+        !smb_password || !ssh_public_key || !ssh_public_key[0] || !res_dir ||
+        !nat_ip || !nat_gateway || !nat_mac) return E_INVALIDARG;
     if (!unix_password_hash(admin_password, password_hash, sizeof(password_hash)))
         return E_FAIL;
     wcscpy_s(dir, _countof(dir), iso_path);
@@ -1461,6 +1465,29 @@ HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,
     swprintf_s(path, _countof(path), L"%s\\meta-data", staging);
     if (_wfopen_s(&file, path, L"w,ccs=UTF-8") != 0 || !file) { hr = E_FAIL; goto cleanup; }
     fwprintf(file, L"instance-id: appsandbox-shared-appliance\nlocal-hostname: appsandbox-share\n");
+    fclose(file); file = NULL;
+
+    /* The maintenance NAT network has static IPAM and no DHCP server, so the
+       image's default DHCP-everything config leaves the guest with no address
+       and the package install never reaches the mirror. Give the maintenance
+       adapter (matched by its requested MAC) its NAT address, gateway and DNS.
+       Only that adapter is listed: the share adapter stays unconfigured until
+       the agent's shared_net sets it up, and netplan keeps this file after
+       setup, so the Update maintenance boot gets the same address. optional
+       keeps normal boots, which have no maintenance adapter, from waiting. */
+    swprintf_s(path, _countof(path), L"%s\\network-config", staging);
+    if (_wfopen_s(&file, path, L"w") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    fprintf(file,
+        "version: 2\n"
+        "ethernets:\n"
+        "  maintenance:\n"
+        "    match:\n      macaddress: \"%s\"\n"
+        "    dhcp4: false\n"
+        "    optional: true\n"
+        "    addresses: [%s/24]\n"
+        "    routes:\n      - to: default\n        via: %s\n"
+        "    nameservers:\n      addresses: [%s, 8.8.8.8, 1.1.1.1]\n",
+        nat_mac, nat_ip, nat_gateway, nat_gateway);
     fclose(file); file = NULL;
 
     swprintf_s(path, _countof(path), L"%s\\user-data", staging);
