@@ -1426,9 +1426,12 @@ static void on_webview2_message(const wchar_t *json)
                 int resource_index;
                 for (resource_index = 0; resource_index < resource_count; ++resource_index) {
                     if (asb_shared_resource_get(resource_index, &resource) &&
-                        _wcsicmp(resource.id, id) == 0 && resource.host_drive_letter) {
-                        wchar_t drive[4] = { resource.host_drive_letter, L':', L'\\', L'\0' };
-                        ShellExecuteW(g_hwnd_main, L"open", drive, NULL, NULL, SW_SHOWNORMAL);
+                        _wcsicmp(resource.id, id) == 0) {
+                        wchar_t path[MAX_PATH] = { resource.host_drive_letter, L':', L'\\', L'\0' };
+                        /* No host letter: the mapping is UNC-only, so open that. */
+                        if (resource.host_drive_letter ||
+                            SUCCEEDED(asb_shared_resource_unc_path(id, path, _countof(path))))
+                            ShellExecuteW(g_hwnd_main, L"open", path, NULL, NULL, SW_SHOWNORMAL);
                         break;
                     }
                 }

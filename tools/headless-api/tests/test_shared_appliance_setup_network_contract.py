@@ -73,6 +73,14 @@ def main() -> None:
     assert "echo 'include = /etc/samba/appsandbox-shares/*.conf'" not in linux_agent
     assert linux_agent.count("appliance_rebuild_share_include() != 0") >= 3, \
         "reconcile, purge and remove must all rebuild the include"
+    # A resource with no host drive letter still opens on the host: the mapping
+    # is UNC-only, it counts as a host mount, and Open Share opens the UNC path.
+    assert "if (!resource || !resource->host_drive_letter) return E_INVALIDARG;" not in appliance
+    assert "New-SmbGlobalMapping -RemotePath $r -Credential $c " in appliance
+    assert "track_unc_host_mount(resource->id, TRUE)" in appliance
+    assert "track_unc_host_mount(resource->id, FALSE)" in appliance
+    ui = (ROOT / "src/app_win/ui.c").read_text(encoding="utf-8")
+    assert "asb_shared_resource_unc_path(id, path, _countof(path))" in ui
     print("[ok] shared appliance setup network (maintenance NAT address) contract")
 
 
