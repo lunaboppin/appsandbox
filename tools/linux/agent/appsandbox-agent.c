@@ -1144,6 +1144,21 @@ static int appliance_set_account(const char *arguments)
     return rc;
 }
 
+/* Samba's include takes one file and does not expand wildcards, so the
+   per-share files are concatenated into appsandbox-shares.conf and that file
+   is included. Also drops the old "include = .../appsandbox-shares/*.conf"
+   line, which never loaded anything. */
+static int appliance_rebuild_share_include(void)
+{
+    return run_sync(
+        "{ cat /etc/samba/appsandbox-shares/*.conf 2>/dev/null || :; } > /etc/samba/appsandbox-shares.conf && "
+        "if grep -qxF 'include = /etc/samba/appsandbox-shares/*.conf' /etc/samba/smb.conf; then "
+        "grep -vxF 'include = /etc/samba/appsandbox-shares/*.conf' /etc/samba/smb.conf > /etc/samba/smb.conf.asb && "
+        "mv /etc/samba/smb.conf.asb /etc/samba/smb.conf; fi && "
+        "{ grep -qx 'include = /etc/samba/appsandbox-shares.conf' /etc/samba/smb.conf || "
+        "echo 'include = /etc/samba/appsandbox-shares.conf' >> /etc/samba/smb.conf; }");
+}
+
 static int appliance_reconcile_share(const char *arguments)
 {
     char copy[256], *mode, directory[128], path[256], command[512];
@@ -1167,7 +1182,7 @@ static int appliance_reconcile_share(const char *arguments)
         "[%s]\npath = /srv/appsandbox/%s\nbrowseable = no\nvalid users = AppSandboxShare\nread only = %s\nforce user = AppSandboxShare\n",
         copy, directory, strcmp(mode, "ro") == 0 ? "yes" : "no");
     fclose(file);
-    if (run_sync("grep -q 'include = /etc/samba/appsandbox-shares/*.conf' /etc/samba/smb.conf || echo 'include = /etc/samba/appsandbox-shares/*.conf' >> /etc/samba/smb.conf") != 0)
+    if (appliance_rebuild_share_include() != 0)
         return EIO;
     return run_sync("testparm -s >/dev/null 2>&1 && systemctl reload smbd");
 }
@@ -1179,9 +1194,10 @@ static int appliance_purge_share(const char *share)
     snprintf(directory, sizeof(directory), "%s", share);
     { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
     snprintf(command, sizeof(command),
-        "rm -f /etc/samba/appsandbox-shares/%s.conf && rm -rf -- /srv/appsandbox/%s && systemctl reload smbd",
+        "rm -f /etc/samba/appsandbox-shares/%s.conf && rm -rf -- /srv/appsandbox/%s",
         directory, directory);
-    return run_sync(command);
+    if (run_sync(command) != 0 || appliance_rebuild_share_include() != 0) return EIO;
+    return run_sync("systemctl reload smbd");
 }
 
 static int appliance_remove_share(const char *share)
@@ -1191,9 +1207,10 @@ static int appliance_remove_share(const char *share)
     snprintf(directory, sizeof(directory), "%s", share);
     { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
     snprintf(command, sizeof(command),
-        "rm -f /etc/samba/appsandbox-shares/%s.conf && systemctl reload smbd",
+        "rm -f /etc/samba/appsandbox-shares/%s.conf",
         directory);
-    return run_sync(command);
+    if (run_sync(command) != 0 || appliance_rebuild_share_include() != 0) return EIO;
+    return run_sync("systemctl reload smbd");
 }
 
 /* ---- Per-client command dispatch ---- */

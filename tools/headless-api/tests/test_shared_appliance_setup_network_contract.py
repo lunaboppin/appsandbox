@@ -66,6 +66,13 @@ def main() -> None:
     # The Default adapter carries its endpoint's MAC; CLSIDFromString needs braces.
     hcs = (ROOT / "src/backend_win/hcs_vm.c").read_text(encoding="utf-8")
     assert 'L"{%s}", endpoint_guid' in hcs and "CLSIDFromString(braced_guid" in hcs
+    # Samba's include doesn't expand wildcards: the Linux agent concatenates the
+    # per-share files into one and includes that, never the *.conf glob.
+    linux_agent = (ROOT / "tools/linux/agent/appsandbox-agent.c").read_text(encoding="utf-8")
+    assert "echo 'include = /etc/samba/appsandbox-shares.conf'" in linux_agent
+    assert "echo 'include = /etc/samba/appsandbox-shares/*.conf'" not in linux_agent
+    assert linux_agent.count("appliance_rebuild_share_include() != 0") >= 3, \
+        "reconcile, purge and remove must all rebuild the include"
     print("[ok] shared appliance setup network (maintenance NAT address) contract")
 
 
