@@ -4936,6 +4936,8 @@ ASB_API HRESULT asb_shared_appliance_grow(DWORD new_size_gb)
 ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config,
                                              BOOL switch_backend)
 { return shared_appliance_rebuild(config, switch_backend); }
+ASB_API HRESULT asb_shared_appliance_delete(void)
+{ return shared_appliance_delete(); }
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id)
 { return shared_appliance_mount_host_resource(id); }
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id)

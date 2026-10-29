@@ -1864,6 +1864,56 @@ HRESULT shared_appliance_rebuild(const SharedApplianceConfig *replacement,
     return S_OK;
 }
 
+/* Remove the appliance entirely: stop it, delete its managed storage tree
+   (OS disk, data disk with every shared resource's files, provisioning media)
+   and its saved config and credentials, leaving it unconfigured so Setup can
+   start over. Shared resource definitions are kept; they publish again once a
+   new appliance is set up. */
+HRESULT shared_appliance_delete(void)
+{
+    wchar_t root[MAX_PATH], path[MAX_PATH];
+    const wchar_t *leaf;
+    HRESULT hr;
+    if (!g_appliance.initialized) return E_UNEXPECTED;
+    if (g_appliance.status.busy || g_appliance.status.active_clients ||
+        g_appliance.status.host_mounts || g_appliance.pending_clients)
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    hr = shared_appliance_stop(FALSE); if (FAILED(hr)) return hr;
+
+    EnterCriticalSection(&g_appliance.cs);
+    wcscpy_s(root, _countof(root), g_appliance.status.storage_root);
+    LeaveCriticalSection(&g_appliance.cs);
+    /* Only ever the tree setup created: it is always <parent>\AppSandboxSharedAppliance. */
+    leaf = wcsrchr(root, L'\\');
+    if (root[0] && leaf && _wcsicmp(leaf + 1, L"AppSandboxSharedAppliance") == 0) {
+        remove_directory_tree(root);
+        if (GetFileAttributesW(root) != INVALID_FILE_ATTRIBUTES) {
+            EnterCriticalSection(&g_appliance.cs);
+            set_error_locked(HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY),
+                             L"Could not remove the shared appliance files");
+            LeaveCriticalSection(&g_appliance.cs);
+            return HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY);
+        }
+    }
+
+    appliance_config_path(path, _countof(path));
+    DeleteFileW(path);
+    appliance_credential_path(path, _countof(path));
+    DeleteFileW(path);
+
+    EnterCriticalSection(&g_appliance.cs);
+    ZeroMemory(&g_appliance.status, sizeof(g_appliance.status));
+    g_appliance.status.state = ASB_APPLIANCE_STATE_UNCONFIGURED;
+    g_appliance.status.data_size_gb = 256;
+    g_appliance.windows_iso_path[0] = L'\0';
+    g_appliance.seed_iso_path[0] = L'\0';
+    g_appliance.legacy_paths[0] = L'\0';
+    InterlockedExchange(&g_appliance.restart_attempts, 0);
+    LeaveCriticalSection(&g_appliance.cs);
+    ui_log(L"Shared appliance deleted.");
+    return S_OK;
+}
+
 static DWORD host_mount_bit(const AsbSharedResourceInfo *resource)
 {
     int offset;

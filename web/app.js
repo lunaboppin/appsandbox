@@ -1264,6 +1264,7 @@ function updateSharedAppliance(){sendCmd('updateSharedAppliance');}
 function growSharedAppliance(){sendCmd('growSharedAppliance',{dataSizeGb:Number(document.getElementById('appliance-data-size').value)});}
 function rebuildSharedAppliance(){var p=appliancePayload();p.switchBackend=!!sharedAppliance.backend&&sharedAppliance.backend!==p.backend;showModal('Rebuild appliance',p.switchBackend?'Changing backend archives the old data VHDX and creates a new empty disk. Continue?':'Rebuild the appliance OS disk while preserving its data disk?','Rebuild').then(function(ok){if(ok)sendCmd('rebuildSharedAppliance',p);});}
 function mountHostResource(id){sendCmd('mountHostResource',{id:id});}
+function deleteSharedAppliance(){showModal('Delete shared appliance','Delete the shared appliance? Its OS disk and data disk are permanently deleted, including every shared resource\'s files. Shared resource definitions are kept and publish again after a new Setup.\n\nThis cannot be undone.','Delete').then(function(ok){if(ok)sendCmd('deleteSharedAppliance');});}
 function onSharedApplianceResult(msg){if(!msg.success)showModal('Shared appliance',msg.message||'The appliance operation failed.','OK');}
 
 function onManageBrowseResult(msg) {
