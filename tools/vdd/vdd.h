@@ -50,6 +50,13 @@ Environment:
  *  Must match FrameHeader in vm_display_idd.c
  * ============================================================================ */
 #define VDD_FRAME_MAGIC     0x52465341  /* "ASFR" little-endian */
+/* Same header, full frame as NV12 (Y plane then interleaved UV, full-range
+   BT.601, stride = width). Sent for frames where most of the screen changed:
+   2.7x fewer bytes than BGRA, which keeps games near 60 fps over the link. */
+#define VDD_FRAME_NV12_MAGIC 0x3231564E  /* "NV12" little-endian */
+#define VDD_NV12_BYTES      (VDD_WIDTH * VDD_HEIGHT * 3 / 2)
+/* Dirty area (percent of the frame) from which a frame goes as NV12. */
+#define VDD_NV12_AREA_PCT   40
 
 #pragma pack(push, 1)
 typedef struct _VDD_WIRE_FRAME_HEADER {
