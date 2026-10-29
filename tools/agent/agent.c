@@ -2076,7 +2076,8 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
    adapter's MAC. The guest can have more than one adapter and Windows does
    not guarantee that the internet-facing one is named "Ethernet". */
 static int configure_nat_nic(const char *ip_a, const char *prefix_a,
-                             const char *gateway_a, const char *mac_a)
+                             const char *gateway_a, const char *mac_a,
+                             const char *dns_a)
 {
     static const char script[] =
         "$ErrorActionPreference='Stop'\r\n"
@@ -2118,7 +2119,8 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
         " Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         " Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
         " New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NAT_IP -PrefixLength ([int]$env:ASB_NAT_PREFIX) -DefaultGateway $env:ASB_NAT_GATEWAY -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
-        " Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($env:ASB_NAT_GATEWAY,'8.8.8.8') -ErrorAction Stop\r\n"
+        " $dns=@($env:ASB_NAT_GATEWAY,'8.8.8.8'); if($env:ASB_NAT_DNS){$dns=@($env:ASB_NAT_DNS -split ',')}\r\n"
+        " Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses $dns -ErrorAction Stop\r\n"
         " for($i=0;$i -lt 20;$i++){\r\n"
         "  $ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NAT_IP}\r\n"
         "  $route=Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {$_.NextHop -eq $env:ASB_NAT_GATEWAY}\r\n"
@@ -2149,6 +2151,7 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
     SetEnvironmentVariableW(L"ASB_NAT_PREFIX", prefix);
     SetEnvironmentVariableW(L"ASB_NAT_GATEWAY", gateway);
     SetEnvironmentVariableW(L"ASB_NAT_NIC_MAC", mac);
+    SetEnvironmentVariableA("ASB_NAT_DNS", dns_a && dns_a[0] ? dns_a : NULL);
     ec = run_agent_powershell_out(path, 120000, out, sizeof(out));
     if (out[0]) {
         char *line = out, *nl;
@@ -2169,6 +2172,7 @@ static int configure_nat_nic(const char *ip_a, const char *prefix_a,
     SetEnvironmentVariableW(L"ASB_NAT_PREFIX", NULL);
     SetEnvironmentVariableW(L"ASB_NAT_GATEWAY", NULL);
     SetEnvironmentVariableW(L"ASB_NAT_NIC_MAC", NULL);
+    SetEnvironmentVariableA("ASB_NAT_DNS", NULL);
     return ec;
 }
 
@@ -2857,8 +2861,9 @@ static void handle_client(AsbConn *client)
             handle_ssh_enable(client, tag);
         }
         else if (strncmp(cmd, "set_ip:", 7) == 0) {
-            /* set_ip:172.20.0.X/PREFIX:GATEWAY */
+            /* set_ip:172.20.0.X/PREFIX:GATEWAY[:MAC[:DNS,DNS]] */
             char ip[32] = {0}, prefix[8] = {0}, gateway[32] = {0}, nat_mac[64] = {0};
+            char dns[160] = {0};
             char *slash, *colon2, *colon3;
             char *arg = cmd + 7;
 
@@ -2876,12 +2881,22 @@ static void handle_client(AsbConn *client)
                     strncpy_s(prefix, sizeof(prefix), slash + 1, pfx_len);
                 if (gateway_len > 0 && gateway_len < (int)sizeof(gateway))
                     strncpy_s(gateway, sizeof(gateway), colon2 + 1, gateway_len);
-                if (colon3)
-                    strncpy_s(nat_mac, sizeof(nat_mac), colon3 + 1, sizeof(nat_mac) - 1);
+                if (colon3) {
+                    char *colon4 = strchr(colon3 + 1, ':');
+                    int mac_len = colon4 ? (int)(colon4 - colon3 - 1) : (int)strlen(colon3 + 1);
+                    if (mac_len > 0 && mac_len < (int)sizeof(nat_mac))
+                        strncpy_s(nat_mac, sizeof(nat_mac), colon3 + 1, mac_len);
+                    if (colon4 && strlen(colon4 + 1) < sizeof(dns)) {
+                        const char *p;
+                        for (p = colon4 + 1; *p; p++)
+                            if (!((*p >= '0' && *p <= '9') || *p == '.' || *p == ',')) break;
+                        if (!*p) strcpy_s(dns, sizeof(dns), colon4 + 1);
+                    }
+                }
             }
 
             if (ip[0] && prefix[0] && gateway[0]) {
-                int exit_code = configure_nat_nic(ip, prefix, gateway, nat_mac);
+                int exit_code = configure_nat_nic(ip, prefix, gateway, nat_mac, dns);
                 if (exit_code == 0) REPLY("ok");
                 else REPLY("error:nat_net_failed");
             } else {

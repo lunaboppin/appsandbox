@@ -240,6 +240,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"gpuName", v->gpu_name);
     jb_int(jb, L"networkMode", v->network_mode);
     jb_string(jb, L"netAdapter", v->net_adapter);
+    jb_string(jb, L"vpnId", v->vpn_id);
     jb_bool(jb, L"isTemplate", v->is_template);
     jb_bool(jb, L"hypervVideoOff", v->hyperv_video_off);
     jb_bool(jb, L"buildingVhdx", v->building_vhdx);
@@ -485,11 +486,15 @@ static void send_templates(void)
 
 static void send_full_state(void)
 {
-    wchar_t buf[32768];
+    /* Heap, not stack: the VPN and shared-resource lists push the state past
+       what a 64 KB stack buffer can hold. */
+    const size_t buf_chars = 49152;
+    wchar_t *buf = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, buf_chars * sizeof(wchar_t));
     JsonBuilder jb;
     int i, count;
 
-    jb_init(&jb, buf, 32768);
+    if (!buf) return;
+    jb_init(&jb, buf, buf_chars);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"fullState");
     jb_string(&jb, L"lastStorageParent", asb_get_last_storage_parent());
@@ -577,6 +582,44 @@ static void send_full_state(void)
         jb_array_end(&jb);
     }
 
+    /* WireGuard VPN configs (no keys) and the gateway that runs them */
+    {
+        int vc = asb_vpn_config_count(), emitted = 0, vi;
+        VpnGatewayStatus g;
+        jb_array_begin(&jb, L"vpnConfigs");
+        for (i = 0; i < vc; i++) {
+            AsbVpnConfigInfo c;
+            int users = 0;
+            if (!asb_vpn_config_get(i, &c)) continue;
+            for (vi = 0; vi < asb_vm_count(); vi++) {
+                VmInstance *v = asb_vm_instance(asb_vm_get(vi));
+                if (v && v->network_mode == ASB_NET_VPN && _wcsicmp(v->vpn_id, c.id) == 0) users++;
+            }
+            if (emitted++) jb_append(&jb, L",");
+            jb_object_begin(&jb);
+            jb_string(&jb, L"id", c.id);
+            jb_string(&jb, L"name", c.name);
+            jb_string(&jb, L"endpoint", c.endpoint);
+            jb_string(&jb, L"address", c.address);
+            jb_string(&jb, L"dns", c.dns);
+            jb_int(&jb, L"vmCount", users);
+            jb_object_end(&jb);
+        }
+        jb_array_end(&jb);
+        asb_vpn_gateway_get_status(&g);
+        if (jb.count > 0) jb_append(&jb, L",");
+        jb_append(&jb, L"\"vpnGateway\":");
+        jb_object_begin(&jb);
+        jb_bool(&jb, L"configured", g.configured);
+        jb_bool(&jb, L"running", g.running);
+        jb_bool(&jb, L"ready", g.ready);
+        jb_bool(&jb, L"busy", g.busy);
+        jb_int(&jb, L"activeClients", g.active_clients);
+        jb_string(&jb, L"progressText", g.progress_text);
+        jb_string(&jb, L"lastError", g.last_error);
+        jb_object_end(&jb);
+    }
+
     {
         SharedApplianceStatus s;
         asb_shared_appliance_get_status(&s);
@@ -606,6 +649,7 @@ static void send_full_state(void)
 
     jb_object_end(&jb);
     webview2_post(buf);
+    HeapFree(GetProcessHeap(), 0, buf);
 }
 
 /* ---- UI logging ---- */
@@ -1066,6 +1110,7 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
         wchar_t adapter_buf[256] = {0}, storage_buf[MAX_PATH] = {0}, exclusions_buf[1024] = {0};
+        wchar_t vpn_buf[ASB_VPN_ID_CHARS] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -1078,6 +1123,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"netAdapter", adapter_buf, 256);
         json_get_string(json, L"storageParent", storage_buf, MAX_PATH);
         json_get_string(json, L"sharedResourceExclusions", exclusions_buf, _countof(exclusions_buf));
+        json_get_string(json, L"vpnId", vpn_buf, _countof(vpn_buf));
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -1090,6 +1136,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.net_adapter = adapter_buf;
         cfg.storage_parent = storage_buf;
         cfg.shared_resource_exclusions = exclusions_buf;
+        cfg.vpn_id = vpn_buf;
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
@@ -1240,9 +1287,50 @@ static void on_webview2_message(const wchar_t *json)
             else if (wcscmp(field, L"cpuCores") == 0) asb_vm_set_cpu(vm, (DWORD)_wtoi(value));
             else if (wcscmp(field, L"gpuMode") == 0) asb_vm_set_gpu(vm, _wtoi(value));
             else if (wcscmp(field, L"networkMode") == 0) asb_vm_set_network(vm, _wtoi(value));
+            else if (wcscmp(field, L"vpnId") == 0) asb_vm_set_vpn(vm, value);
             asb_save();
             send_vm_list();
         }
+    } else if (wcscmp(action, L"importVpnConfig") == 0) {
+        /* The .conf text arrives from a file picked in the page or pasted
+           into it. It holds a private key: scrub it once stored. */
+        wchar_t name[64] = {0}, error[256] = {0}, out[640];
+        wchar_t *text = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                             32768 * sizeof(wchar_t));
+        HRESULT hr = E_OUTOFMEMORY;
+        JsonBuilder rj;
+        if (text) {
+            json_get_string(json, L"name", name, _countof(name));
+            json_get_string(json, L"text", text, 32768);
+            hr = asb_vpn_config_import(name, text, error, _countof(error));
+            SecureZeroMemory(text, 32768 * sizeof(wchar_t));
+            HeapFree(GetProcessHeap(), 0, text);
+        }
+        jb_init(&rj, out, _countof(out));
+        jb_object_begin(&rj);
+        jb_string(&rj, L"type", L"vpnConfigResult");
+        jb_bool(&rj, L"success", SUCCEEDED(hr));
+        jb_string(&rj, L"error", error);
+        jb_object_end(&rj);
+        webview2_post(out);
+        send_full_state();
+    } else if (wcscmp(action, L"deleteVpnConfig") == 0) {
+        wchar_t id[ASB_VPN_ID_CHARS] = {0}, out[256];
+        HRESULT hr = E_INVALIDARG;
+        JsonBuilder rj;
+        if (json_get_string(json, L"id", id, _countof(id))) hr = asb_vpn_config_delete(id);
+        jb_init(&rj, out, _countof(out));
+        jb_object_begin(&rj);
+        jb_string(&rj, L"type", L"vpnConfigResult");
+        jb_bool(&rj, L"success", SUCCEEDED(hr));
+        jb_string(&rj, L"error", hr == HRESULT_FROM_WIN32(ERROR_BUSY)
+            ? L"A VM still uses this config. Change that VM's network first." : L"");
+        jb_object_end(&rj);
+        webview2_post(out);
+        send_full_state();
+    } else if (wcscmp(action, L"stopVpnGateway") == 0) {
+        asb_vpn_gateway_stop();
+        send_full_state();
     } else if (wcscmp(action, L"selectVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) g_selected_vm = idx;

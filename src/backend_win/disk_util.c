@@ -1592,6 +1592,108 @@ cleanup:
 }
 
 
+/* NoCloud seed for the VPN gateway: an Ubuntu VM with WireGuard and the
+   AppSandbox Linux agent, which runs the tunnels and routing on the host's
+   command. Both adapters are static and matched by MAC: the uplink on the
+   NAT network (the gateway's own internet, used to reach VPN endpoints) and
+   the LAN side at <vpn base>.2 on the Private VPN network. Forwarding and the
+   kill switch are set up by the agent's vpn_init on every boot. */
+HRESULT iso_create_vpn_gateway_cloud_init(const wchar_t *iso_path,
+                                          const wchar_t *admin_user,
+                                          const wchar_t *ssh_public_key,
+                                          const wchar_t *res_dir,
+                                          const char *uplink_ip,
+                                          const char *uplink_gateway,
+                                          const char *uplink_mac,
+                                          const char *lan_ip,
+                                          const char *lan_mac)
+{
+    wchar_t dir[MAX_PATH], staging[MAX_PATH], path[MAX_PATH], *slash;
+    FILE *file = NULL;
+    HRESULT hr = S_OK;
+    if (!iso_path || !admin_user || !ssh_public_key || !ssh_public_key[0] || !res_dir ||
+        !uplink_ip || !uplink_gateway || !uplink_mac || !lan_ip || !lan_mac)
+        return E_INVALIDARG;
+    wcscpy_s(dir, _countof(dir), iso_path);
+    slash = wcsrchr(dir, L'\\'); if (slash) *slash = L'\0';
+    swprintf_s(staging, _countof(staging), L"%s\\_vpn_gateway_seed", dir);
+    remove_staging_dir(staging);
+    if (!CreateDirectoryW(staging, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    swprintf_s(path, _countof(path), L"%s\\meta-data", staging);
+    if (!write_seed_file(path, L"instance-id: appsandbox-vpn-gateway\nlocal-hostname: appsandbox-vpn\n")) {
+        hr = E_FAIL; goto cleanup;
+    }
+
+    swprintf_s(path, _countof(path), L"%s\\network-config", staging);
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    fprintf(file,
+        "version: 2\n"
+        "ethernets:\n"
+        "  uplink:\n"
+        "    match:\n      macaddress: \"%s\"\n"
+        "    dhcp4: false\n"
+        "    addresses: [%s/24]\n"
+        "    routes:\n      - to: default\n        via: %s\n"
+        "    nameservers:\n      addresses: [%s, 8.8.8.8, 1.1.1.1]\n"
+        "  vpnlan:\n"
+        "    match:\n      macaddress: \"%s\"\n"
+        "    dhcp4: false\n"
+        "    optional: true\n"
+        "    addresses: [%s/24]\n",
+        uplink_mac, uplink_ip, uplink_gateway, uplink_gateway, lan_mac, lan_ip);
+    fclose(file); file = NULL;
+
+    swprintf_s(path, _countof(path), L"%s\\user-data", staging);
+    if (!write_seed_file(path,
+        L"#cloud-config\n"
+        L"users:\n  - default\n  - name: %s\n    groups: [adm, sudo]\n"
+        L"    shell: /bin/bash\n    lock_passwd: true\n"
+        L"    sudo: 'ALL=(ALL) NOPASSWD:ALL'\n"
+        L"    ssh_authorized_keys: ['%s']\n"
+        L"ssh_pwauth: false\npackage_update: true\n"
+        L"packages: [wireguard-tools, iptables, gcc, libc6-dev]\n"
+        L"write_files:\n"
+        L"  - path: /etc/sysctl.d/90-appsandbox-vpn.conf\n"
+        L"    content: |\n      net.ipv4.ip_forward = 1\n      net.ipv6.conf.all.disable_ipv6 = 1\n"
+        L"  - path: /usr/local/sbin/appsandbox-vpn-firstboot\n"
+        L"    permissions: '0700'\n    content: |\n"
+        L"      #!/bin/sh\n      set -eu\n"
+        L"      sysctl --system >/dev/null\n"
+        L"      mkdir -p /mnt/appsandbox-seed; mount -o ro /dev/sr0 /mnt/appsandbox-seed || true\n"
+        L"      gcc -O2 -pthread -D_GNU_SOURCE -o /usr/local/sbin/appsandbox-agent /mnt/appsandbox-seed/appsandbox-agent.c\n"
+        L"      install -m 0644 /mnt/appsandbox-seed/appsandbox-agent.service /etc/systemd/system/\n"
+        L"      systemctl daemon-reload; systemctl enable appsandbox-agent\n"
+        L"      umount /mnt/appsandbox-seed || true\n"
+        L"      rm -f /usr/local/sbin/appsandbox-vpn-firstboot\n"
+        L"      systemctl start appsandbox-agent\n"
+        L"runcmd:\n  - [/usr/local/sbin/appsandbox-vpn-firstboot]\n"
+        L"final_message: 'AppSandbox VPN gateway provisioned'\n",
+        admin_user, ssh_public_key)) {
+        hr = E_FAIL; goto cleanup;
+    }
+
+    if (!copy_appliance_source(staging, res_dir, L"appsandbox-agent.c",
+            L"tools\\linux\\agent\\appsandbox-agent.c")) {
+        hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); goto cleanup;
+    }
+    swprintf_s(path, _countof(path), L"%s\\appsandbox-agent.service", staging);
+    if (_wfopen_s(&file, path, L"wb") != 0 || !file) { hr = E_FAIL; goto cleanup; }
+    fputs("[Unit]\nDescription=AppSandbox VPN Gateway Agent\nAfter=network.target\n"
+          "[Service]\nType=simple\nExecStart=/usr/local/sbin/appsandbox-agent\nRestart=always\n"
+          "[Install]\nWantedBy=multi-user.target\n", file);
+    fclose(file); file = NULL;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    hr = create_iso_from_dir(iso_path, staging, L"CIDATA");
+    CoUninitialize();
+cleanup:
+    if (file) fclose(file);
+    remove_staging_dir(staging);
+    return hr;
+}
+
+
 HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *vm_name,
                                        const wchar_t *admin_user,

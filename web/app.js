@@ -32,7 +32,9 @@ function toggleSection(id) {
     });
 })();
 
-const netNames = ['None', 'NAT', 'External', 'Internal'];
+const netNames = ['None', 'NAT', 'External', 'Internal', 'VPN'];
+let vpnConfigs = [];
+let vpnGateway = {};
 
 /* ---- Message bridge ----
  *
@@ -111,6 +113,7 @@ window.onHostMessage = function(msg) {
         case 'createStorageBrowseResult': document.getElementById('storage-parent').value = msg.path || ''; break;
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
+        case 'vpnConfigResult': onVpnConfigResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
         case 'manageResult':  onManageResult(msg); break;
@@ -145,6 +148,10 @@ function onFullState(msg) {
     lastStorageParent = msg.lastStorageParent || lastStorageParent;
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
+    vpnConfigs = msg.vpnConfigs || [];
+    vpnGateway = msg.vpnGateway || {};
+    renderVpnSettings();
+    populateCreateVpnConfigs();
     renderSharedAppliance();
     renderSettingsResources();
     renderCreateSharedResources();
@@ -330,6 +337,9 @@ function updateCreateButtons() {
     var hasTpl = document.getElementById('template-select').value !== '';
     /* Guests build from a user-picked ISO — or a saved Windows template. */
     var createOk = hasImage || hasTpl;
+    /* A VPN VM needs a config to route through. */
+    if (parseInt(document.getElementById('net-mode').value) === 4 &&
+        !document.getElementById('vpn-config').value) createOk = false;
     document.getElementById('btn-create').disabled = !createOk;
     /* Templates are Windows-only; disabling create-as-template for Linux
        is fine since hasImage is the only signal we check. */
@@ -403,6 +413,10 @@ function onNetModeChange() {
     var show = (mode === 2) ? '' : 'none';
     document.getElementById('net-adapter').style.display = show;
     document.getElementById('net-adapter-label').style.display = show;
+    var vpn = (mode === 4) ? '' : 'none';
+    document.getElementById('vpn-config').style.display = vpn;
+    document.getElementById('vpn-config-label').style.display = vpn;
+    if (typeof updateCreateButtons === 'function') updateCreateButtons();
 }
 onNetModeChange();
 
@@ -430,6 +444,7 @@ function gatherConfig() {
         gpuMode:     parseInt(document.getElementById('gpu-mode').value),
         networkMode: parseInt(document.getElementById('net-mode').value),
         netAdapter:  document.getElementById('net-adapter').value,
+        vpnId:       document.getElementById('vpn-config').value,
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
@@ -724,7 +739,7 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.ramMb + ' MB', i, 5, 'Memory allocated to this VM, in megabytes'),
         makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
         makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
-        makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+        makeCell(vmNetworkLabel(vm), i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
     cells.push(makeCheckpointSummaryCell(vm, i));
     cells.push(
@@ -944,7 +959,13 @@ function startInlineEdit(row, col, td) {
         /* Network combo */
         var sel = document.createElement('select');
         sel.innerHTML = '<option value="0">None</option><option value="1">NAT</option><option value="2">External</option><option value="3">Internal</option>';
-        sel.value = String(vm.networkMode);
+        vpnConfigs.forEach(function(c) {
+            var o = document.createElement('option');
+            o.value = 'vpn:' + c.id;
+            o.textContent = 'VPN: ' + c.name;
+            sel.appendChild(o);
+        });
+        sel.value = vm.networkMode === 4 ? 'vpn:' + vm.vpnId : String(vm.networkMode);
         sel.onclick = function(e) { e.stopPropagation(); };
         sel.onchange = function() { commitInlineEdit(); };
         sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
@@ -991,6 +1012,11 @@ function commitInlineEdit() {
         if (!isNaN(mb)) value = String(alignRamMb(mb));
     }
 
+    if (field === 'networkMode' && value.indexOf('vpn:') === 0) {
+        /* Config first: the host only accepts VPN mode once one is set. */
+        sendCmd('editVm', { vmIndex: row, field: 'vpnId', value: value.substring(4) });
+        value = '4';
+    }
     if (field) {
         sendCmd('editVm', { vmIndex: row, field: field, value: value });
         if (field === 'networkMode' && value === '2' && currentDefaultAdapter) {
@@ -1265,6 +1291,121 @@ function growSharedAppliance(){sendCmd('growSharedAppliance',{dataSizeGb:Number(
 function rebuildSharedAppliance(){var p=appliancePayload();p.switchBackend=!!sharedAppliance.backend&&sharedAppliance.backend!==p.backend;showModal('Rebuild appliance',p.switchBackend?'Changing backend archives the old data VHDX and creates a new empty disk. Continue?':'Rebuild the appliance OS disk while preserving its data disk?','Rebuild').then(function(ok){if(ok)sendCmd('rebuildSharedAppliance',p);});}
 function mountHostResource(id){sendCmd('mountHostResource',{id:id});}
 function deleteSharedAppliance(){showModal('Delete shared appliance','Delete the shared appliance? Its OS disk and data disk are permanently deleted, including every shared resource\'s files. Shared resource definitions are kept and publish again after a new Setup.\n\nThis cannot be undone.','Delete').then(function(ok){if(ok)sendCmd('deleteSharedAppliance');});}
+/* ---- WireGuard VPN ---- */
+
+function vpnConfigName(id) {
+    var c = vpnConfigs.find(function(x) { return x.id === id; });
+    return c ? c.name : '';
+}
+
+function vmNetworkLabel(vm) {
+    if (vm.networkMode === 4) {
+        var name = vpnConfigName(vm.vpnId);
+        return name ? 'VPN: ' + name : 'VPN (config missing)';
+    }
+    return netNames[vm.networkMode] || 'None';
+}
+
+function populateCreateVpnConfigs() {
+    var sel = document.getElementById('vpn-config');
+    if (!sel) return;
+    var current = sel.value;
+    sel.innerHTML = '';
+    if (!vpnConfigs.length) {
+        var none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'No configs - add one in Settings';
+        sel.appendChild(none);
+    }
+    vpnConfigs.forEach(function(c) {
+        var o = document.createElement('option');
+        o.value = c.id;
+        o.textContent = c.name;
+        sel.appendChild(o);
+    });
+    if (vpnConfigs.some(function(c) { return c.id === current; })) sel.value = current;
+    updateCreateButtons();
+}
+
+function renderVpnSettings() {
+    var status = document.getElementById('vpn-gateway-status');
+    var box = document.getElementById('vpn-config-list');
+    if (!status || !box) return;
+    var g = vpnGateway || {};
+    status.textContent = 'VPN gateway: ' + (g.progressText || (g.configured ? 'Stopped' : 'Not set up')) +
+        (g.activeClients ? ' - ' + g.activeClients + ' VM(s) connected' : '') +
+        (g.lastError ? ' - ' + g.lastError : '');
+    box.innerHTML = '';
+    if (!vpnConfigs.length) {
+        var empty = document.createElement('p');
+        empty.className = 'settings-resource-meta';
+        empty.textContent = 'No VPN configs yet.';
+        box.appendChild(empty);
+    }
+    vpnConfigs.forEach(function(c) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = c.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        meta.textContent = c.endpoint + ' - ' + c.address + (c.dns ? ' - DNS ' + c.dns : '') +
+            (c.vmCount ? ' - used by ' + c.vmCount + ' VM(s)' : '');
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'danger';
+        del.textContent = 'Delete';
+        del.title = c.vmCount ? 'Change the network of the VMs using this config first.' : 'Delete this VPN config and its stored keys.';
+        del.disabled = !!c.vmCount;
+        del.onclick = function() {
+            showModal('Delete VPN config', 'Delete "' + c.name + '" and its stored keys?', 'Delete').then(function(ok) {
+                if (ok) sendCmd('deleteVpnConfig', { id: c.id });
+            });
+        };
+        actions.appendChild(del);
+        row.append(details, actions);
+        box.appendChild(row);
+    });
+}
+
+function onVpnFilePicked(input) {
+    var file = input.files && input.files[0];
+    if (!file) return;
+    if (file.size > 64 * 1024) { showModal('VPN config', 'That file is too large to be a WireGuard config.', 'OK'); return; }
+    var reader = new FileReader();
+    reader.onload = function() {
+        document.getElementById('vpn-import-text').value = reader.result;
+        var nameEl = document.getElementById('vpn-import-name');
+        if (!nameEl.value.trim()) nameEl.value = file.name.replace(/\.conf$/i, '').substring(0, 63);
+    };
+    reader.readAsText(file);
+}
+
+function importVpnConfig() {
+    var name = document.getElementById('vpn-import-name').value.trim();
+    var text = document.getElementById('vpn-import-text').value;
+    if (!name) { showModal('VPN config', 'Give the config a name.', 'OK'); return; }
+    if (!text.trim()) { showModal('VPN config', 'Choose a .conf file or paste its contents.', 'OK'); return; }
+    sendCmd('importVpnConfig', { name: name, text: text });
+}
+
+function onVpnConfigResult(msg) {
+    if (msg.success) {
+        /* The text held a private key: don't leave it in the page. */
+        document.getElementById('vpn-import-text').value = '';
+        document.getElementById('vpn-import-name').value = '';
+        document.getElementById('vpn-import-file').value = '';
+    } else {
+        showModal('VPN config', msg.error || 'The VPN config operation failed.', 'OK');
+    }
+}
+
 function onSharedApplianceResult(msg){if(!msg.success)showModal('Shared appliance',msg.message||'The appliance operation failed.','OK');}
 
 function onManageBrowseResult(msg) {

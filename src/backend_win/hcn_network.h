@@ -53,6 +53,16 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
 HRESULT hcn_create_share_network(GUID *network_id);
 const char *hcn_share_subnet_base(void);
 
+/* Private network (no host adapter, no NAT) for VPN-routed VMs; the VPN
+   gateway is at <base>.2 and is the only way off it. */
+HRESULT hcn_create_vpn_network(GUID *network_id);
+const char *hcn_vpn_subnet_base(void);
+
+/* Endpoint with a fixed IP and requested MAC, no policies. */
+HRESULT hcn_create_static_endpoint(const GUID *network_id, GUID *endpoint_id,
+                                   wchar_t *endpoint_guid_str, size_t str_len,
+                                   const char *ip, const char *mac_address);
+
 /* Create a statically addressed endpoint on the shared-resource network.
    ACLs permit only signed-SMB traffic to the host address. */
 HRESULT hcn_create_share_endpoint(const GUID *network_id, GUID *endpoint_id,

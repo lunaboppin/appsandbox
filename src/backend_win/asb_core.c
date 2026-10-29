@@ -21,6 +21,8 @@
 #include "ui.h"
 #include "shared_resources.h"
 #include "shared_appliance.h"
+#include "vpn_configs.h"
+#include "vpn_gateway.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -371,7 +373,8 @@ ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
     for (i = 0; i < g_vm_count; i++) {
         if (g_vms[i].unique_id == id) return &g_vms[i];
     }
-    return shared_appliance_instance_by_id(id);
+    VmInstance *appliance = shared_appliance_instance_by_id(id);
+    return appliance ? appliance : vpn_gateway_instance_by_id(id);
 }
 
 /* ---- Per-VM state JSON (beside disk.vhdx) ---- */
@@ -537,6 +540,8 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"GpuMode=%d\n", g_vms[i].gpu_mode);
         fwprintf(f, L"GpuName=%s\n", g_vms[i].gpu_name);
         fwprintf(f, L"NetworkMode=%d\n", g_vms[i].network_mode);
+        if (g_vms[i].vpn_id[0])
+            fwprintf(f, L"VpnId=%s\n", g_vms[i].vpn_id);
         if (g_vms[i].net_adapter[0] != L'\0')
             fwprintf(f, L"NetAdapter=%s\n", g_vms[i].net_adapter);
         if (g_vms[i].resources_iso_path[0] != L'\0')
@@ -665,6 +670,8 @@ static void load_vm_list(void)
                                  _countof(vm->config_passthrough), line);
         else if (wcsncmp(line, L"NetworkMode=", 12) == 0)
             vm->network_mode = _wtoi(line + 12);
+        else if (wcsncmp(line, L"VpnId=", 6) == 0)
+            wcscpy_s(vm->vpn_id, _countof(vm->vpn_id), line + 6);
         else if (wcsncmp(line, L"NetAdapter=", 11) == 0)
             wcscpy_s(vm->net_adapter, 256, line + 11);
         else if (wcsncmp(line, L"ResourcesIso=", 13) == 0)
@@ -1106,6 +1113,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
     if (!instance) return;
     if (shared_appliance_handle_hcs_state(instance, event)) return;
+    if (vpn_gateway_handle_hcs_state(instance, event)) return;
 
     for (i = 0; i < g_vm_count; i++) {
         if (&g_vms[i] != instance) continue;
@@ -1200,13 +1208,16 @@ ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 {
     if (!vm) return;
     shared_appliance_release_client(vm);
+    vpn_gateway_release_client(vm);
     if (vm->network_mode == NET_NONE) return;
     if (vm->network_cleaned) return;
     hcn_delete_endpoint(&vm->endpoint_id);
     /* The HCN network is shared across all VMs of the same mode
        (fixed GUID). Only tear it down if no other running VM is
-       still attached to it. */
-    if (!another_vm_uses_network_mode(vm, vm->network_mode))
+       still attached to it. The VPN network also carries the gateway,
+       which deletes it when it stops. */
+    if (vm->network_mode != NET_VPN &&
+        !another_vm_uses_network_mode(vm, vm->network_mode))
         hcn_delete_network(&vm->network_id);
     vm->network_cleaned = TRUE;
 }
@@ -1341,13 +1352,17 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
         case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->vm->net_adapter); break;
+        case NET_VPN:      hr = vpn_gateway_prepare_client(vm, &args->network_id, &args->endpoint_id,
+                                                           endpoint_guid_str, 64); break;
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          endpoint_guid_str, 64,
-                                          vm->nat_ip, sizeof(vm->nat_ip),
-                                          args->network_mode == NET_NAT);
+            /* The VPN gateway already made the endpoint. */
+            if (args->network_mode != NET_VPN)
+                hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                              endpoint_guid_str, 64,
+                                              vm->nat_ip, sizeof(vm->nat_ip),
+                                              args->network_mode == NET_NAT);
             if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
@@ -1702,15 +1717,23 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
         case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
+        case NET_VPN:
+            hr = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                ? vpn_gateway_prepare_client(&g_vms[args->vm_index], &args->network_id,
+                                             &args->endpoint_id, args->endpoint_guid, 64)
+                : E_INVALIDARG;
+            break;
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
             BOOL is_nat = (args->config.network_mode == NET_NAT);
             size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
                               ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat);
+            /* The VPN gateway already made the endpoint. */
+            if (args->config.network_mode != NET_VPN)
+                hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                              args->endpoint_guid, 64,
+                                              nat_ip, ip_size, is_nat);
             if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
                 if (is_nat) save_vm_list();
@@ -2831,15 +2854,23 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
         case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
+        case NET_VPN:
+            hr = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                ? vpn_gateway_prepare_client(&g_vms[args->vm_index], &args->network_id,
+                                             &args->endpoint_id, args->endpoint_guid, 64)
+                : E_INVALIDARG;
+            break;
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
             BOOL is_nat = (args->config.network_mode == NET_NAT);
             size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
                               ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat);
+            /* The VPN gateway already made the endpoint. */
+            if (args->config.network_mode != NET_VPN)
+                hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                              args->endpoint_guid, 64,
+                                              nat_ip, ip_size, is_nat);
             if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
                 if (is_nat) save_vm_list();
@@ -3061,6 +3092,8 @@ ASB_API HRESULT asb_init(void)
     }
     shared_resources_init();
     shared_appliance_init();
+    vpn_configs_init();
+    vpn_gateway_init();
     {
         int ri;
         for(ri=0;ri<g_vm_count;ri++){
@@ -3097,6 +3130,7 @@ ASB_API void asb_cleanup(void)
     }
 
     shared_appliance_cleanup();
+    vpn_gateway_cleanup();
     hcs_cleanup();
     hcn_cleanup();
     DeleteCriticalSection(&g_cs);
@@ -3167,6 +3201,10 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     cfg.cpu_cores = config->cpu_cores;
     cfg.gpu_mode = config->gpu_mode;
     cfg.network_mode = config->network_mode;
+    if (cfg.network_mode == NET_VPN && !vpn_configs_find(config->vpn_id, NULL)) {
+        asb_log(L"Error: choose a VPN config for \"%s\".", config->name);
+        return E_INVALIDARG;
+    }
     cfg.ssh_enabled = config->ssh_enabled;
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
        stores the public key on the instance (the agent deploys it at runtime). */
@@ -3349,6 +3387,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
+            wcscpy_s(inst->vpn_id, _countof(inst->vpn_id), config->vpn_id ? config->vpn_id : L"");
             inst->is_template = is_template_create;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
@@ -3423,6 +3462,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
+            wcscpy_s(inst->vpn_id, _countof(inst->vpn_id), config->vpn_id ? config->vpn_id : L"");
             inst->is_template = FALSE;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
@@ -3556,12 +3596,14 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
         case NET_NAT:      hr = hcn_create_nat_network(&inst->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&inst->network_id); break;
         case NET_EXTERNAL: hr = hcn_create_external_network(&inst->network_id, inst->net_adapter); break;
+        case NET_VPN:      hr = vpn_gateway_prepare_client(inst, &inst->network_id, &inst->endpoint_id,
+                                                           endpoint_guid_str, 64); break;
         default:           hr = E_INVALIDARG; break;
         }
         if (FAILED(hr)) {
             asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
             cfg.network_mode = NET_NONE;
-        } else {
+        } else if (cfg.network_mode != NET_VPN) {
             hr = try_endpoint_with_retry(&inst->network_id, &inst->endpoint_id,
                                           endpoint_guid_str, 64,
                                           inst->nat_ip, sizeof(inst->nat_ip),
@@ -4131,7 +4173,8 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
-    if (mode < 0 || mode > 3) return E_INVALIDARG;
+    if (mode < 0 || mode > NET_VPN) return E_INVALIDARG;
+    if (mode == NET_VPN && !vpn_configs_find(g_vms[idx].vpn_id, NULL)) return E_INVALIDARG;
     g_vms[idx].network_mode = mode;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
@@ -4938,6 +4981,65 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 { return shared_appliance_rebuild(config, switch_backend); }
 ASB_API HRESULT asb_shared_appliance_delete(void)
 { return shared_appliance_delete(); }
+/* ---- WireGuard VPN ---- */
+
+ASB_API int asb_vpn_config_count(void) { return vpn_configs_count(); }
+ASB_API BOOL asb_vpn_config_get(int index, AsbVpnConfigInfo *out)
+{ return vpn_configs_get(index, out); }
+
+ASB_API HRESULT asb_vpn_config_import(const wchar_t *name, const wchar_t *text,
+                                      wchar_t *error, size_t error_chars)
+{
+    return vpn_configs_import(name, text, NULL, 0, error, error_chars);
+}
+
+ASB_API HRESULT asb_vpn_config_delete(const wchar_t *id)
+{
+    int i;
+    HRESULT hr;
+    if (!id || !id[0]) return E_INVALIDARG;
+    for (i = 0; i < g_vm_count; i++) {
+        if (_wcsicmp(g_vms[i].vpn_id, id) == 0 && g_vms[i].network_mode == NET_VPN) {
+            asb_log(L"VPN config is still used by \"%s\"; change its network first.", g_vms[i].name);
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+    }
+    hr = vpn_configs_delete(id);
+    if (SUCCEEDED(hr)) {
+        vpn_gateway_unload_config(id);
+        for (i = 0; i < g_vm_count; i++)
+            if (_wcsicmp(g_vms[i].vpn_id, id) == 0) g_vms[i].vpn_id[0] = L'\0';
+        save_vm_list();
+    }
+    return hr;
+}
+
+ASB_API HRESULT asb_vm_set_vpn(AsbVm vm, const wchar_t *vpn_id)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
+    if (vpn_id && vpn_id[0] && !vpn_configs_find(vpn_id, NULL)) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    wcscpy_s(g_vms[idx].vpn_id, _countof(g_vms[idx].vpn_id), vpn_id ? vpn_id : L"");
+    /* Clearing the config of a VPN VM leaves it with no network rather than
+       silently falling back to NAT. */
+    if (!g_vms[idx].vpn_id[0] && g_vms[idx].network_mode == NET_VPN)
+        g_vms[idx].network_mode = NET_NONE;
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API const wchar_t *asb_vm_vpn_id(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->vpn_id : L"";
+}
+
+ASB_API void asb_vpn_gateway_get_status(VpnGatewayStatus *out)
+{ vpn_gateway_get_status(out); }
+ASB_API HRESULT asb_vpn_gateway_stop(void) { return vpn_gateway_stop(); }
+
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id)
 { return shared_appliance_mount_host_resource(id); }
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id)

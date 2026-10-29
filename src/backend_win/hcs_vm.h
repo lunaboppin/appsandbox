@@ -28,6 +28,7 @@ typedef void *HCS_OPERATION;
 #define NET_NAT      1
 #define NET_EXTERNAL 2
 #define NET_INTERNAL 3
+#define NET_VPN      4   /* Private VPN network, routed by the VPN gateway */
 
 /* Configuration for creating a new VM */
 typedef struct {
@@ -86,6 +87,9 @@ typedef struct {
     char        share_host_ip[32];
     char        share_mac[32];
     BOOL        share_network_cleaned;
+    wchar_t     vpn_id[40];       /* WireGuard config for NET_VPN (vpn_configs id) */
+    char        vpn_ip[32];       /* address on the VPN network while running */
+    char        vpn_mac[32];
     GUID        runtime_id;           /* VM RuntimeId for AF_HYPERV connections */
     wchar_t     resources_iso_path[MAX_PATH];
     BOOL        running;
