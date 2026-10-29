@@ -672,6 +672,16 @@ static int handle_request(PHTTP_REQUEST req)
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
     }
+    if (wcscmp(path, L"/v1/shared-appliance") == 0 && verb == HttpVerbDELETE) {
+        HRESULT hr = asb_shared_appliance_delete();
+        if (SUCCEEDED(hr)) send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+        else if (hr == HRESULT_FROM_WIN32(ERROR_BUSY))
+            send_err(req->RequestId, 409, "Conflict", "busy",
+                     "shared appliance is busy or in use by a running VM or host mount");
+        else send_err(req->RequestId, 400, "Bad Request", "appliance_operation_failed",
+                      "shared appliance delete failed");
+        return 0;
+    }
     if (wcsncmp(path, L"/v1/shared-appliance/", 21) == 0 && verb == HttpVerbPOST) {
         const wchar_t *action = path + 21;
         wchar_t body[4096];

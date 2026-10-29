@@ -157,6 +157,10 @@ class Client:
         return self._req("POST", "/shared-appliance/update")
     def grow_shared_appliance(self, data_size_gb):
         return self._req("POST", "/shared-appliance/grow", {"dataSizeGb": data_size_gb})
+    def delete_shared_appliance(self):
+        """Stop the appliance and delete its disks (all shared data), config and
+        credentials. 409 while a running VM or host mount uses it."""
+        return self._req("DELETE", "/shared-appliance")
     def rebuild_shared_appliance(self, switch_backend=False, **config):
         config["switchBackend"] = bool(switch_backend)
         return self._req("POST", "/shared-appliance/rebuild", config)

@@ -1348,10 +1348,13 @@ static void on_webview2_message(const wchar_t *json)
                wcscmp(action, L"startSharedAppliance") == 0 ||
                wcscmp(action, L"stopSharedAppliance") == 0 ||
                wcscmp(action, L"updateSharedAppliance") == 0 ||
-               wcscmp(action, L"growSharedAppliance") == 0) {
+               wcscmp(action, L"growSharedAppliance") == 0 ||
+               wcscmp(action, L"deleteSharedAppliance") == 0) {
         HRESULT hr = E_INVALIDARG;
         if (wcscmp(action, L"startSharedAppliance") == 0)
             hr = asb_shared_appliance_start(FALSE, 0);
+        else if (wcscmp(action, L"deleteSharedAppliance") == 0)
+            hr = asb_shared_appliance_delete();
         else if (wcscmp(action, L"stopSharedAppliance") == 0) {
             hr = asb_shared_appliance_stop(FALSE);
             /* The disk is only readable once the VM has released it, so this

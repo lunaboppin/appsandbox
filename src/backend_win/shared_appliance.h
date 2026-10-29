@@ -64,6 +64,7 @@ HRESULT shared_appliance_update(void);
 HRESULT shared_appliance_grow(DWORD new_size_gb);
 HRESULT shared_appliance_rebuild(const SharedApplianceConfig *replacement,
                                  BOOL switch_backend);
+HRESULT shared_appliance_delete(void);
 HRESULT shared_appliance_reconcile(void);
 
 /* Called by the normal VM lifecycle. It starts the dependency, then creates

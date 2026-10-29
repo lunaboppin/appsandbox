@@ -277,6 +277,9 @@ ASB_API HRESULT asb_shared_appliance_update(void);
 ASB_API HRESULT asb_shared_appliance_grow(DWORD new_size_gb);
 ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config,
                                              BOOL switch_backend);
+/* Stop the appliance and delete its disks, data and saved config (unconfigured
+   afterwards). ERROR_BUSY while clients or host mounts use it. */
+ASB_API HRESULT asb_shared_appliance_delete(void);
 ASB_API HRESULT asb_shared_resource_host_mount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_host_unmount(const wchar_t *id);
 ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
