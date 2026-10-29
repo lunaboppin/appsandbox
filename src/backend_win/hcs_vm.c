@@ -959,9 +959,15 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         wchar_t default_mac_field[64] = L"";
         wchar_t share_mac_field[64] = L"";
         char default_mac[32] = "";
+        wchar_t braced_guid[64];
         GUID default_endpoint_id;
+        /* Endpoint ids are stored without braces, which CLSIDFromString
+           rejects; without the MAC here HCS gives the adapter a random one. */
+        if (endpoint_guid && endpoint_guid[0] != L'\0')
+            swprintf_s(braced_guid, _countof(braced_guid),
+                       endpoint_guid[0] == L'{' ? L"%s" : L"{%s}", endpoint_guid);
         if (endpoint_guid && endpoint_guid[0] != L'\0' &&
-            SUCCEEDED(CLSIDFromString(endpoint_guid, &default_endpoint_id)) &&
+            SUCCEEDED(CLSIDFromString(braced_guid, &default_endpoint_id)) &&
             SUCCEEDED(hcn_get_endpoint_mac(&default_endpoint_id,
                                            default_mac, sizeof(default_mac))) &&
             default_mac[0])

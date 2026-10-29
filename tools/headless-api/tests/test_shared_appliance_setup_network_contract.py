@@ -54,6 +54,18 @@ def main() -> None:
                      r"if \(g_appliance\.status\.backend == ASB_APPLIANCE_BACKEND_UBUNTU\)\s*"
                      r"start_serial_capture\(\);", appliance), "capture must start after the VM starts"
     assert "start_serial_capture();" in appliance and "console.log" in appliance
+    # Seed files are UTF-8 without a BOM and with LF endings: a BOM or CR on
+    # "#cloud-config" makes cloud-init skip the whole user-data.
+    seed = disk[disk.index("HRESULT iso_create_appliance_cloud_init("):]
+    seed = seed[:seed.index("\nHRESULT ", 10)]
+    assert "ccs=UTF-8" not in seed, "seed files must not get a BOM"
+    assert re.search(r"write_seed_file\(path,\s*L\"#cloud-config\\n", seed)
+    assert 'L"w")' not in seed, "seed files must be written in binary mode (LF endings)"
+    assert '_wfopen_s(&file, path, L"wb")' in disk
+
+    # The Default adapter carries its endpoint's MAC; CLSIDFromString needs braces.
+    hcs = (ROOT / "src/backend_win/hcs_vm.c").read_text(encoding="utf-8")
+    assert 'L"{%s}", endpoint_guid' in hcs and "CLSIDFromString(braced_guid" in hcs
     print("[ok] shared appliance setup network (maintenance NAT address) contract")
 
 
