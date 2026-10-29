@@ -50,6 +50,10 @@ def main() -> None:
     assert "apply_staged_vdd_update();" in agent and "vdd-update.pending" in agent
     assert "refresh_guest_display_driver(drive, source_dir);" in core
     assert "guest_payload_current(vm->vhdx_path, stamp)" in core
+    # Drivers are built beside the app, not in resources\ with the helpers.
+    assert "static void guest_drivers_dir(" in core
+    assert "guest_drivers_dir(source_dir, drivers_dir, MAX_PATH);" in core
+    assert "guest_drivers_dir(dir, drivers_dir, MAX_PATH);" in core
     print("[ok] IDD game mode (relative mouse capture, packed frames) contract")
 
 
