@@ -113,7 +113,43 @@ select {
     height: 24px;
 }
 
-input:focus, select:focus {
+textarea {
+    background: var(--ctrl-bg);
+    color: var(--text);
+    border: 1px solid var(--ctrl-border);
+    border-radius: var(--radius);
+    padding: 4px 6px;
+    font-size: 12px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    outline: none;
+    width: 100%;
+    resize: vertical;
+    box-sizing: border-box;
+}
+textarea::placeholder { color: var(--text-dim, #777); }
+textarea::-webkit-scrollbar { width: 8px; }
+textarea::-webkit-scrollbar-thumb { background: var(--ctrl-border); border-radius: 4px; }
+
+/* File picker: text in the theme colour, the button styled like ours. */
+input[type="file"] {
+    color: var(--text);
+    font-size: 12px;
+    font-family: inherit;
+}
+input[type="file"]::file-selector-button {
+    background: var(--ctrl-bg);
+    color: var(--text);
+    border: 1px solid var(--ctrl-border);
+    border-radius: var(--radius);
+    padding: 3px 12px;
+    margin-right: 8px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+}
+input[type="file"]::file-selector-button:hover { background: #3a3a3a; border-color: #555; }
+
+input:focus, select:focus, textarea:focus {
     border-color: var(--accent);
 }
 
