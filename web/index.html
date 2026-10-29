@@ -224,6 +224,15 @@
         </fieldset>
 
         <fieldset>
+            <legend>Network</legend>
+            <div class="manage-row">
+                <select id="manage-network" title="How this VM reaches the network. VPN routes all of its traffic through a WireGuard config from Settings."></select>
+                <button id="manage-network-apply" class="primary" onclick="applyManageNetwork()">Apply</button>
+            </div>
+            <small>With a VPN, all of this VM's traffic goes through the tunnel; if the tunnel drops, the VM goes offline instead of using your own connection. Applies on the next start.</small>
+        </fieldset>
+
+        <fieldset>
             <legend>Display</legend>
             <label class="manage-check"><input type="checkbox" id="manage-auto-display" onchange="saveManageDisplay()"> Auto-open the IDD virtual monitor when this VM boots</label>
         </fieldset>

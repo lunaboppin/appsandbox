@@ -958,14 +958,8 @@ function startInlineEdit(row, col, td) {
     } else if (col === 8) {
         /* Network combo */
         var sel = document.createElement('select');
-        sel.innerHTML = '<option value="0">None</option><option value="1">NAT</option><option value="2">External</option><option value="3">Internal</option>';
-        vpnConfigs.forEach(function(c) {
-            var o = document.createElement('option');
-            o.value = 'vpn:' + c.id;
-            o.textContent = 'VPN: ' + c.name;
-            sel.appendChild(o);
-        });
-        sel.value = vm.networkMode === 4 ? 'vpn:' + vm.vpnId : String(vm.networkMode);
+        sel.innerHTML = networkOptionsHtml();
+        sel.value = vmNetworkValue(vm);
         sel.onclick = function(e) { e.stopPropagation(); };
         sel.onchange = function() { commitInlineEdit(); };
         sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
@@ -1012,17 +1006,44 @@ function commitInlineEdit() {
         if (!isNaN(mb)) value = String(alignRamMb(mb));
     }
 
-    if (field === 'networkMode' && value.indexOf('vpn:') === 0) {
+    if (field === 'networkMode') { setVmNetwork(row, value); return; }
+    if (field) sendCmd('editVm', { vmIndex: row, field: field, value: value });
+}
+
+/* value: '0'-'3' for None/NAT/External/Internal, or 'vpn:<config id>'. */
+function setVmNetwork(row, value) {
+    if (value.indexOf('vpn:') === 0) {
         /* Config first: the host only accepts VPN mode once one is set. */
         sendCmd('editVm', { vmIndex: row, field: 'vpnId', value: value.substring(4) });
         value = '4';
     }
-    if (field) {
-        sendCmd('editVm', { vmIndex: row, field: field, value: value });
-        if (field === 'networkMode' && value === '2' && currentDefaultAdapter) {
-            sendCmd('editVm', { vmIndex: row, field: 'netAdapter', value: currentDefaultAdapter });
-        }
-    }
+    sendCmd('editVm', { vmIndex: row, field: 'networkMode', value: value });
+    if (value === '2' && currentDefaultAdapter)
+        sendCmd('editVm', { vmIndex: row, field: 'netAdapter', value: currentDefaultAdapter });
+}
+
+function networkOptionsHtml() {
+    var html = '<option value="0">None</option><option value="1">NAT</option><option value="2">External</option><option value="3">Internal</option>';
+    vpnConfigs.forEach(function(c) {
+        html += '<option value="vpn:' + escapeHtmlAttr(c.id) + '">VPN: ' + escapeHtmlText(c.name) + '</option>';
+    });
+    return html;
+}
+
+function escapeHtmlText(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function escapeHtmlAttr(s) {
+    return escapeHtmlText(s).replace(/"/g, '&quot;');
+}
+
+function vmNetworkValue(vm) {
+    return vm.networkMode === 4 ? 'vpn:' + vm.vpnId : String(vm.networkMode);
+}
+
+function applyManageNetwork() {
+    if (manageVmIndex < 0) return;
+    setVmNetwork(manageVmIndex, document.getElementById('manage-network').value);
 }
 
 function cancelInlineEdit() {
@@ -1180,7 +1201,7 @@ function refreshManageVm(forceFields) {
     document.getElementById('manage-vm-name').textContent = vm.name;
     document.getElementById('manage-state').textContent = managePending || vm.managementBusy
         ? 'A management operation is running. Do not close the app or move these files manually.'
-        : (vm.running ? 'Stop the VM to change media, storage, disk size, or checkpoints.' : 'VM is stopped and ready to manage.');
+        : (vm.running ? 'Stop the VM to change media, storage, network, disk size, or checkpoints.' : 'VM is stopped and ready to manage.');
     if (forceFields || document.activeElement !== document.getElementById('manage-iso-path'))
         document.getElementById('manage-iso-path').value = vm.imagePath || '';
     document.getElementById('manage-storage-current').value = vm.storageDir || '';
@@ -1189,10 +1210,16 @@ function refreshManageVm(forceFields) {
     sizeInput.min = vm.hddGb + 1;
     if (forceFields || document.activeElement !== sizeInput) sizeInput.value = vm.hddGb + 1;
     document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
+    var netSel = document.getElementById('manage-network');
+    if (forceFields || document.activeElement !== netSel) {
+        netSel.innerHTML = networkOptionsHtml();
+        netSel.value = vmNetworkValue(vm);
+    }
     renderManageSharedResources(vm);
     populateManageCheckpointSelect(vm);
 
     ['manage-iso-attach','manage-iso-eject','manage-storage-move','manage-disk-grow',
+     'manage-network','manage-network-apply',
      'manage-checkpoint-create','manage-checkpoint-rename','manage-checkpoint-delete']
         .forEach(function(id) { setManageDisabled(id, !stoppedIdle); });
     setManageDisabled('manage-disk-grow', !stoppedIdle || hasChildren);

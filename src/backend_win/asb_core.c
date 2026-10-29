@@ -1391,6 +1391,15 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             prepare_gl_layers_share(&args->config.gpu_shares);
     }
 
+    if (args->config.shared_resource_count == 0 && args->network_mode == NET_VPN &&
+        vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
+        /* A VPN VM's network config carries its DNS servers, which agents
+           older than the VPN feature can't parse. */
+        hr = upgrade_windows_agent_offline(vm->vhdx_path);
+        if (FAILED(hr))
+            asb_log(L"Could not refresh the guest agent on \"%s\" (0x%08X); its VPN DNS may not apply.",
+                    vm->name, hr);
+    }
     if (args->config.shared_resource_count > 0 && vm->install_complete &&
         _wcsicmp(vm->os_type, L"Windows") == 0) {
         hr = upgrade_windows_agent_offline(vm->vhdx_path);

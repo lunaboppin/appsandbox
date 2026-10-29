@@ -68,7 +68,10 @@ def main() -> None:
     assert 'L"importVpnConfig"' in ui and 'L"deleteVpnConfig"' in ui
     assert "SecureZeroMemory(text, 32768 * sizeof(wchar_t))" in ui
     assert '<option value="4">VPN</option>' in html and 'id="vpn-config"' in html
-    assert "function importVpnConfig()" in app and "'vpn:' + c.id" in app
+    assert "function importVpnConfig()" in app and "function networkOptionsHtml()" in app
+    # Existing VMs switch to a VPN from the Manage dialog or the Network cell.
+    assert 'id="manage-network"' in html and "function applyManageNetwork()" in app
+    assert "args->network_mode == NET_VPN &&" in core, "VPN VMs get the current guest agent"
 
     assert "vpn_configs.c" in project and "vpn_gateway.c" in project
     print("[ok] WireGuard VPN configs and gateway-routed VMs contract")
