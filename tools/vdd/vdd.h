@@ -210,6 +210,21 @@ typedef struct _VDD_SWAP_PROC {
     UINT64              frameSeq;
     PBYTE               pSendBuf;           /* one packed frame: header, rects, size, pixels */
 
+    /* Sender thread: sends one packed frame while the swap chain thread reads
+       back and packs the next, so the two stages overlap instead of adding up.
+       The buffers swap on hand-off; sendLock keeps cursor messages from
+       interleaving with a frame on the connection. */
+    HANDLE              hSendThread;
+    HANDLE              hSendWork;          /* auto-reset: a frame was handed off */
+    HANDLE              hSendIdle;          /* manual-reset: set while nothing is in flight */
+    HANDLE              hSendStop;
+    CRITICAL_SECTION    sendLock;
+    PBYTE               pSendBufOut;        /* frame being sent */
+    int                 sendLen;
+    AsbConn*            sendConn;
+    volatile BOOL       sendFailed;         /* last hand-off failed to send */
+    volatile double     perfSendMs;         /* send time, summed by the sender thread */
+
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */
     HANDLE              hCursorEvent;       /* signaled when cursor data changes */
