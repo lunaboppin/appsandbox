@@ -254,6 +254,12 @@
             <label class="manage-check"><input type="checkbox" id="manage-auto-display" onchange="saveManageDisplay()"> Auto-open the IDD virtual monitor when this VM boots</label>
         </fieldset>
 
+        <fieldset id="manage-domain-section">
+            <legend>Domain</legend>
+            <label class="manage-check"><input type="checkbox" id="manage-domain-member" onchange="saveManageDomainMember()"> Join the AppSandbox domain (managed)</label>
+            <small id="manage-domain-hint"></small>
+        </fieldset>
+
         <fieldset id="manage-secure-boot-section">
             <legend>Secure Boot</legend>
             <label class="manage-check"><input type="checkbox" id="manage-secure-boot" onchange="saveManageSecureBoot()"> Start this VM with Secure Boot</label>

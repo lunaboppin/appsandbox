@@ -4493,6 +4493,35 @@ ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled)
     return S_OK;
 }
 
+/* Make an existing Windows VM managed: from its next start it gets the
+   appliance link and joins the domain (its local accounts keep working).
+   Turning it off only stops AppSandbox joining it; a joined VM stays in the
+   domain until it is removed in Windows. */
+ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member)
+{
+    VmInstance *inst;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    if (_wcsicmp(inst->os_type, L"Windows") != 0 || inst->is_template) return E_INVALIDARG;
+    if (member) {
+        SharedApplianceStatus appliance;
+        shared_appliance_get_status(&appliance);
+        if (!appliance.domain_enabled) {
+            asb_log(L"Error: set up the domain controller (Domain) before joining VMs to it.");
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+    }
+    inst->domain_member = member ? TRUE : FALSE;
+    asb_log(member
+        ? L"\"%s\" will join the " L"" ASB_DOMAIN_NETBIOS L" domain at its next start%s."
+        : L"\"%s\" is no longer managed%s; it stays joined until removed in Windows.",
+        inst->name, inst->running ? L" (restart it)" : L"");
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
 /* Keep only valid winget IDs (letters, digits, . + _ -), comma-separated. */
 static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t chars)
 {

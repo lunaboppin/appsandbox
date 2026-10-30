@@ -1513,6 +1513,12 @@ function refreshManageVm(forceFields) {
     document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
     document.getElementById('manage-secure-boot-section').style.display = vm.osType === 'Windows' ? '' : 'none';
     document.getElementById('manage-secure-boot').checked = vm.secureBoot !== false;
+    document.getElementById('manage-domain-section').style.display =
+        vm.osType === 'Windows' && !vm.isTemplate ? '' : 'none';
+    document.getElementById('manage-domain-member').checked = !!vm.domainMember;
+    document.getElementById('manage-domain-hint').textContent = domainState() === 'ready' || vm.domainMember
+        ? 'Joins ' + (sharedAppliance.domainName || 'the domain') + ' at the next start (restart a running VM); domain users can then sign in, and its local accounts keep working. Turning this off stops AppSandbox joining it, but it stays in the domain until removed in Windows.'
+        : 'Set up the domain controller (Domain) to join this VM to it.';
     var netSel = document.getElementById('manage-network');
     if (forceFields || document.activeElement !== netSel) {
         netSel.innerHTML = networkOptionsHtml();
@@ -1528,6 +1534,8 @@ function refreshManageVm(forceFields) {
     setManageDisabled('manage-disk-grow', !stoppedIdle || hasChildren);
     setManageDisabled('manage-auto-display', managePending);
     setManageDisabled('manage-secure-boot', managePending);
+    setManageDisabled('manage-domain-member', managePending ||
+        (domainState() !== 'ready' && !(vms[manageVmIndex] || {}).domainMember));
     onManageCheckpointSelection();
 }
 
@@ -1791,6 +1799,13 @@ function growManageDisk() {
         managePending = true; refreshManageVm(false);
         sendCmd('resizeVmDisk', {vmIndex: manageVmIndex, sizeGb: size});
     });
+}
+
+function saveManageDomainMember() {
+    if (manageVmIndex < 0) return;
+    var member = document.getElementById('manage-domain-member').checked;
+    managePending = true; refreshManageVm(false);
+    sendCmd('setVmDomainMember', { vmIndex: manageVmIndex, member: member });
 }
 
 function saveManageSecureBoot() {

@@ -195,6 +195,7 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
 ASB_API HRESULT asb_vm_set_installer_iso(AsbVm vm, const wchar_t *path);
 ASB_API HRESULT asb_vm_set_auto_open_display(AsbVm vm, BOOL enabled);
 ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled);
+ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member);
 ASB_API HRESULT asb_vm_resize_disk(AsbVm vm, DWORD new_size_gb);
 ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent);
 

@@ -1697,6 +1697,11 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
             hr = asb_vm_set_secure_boot(asb_vm_get(vi), enabled);
         send_manage_result(0, hr); send_vm_list();
+    } else if (wcscmp(action, L"setVmDomainMember") == 0) {
+        int vi; BOOL member = FALSE; HRESULT hr = E_INVALIDARG;
+        if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"member", &member))
+            hr = asb_vm_set_domain_member(asb_vm_get(vi), member);
+        send_manage_result(0, hr); send_vm_list();
     } else if (wcscmp(action, L"moveVmStorage") == 0) {
         int vi; wchar_t parent[MAX_PATH] = { 0 };
         if (json_get_int(json, L"vmIndex", &vi) &&

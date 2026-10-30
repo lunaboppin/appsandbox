@@ -71,6 +71,13 @@ def main() -> None:
     assert "shutdown.exe /r /t 15" in agent
     assert 'cfg.domain_member = !is_tpl && _wcsicmp(account_buf, L"managed") == 0;' in ui
     assert 'id="account-mode"' in html and "managedOption.disabled = !ready;" in js
+    # Existing VMs can be made managed from Manage.
+    setter = core[core.index("ASB_API HRESULT asb_vm_set_domain_member("):]
+    setter = setter[:setter.index("\n}\n")]
+    assert "if (!appliance.domain_enabled)" in setter and "inst->domain_member = member" in setter
+    assert 'wcscmp(action, L"setVmDomainMember") == 0' in ui
+    assert 'id="manage-domain-member"' in html
+    assert "sendCmd('setVmDomainMember'" in js
 
     # SMB on a DC uses the domain account.
     assert 'swprintf_s(out, chars, L"%S\\\\%s", ASB_DOMAIN_NETBIOS, APPLIANCE_SERVICE_USER);' in app
