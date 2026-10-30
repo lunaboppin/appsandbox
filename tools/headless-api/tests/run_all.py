@@ -105,6 +105,8 @@ if RUN_STATIC:
     results["clean_taskbar"] = [] if p.returncode == 0 else ["test_clean_taskbar_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_secure_boot_setting_contract.py")], cwd=HERE)
     results["secure_boot"] = [] if p.returncode == 0 else ["test_secure_boot_setting_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_preinstall_apps_contract.py")], cwd=HERE)
+    results["preinstall_apps"] = [] if p.returncode == 0 else ["test_preinstall_apps_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_vbcable_fallback_contract.py")], cwd=HERE)
     results["vbcable"] = [] if p.returncode == 0 else ["test_vbcable_fallback_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_release_shared_resource_artifacts.py")], cwd=HERE)

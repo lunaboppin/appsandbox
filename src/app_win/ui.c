@@ -1174,6 +1174,7 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
         wchar_t adapter_buf[256] = {0}, storage_buf[MAX_PATH] = {0}, exclusions_buf[1024] = {0};
         wchar_t vpn_buf[ASB_VPN_ID_CHARS] = {0};
+        wchar_t apps_buf[1024] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -1187,6 +1188,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"storageParent", storage_buf, MAX_PATH);
         json_get_string(json, L"sharedResourceExclusions", exclusions_buf, _countof(exclusions_buf));
         json_get_string(json, L"vpnId", vpn_buf, _countof(vpn_buf));
+        json_get_string(json, L"preinstallApps", apps_buf, _countof(apps_buf));
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -1200,6 +1202,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.storage_parent = storage_buf;
         cfg.shared_resource_exclusions = exclusions_buf;
         cfg.vpn_id = vpn_buf;
+        cfg.preinstall_apps = apps_buf;
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;

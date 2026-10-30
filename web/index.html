@@ -174,6 +174,13 @@
                 <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
                 <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>
+
+            <label class="win-only app-label">Apps:</label>
+            <div class="win-only app-picker">
+                <div id="create-app-list" class="app-check-grid"></div>
+                <input type="text" id="create-app-extra" placeholder="More winget IDs, comma-separated (e.g. Spotify.Spotify)" spellcheck="false">
+                <small>Installed with winget after your first sign-in. Needs internet access in the VM. Not used for templates.</small>
+            </div>
         </div>
         <div class="modal-buttons">
             <button onclick="closeCreateModal()">Cancel</button>

@@ -165,6 +165,8 @@ static void                *g_removed_ud   = NULL;
 
 /* ---- Internal logging (writes to appsandbox.log and the registered log callback) ---- */
 
+static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t chars);
+
 static void asb_log(const wchar_t *fmt, ...)
 {
     wchar_t buf[4096];
@@ -570,6 +572,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
             fwprintf(f, L"SharedResourceExclusions=%s\n", g_vms[i].shared_resource_exclusions);
+        if (g_vms[i].preinstall_apps[0])
+            fwprintf(f, L"PreinstallApps=%s\n", g_vms[i].preinstall_apps);
         if (g_vms[i].shared_resource_pending)
             fwprintf(f, L"SharedResourcesPending=1\n");
         if (g_vms[i].config_passthrough[0] != L'\0')
@@ -705,6 +709,8 @@ static void load_vm_list(void)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
             wcsncpy_s(vm->shared_resource_exclusions, 1024, line + 25, _TRUNCATE);
+        else if (wcsncmp(line, L"PreinstallApps=", 15) == 0)
+            wcsncpy_s(vm->preinstall_apps, _countof(vm->preinstall_apps), line + 15, _TRUNCATE);
         else if (wcsncmp(line, L"SharedResourcesPending=", 23) == 0)
             vm->shared_resource_pending = (_wtoi(line + 23) != 0);
         else
@@ -3497,6 +3503,13 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);
     inst->secure_boot_off = cfg.secure_boot_off;
 
+    /* Apps to install after the first sign-in (Windows VMs, not templates,
+       which are sysprepped). Kept until the agent has queued them. */
+    if (config->preinstall_apps && !is_template_create &&
+        _wcsicmp(cfg.os_type, L"Windows") == 0)
+        preinstall_apps_normalize(config->preinstall_apps, inst->preinstall_apps,
+                                  _countof(inst->preinstall_apps));
+
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
         wcscmp(config->net_adapter, L"(Auto)") != 0)
@@ -4445,6 +4458,31 @@ ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled)
     if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
     if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
     return S_OK;
+}
+
+/* Keep only valid winget IDs (letters, digits, . + _ -), comma-separated. */
+static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t chars)
+{
+    size_t used = 0;
+    const wchar_t *p = in;
+    out[0] = L'\0';
+    while (*p) {
+        const wchar_t *end = p;
+        size_t len, i;
+        BOOL ok = TRUE;
+        while (*end && *end != L',' && *end != L' ' && *end != L';') end++;
+        len = (size_t)(end - p);
+        for (i = 0; i < len; i++)
+            if (!iswalnum(p[i]) && p[i] != L'.' && p[i] != L'+' && p[i] != L'_' && p[i] != L'-')
+                ok = FALSE;
+        if (ok && len && len <= 100 && used + len + 2 < chars) {
+            if (used) out[used++] = L',';
+            wmemcpy(out + used, p, len);
+            used += len;
+            out[used] = L'\0';
+        }
+        p = *end ? end + 1 : end;
+    }
 }
 
 static HRESULT management_begin(VmInstance *inst, BOOL require_closed_handle)
