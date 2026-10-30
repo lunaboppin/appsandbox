@@ -158,6 +158,7 @@ static void bs_receive(BsView *v, SOCKET s)
     BsFrameHeader hdr;
     BYTE *band = NULL;
     size_t band_cap = 0;
+    BOOL first = TRUE;
     while (!v->closing && bs_recv_all(s, &hdr, sizeof(hdr))) {
         size_t bytes;
         if (hdr.magic != BS_FRAME_MAGIC || !hdr.width || !hdr.height ||
@@ -185,6 +186,10 @@ static void bs_receive(BsView *v, SOCKET s)
         if (v->pixels && (int)hdr.width == v->width)
             memcpy(v->pixels + (size_t)hdr.y * hdr.width * 4, band, bytes);
         LeaveCriticalSection(&v->cs);
+        if (first) {
+            first = FALSE;
+            view_status(v, L"");
+        }
         {
             HWND hwnd = v->hwnd;   /* NULL once the window is gone; never invalidate "all" */
             if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
@@ -229,7 +234,7 @@ static DWORD WINAPI bs_net_thread(LPVOID param)
         EnterCriticalSection(&v->cs);
         v->sock = s;
         LeaveCriticalSection(&v->cs);
-        view_status(v, L"");
+        view_status(v, L"Connected; waiting for the picture...");
         bs_receive(v, s);
         EnterCriticalSection(&v->cs);
         v->sock = INVALID_SOCKET;
