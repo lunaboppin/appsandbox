@@ -324,7 +324,31 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_SHOW_CONSOLE   0x1030
 #define IDM_GAME_MODE      0x1040
 #define IDM_CAPTURE_MOUSE  0x1050
+#define IDM_BACKSTAGE      0x1060
 static BOOL g_idd_class_registered;
+
+/* Backstage (appsandbox-backstage.exe in the guest): a SYSTEM shell on its
+   own desktop. The agent toggles it and answers once the desktop is up,
+   which can take a few seconds, so it is asked from a worker thread. */
+typedef struct {
+    VmInstance *vm;
+    HWND hwnd;
+} IddBackstageAsk;
+
+static DWORD WINAPI idd_backstage_thread(LPVOID param)
+{
+    IddBackstageAsk *ask = (IddBackstageAsk *)param;
+    char reply[256] = "";
+    wchar_t message[400];
+    if (!vm_agent_send(ask->vm, "backstage", reply, sizeof(reply), 30000)) {
+        swprintf_s(message, _countof(message), L"Backstage could not be opened: %S",
+                   strncmp(reply, "error:", 6) == 0 ? reply + 6
+                   : reply[0] ? reply : "the VM's agent did not answer.");
+        MessageBoxW(ask->hwnd, message, L"Backstage", MB_ICONWARNING);
+    }
+    free(ask);
+    return 0;
+}
 static WNDPROC g_orig_listbox_proc;
 
 /* Listbox subclass — handles Ctrl+A / Ctrl+C */
@@ -2219,6 +2243,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                         L"Game Mode (capture mouse when the VM hides it)");
             AppendMenuW(sysmenu, MF_STRING, IDM_CAPTURE_MOUSE,
                         L"Capture Mouse Now (Ctrl+Alt releases)");
+            if (d->vm && _wcsicmp(d->vm->os_type, L"Windows") == 0)
+                AppendMenuW(sysmenu, MF_STRING, IDM_BACKSTAGE,
+                            L"Backstage Session (SYSTEM) - open or leave");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             if (d->switchable)
                 AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_CONSOLE,
@@ -2390,6 +2417,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && (wp & 0xFFF0) == IDM_CAPTURE_MOUSE) {
             d->input_focused = TRUE;   /* the menu was just used on this window */
             idd_begin_capture(d, FALSE);
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_BACKSTAGE) {
+            IddBackstageAsk *ask = (IddBackstageAsk *)calloc(1, sizeof(*ask));
+            HANDLE thread = NULL;
+            if (ask && d->vm) {
+                ask->vm = d->vm;
+                ask->hwnd = hwnd;
+                thread = CreateThread(NULL, 0, idd_backstage_thread, ask, 0, NULL);
+            }
+            if (thread) CloseHandle(thread);
+            else free(ask);
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {

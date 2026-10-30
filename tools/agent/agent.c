@@ -875,6 +875,97 @@ static void kill_input_helper(void)
     }
 }
 
+/* ---- Backstage session (appsandbox-backstage.exe) ----
+   A SYSTEM shell on its own desktop in the console session, like
+   ScreenConnect's Backstage. The command toggles it: started here, it
+   switches the screen to its desktop and holds the running mutex; asked
+   again, the exit event sends it back to the desktop that was showing. */
+#define BACKSTAGE_EXIT_EVENT    L"Global\\AppSandboxBackstageExit"
+#define BACKSTAGE_RUNNING_MUTEX L"Global\\AppSandboxBackstageRunning"
+
+static HANDLE g_backstage_exit;
+
+static void backstage_toggle(char *reply, size_t cap)
+{
+    HANDLE cur_token = NULL, dup_token = NULL, running;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t exe_path[MAX_PATH], cmd[MAX_PATH + 8], *slash;
+    DWORD session_id = WTSGetActiveConsoleSessionId();
+    int waited;
+
+    if (!g_backstage_exit)
+        g_backstage_exit = CreateEventW(NULL, TRUE, FALSE, BACKSTAGE_EXIT_EVENT);
+    running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
+    if (running) {
+        CloseHandle(running);
+        if (g_backstage_exit) SetEvent(g_backstage_exit);
+        agent_log("Backstage: leaving.");
+        strcpy_s(reply, cap, "ok:left");
+        return;
+    }
+    if (!g_backstage_exit) {
+        sprintf_s(reply, cap, "error:could not create the exit event (%lu)", GetLastError());
+        return;
+    }
+    ResetEvent(g_backstage_exit);
+    if (session_id == 0xFFFFFFFF || session_id == 0) {
+        strcpy_s(reply, cap, "error:Windows has no console session yet");
+        return;
+    }
+
+    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
+    slash = wcsrchr(exe_path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe_path, MAX_PATH, L"appsandbox-backstage.exe");
+    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
+        strcpy_s(reply, cap, "error:appsandbox-backstage.exe is not in the VM yet; restart the VM to add it");
+        return;
+    }
+    swprintf_s(cmd, _countof(cmd), L"\"%s\"", exe_path);
+
+    /* SYSTEM token placed in the console session, as for the input helper */
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token) ||
+        !DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
+                          SecurityImpersonation, TokenPrimary, &dup_token) ||
+        !SetTokenInformation(dup_token, TokenSessionId, &session_id, sizeof(session_id))) {
+        sprintf_s(reply, cap, "error:could not prepare the session token (%lu)", GetLastError());
+        if (cur_token) CloseHandle(cur_token);
+        if (dup_token) CloseHandle(dup_token);
+        return;
+    }
+    CloseHandle(cur_token);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessAsUserW(dup_token, exe_path, cmd, NULL, NULL, FALSE, 0,
+                              NULL, NULL, &si, &pi)) {
+        sprintf_s(reply, cap, "error:could not start the Backstage shell (%lu)", GetLastError());
+        CloseHandle(dup_token);
+        return;
+    }
+    CloseHandle(dup_token);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    /* The shell takes the mutex once its desktop is showing. */
+    for (waited = 0; waited < 15000; waited += 100) {
+        running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
+        if (running) {
+            CloseHandle(running);
+            agent_log("Backstage: shown in session %lu.", session_id);
+            strcpy_s(reply, cap, "ok:entered");
+            return;
+        }
+        Sleep(100);
+    }
+    agent_log("Backstage: the desktop did not come up (see backstage.log).");
+    strcpy_s(reply, cap, "error:the Backstage desktop could not be shown "
+                         "(see C:\\Windows\\AppSandbox\\backstage.log in the VM)");
+}
+
 /* Spawn appsandbox-input.exe as SYSTEM in the given session.
    Duplicates our own token, sets the session ID, then CreateProcessAsUser. */
 static BOOL spawn_input_in_session(DWORD session_id)
@@ -3778,6 +3869,11 @@ static void handle_client(AsbConn *client)
             } else {
                 REPLY("error:out of memory");
             }
+        }
+        else if (strcmp(cmd, "backstage") == 0) {
+            char reply[256];
+            backstage_toggle(reply, sizeof(reply));
+            REPLY(reply);
         }
         else if (strcmp(cmd, "lab_start") == 0 || strcmp(cmd, "lab_stop") == 0 ||
                  strncmp(cmd, "lab_chunk:", 10) == 0) {
