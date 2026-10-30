@@ -103,6 +103,42 @@ static void follow_input_desktop(void)
     switch_to_input_desktop();
 }
 
+/* ---- AppSandbox monitor ----
+   Host mouse positions are pixels of the AppSandbox virtual display. With
+   another display attached (the Hyper-V basic adapter, say) that monitor may
+   not be the primary one or sit at the desktop origin, so positions are
+   placed inside its own rectangle of the virtual desktop. Looked up again
+   every second so layout changes are followed. */
+static RECT  g_vdd_rect;
+static BOOL  g_vdd_found;
+static DWORD g_vdd_checked_tick;
+
+static void find_vdd_monitor(void)
+{
+    DISPLAY_DEVICEW dd;
+    DEVMODEW dm;
+    DWORD i, now = GetTickCount();
+    if (g_vdd_checked_tick && now - g_vdd_checked_tick < 1000) return;
+    g_vdd_checked_tick = now;
+    g_vdd_found = FALSE;
+    for (i = 0; ; i++) {
+        ZeroMemory(&dd, sizeof(dd));
+        dd.cb = sizeof(dd);
+        if (!EnumDisplayDevicesW(NULL, i, &dd, 0)) break;
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+        if (!wcsstr(dd.DeviceString, L"App Sandbox Virtual Display")) continue;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0)) continue;
+        g_vdd_rect.left   = dm.dmPosition.x;
+        g_vdd_rect.top    = dm.dmPosition.y;
+        g_vdd_rect.right  = dm.dmPosition.x + (LONG)dm.dmPelsWidth;
+        g_vdd_rect.bottom = dm.dmPosition.y + (LONG)dm.dmPelsHeight;
+        g_vdd_found = TRUE;
+        break;
+    }
+}
+
 /* ---- Input injection ---- */
 
 static void inject_input(const InputPacket *pkt)
@@ -113,14 +149,25 @@ static void inject_input(const InputPacket *pkt)
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
-        int screen_w = GetSystemMetrics(SM_CXSCREEN);
-        int screen_h = GetSystemMetrics(SM_CYSCREEN);
-        if (screen_w <= 0) screen_w = 1920;
-        if (screen_h <= 0) screen_h = 1080;
+        /* Normalised over the whole virtual desktop, offset to our monitor. */
+        LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        LONG vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        LONG vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        LONG vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        LONG x = (LONG)pkt->param1, y = (LONG)pkt->param2;
+        find_vdd_monitor();
+        if (g_vdd_found) {
+            x += g_vdd_rect.left;
+            y += g_vdd_rect.top;
+            if (x >= g_vdd_rect.right)  x = g_vdd_rect.right - 1;
+            if (y >= g_vdd_rect.bottom) y = g_vdd_rect.bottom - 1;
+        }
+        if (vw <= 1) { vx = 0; vw = 1920; }
+        if (vh <= 1) { vy = 0; vh = 1080; }
         inp.type = INPUT_MOUSE;
-        inp.mi.dx = (LONG)(pkt->param1 * 65535 / (UINT32)(screen_w - 1));
-        inp.mi.dy = (LONG)(pkt->param2 * 65535 / (UINT32)(screen_h - 1));
-        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        inp.mi.dx = (LONG)((LONGLONG)(x - vx) * 65535 / (vw - 1));
+        inp.mi.dy = (LONG)((LONGLONG)(y - vy) * 65535 / (vh - 1));
+        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         result = SendInput(1, &inp, sizeof(INPUT));
         if (result == 0)
             input_log("SendInput(MOUSE_MOVE) failed: %lu", GetLastError());
