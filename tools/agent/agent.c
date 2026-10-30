@@ -3185,20 +3185,23 @@ static DWORD appliance_set_account(const char *arguments)
        absent from trimmed Windows images, and a missing cmdlet exits the whole
        script with a bare 1 that says nothing. ADSI is part of the OS.
        No double quotes: the caller wraps this script in them.
-       0x10000 = DONT_EXPIRE_PASSWD, 0x2 = ACCOUNTDISABLE. */
+       0x10000 = DONT_EXPIRE_PASSWD, 0x2 = ACCOUNTDISABLE.
+       On a domain controller this lands in Active Directory, which is still
+       starting for a minute or two after boot, so it retries for ~150 s. */
     rc = run_powershell_wait(
-        L"try{"
+        L"$ok=$false; $err=$null; for($k=0;$k -lt 30 -and -not $ok;$k++){ try{"
         L"$n=$env:ASB_APPLIANCE_USER; $p=$env:ASB_APPLIANCE_PASSWORD; $c=$env:COMPUTERNAME; "
         L"$root=[ADSI]('WinNT://'+$c); $u=$null; "
         L"try{$t=[ADSI]('WinNT://'+$c+'/'+$n+',user'); if($t.Name){$u=$t}}catch{$u=$null}; "
         L"if(-not $u){$u=$root.Create('User',$n)}; "
         L"$u.SetPassword($p); $u.SetInfo(); "
         L"$f=[int]$u.UserFlags.Value; "
-        L"$u.UserFlags.Value=(($f -bor 0x10000) -band (-bnot 0x2)); $u.SetInfo()"
-        L"}catch{$e=([int]$_.Exception.HResult -band 0xffff); if($e -eq 0){$e=1}; exit $e}; "
+        L"$u.UserFlags.Value=(($f -bor 0x10000) -band (-bnot 0x2)); $u.SetInfo(); $ok=$true"
+        L"}catch{$err=$_; Start-Sleep -Seconds 5} }; "
+        L"if(-not $ok){$e=([int]$err.Exception.HResult -band 0xffff); if($e -eq 0){$e=1}; exit $e}; "
         L"try{$g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); "
         L"$g.Remove(('WinNT://'+$env:COMPUTERNAME+'/'+$env:ASB_APPLIANCE_USER+',user'))}catch{}; "
-        L"exit 0", 30000);
+        L"exit 0", 180000);
     if (rc == ERROR_SUCCESS) {
         BYTE sid[SECURITY_MAX_SID_SIZE];
         wchar_t domain[256];

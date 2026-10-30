@@ -1826,7 +1826,8 @@ static HRESULT reconcile_internal(void)
     WideCharToMultiByte(CP_UTF8, 0, smb_user, -1, user, sizeof(user), NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, smb_password, -1, password, sizeof(password), NULL, NULL);
     sprintf_s(command, sizeof(command), "appliance_account:%s:%s", user, password);
-    if (!appliance_send(command, response, sizeof(response), 30000)) {
+    /* The guest retries for ~150 s while a domain controller's AD starts. */
+    if (!appliance_send(command, response, sizeof(response), 200000)) {
         /* vm_agent_send redacts this command, so name the step here or the
            only trace of the failure is an anonymous "credential-bearing
            command" line. The reply carries the guest's Win32/HRESULT code. */
