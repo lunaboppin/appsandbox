@@ -900,6 +900,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 {
     AgentConn *conn = find_conn(instance);
     BOOL ok;
+    BOOL quiet = command && strncmp(command, "lab_chunk:", 10) == 0;
     BOOL redact = command &&
         (strncmp(command, "appliance_account:", 18) == 0 ||
          strncmp(command, "shared_smb_map:", 15) == 0 ||
@@ -945,8 +946,9 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
 
     ok = (strcmp(conn->rsp, "ok") == 0 || strncmp(conn->rsp, "ok:", 3) == 0);
-    if (redact) ui_log(L"Agent: credential-bearing command -> %.120S", conn->rsp);
-    else ui_log(L"Agent: %S -> %S", command, conn->rsp);
+    if (quiet) ;
+    else if (redact) ui_log(L"Agent: credential-bearing command -> %.120S", conn->rsp);
+    else ui_log(L"Agent: %S -> %.300S", command, conn->rsp);
     return ok;
 }
 

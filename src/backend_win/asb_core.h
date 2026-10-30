@@ -70,6 +70,7 @@ typedef struct {
     const wchar_t *vpn_id;         /* WireGuard config for ASB_NET_VPN */
     const wchar_t *preinstall_apps; /* Windows: comma-separated winget IDs installed after first sign-in */
     BOOL   domain_member;          /* Windows: managed account, joins the AppSandbox domain */
+    BOOL   lab_mode;               /* Windows: malware lab VM (isolated, disposable, recorded runs) */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -197,6 +198,12 @@ ASB_API HRESULT asb_vm_set_auto_open_display(AsbVm vm, BOOL enabled);
 ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled);
 ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member);
 ASB_API HRESULT asb_vm_set_disposable(AsbVm vm, BOOL enabled);
+/* Malware lab: record an analysis run, then build its report (blocking,
+   minutes: call from a worker). report_html receives the report's path. */
+ASB_API HRESULT asb_lab_start(AsbVm vm, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_lab_stop(AsbVm vm, wchar_t *report_html, size_t report_chars,
+                             wchar_t *message, size_t message_chars);
+ASB_API void asb_lab_reports_dir(AsbVm vm, wchar_t *out, size_t chars);
 ASB_API HRESULT asb_vm_resize_disk(AsbVm vm, DWORD new_size_gb);
 ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent);
 

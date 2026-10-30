@@ -16,6 +16,7 @@
         <div class="header-actions">
             <button class="win-host-only" onclick="openSettingsModal()" title="Open the shared appliance and shared resource settings.">Shared Resources</button>
             <button class="win-host-only" onclick="openDomainModal()" title="Manage the users and groups of the AppSandbox domain (Windows Server Core appliance).">Domain</button>
+            <button class="win-host-only" onclick="openLabModal()" title="Isolated, disposable VMs for running suspicious files, with recorded analysis reports.">Malware Lab</button>
             <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
         </div>
     </div>
@@ -292,6 +293,33 @@
         <div class="modal-buttons">
             <button onclick="closeManageVm()">Close</button>
         </div>
+    </div>
+</div>
+
+<!-- Malware lab: isolated, disposable VMs with recorded analysis runs -->
+<div class="modal-overlay win-host-only" id="lab-overlay">
+    <div class="modal manage-modal">
+        <h3>Malware Lab</h3>
+        <p>Lab VMs are isolated Windows VMs for running suspicious files: no shared drives, domain or clipboard, and every start begins from a clean copy. Start an analysis, run the sample, then stop it to get a report of every process, file, registry and network change, with screenshots.</p>
+        <div id="lab-vm-list" class="settings-resource-list"></div>
+        <fieldset>
+            <legend>New lab VM</legend>
+            <div class="form-grid resource-editor">
+                <label for="lab-name">Name:</label><input id="lab-name" value="MalwareLab" maxlength="40" spellcheck="false">
+                <label for="lab-iso">Windows ISO:</label>
+                <div class="manage-row"><input id="lab-iso" placeholder="Path to a Windows 10/11 ISO" spellcheck="false"><button type="button" onclick="browseLabIso()">Browse...</button></div>
+                <label for="lab-network">Network:</label>
+                <div>
+                    <select id="lab-network"></select>
+                    <small>None keeps the sample offline. A VPN gives it the internet without exposing your connection.</small>
+                </div>
+                <label for="lab-ram">Size:</label>
+                <div class="manage-row compact"><input id="lab-ram" type="number" min="2048" step="2" value="8192"> MB RAM <input id="lab-cpu" type="number" min="1" value="4" style="width:70px"> vCPU <input id="lab-disk" type="number" min="32" value="64"> GB disk</div>
+            </div>
+            <small>Builds Windows Pro from the ISO and starts it; it signs in as <b>analyst</b> (password <b>analyst</b>). Install any analysis tools you want, then shut it down: its next start saves that state as the clean copy every later start begins from.</small>
+            <div class="modal-buttons"><button type="button" class="primary" onclick="createLabVm()">Create &amp; Run</button></div>
+        </fieldset>
+        <div class="modal-buttons"><button type="button" onclick="closeLabModal()">Close</button></div>
     </div>
 </div>
 

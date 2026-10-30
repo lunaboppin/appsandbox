@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Malware Lab Report</title>
+<!-- Filled in by AppSandbox: the run's data replaces the marker below.
+     Everything shown comes from a VM that ran untrusted code, so it is only
+     ever placed with textContent, never as HTML. -->
+<script>/*LAB_DATA*/</script>
+<style>
+:root {
+    --bg: #16181c; --panel: #1f2228; --panel2: #262a31; --line: #343a43;
+    --text: #e6e8eb; --dim: #9aa3ad; --accent: #6aa9ff;
+    --red: #ff7a7a; --amber: #ffbe5c; --green: #6fd38f; --violet: #c49bff;
+    --radius: 8px;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 "Segoe UI", system-ui, sans-serif; }
+header { padding: 20px 24px 12px; border-bottom: 1px solid var(--line); }
+h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+.sub { color: var(--dim); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; padding: 16px 24px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; cursor: pointer; }
+.card b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.card span { color: var(--dim); font-size: 12px; }
+.card.alert b { color: var(--red); }
+nav { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 24px; border-bottom: 1px solid var(--line); }
+nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--dim); padding: 10px 12px; font: inherit; cursor: pointer; }
+nav button.on { color: var(--text); border-bottom-color: var(--accent); }
+.tools { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 24px; }
+.tools input[type=search] { flex: 1; min-width: 200px; background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 7px 10px; font: inherit; }
+.tools label { color: var(--dim); white-space: nowrap; }
+main { padding: 0 24px 40px; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+th { color: var(--dim); font-weight: 600; position: sticky; top: 0; background: var(--bg); }
+td.mono, .mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+.badge { display: inline-block; border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: 600; background: var(--panel2); color: var(--dim); }
+.b-created, .b-added, .b-start { color: var(--green); }
+.b-deleted, .b-exit { color: var(--red); }
+.b-modified, .b-changed, .b-renamed { color: var(--amber); }
+.b-net { color: var(--accent); }
+.b-persist { background: #4a2330; color: var(--red); margin-left: 6px; }
+.noise { opacity: .55; }
+.empty { color: var(--dim); padding: 24px 0; }
+.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.shot { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; cursor: zoom-in; }
+.shot img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; }
+.shot span { display: block; padding: 6px 8px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.tree ul { list-style: none; margin: 0; padding-left: 20px; border-left: 1px solid var(--line); }
+.tree > ul { padding-left: 0; border-left: 0; }
+.tree li { padding: 4px 0; }
+.proc { display: inline-flex; flex-direction: column; gap: 1px; }
+.proc .name { font-weight: 600; }
+.proc .meta { color: var(--dim); font-size: 12px; }
+.proc.old .name { color: var(--dim); font-weight: 400; }
+.tl-time { width: 90px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.tl-kind { width: 110px; }
+.tl-thumb { max-width: 240px; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; }
+#lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center; justify-content: center; flex-direction: column; gap: 10px; z-index: 10; }
+#lightbox.on { display: flex; }
+#lightbox img { max-width: 94vw; max-height: 84vh; border-radius: 6px; }
+#lightbox .bar { display: flex; gap: 10px; align-items: center; color: var(--dim); }
+#lightbox button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 14px; font: inherit; cursor: pointer; }
+.note { color: var(--amber); padding: 8px 0; }
+@media (max-width: 700px) { header, .cards, nav, .tools, main { padding-left: 12px; padding-right: 12px; } th.hide-sm, td.hide-sm { display: none; } }
+</style>
+</head>
+<body>
+<header>
+    <h1 id="title">Malware Lab report</h1>
+    <div class="sub" id="subtitle"></div>
+</header>
+<section class="cards" id="cards"></section>
+<nav id="tabs"></nav>
+<div class="tools">
+    <input type="search" id="filter" placeholder="Filter this tab (path, process, value...)">
+    <label><input type="checkbox" id="noise"> Show Windows background activity</label>
+</div>
+<main id="view"></main>
+<div id="lightbox" role="dialog" aria-label="Screenshot">
+    <img id="lb-img" alt="">
+    <div class="bar"><button id="lb-prev">Previous</button><span id="lb-cap"></span><button id="lb-next">Next</button><button id="lb-close">Close</button></div>
+</div>
+<script>
+(function () {
+    var R = window.LAB_REPORT || {}, SHOTS = window.LAB_SHOTS || [], META = window.LAB_META || {};
+    var procs = R.processes || [], files = R.files || [], reg = R.registry || [], net = R.network || [];
+    var byPid = {};
+    procs.forEach(function (p) { if (!byPid[p.pid] || !p.existing) byPid[p.pid] = p; });
+
+    function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined && text !== null) e.textContent = String(text);
+        return e;
+    }
+    function base(path) { var s = String(path || ''); var i = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/')); return i >= 0 ? s.slice(i + 1) : s; }
+    function t(ms) {
+        ms = Math.max(0, ms || 0);
+        var s = Math.floor(ms / 1000), m = Math.floor(s / 60);
+        return (m ? m + 'm ' : '') + (s % 60) + '.' + String(Math.floor(ms % 1000 / 100)) + 's';
+    }
+    function badge(text, cls) { return el('span', 'badge ' + (cls || ''), text); }
+    function showNoise() { return document.getElementById('noise').checked; }
+    function matches(text) {
+        var q = document.getElementById('filter').value.trim().toLowerCase();
+        return !q || String(text).toLowerCase().indexOf(q) >= 0;
+    }
+    function procName(pid) { var p = byPid[pid]; return p ? base(p.image) + ' (' + pid + ')' : 'PID ' + pid; }
+
+    var newProcs = procs.filter(function (p) { return !p.existing; });
+    var realFiles = files.filter(function (f) { return !f.noise; });
+    var realReg = reg.filter(function (r) { return !r.noise; });
+    var persist = reg.filter(function (r) { return r.persistence && r.action !== 'deleted'; });
+    var outbound = net.filter(function (n) { return n.remote; });
+
+    document.getElementById('title').textContent = 'Malware Lab report — ' + (META.vm || R.computer || '');
+    document.getElementById('subtitle').textContent =
+        'Recorded ' + (R.started || '') + ' to ' + (R.stopped || '') + ' (' + t(R.durationMs) + ') on ' + (R.computer || 'the lab VM') + '.';
+
+    var TABS = [
+        ['timeline', 'Timeline'], ['shots', 'Screenshots (' + SHOTS.length + ')'], ['processes', 'Processes (' + newProcs.length + ')'],
+        ['files', 'Files (' + realFiles.length + ')'], ['registry', 'Registry (' + realReg.length + ')'], ['network', 'Network (' + net.length + ')']
+    ];
+    var current = 'timeline';
+
+    function card(n, label, tab, alert) {
+        var c = el('div', 'card' + (alert && n ? ' alert' : ''));
+        c.appendChild(el('b', '', n));
+        c.appendChild(el('span', '', label));
+        c.onclick = function () { select(tab); };
+        return c;
+    }
+    var cards = document.getElementById('cards');
+    cards.appendChild(card(newProcs.length, 'processes started', 'processes'));
+    cards.appendChild(card(realFiles.length, 'files changed', 'files'));
+    cards.appendChild(card(realReg.length, 'registry changes', 'registry'));
+    cards.appendChild(card(persist.length, 'autostart entries', 'registry', true));
+    cards.appendChild(card(outbound.length, 'network connections', 'network'));
+    cards.appendChild(card(SHOTS.length, 'screenshots', 'shots'));
+
+    var nav = document.getElementById('tabs');
+    TABS.forEach(function (tb) {
+        var b = el('button', '', tb[1]);
+        b.dataset.tab = tb[0];
+        b.onclick = function () { select(tb[0]); };
+        nav.appendChild(b);
+    });
+    document.getElementById('filter').oninput = render;
+    document.getElementById('noise').onchange = render;
+
+    function select(tab) { current = tab; render(); }
+
+    function table(headers, rows) {
+        if (!rows.length) return el('div', 'empty', 'Nothing recorded here.');
+        var tb = el('table'), head = el('tr');
+        headers.forEach(function (h) { var th = el('th', h.cls || '', h.label); if (h.width) th.style.width = h.width; head.appendChild(th); });
+        tb.appendChild(head);
+        rows.forEach(function (cells) {
+            var tr = el('tr', cells.rowCls || '');
+            cells.forEach(function (c, i) {
+                var td = el('td', headers[i].cls || '');
+                if (c instanceof Node) td.appendChild(c); else td.textContent = c;
+                tr.appendChild(td);
+            });
+            tb.appendChild(tr);
+        });
+        return tb;
+    }
+
+    function renderTimeline(v) {
+        var ev = [];
+        newProcs.forEach(function (p) {
+            ev.push({ ms: p.start, kind: badge('process', 'b-start'), text: base(p.image) + ' started by ' + procName(p.ppid), detail: p.cmd || p.image });
+            if (p.ended) ev.push({ ms: p.end, kind: badge('exit', 'b-exit'), text: base(p.image) + ' (' + p.pid + ') exited', detail: '' });
+        });
+        files.forEach(function (f) {
+            if (f.noise && !showNoise()) return;
+            ev.push({ ms: f.time, kind: badge(f.action, 'b-' + f.action), text: f.path, detail: '', noise: f.noise });
+        });
+        outbound.forEach(function (n) {
+            ev.push({ ms: n.time, kind: badge('network', 'b-net'), text: n.proto + ' ' + n.remote + ' from ' + procName(n.pid), detail: '' });
+        });
+        SHOTS.forEach(function (s, i) { ev.push({ ms: s.ms, shot: i }); });
+        ev.sort(function (a, b) { return a.ms - b.ms; });
+        var rows = [];
+        ev.forEach(function (e) {
+            if (e.shot !== undefined) {
+                if (!matches('screenshot')) return;
+                var img = el('img', 'tl-thumb');
+                img.src = SHOTS[e.shot].file; img.alt = 'Screenshot at ' + t(e.ms);
+                img.onclick = function () { openShot(e.shot); };
+                var r = [t(e.ms), badge('screen'), img, '']; rows.push(r); return;
+            }
+            if (!matches(e.text + ' ' + e.detail)) return;
+            var body = el('div');
+            body.appendChild(el('div', 'mono', e.text));
+            if (e.detail) body.appendChild(el('div', 'mono sub', e.detail));
+            var row = [t(e.ms), e.kind, body, '']; if (e.noise) row.rowCls = 'noise'; rows.push(row);
+        });
+        if (realReg.length) v.appendChild(el('div', 'note', 'Registry changes have no timestamps; see the Registry tab (' + realReg.length + ' changes' + (persist.length ? ', ' + persist.length + ' in autostart locations' : '') + ').'));
+        v.appendChild(table([{ label: 'Time', width: '90px' }, { label: 'Event', width: '110px' }, { label: 'Details' }, { label: '', width: '1px' }], rows));
+    }
+
+    function renderShots(v) {
+        if (!SHOTS.length) { v.appendChild(el('div', 'empty', 'No screenshots: keep the lab VM\'s display window open while recording.')); return; }
+        var g = el('div', 'shots');
+        SHOTS.forEach(function (s, i) {
+            if (!matches(t(s.ms))) return;
+            var c = el('div', 'shot'), img = el('img');
+            img.src = s.file; img.alt = 'Screenshot at ' + t(s.ms); img.loading = 'lazy';
+            c.appendChild(img); c.appendChild(el('span', '', t(s.ms)));
+            c.onclick = function () { openShot(i); };
+            g.appendChild(c);
+        });
+        v.appendChild(g);
+    }
+
+    function renderProcesses(v) {
+        if (!newProcs.length) { v.appendChild(el('div', 'empty', 'No new processes started during the run.')); return; }
+        var kids = {}, roots = [], shown = {};
+        newProcs.forEach(function (p) { (kids[p.ppid] = kids[p.ppid] || []).push(p); });
+        newProcs.forEach(function (p) {
+            var parent = byPid[p.ppid];
+            if (!parent || parent.existing) {
+                var key = parent ? 'old' + parent.pid : 'none' + p.ppid;
+                if (!shown[key]) { shown[key] = 1; roots.push(parent ? { proc: parent, old: true } : { pid: p.ppid }); }
+            }
+        });
+        function node(p, old) {
+            var li = el('li'), box = el('div', 'proc' + (old ? ' old' : ''));
+            box.appendChild(el('span', 'name', base(p.image) + '  (PID ' + p.pid + ')'));
+            if (!old) {
+                box.appendChild(el('span', 'meta mono', p.cmd || p.image));
+                box.appendChild(el('span', 'meta', 'started ' + t(p.start) + (p.ended ? ', exited ' + t(p.end) : ', still running at the end')));
+            } else {
+                box.appendChild(el('span', 'meta', 'already running before the run'));
+            }
+            li.appendChild(box);
+            var children = (kids[p.pid] || []).filter(function (c) { return matches(c.image + ' ' + c.cmd) || (kids[c.pid] || []).length; });
+            if (children.length) {
+                var ul = el('ul');
+                children.forEach(function (c) { if (!c.existing) ul.appendChild(node(c, false)); });
+                li.appendChild(ul);
+            }
+            return li;
+        }
+        var tree = el('div', 'tree'), ul = el('ul');
+        roots.forEach(function (r) {
+            if (r.proc) ul.appendChild(node(r.proc, true));
+            else (kids[r.pid] || []).forEach(function (c) { ul.appendChild(node(c, false)); });
+        });
+        tree.appendChild(ul);
+        v.appendChild(tree);
+    }
+
+    function renderFiles(v) {
+        var rows = [];
+        files.forEach(function (f) {
+            if (f.noise && !showNoise()) return;
+            if (!matches(f.path + ' ' + f.action)) return;
+            var row = [t(f.time), badge(f.action + (f.dir ? ' (folder)' : ''), 'b-' + f.action), f.path];
+            if (f.noise) row.rowCls = 'noise';
+            rows.push(row);
+        });
+        if (R.filesTruncated) v.appendChild(el('div', 'note', 'Very many files changed; only the first part is listed.'));
+        v.appendChild(table([{ label: 'First seen', width: '90px' }, { label: 'Change', width: '130px' }, { label: 'Path', cls: 'mono' }], rows));
+    }
+
+    function renderRegistry(v) {
+        var rows = [];
+        var sorted = reg.slice().sort(function (a, b) { return (b.persistence - a.persistence) || (a.path < b.path ? -1 : 1); });
+        sorted.forEach(function (r) {
+            if (r.noise && !showNoise()) return;
+            var where = r.path + (r.value ? '\\' + r.value : '');
+            if (!matches(where + ' ' + (r.data || '') + ' ' + r.action)) return;
+            var act = el('span');
+            act.appendChild(badge(r.action + (r.kind === 'key' ? ' key' : ''), 'b-' + r.action));
+            if (r.persistence) act.appendChild(badge('autostart', 'b-persist'));
+            var row = [act, where, r.type || '', r.data || ''];
+            if (r.noise) row.rowCls = 'noise';
+            rows.push(row);
+        });
+        if (R.registryTruncated) v.appendChild(el('div', 'note', 'Very many registry changes; only the first part is listed.'));
+        v.appendChild(table([{ label: 'Change', width: '150px' }, { label: 'Key \\ value', cls: 'mono' }, { label: 'Type', width: '120px', cls: 'hide-sm' }, { label: 'New data', cls: 'mono hide-sm' }], rows));
+    }
+
+    var TCP = { 1: 'closed', 2: 'listening', 3: 'SYN sent', 4: 'SYN received', 5: 'established', 6: 'FIN wait 1', 7: 'FIN wait 2', 8: 'close wait', 9: 'closing', 10: 'last ACK', 11: 'time wait', 12: 'delete' };
+    function renderNetwork(v) {
+        var rows = [];
+        net.slice().sort(function (a, b) { return (b.remote ? 1 : 0) - (a.remote ? 1 : 0) || a.time - b.time; }).forEach(function (n) {
+            var what = n.proto + ' ' + n.local + ' ' + n.remote + ' ' + procName(n.pid);
+            if (!matches(what)) return;
+            rows.push([t(n.time), n.proto, n.local, n.remote || (n.proto === 'UDP' ? '(listening)' : '(listening)'), n.proto === 'TCP' ? (TCP[n.state] || n.state) : '', procName(n.pid)]);
+        });
+        v.appendChild(table([{ label: 'First seen', width: '90px' }, { label: 'Proto', width: '60px' }, { label: 'Local', cls: 'mono' }, { label: 'Remote', cls: 'mono' }, { label: 'State', width: '110px', cls: 'hide-sm' }, { label: 'Process' }], rows));
+    }
+
+    function render() {
+        [].forEach.call(nav.children, function (b) { b.classList.toggle('on', b.dataset.tab === current); });
+        var v = document.getElementById('view');
+        v.textContent = '';
+        ({ timeline: renderTimeline, shots: renderShots, processes: renderProcesses, files: renderFiles, registry: renderRegistry, network: renderNetwork })[current](v);
+    }
+
+    var lb = document.getElementById('lightbox'), lbIndex = 0;
+    function openShot(i) {
+        lbIndex = Math.max(0, Math.min(SHOTS.length - 1, i));
+        document.getElementById('lb-img').src = SHOTS[lbIndex].file;
+        document.getElementById('lb-cap').textContent = (lbIndex + 1) + ' / ' + SHOTS.length + ' — ' + t(SHOTS[lbIndex].ms);
+        lb.classList.add('on');
+    }
+    document.getElementById('lb-prev').onclick = function () { openShot(lbIndex - 1); };
+    document.getElementById('lb-next').onclick = function () { openShot(lbIndex + 1); };
+    document.getElementById('lb-close').onclick = function () { lb.classList.remove('on'); };
+    lb.onclick = function (e) { if (e.target === lb) lb.classList.remove('on'); };
+    document.addEventListener('keydown', function (e) {
+        if (!lb.classList.contains('on')) return;
+        if (e.key === 'Escape') lb.classList.remove('on');
+        if (e.key === 'ArrowLeft') openShot(lbIndex - 1);
+        if (e.key === 'ArrowRight') openShot(lbIndex + 1);
+    });
+
+    render();
+})();
+</script>
+</body>
+</html>

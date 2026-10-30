@@ -261,6 +261,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"secureBoot", !v->secure_boot_off);
     jb_bool(jb, L"domainMember", v->domain_member);
     jb_bool(jb, L"disposable", v->disposable_snap[0] != L'\0');
+    jb_bool(jb, L"labMode", v->lab_mode);
+    jb_bool(jb, L"labRunning", v->lab_running != 0);
+    jb_int(jb, L"labShots", (int)v->lab_shots);
+    jb_int(jb, L"labSeconds", v->lab_running ? (int)((GetTickCount64() - v->lab_t0) / 1000) : 0);
+    jb_string(jb, L"labReport", v->lab_report);
     jb_bool(jb, L"managementBusy", asb_vm_management_busy(asb_vm_get(i)));
     jb_int(jb, L"guestGrowTargetGb", (int)v->guest_grow_target_gb);
     jb_string(jb, L"sharedResourceExclusions", v->shared_resource_exclusions);
@@ -1090,6 +1095,51 @@ static void start_manage_work(int vm_index, int operation,
     CloseHandle(thread);
 }
 
+/* Malware lab runs: starting takes a registry baseline and stopping builds
+   the report (minutes), so both run on a worker. */
+typedef struct {
+    wchar_t action[16];
+    int vm_index;
+    HRESULT result;
+    wchar_t message[512];
+    wchar_t report[MAX_PATH];
+} LabWork;
+
+#define WM_LAB_DONE (WM_APP + 23)
+
+static DWORD WINAPI lab_work_thread(LPVOID param)
+{
+    LabWork *w = (LabWork *)param;
+    AsbVm vm = asb_vm_get(w->vm_index);
+    if (wcscmp(w->action, L"labStart") == 0)
+        w->result = asb_lab_start(vm, w->message, _countof(w->message));
+    else
+        w->result = asb_lab_stop(vm, w->report, _countof(w->report), w->message, _countof(w->message));
+    if (!PostMessageW(g_hwnd_main, WM_LAB_DONE, 0, (LPARAM)w)) free(w);
+    return 0;
+}
+
+static void finish_lab_work(LabWork *w)
+{
+    wchar_t out[2048];
+    JsonBuilder jb;
+    if (FAILED(w->result) && !w->message[0])
+        format_hresult_message(w->result, w->message, _countof(w->message));
+    jb_init(&jb, out, _countof(out));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"labResult");
+    jb_string(&jb, L"action", w->action);
+    jb_int(&jb, L"vmIndex", w->vm_index);
+    jb_bool(&jb, L"success", SUCCEEDED(w->result));
+    if (FAILED(w->result)) jb_string(&jb, L"message", w->message);
+    jb_string(&jb, L"report", w->report);
+    jb_object_end(&jb);
+    webview2_post(out);
+    if (SUCCEEDED(w->result) && w->report[0])
+        ShellExecuteW(g_hwnd_main, L"open", w->report, NULL, NULL, SW_SHOWNORMAL);
+    send_vm_list();
+}
+
 /* Domain management talks to the appliance, which may have to start first
    (and setting the domain up takes many minutes), so it runs on a worker and
    finishes on the UI thread with a domainResult message. */
@@ -1336,6 +1386,8 @@ static void on_webview2_message(const wchar_t *json)
         cfg.vpn_id = vpn_buf;
         cfg.preinstall_apps = apps_buf;
         cfg.domain_member = !is_tpl && _wcsicmp(account_buf, L"managed") == 0;
+        json_get_bool(json, L"labMode", &cfg.lab_mode);
+        if (cfg.lab_mode) { cfg.domain_member = FALSE; cfg.preinstall_apps = NULL; }
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
@@ -1750,6 +1802,32 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
             hr = asb_vm_set_secure_boot(asb_vm_get(vi), enabled);
         send_manage_result(0, hr); send_vm_list();
+    } else if (wcscmp(action, L"labStart") == 0 || wcscmp(action, L"labStop") == 0) {
+        LabWork *work = (LabWork *)calloc(1, sizeof(*work));
+        HANDLE thread = NULL;
+        if (work && json_get_int(json, L"vmIndex", &work->vm_index)) {
+            wcscpy_s(work->action, _countof(work->action), action);
+            thread = CreateThread(NULL, 0, lab_work_thread, work, 0, NULL);
+        }
+        if (thread) CloseHandle(thread);
+        else free(work);
+        send_vm_list();
+    } else if (wcscmp(action, L"labOpenReport") == 0 || wcscmp(action, L"labOpenFolder") == 0) {
+        int vi;
+        if (json_get_int(json, L"vmIndex", &vi)) {
+            VmInstance *v = asb_vm_instance(asb_vm_get(vi));
+            wchar_t dir[MAX_PATH];
+            asb_lab_reports_dir(asb_vm_get(vi), dir, MAX_PATH);
+            if (wcscmp(action, L"labOpenReport") == 0 && v && v->lab_report[0])
+                ShellExecuteW(g_hwnd_main, L"open", v->lab_report, NULL, NULL, SW_SHOWNORMAL);
+            else
+                ShellExecuteW(g_hwnd_main, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
+        }
+    } else if (wcscmp(action, L"labSaveClean") == 0) {
+        int vi; HRESULT hr = E_INVALIDARG;
+        if (json_get_int(json, L"vmIndex", &vi))
+            hr = asb_vm_set_disposable(asb_vm_get(vi), TRUE);
+        send_manage_result(0, hr); send_vm_list();
     } else if (wcscmp(action, L"setVmDisposable") == 0) {
         int vi; BOOL enabled = FALSE; HRESULT hr = E_INVALIDARG;
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
@@ -2049,6 +2127,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DOMAIN_PROGRESS:
         send_full_state();
+        return 0;
+    case WM_LAB_DONE:
+        if (lp) {
+            finish_lab_work((LabWork *)lp);
+            free((LabWork *)lp);
+        }
         return 0;
     case WM_DOMAIN_DONE:
     {

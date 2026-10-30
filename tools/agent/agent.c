@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include "p9copy.h"
+#include "lab_recorder.h"
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -3585,6 +3586,8 @@ static void handle_client(AsbConn *client)
             agent_log("Command: shared_smb_map:<redacted>");
         else if (strncmp(cmd, "domain_", 7) == 0)
             agent_log("Command: %.20s<redacted>", cmd);
+        else if (strncmp(cmd, "lab_chunk:", 10) == 0)
+            ;   /* report transfer: one per 18 KB, not worth a log line each */
         else
             agent_log("Command: %s", buf);
 
@@ -3774,6 +3777,19 @@ static void handle_client(AsbConn *client)
                 free(reply);
             } else {
                 REPLY("error:out of memory");
+            }
+        }
+        else if (strcmp(cmd, "lab_start") == 0 || strcmp(cmd, "lab_stop") == 0 ||
+                 strncmp(cmd, "lab_chunk:", 10) == 0) {
+            /* Malware lab recorder (lab_recorder.c). */
+            char *reply = (char *)malloc(LAB_CHUNK_BYTES * 2);
+            if (!reply) { REPLY("error:out of memory"); }
+            else {
+                if (strcmp(cmd, "lab_start") == 0) lab_start(reply, LAB_CHUNK_BYTES * 2);
+                else if (strcmp(cmd, "lab_stop") == 0) lab_stop(reply, LAB_CHUNK_BYTES * 2);
+                else lab_chunk((size_t)_strtoui64(cmd + 10, NULL, 10), reply, LAB_CHUNK_BYTES * 2);
+                REPLY(reply);
+                free(reply);
             }
         }
         else if (strncmp(cmd, "user_drives:", 12) == 0) {
@@ -4262,6 +4278,8 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Finish installing apps chosen at creation that are still queued */
     start_app_install();
+
+    lab_init(agent_log);
 
     /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
     ensure_hyperv_video_disabled(NULL);

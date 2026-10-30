@@ -107,6 +107,14 @@ typedef struct {
     BOOL        domain_member;    /* TRUE = managed: domain users sign in, joins at every boot */
     wchar_t     disposable_snap[64];   /* GUID of the clean checkpoint every start begins from; empty = off */
     wchar_t     disposable_branch[64]; /* branch the last disposable start created (deleted at the next) */
+    /* Malware lab VM: isolated (no shared drives, domain or clipboard),
+       disposable once set up, with recorded analysis runs. */
+    BOOL        lab_mode;
+    volatile LONG lab_running;     /* an analysis is recording */
+    volatile LONG lab_shots;       /* screenshots saved this run */
+    ULONGLONG   lab_t0;            /* GetTickCount64 at the run's start */
+    wchar_t     lab_dir[MAX_PATH]; /* this run's report folder */
+    wchar_t     lab_report[MAX_PATH]; /* last report.html */
     DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */
     volatile LONG management_busy; /* serializes stopped-VM media/storage/disk operations */
     wchar_t     config_passthrough[4096]; /* unrecognized vms.cfg keys */

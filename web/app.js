@@ -104,7 +104,7 @@ window.onHostMessage = function(msg) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); break;
+        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); renderLab(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
@@ -115,6 +115,7 @@ window.onHostMessage = function(msg) {
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
         case 'domainResult': onDomainResult(msg); break;
+        case 'labResult': onLabResult(msg); break;
         case 'vpnConfigResult': onVpnConfigResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
@@ -151,6 +152,7 @@ function onFullState(msg) {
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
     if (document.getElementById('resource-groups')) applyResourceDomainUI();
+    renderLab();
     if (document.getElementById('domain-overlay').classList.contains('active')) {
         renderDomain();
         /* Became ready while the dialog was open: load the users, once.
@@ -336,6 +338,11 @@ function onDeleteTemplate(name) {
 /* ---- Browse result ---- */
 
 function onBrowseResult(path) {
+    if (labBrowsing) {
+        labBrowsing = false;
+        if (path) document.getElementById('lab-iso').value = path;
+        return;
+    }
     if (path) {
         document.getElementById('image-path').value = path;
         selectTemplate('', templateDefaultLabel());
@@ -487,6 +494,134 @@ function gatherPreinstallApps() {
         if (ids.indexOf(extra[i]) < 0) ids.push(extra[i]);
     }
     return ids.join(',');
+}
+
+/* ---- Malware lab ---- */
+
+var labBusy = {};          /* vmIndex -> 'Starting the recording...' etc. */
+var labBrowsing = false;
+var labTimer = null;
+
+function openLabModal() {
+    var sel = document.getElementById('lab-network');
+    sel.innerHTML = '';
+    var none = document.createElement('option');
+    none.value = 'none'; none.textContent = 'None (offline)';
+    sel.appendChild(none);
+    (vpnConfigs || []).forEach(function(c) {
+        var o = document.createElement('option');
+        o.value = 'vpn:' + c.id; o.textContent = 'VPN: ' + c.name;
+        sel.appendChild(o);
+    });
+    document.getElementById('lab-overlay').classList.add('active');
+    renderLab();
+    /* Recording counters (time, screenshots) come with each state refresh. */
+    if (!labTimer) labTimer = setInterval(function() {
+        if (!document.getElementById('lab-overlay').classList.contains('active')) { clearInterval(labTimer); labTimer = null; return; }
+        if (vms.some(function(v) { return v.labMode && v.labRunning; })) sendCmd('getState');
+    }, 3000);
+}
+
+function closeLabModal() { document.getElementById('lab-overlay').classList.remove('active'); }
+
+function browseLabIso() { labBrowsing = true; sendCmd('browseImage'); }
+
+function labButton(text, title, fn, cls) {
+    var b = document.createElement('button');
+    b.type = 'button'; b.textContent = text; b.title = title || '';
+    if (cls) b.className = cls;
+    b.onclick = fn;
+    return b;
+}
+
+function renderLab() {
+    var box = document.getElementById('lab-vm-list');
+    if (!box) return;
+    box.innerHTML = '';
+    var labs = [];
+    vms.forEach(function(v, i) { if (v.labMode) labs.push([v, i]); });
+    if (!labs.length) {
+        var p = document.createElement('div');
+        p.className = 'settings-resource-meta';
+        p.textContent = 'No lab VMs yet. Create one below.';
+        box.appendChild(p);
+        return;
+    }
+    labs.forEach(function(pair) {
+        var v = pair[0], i = pair[1];
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = v.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        var state = v.buildingVhdx ? 'Building Windows (' + (v.vhdxProgress || 0) + '%)'
+            : !v.installComplete ? (v.running ? 'Setting up Windows...' : 'Not set up yet')
+            : v.running ? (v.agentOnline ? 'Running' : 'Starting...') : 'Stopped';
+        if (v.labRunning) state = 'Recording for ' + v.labSeconds + ' s — ' + v.labShots + ' screenshots';
+        if (labBusy[i]) state = labBusy[i];
+        meta.textContent = state + ' · ' + (v.disposable ? 'starts from its clean copy' : 'clean copy saved at its next start after setup') +
+            ' · ' + vmNetworkLabel(v);
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        var busy = !!labBusy[i] || v.buildingVhdx;
+        if (!v.running) {
+            actions.appendChild(labButton('Start', 'Start the lab VM from its clean copy.', function() { sendCmd('startVm', { vmIndex: i }); }));
+            if (v.installComplete) actions.appendChild(labButton('Save Clean State', 'Make the VM as it is now the clean copy every start begins from.', function() {
+                showModal('Save clean state', 'Make "' + v.name + '" as it is now the clean copy that every start begins from?', 'Save', { confirmClass: 'primary' })
+                    .then(function(ok) { if (ok) sendCmd('labSaveClean', { vmIndex: i }); });
+            }));
+        } else {
+            actions.appendChild(labButton('Display', 'Open the lab VM\'s screen. Keep it open while recording to capture screenshots.', function() { sendCmd('connectIddVm', { vmIndex: i }); }));
+            if (v.labRunning)
+                actions.appendChild(labButton('Stop & Build Report', 'Stop recording and build the report.', function() {
+                    labBusy[i] = 'Building the report (diffing the registry and file journal)...'; renderLab();
+                    sendCmd('labStop', { vmIndex: i });
+                }, 'primary'));
+            else if (v.agentOnline && v.installComplete)
+                actions.appendChild(labButton('Start Analysis', 'Take a baseline, then record everything until you stop.', function() {
+                    labBusy[i] = 'Taking the baseline (registry, processes, network)...'; renderLab();
+                    sendCmd('connectIddVm', { vmIndex: i });
+                    sendCmd('labStart', { vmIndex: i });
+                }, 'primary'));
+            actions.appendChild(labButton('Shut Down', 'Shut the lab VM down; its next start is clean again.', function() { sendCmd('shutdownVm', { vmIndex: i }); }));
+        }
+        if (v.labReport) actions.appendChild(labButton('Open Report', 'Open the last analysis report.', function() { sendCmd('labOpenReport', { vmIndex: i }); }));
+        actions.appendChild(labButton('Reports', 'Open the folder with every report of this lab VM.', function() { sendCmd('labOpenFolder', { vmIndex: i }); }));
+        [].forEach.call(actions.children, function(b) { if (busy && b.textContent !== 'Reports' && b.textContent !== 'Open Report') b.disabled = true; });
+        row.append(details, actions);
+        box.appendChild(row);
+    });
+}
+
+function createLabVm() {
+    var name = document.getElementById('lab-name').value.trim();
+    var iso = document.getElementById('lab-iso').value.trim();
+    var nameErr = validateVmName(name);
+    if (nameErr) { showModal('Malware Lab', nameErr, 'OK', { confirmClass: 'primary' }); return; }
+    if (!iso) { showModal('Malware Lab', 'Choose a Windows ISO to build the lab VM from.', 'OK', { confirmClass: 'primary' }); return; }
+    var net = document.getElementById('lab-network').value;
+    sendCmd('createVm', {
+        name: name, osType: 'Windows', imagePath: iso, templateName: '', storageParent: '',
+        sharedResourceExclusions: '', hddGb: parseInt(document.getElementById('lab-disk').value, 10) || 64,
+        ramMb: alignRamMb(parseInt(document.getElementById('lab-ram').value, 10) || 8192),
+        cpuCores: parseInt(document.getElementById('lab-cpu').value, 10) || 4,
+        gpuMode: 1, networkMode: net === 'none' ? 0 : 4, netAdapter: '',
+        vpnId: net.indexOf('vpn:') === 0 ? net.slice(4) : '',
+        adminUser: 'analyst', adminPass: 'analyst', sshEnabled: false, sshDeployKey: false,
+        preinstallApps: '', accountMode: 'local', labMode: true
+    });
+    showModal('Malware Lab', 'Building "' + name + '" from the ISO. It starts by itself when Windows is installed; watch its progress here.', 'OK', { confirmClass: 'primary' });
+}
+
+function onLabResult(msg) {
+    delete labBusy[msg.vmIndex];
+    if (!msg.success) showModal('Malware Lab', msg.message || 'The request failed.', 'OK');
+    renderLab();
 }
 
 /* ---- AppSandbox domain (Windows Server Core appliance) ---- */

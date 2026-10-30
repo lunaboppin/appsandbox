@@ -574,6 +574,10 @@ static BOOL save_vm_list(void)
         if (g_vms[i].disposable_snap[0])
             fwprintf(f, L"DisposableSnap=%s\nDisposableBranch=%s\n",
                      g_vms[i].disposable_snap, g_vms[i].disposable_branch);
+        if (g_vms[i].lab_mode)
+            fwprintf(f, L"LabMode=1\n");
+        if (g_vms[i].lab_report[0])
+            fwprintf(f, L"LabReport=%s\n", g_vms[i].lab_report);
         if (g_vms[i].guest_grow_target_gb)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
@@ -717,6 +721,10 @@ static void load_vm_list(void)
             wcsncpy_s(vm->disposable_snap, _countof(vm->disposable_snap), line + 15, _TRUNCATE);
         else if (wcsncmp(line, L"DisposableBranch=", 17) == 0)
             wcsncpy_s(vm->disposable_branch, _countof(vm->disposable_branch), line + 17, _TRUNCATE);
+        else if (wcsncmp(line, L"LabMode=", 8) == 0)
+            vm->lab_mode = (_wtoi(line + 8) != 0);
+        else if (wcsncmp(line, L"LabReport=", 10) == 0)
+            wcsncpy_s(vm->lab_report, _countof(vm->lab_report), line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
@@ -3514,6 +3522,10 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
         wcscpy_s(cfg.admin_pass + 20, 108, L"#7a");
         cfg.domain_member = TRUE;
     }
+    if (config->lab_mode && (_wcsicmp(cfg.os_type, L"Windows") != 0 || is_template_create)) {
+        asb_log(L"Error: a malware lab VM must be a Windows VM, not a template.");
+        return E_INVALIDARG;
+    }
 
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
@@ -3601,6 +3613,12 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);
     inst->secure_boot_off = cfg.secure_boot_off;
     inst->domain_member = cfg.domain_member;
+    if (config->lab_mode) {
+        inst->lab_mode = TRUE;
+        inst->domain_member = cfg.domain_member = FALSE;
+        asb_log(L"\"%s\" is a malware lab VM: isolated from shared drives, the domain and the clipboard. "
+                L"Its state is saved as the clean copy at its first start after setup.", cfg.name);
+    }
 
     /* Apps to install after the first sign-in (Windows VMs, not templates,
        which are sysprepped). Kept until the agent has queued them. */
@@ -4038,7 +4056,22 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         return HRESULT_FROM_WIN32(ERROR_BUSY);
     }
 
-    if (!allow_missing_shared_resources &&
+    /* Lab VM: the first start after setup saves the clean copy every later
+       start begins from (installs made before this shutdown are kept). */
+    if (inst->lab_mode && inst->install_complete && !inst->disposable_snap[0] &&
+        snap_idx == -1 && !inst->running) {
+        SnapshotTree *tree = &g_snap_trees[idx];
+        if (SUCCEEDED(snapshot_take(tree, inst, L"Lab clean state")) && tree->count > 0) {
+            SnapNode *node = &tree->nodes[tree->count - 1];
+            wcscpy_s(inst->disposable_snap, _countof(inst->disposable_snap), node->guid);
+            wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+                     node->branch_count ? node->branches[node->branch_count - 1].guid : L"");
+            asb_log(L"Lab: saved \"%s\" as its clean state; every start begins from it.", inst->name);
+            save_vm_list();
+        }
+    }
+
+    if (!inst->lab_mode && !allow_missing_shared_resources &&
         shared_resources_build_attachments(inst->os_type,
             inst->shared_resource_exclusions, inst->shared_resources,
             ASB_MAX_SHARED_RESOURCES) > 0) {
@@ -4137,9 +4170,10 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         args->config.secure_boot_off = inst->secure_boot_off;
-        args->config.domain_member = inst->domain_member;
+        args->config.domain_member = inst->domain_member && !inst->lab_mode;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
-        args->config.shared_resource_count = shared_resources_build_attachments(
+        /* Lab VMs never get shared drives (nor the appliance link with them). */
+        args->config.shared_resource_count = inst->lab_mode ? 0 : shared_resources_build_attachments(
             inst->os_type, inst->shared_resource_exclusions,
             args->config.shared_resources, ASB_MAX_SHARED_RESOURCES);
         args->config.allow_missing_shared_resources = allow_missing_shared_resources;
@@ -4622,6 +4656,183 @@ ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member)
         : L"\"%s\" is no longer managed%s; it stays joined until removed in Windows.",
         inst->name, inst->running ? L" (restart it)" : L"");
     if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* ---- Malware lab ----
+   A lab VM is isolated at start (no shared drives, domain link or
+   clipboard). An analysis run asks the guest agent to record (files,
+   registry, processes, network: lab_recorder.c) while the display window
+   saves a screenshot whenever the screen changes; stopping fetches the
+   guest's JSON report and writes report.html next to the screenshots,
+   from the web\lab-report.html template. */
+
+#define LAB_REPORTS_ROOT L"C:\\ProgramData\\AppSandbox\\LabReports"
+
+ASB_API void asb_lab_reports_dir(AsbVm vm, wchar_t *out, size_t chars)
+{
+    VmInstance *inst = vm_inst(vm);
+    swprintf_s(out, chars, L"%s\\%s", LAB_REPORTS_ROOT, inst ? inst->name : L"");
+}
+
+ASB_API HRESULT asb_lab_start(AsbVm vm, wchar_t *message, size_t message_chars)
+{
+    VmInstance *inst = vm_inst(vm);
+    wchar_t dir[MAX_PATH], shots[MAX_PATH];
+    char reply[512] = "";
+    SYSTEMTIME t;
+    if (message && message_chars) message[0] = L'\0';
+    if (!inst || !inst->lab_mode) return E_INVALIDARG;
+    if (!inst->running || !inst->agent_online) {
+        swprintf_s(message, message_chars, L"Start the lab VM and wait for Windows to finish starting first.");
+        return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    }
+    if (inst->lab_running) return S_FALSE;
+    GetLocalTime(&t);
+    asb_lab_reports_dir(vm, dir, MAX_PATH);
+    CreateDirectoryW(L"C:\\ProgramData\\AppSandbox", NULL);
+    CreateDirectoryW(LAB_REPORTS_ROOT, NULL);
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(dir + wcslen(dir), MAX_PATH - wcslen(dir), L"\\%04u%02u%02u-%02u%02u%02u",
+               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(shots, MAX_PATH, L"%s\\screenshots", dir);
+    CreateDirectoryW(shots, NULL);
+    asb_log(L"Lab: \"%s\" is taking its baseline (registry, processes, network)...", inst->name);
+    if (!vm_agent_send(inst, "lab_start", reply, sizeof(reply), 5ul * 60ul * 1000ul)) {
+        swprintf_s(message, message_chars, L"The lab VM could not start recording: %S",
+                   strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
+        return E_FAIL;
+    }
+    wcscpy_s(inst->lab_dir, MAX_PATH, dir);
+    InterlockedExchange(&inst->lab_shots, 0);
+    inst->lab_t0 = GetTickCount64();
+    InterlockedExchange(&inst->lab_running, 1);
+    asb_log(L"Lab: recording \"%s\". Run the sample now; screenshots go to %s.", inst->name, dir);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* report.json + screenshots -> report.html: the template's LAB_DATA marker
+   comment becomes the data. "</" is escaped so no string ends the script. */
+static HRESULT lab_write_html(const wchar_t *dir, const char *json, size_t json_len,
+                              const wchar_t *vm_name, wchar_t *out_path, size_t out_chars)
+{
+    wchar_t module[MAX_PATH], tpl_path[MAX_PATH], find[MAX_PATH], *slash;
+    char *tpl = NULL, *marker, name8[512];
+    FILE *f = NULL, *o = NULL;
+    long tpl_len;
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    BOOL first = TRUE;
+    size_t i;
+    GetModuleFileNameW(g_dll_module, module, MAX_PATH);
+    slash = wcsrchr(module, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(tpl_path, MAX_PATH, L"%s\\web\\lab-report.html", module);
+    if (_wfopen_s(&f, tpl_path, L"rb") != 0 || !f) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    fseek(f, 0, SEEK_END);
+    tpl_len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    tpl = (char *)malloc((size_t)tpl_len + 1);
+    if (!tpl) { fclose(f); return E_OUTOFMEMORY; }
+    tpl[fread(tpl, 1, (size_t)tpl_len, f)] = '\0';
+    fclose(f);
+    marker = strstr(tpl, "/*LAB_DATA*/");
+    swprintf_s(out_path, out_chars, L"%s\\report.html", dir);
+    if (!marker || _wfopen_s(&o, out_path, L"wb") != 0 || !o) { free(tpl); return E_FAIL; }
+    fwrite(tpl, 1, (size_t)(marker - tpl), o);
+    fputs("window.LAB_REPORT=", o);
+    for (i = 0; i < json_len; i++) {
+        if (json[i] == '<' && i + 1 < json_len && json[i + 1] == '/') fputs("<\\", o);
+        else fputc(json[i], o);
+    }
+    WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, name8, sizeof(name8), NULL, NULL);
+    fputs(";\nwindow.LAB_META={\"vm\":\"", o);
+    for (i = 0; name8[i]; i++) { if (name8[i] == '"' || name8[i] == '\\' || name8[i] == '<') fputc('\\', o); fputc(name8[i], o); }
+    fputs("\"};\nwindow.LAB_SHOTS=[", o);
+    swprintf_s(find, MAX_PATH, L"%s\\screenshots\\shot_*.jpg", dir);
+    h = FindFirstFileW(find, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            unsigned long ms = wcstoul(fd.cFileName + 5, NULL, 10);
+            fprintf(o, "%s{\"file\":\"screenshots/%S\",\"ms\":%lu}", first ? "" : ",", fd.cFileName, ms);
+            first = FALSE;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    fputs("];\n", o);
+    fputs(marker + strlen("/*LAB_DATA*/"), o);
+    fclose(o);
+    free(tpl);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_lab_stop(AsbVm vm, wchar_t *report_html, size_t report_chars,
+                             wchar_t *message, size_t message_chars)
+{
+    VmInstance *inst = vm_inst(vm);
+    char *reply, cmd[64];
+    char *json = NULL;
+    size_t total = 0, cap = 0;
+    wchar_t json_path[MAX_PATH];
+    FILE *f;
+    HRESULT hr;
+    if (message && message_chars) message[0] = L'\0';
+    if (report_html && report_chars) report_html[0] = L'\0';
+    if (!inst || !inst->lab_mode || !inst->lab_running) return S_FALSE;
+    InterlockedExchange(&inst->lab_running, 0);   /* screenshots stop here */
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    reply = (char *)malloc(ASB_DOMAIN_REPLY_MAX);
+    if (!reply) return E_OUTOFMEMORY;
+    asb_log(L"Lab: \"%s\" is building the report (diffing the registry and file journal)...", inst->name);
+    if (!vm_agent_send(inst, "lab_stop", reply, ASB_DOMAIN_REPLY_MAX, 10ul * 60ul * 1000ul)) {
+        swprintf_s(message, message_chars, L"The lab VM could not build the report: %S",
+                   strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
+        free(reply);
+        return E_FAIL;
+    }
+    for (;;) {
+        BYTE *raw;
+        DWORD raw_len = 0;
+        const char *b64;
+        sprintf_s(cmd, sizeof(cmd), "lab_chunk:%zu", total);
+        if (!vm_agent_send(inst, cmd, reply, ASB_DOMAIN_REPLY_MAX, 60000) ||
+            strncmp(reply, "ok:", 3) != 0) {
+            swprintf_s(message, message_chars, L"Fetching the report from the lab VM failed.");
+            free(reply); free(json);
+            return E_FAIL;
+        }
+        b64 = reply + 3;
+        if (!*b64) break;
+        if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, NULL, &raw_len, NULL, NULL)) break;
+        if (total + raw_len + 1 > cap) {
+            char *nj;
+            cap = (total + raw_len + 1) * 2;
+            nj = (char *)realloc(json, cap);
+            if (!nj) { free(reply); free(json); return E_OUTOFMEMORY; }
+            json = nj;
+        }
+        raw = (BYTE *)json + total;
+        if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, raw, &raw_len, NULL, NULL)) break;
+        total += raw_len;
+    }
+    free(reply);
+    if (!json) { swprintf_s(message, message_chars, L"The lab VM returned an empty report."); return E_FAIL; }
+    json[total] = '\0';
+    swprintf_s(json_path, MAX_PATH, L"%s\\report.json", inst->lab_dir);
+    if (_wfopen_s(&f, json_path, L"wb") == 0 && f) { fwrite(json, 1, total, f); fclose(f); }
+    hr = lab_write_html(inst->lab_dir, json, total, inst->name, report_html, report_chars);
+    free(json);
+    if (FAILED(hr)) {
+        swprintf_s(message, message_chars, L"The report data is saved (%s), but report.html could not be written.", json_path);
+        return hr;
+    }
+    wcscpy_s(inst->lab_report, MAX_PATH, report_html);
+    save_vm_list();
+    asb_log(L"Lab: report for \"%s\" is ready (%ld screenshots): %s",
+            inst->name, inst->lab_shots, report_html);
     if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
     return S_OK;
 }
