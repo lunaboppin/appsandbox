@@ -45,6 +45,13 @@ def main() -> None:
     assert 'wcsstr(dd.DeviceString, L"App Sandbox Virtual Display")' in guest
     assert "MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK" in guest
     assert "x += g_vdd_rect.left;" in guest
+    # ...and other monitors (e.g. a GPU-PV adapter's own output) are switched
+    # off so the AppSandbox display is the only, main one.
+    disp = read("tools/agent/appsandbox-displays.c")
+    assert 'strcmp(argv[1], "--only-appsandbox") == 0' in disp
+    assert "paths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;" in disp
+    assert "SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG" in disp
+    assert agent.count("keep_only_appsandbox_display();") == 2
 
     # Driver: one packed send per frame
     assert "static int VddPackFrame(" in vdd

@@ -1818,83 +1818,55 @@ static void ensure_hyperv_video_disabled(AsbConn *notify)
     agent_log("Hyper-V Video disable (exit=%lu): %.400s", exit_code, output);
 }
 
-/* ---- Report display monitor info to host ---- */
-
-/* Spawn appsandbox-displays.exe in the interactive session and capture its
-   stdout.  The helper prints "N,WxH,WxH,..." and exits.  We use the same
-   token-dup + SetTokenInformation pattern as spawn_input_in_session(). */
-static void report_displays(AsbConn *notify)
+/* ---- Keep the AppSandbox monitor the only one ----
+   With GPU-PV the host GPU's driver can expose a display output of its own;
+   Windows then makes that the main monitor and the AppSandbox window shows
+   the secondary one. appsandbox-displays.exe --only-appsandbox (run in the
+   console session, where display configuration applies) switches the other
+   monitors off and makes ours the main one. Cheap when nothing changes, so
+   it runs on the device-check cadence and catches a monitor that appears
+   later (e.g. after the GPU driver loads). */
+static void keep_only_appsandbox_display(void)
 {
     HANDLE cur_token = NULL, dup_token = NULL;
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
     SECURITY_ATTRIBUTES sa;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    wchar_t exe_path[MAX_PATH];
+    wchar_t exe_path[MAX_PATH], cmd[MAX_PATH + 32];
     wchar_t *slash;
-    DWORD session_id;
-    char output[512];
-    DWORD bytes_read;
-    char msg[512];
-
-    output[0] = '\0';
+    DWORD session_id, bytes_read;
+    char output[256];
+    int total = 0;
 
     session_id = WTSGetActiveConsoleSessionId();
-    if (session_id == 0xFFFFFFFF || session_id == 0) {
-        /* No interactive user session — skip display enumeration.
-           Session 0 is the services session (no desktop).
-           0xFFFFFFFF means no console session at all. */
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
-    }
+    if (session_id == 0xFFFFFFFF || session_id == 0) return;
 
-    /* Build path to appsandbox-displays.exe (same directory as agent) */
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
     slash = wcsrchr(exe_path, L'\\');
     if (slash) *(slash + 1) = L'\0';
     wcscat_s(exe_path, MAX_PATH, L"appsandbox-displays.exe");
+    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) return;
+    swprintf_s(cmd, _countof(cmd), L"\"%s\" --only-appsandbox", exe_path);
 
-    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
-        agent_log("report_displays: %ls not found.", exe_path);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
-    }
-
-    /* Create pipe for stdout capture */
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = NULL;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        agent_log("report_displays: CreatePipe failed (%lu).", GetLastError());
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
-    }
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    /* Duplicate our token and set the interactive session */
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token)) {
-        agent_log("report_displays: OpenProcessToken failed (%lu).", GetLastError());
+    /* SYSTEM token placed in the console session, as for the input helper */
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token) ||
+        !DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
+                          SecurityImpersonation, TokenPrimary, &dup_token) ||
+        !SetTokenInformation(dup_token, TokenSessionId, &session_id, sizeof(session_id))) {
+        agent_log("Displays: could not prepare the session token (%lu).", GetLastError());
+        if (cur_token) CloseHandle(cur_token);
+        if (dup_token) CloseHandle(dup_token);
         CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
-    }
-    if (!DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
-                           SecurityImpersonation, TokenPrimary, &dup_token)) {
-        agent_log("report_displays: DuplicateTokenEx failed (%lu).", GetLastError());
-        CloseHandle(cur_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
         return;
     }
     CloseHandle(cur_token);
-
-    if (!SetTokenInformation(dup_token, TokenSessionId,
-                              &session_id, sizeof(session_id))) {
-        agent_log("report_displays: SetTokenInformation(session=%lu) failed (%lu).",
-                   session_id, GetLastError());
-        CloseHandle(dup_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
-    }
 
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -1902,53 +1874,34 @@ static void report_displays(AsbConn *notify)
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
-    si.hStdInput = NULL;
     ZeroMemory(&pi, sizeof(pi));
-
-    if (!CreateProcessAsUserW(dup_token, exe_path, NULL, NULL, NULL,
-                               TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        agent_log("report_displays: CreateProcessAsUserW failed (%lu).", GetLastError());
+    if (!CreateProcessAsUserW(dup_token, NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                              NULL, NULL, &si, &pi)) {
+        agent_log("Displays: CreateProcessAsUserW failed (%lu).", GetLastError());
         CloseHandle(dup_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
         return;
     }
     CloseHandle(dup_token);
-    CloseHandle(hWritePipe);  /* Close write end so ReadFile sees EOF */
-    hWritePipe = NULL;
-
-    /* Wait for process (max 2s) then read output.
-       Timeout is normal at early boot before the desktop is ready. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
-        agent_log("report_displays: helper timed out (desktop may not be ready).");
+    CloseHandle(hWritePipe);
+    if (WaitForSingleObject(pi.hProcess, 10000) == WAIT_TIMEOUT) {
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 1000);
     }
-
-    {
-        int total = 0;
-        while (ReadFile(hReadPipe, output + total,
-                        (DWORD)(sizeof(output) - 1 - total), &bytes_read, NULL) &&
-               bytes_read > 0) {
-            total += (int)bytes_read;
-            if (total >= (int)sizeof(output) - 1) break;
-        }
-        output[total] = '\0';
-    }
-
+    while (total < (int)sizeof(output) - 1 &&
+           ReadFile(hReadPipe, output + total, (DWORD)(sizeof(output) - 1 - total),
+                    &bytes_read, NULL) && bytes_read > 0)
+        total += (int)bytes_read;
+    output[total] = '\0';
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(hReadPipe);
 
-    /* Strip trailing whitespace */
-    {
-        int len = (int)strlen(output);
-        while (len > 0 && (output[len-1] == '\r' || output[len-1] == '\n' || output[len-1] == ' '))
-            output[--len] = '\0';
+    if (strncmp(output, "applied", 7) == 0 || strncmp(output, "error", 5) == 0) {
+        agent_log("Displays: %s", output);
+        if (strncmp(output, "applied", 7) == 0)
+            agent_log_to_host("Switched off an extra monitor in the VM so the AppSandbox "
+                              "display is the only one (%s).", output);
     }
-
-    snprintf(msg, sizeof(msg), "displays:%s", output);
-    agent_log("Displays: %s", output);
-    if (notify != NULL) send_line(notify, msg);
 }
 
 /* ---- IDD connect: respawn helpers in console session ---- */
@@ -3091,6 +3044,7 @@ static void handle_client(AsbConn *client)
     /* Initial device checks */
     ensure_vdd_running();
     ensure_hyperv_video_disabled(client);
+    keep_only_appsandbox_display();
 
     last_heartbeat = GetTickCount();
     last_device_check = last_heartbeat;
@@ -3118,6 +3072,7 @@ static void handle_client(AsbConn *client)
             last_device_check = now;
             ensure_vdd_running();
             ensure_hyperv_video_disabled(client);
+            keep_only_appsandbox_display();
             report_idd_status(client, 0);   /* re-report the (possibly self-healed) VDD state; on-change only */
         }
 
