@@ -50,7 +50,12 @@ $held = $null
 try {
     # ------------------------------------------------------------ install ---
     $code = Run-Setup $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=desktopicon', "/DIR=`"$dir`"", "/LOG=`"$log`"")
-    Check 'installer exits 0' ($code -eq 0) "exit $code; log: $log"
+    Check 'installer exits 0' ($code -eq 0) "exit $code"
+    if ($code -ne 0) {
+        # Nothing below means anything without an install, and the log says why.
+        if (Test-Path $log) { Get-Content $log | Write-Host }
+        throw "Setup exited $code, so nothing was installed. Exit 1 before any log usually means this Windows is below MinVersion."
+    }
 
     foreach ($f in @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
                      'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe',

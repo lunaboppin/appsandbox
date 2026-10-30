@@ -34,7 +34,9 @@ jobs:
 
   build:
     name: Build, updater and installer (x64)
-    runs-on: windows-2022
+    # Not windows-2022: that is build 20348, below the installer's Windows 11 minimum,
+    # so Setup would refuse to run on it.
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
