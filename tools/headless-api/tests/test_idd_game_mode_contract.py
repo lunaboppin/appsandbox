@@ -40,6 +40,11 @@ def main() -> None:
     # Guest: relative moves, X buttons, horizontal wheel
     assert "inp.mi.dwFlags = MOUSEEVENTF_MOVE;" in guest
     assert "MOUSEEVENTF_XDOWN" in guest and "MOUSEEVENTF_HWHEEL" in guest
+    # Absolute moves land on the AppSandbox monitor even when another display
+    # (e.g. Hyper-V basic video) is primary or sits to its left.
+    assert 'wcsstr(dd.DeviceString, L"App Sandbox Virtual Display")' in guest
+    assert "MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK" in guest
+    assert "x += g_vdd_rect.left;" in guest
 
     # Driver: one packed send per frame
     assert "static int VddPackFrame(" in vdd
