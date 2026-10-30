@@ -6,6 +6,7 @@
  * registered through asb_set_*_callback().
  */
 
+#define _CRT_RAND_S   /* rand_s, for generated passwords */
 #include <winsock2.h>
 #include "asb_core.h"
 #include "hcs_vm.h"
@@ -568,6 +569,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"AutoOpenDisplay=1\n");
         if (g_vms[i].secure_boot_off)
             fwprintf(f, L"SecureBootOff=1\n");
+        if (g_vms[i].domain_member)
+            fwprintf(f, L"DomainMember=1\n");
         if (g_vms[i].guest_grow_target_gb)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
@@ -705,6 +708,8 @@ static void load_vm_list(void)
             vm->auto_open_display = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"SecureBootOff=", 14) == 0)
             vm->secure_boot_off = (_wtoi(line + 14) != 0);
+        else if (wcsncmp(line, L"DomainMember=", 13) == 0)
+            vm->domain_member = (_wtoi(line + 13) != 0);
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
@@ -3417,6 +3422,32 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
 
+    /* Managed: domain users sign in, so the local admin Windows setup needs
+       gets a generated password nobody has to know. */
+    if (config->domain_member) {
+        SharedApplianceStatus appliance;
+        unsigned int r;
+        int k;
+        static const wchar_t chars[] =
+            L"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+        if (_wcsicmp(cfg.os_type, L"Windows") != 0 || is_template_create) {
+            asb_log(L"Error: only Windows VMs (not templates) can be managed.");
+            return E_INVALIDARG;
+        }
+        shared_appliance_get_status(&appliance);
+        if (!appliance.domain_enabled) {
+            asb_log(L"Error: set up the domain controller (Domain) before creating managed VMs.");
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+        wcscpy_s(cfg.admin_user, 128, L"asbadmin");
+        for (k = 0; k < 20; k++) {
+            if (rand_s(&r) != 0) r = GetTickCount() * 2654435761u + (unsigned)k;
+            cfg.admin_pass[k] = chars[r % (_countof(chars) - 1)];
+        }
+        wcscpy_s(cfg.admin_pass + 20, 108, L"#7a");
+        cfg.domain_member = TRUE;
+    }
+
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
@@ -3502,6 +3533,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
        install; Manage > Secure Boot can still turn it on. */
     cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);
     inst->secure_boot_off = cfg.secure_boot_off;
+    inst->domain_member = cfg.domain_member;
 
     /* Apps to install after the first sign-in (Windows VMs, not templates,
        which are sysprepped). Kept until the agent has queued them. */
@@ -4001,6 +4033,7 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         args->config.secure_boot_off = inst->secure_boot_off;
+        args->config.domain_member = inst->domain_member;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         args->config.shared_resource_count = shared_resources_build_attachments(
             inst->os_type, inst->shared_resource_exclusions,
@@ -4477,7 +4510,7 @@ static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t ch
                 ok = FALSE;
         if (ok && len && len <= 100 && used + len + 2 < chars) {
             if (used) out[used++] = L',';
-            wmemcpy(out + used, p, len);
+            memcpy(out + used, p, len * sizeof(wchar_t));
             used += len;
             out[used] = L'\0';
         }
@@ -5239,6 +5272,19 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 { return shared_appliance_rebuild(config, switch_backend); }
 ASB_API HRESULT asb_shared_appliance_delete(void)
 { return shared_appliance_delete(); }
+ASB_API HRESULT asb_domain_setup(void)
+{ return shared_appliance_domain_setup(); }
+ASB_API HRESULT asb_domain_list(char *json, size_t chars, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_list(json, chars, message, message_chars); }
+ASB_API HRESULT asb_domain_user_set(const wchar_t *name, const wchar_t *password, BOOL enabled,
+                                    const wchar_t *groups, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_user_set(name, password, enabled, groups, message, message_chars); }
+ASB_API HRESULT asb_domain_user_delete(const wchar_t *name, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_user_delete(name, message, message_chars); }
+ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_group_add(name, message, message_chars); }
+ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_group_delete(name, message, message_chars); }
 /* ---- WireGuard VPN ---- */
 
 ASB_API int asb_vpn_config_count(void) { return vpn_configs_count(); }

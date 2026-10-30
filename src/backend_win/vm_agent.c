@@ -54,7 +54,7 @@ typedef struct AgentConn {
     volatile BOOL  cmd_pending;
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
     char           cmd[2048];
-    char           rsp[256];
+    char           rsp[ASB_DOMAIN_REPLY_MAX]; /* domain_list replies with JSON */
     DWORD          cmd_timeout_ms; /* How long the guest may take on cmd */
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
 } AgentConn;
@@ -457,7 +457,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
        cleanly. Pointer freshness is now guaranteed for the body of
        each iteration; we never stash a stale &g_vms[idx]. */
     while (!conn->stop && (vm = asb_find_vm_by_id(conn->vm_id)) != NULL) {
-        char buf[256];
+        /* A line longer than the buffer would be split and the rest read as
+           the next message; the agent's log: lines run to ~1 KB. */
+        char buf[8192];
         int n;
         BOOL nat_configured = FALSE;
         SOCKET s;
@@ -541,8 +543,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Configure the independent host-only NIC, then recreate signed global
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */
-        if (vm->shared_resource_count > 0 &&
-            _wcsicmp(vm->shared_resource_transport, L"appliance") == 0 &&
+        if (((vm->shared_resource_count > 0 &&
+              _wcsicmp(vm->shared_resource_transport, L"appliance") == 0) ||
+             vm->domain_member) &&
             vm->share_ip[0] && vm->share_host_ip[0] && vm->share_mac[0]) {
             int ri;
             wchar_t user_w[128], password_w[128];
@@ -577,6 +580,27 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             if (!configure_guest_nat(s, vm, conn, buf, sizeof(buf)))
                 goto disconnected;
             nat_configured = TRUE;
+
+            /* Managed VMs join the domain over this link. Sent every boot:
+               the guest answers "already" at once when joined, and a VM
+               rolled back to a checkpoint from before the join rejoins. */
+            if (vm->domain_member) {
+                char join_cmd[1024];
+                if (shared_appliance_domain_join_command(vm->share_host_ip,
+                                                         join_cmd, sizeof(join_cmd))) {
+                    n = send_tagged_cmd(s, vm, &conn->cmd_seq, join_cmd, buf, sizeof(buf), 300000);
+                    SecureZeroMemory(join_cmd, sizeof(join_cmd));
+                    if (n <= 0) goto disconnected;
+                    if (strcmp(buf, "ok:joined") == 0)
+                        ui_log(L"\"%s\" joined the %S domain and restarts to finish.",
+                               vm->name, ASB_DOMAIN_NETBIOS);
+                    else if (strcmp(buf, "ok:already") != 0)
+                        ui_log(L"Joining \"%s\" to the domain failed (%S).", vm->name, buf);
+                } else {
+                    ui_log(L"\"%s\" is managed, but the shared appliance is not a domain controller.",
+                           vm->name);
+                }
+            }
 
             cred_hr = shared_appliance_get_smb_credentials(
                 user_w, _countof(user_w), password_w, _countof(password_w))
@@ -850,7 +874,8 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     BOOL redact = command &&
         (strncmp(command, "appliance_account:", 18) == 0 ||
          strncmp(command, "shared_smb_map:", 15) == 0 ||
-         strncmp(command, "vpn_set:", 8) == 0);
+         strncmp(command, "vpn_set:", 8) == 0 ||
+         strncmp(command, "domain_", 7) == 0);
 
     if (!conn || !instance->agent_online) {
         ui_log(L"Agent: not connected to \"%s\"", instance->name);
@@ -891,7 +916,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
 
     ok = (strcmp(conn->rsp, "ok") == 0 || strncmp(conn->rsp, "ok:", 3) == 0);
-    if (redact) ui_log(L"Agent: credential-bearing command -> %S", conn->rsp);
+    if (redact) ui_log(L"Agent: credential-bearing command -> %.120S", conn->rsp);
     else ui_log(L"Agent: %S -> %S", command, conn->rsp);
     return ok;
 }

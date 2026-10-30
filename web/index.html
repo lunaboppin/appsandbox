@@ -15,6 +15,7 @@
         <h2>Sandboxes</h2>
         <div class="header-actions">
             <button class="win-host-only" onclick="openSettingsModal()" title="Open the shared appliance and shared resource settings.">Shared Resources</button>
+            <button class="win-host-only" onclick="openDomainModal()" title="Manage the users and groups of the AppSandbox domain (Windows Server Core appliance).">Domain</button>
             <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
         </div>
     </div>
@@ -154,14 +155,23 @@
                 <select id="vpn-config" onchange="updateCreateButtons()" title="WireGuard config this VM's traffic is routed through. Add configs in Settings."></select>
             </div>
 
-            <label>Username:</label>
-            <div class="cred-row">
+            <label class="win-only">Account:</label>
+            <div class="form-row win-only">
+                <select id="account-mode" onchange="applyAccountModeUI()">
+                    <option value="local" selected>Local user</option>
+                    <option value="managed">Managed (domain users)</option>
+                </select>
+                <span class="host-info" id="account-mode-info"></span>
+            </div>
+
+            <label class="local-account">Username:</label>
+            <div class="cred-row local-account">
                 <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" spellcheck="false">
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
-            <label>Password:</label>
-            <div class="cred-row">
+            <label class="local-account">Password:</label>
+            <div class="cred-row local-account">
                 <input type="password" id="admin-pass" value="test123">
                 <label>Confirm:</label>
                 <input type="password" id="admin-confirm" value="test123">
@@ -273,6 +283,45 @@
     </div>
 </div>
 
+<!-- AppSandbox domain: users and groups on the Server Core appliance -->
+<div class="modal-overlay win-host-only" id="domain-overlay">
+    <div class="modal manage-modal">
+        <h3>AppSandbox Domain</h3>
+        <p id="domain-status">Loading...</p>
+        <div class="modal-buttons" id="domain-setup-row" style="justify-content:flex-start">
+            <button type="button" class="primary" id="btn-domain-setup" onclick="setupDomain()" title="Install Active Directory on the Windows Server Core appliance and make it the domain controller.">Set Up Domain Controller</button>
+        </div>
+        <div id="domain-manage">
+            <fieldset>
+                <legend>Users</legend>
+                <div id="domain-user-list" class="settings-resource-list"></div>
+                <div class="form-grid resource-editor">
+                    <label for="domain-user-name">User name:</label><input id="domain-user-name" maxlength="20" spellcheck="false" autocomplete="off">
+                    <label for="domain-user-pass">Password:</label><input id="domain-user-pass" type="password" autocomplete="new-password">
+                    <label>Groups:</label><div id="domain-user-groups" class="app-check-grid"></div>
+                    <label></label><label class="manage-check" style="text-align:left"><input type="checkbox" id="domain-user-enabled" checked> Enabled</label>
+                </div>
+                <div class="modal-buttons">
+                    <button type="button" onclick="clearDomainUser()">New</button>
+                    <button type="button" class="primary" id="btn-domain-user-save" onclick="saveDomainUser()">Add User</button>
+                </div>
+            </fieldset>
+            <fieldset>
+                <legend>Groups</legend>
+                <div id="domain-group-list" class="settings-resource-list"></div>
+                <div class="manage-row">
+                    <input id="domain-group-name" maxlength="64" placeholder="New group name" spellcheck="false">
+                    <button type="button" onclick="addDomainGroup()">Add Group</button>
+                </div>
+            </fieldset>
+        </div>
+        <div class="modal-buttons">
+            <button type="button" onclick="refreshDomain()">Refresh</button>
+            <button type="button" onclick="closeDomainModal()">Close</button>
+        </div>
+    </div>
+</div>
+
 <!-- Application settings: hidden shared-storage appliance -->
 <div class="modal-overlay win-host-only" id="settings-overlay">
     <div class="modal manage-modal">
@@ -281,7 +330,7 @@
             <p id="appliance-status">Not configured</p>
             <div class="form-grid resource-editor">
                 <label for="appliance-backend">Backend:</label>
-                <select id="appliance-backend"><option value="ubuntu">Ubuntu 24.04 LTS / Samba</option><option value="server_core">Windows Server Core</option></select>
+                <select id="appliance-backend" onchange="applyApplianceBackendUI()"><option value="ubuntu">Ubuntu 24.04 LTS / Samba</option><option value="server_core">Windows Server Core</option></select>
                 <label for="appliance-storage-parent">Storage parent:</label>
                 <div class="manage-row"><input id="appliance-storage-parent"><button type="button" onclick="sendCmd('browseApplianceStorage')" title="Choose the parent folder where the shared appliance files are stored.">Browse...</button></div>
                 <label for="appliance-data-size">Data disk (GB):</label><input id="appliance-data-size" type="number" min="8" value="256">
@@ -299,6 +348,8 @@
                     <option value="Windows Server 2019 Datacenter"></option>
                 </datalist>
                 <label for="appliance-product-key">Optional product key:</label><input id="appliance-product-key" type="password" autocomplete="off">
+                <label for="appliance-domain" class="appliance-domain-row">Domain:</label>
+                <label class="manage-check appliance-domain-row" style="text-align:left" title="Server Core only. Makes the appliance the domain controller of the AppSandbox domain (no password rules). New VMs can then use managed domain accounts. Off: the appliance works as it does today."><input type="checkbox" id="appliance-domain"> Make the appliance a domain controller (managed VM accounts)</label>
             </div>
             <div class="modal-buttons">
                 <button type="button" onclick="startSharedAppliance()" title="Start the shared appliance VM.">Start</button><button type="button" onclick="stopSharedAppliance()" title="Stop the shared appliance VM.">Stop</button>

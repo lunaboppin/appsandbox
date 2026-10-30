@@ -69,6 +69,7 @@ static VmDisplay *g_appliance_display = NULL;
 #define WM_PREREQ_DONE        (WM_APP + 17)
 #define WM_VM_MANAGE_DONE     (WM_APP + 19)
 #define WM_HOST_RESOURCE_DONE (WM_APP + 20)
+#define WM_DOMAIN_DONE        (WM_APP + 21)
 
 #define MANAGE_OP_MOVE_STORAGE 1
 #define MANAGE_OP_RESIZE_DISK  2
@@ -257,6 +258,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"vhdxPath", v->vhdx_path);
     jb_bool(jb, L"autoOpenDisplay", v->auto_open_display);
     jb_bool(jb, L"secureBoot", !v->secure_boot_off);
+    jb_bool(jb, L"domainMember", v->domain_member);
     jb_bool(jb, L"managementBusy", asb_vm_management_busy(asb_vm_get(i)));
     jb_int(jb, L"guestGrowTargetGb", (int)v->guest_grow_target_gb);
     jb_string(jb, L"sharedResourceExclusions", v->shared_resource_exclusions);
@@ -647,6 +649,9 @@ static void send_full_state(void)
         jb_string(&jb, L"dataVhdxPath", s.data_vhdx_path);
         jb_string(&jb, L"progressText", s.progress_text);
         jb_string(&jb, L"lastError", s.last_error);
+        jb_bool(&jb, L"domainEnabled", s.domain_enabled);
+        jb_bool(&jb, L"domainBusy", s.domain_busy);
+        jb_string(&jb, L"domainName", L"" ASB_DOMAIN_FQDN);
         jb_object_end(&jb);
     }
 
@@ -1082,6 +1087,79 @@ static void start_manage_work(int vm_index, int operation,
     CloseHandle(thread);
 }
 
+/* Domain management talks to the appliance, which may have to start first
+   (and setting the domain up takes many minutes), so it runs on a worker and
+   finishes on the UI thread with a domainResult message. */
+typedef struct {
+    wchar_t action[32];
+    wchar_t name[80];
+    wchar_t password[256];
+    wchar_t groups[1024];
+    BOOL set_password;
+    BOOL enabled;
+    HRESULT result;
+    wchar_t message[512];
+    char *json;                 /* domainList reply */
+} DomainWork;
+
+static DWORD WINAPI domain_work_thread(LPVOID param)
+{
+    DomainWork *w = (DomainWork *)param;
+    if (wcscmp(w->action, L"domainSetup") == 0) {
+        w->result = asb_domain_setup();
+    } else if (wcscmp(w->action, L"domainList") == 0) {
+        w->json = (char *)malloc(ASB_DOMAIN_JSON_MAX);
+        w->result = w->json
+            ? asb_domain_list(w->json, ASB_DOMAIN_JSON_MAX, w->message, _countof(w->message))
+            : E_OUTOFMEMORY;
+    } else if (wcscmp(w->action, L"domainUserSet") == 0) {
+        w->result = asb_domain_user_set(w->name, w->set_password ? w->password : NULL,
+                                        w->enabled, w->groups, w->message, _countof(w->message));
+    } else if (wcscmp(w->action, L"domainUserDelete") == 0) {
+        w->result = asb_domain_user_delete(w->name, w->message, _countof(w->message));
+    } else if (wcscmp(w->action, L"domainGroupAdd") == 0) {
+        w->result = asb_domain_group_add(w->name, w->message, _countof(w->message));
+    } else if (wcscmp(w->action, L"domainGroupDelete") == 0) {
+        w->result = asb_domain_group_delete(w->name, w->message, _countof(w->message));
+    } else {
+        w->result = E_INVALIDARG;
+    }
+    SecureZeroMemory(w->password, sizeof(w->password));
+    if (!PostMessageW(g_hwnd_main, WM_DOMAIN_DONE, 0, (LPARAM)w)) {
+        free(w->json);
+        free(w);
+    }
+    return 0;
+}
+
+static void finish_domain_work(DomainWork *w)
+{
+    size_t json_len = w->json ? strlen(w->json) : 0;
+    size_t chars = 2048 + json_len * 2;   /* escaping at most doubles it */
+    wchar_t *out = (wchar_t *)malloc(chars * sizeof(wchar_t)), *data = NULL;
+    JsonBuilder jb;
+    if (!out) return;
+    if (FAILED(w->result) && !w->message[0])
+        format_hresult_message(w->result, w->message, _countof(w->message));
+    jb_init(&jb, out, chars);
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"domainResult");
+    jb_string(&jb, L"action", w->action);
+    jb_bool(&jb, L"success", SUCCEEDED(w->result));
+    if (FAILED(w->result)) jb_string(&jb, L"message", w->message);
+    if (SUCCEEDED(w->result) && json_len) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, w->json, -1, NULL, 0);
+        data = n > 0 ? (wchar_t *)malloc((size_t)n * sizeof(wchar_t)) : NULL;
+        if (data && MultiByteToWideChar(CP_UTF8, 0, w->json, -1, data, n) > 0)
+            jb_string(&jb, L"data", data);
+    }
+    jb_object_end(&jb);
+    webview2_post(out);
+    free(data);
+    free(out);
+    send_full_state();
+}
+
 /* Mount, open, unmount and purge can start the appliance and wait minutes
    for it, so they run on a worker and finish on the UI thread. */
 typedef struct {
@@ -1175,6 +1253,7 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t adapter_buf[256] = {0}, storage_buf[MAX_PATH] = {0}, exclusions_buf[1024] = {0};
         wchar_t vpn_buf[ASB_VPN_ID_CHARS] = {0};
         wchar_t apps_buf[1024] = {0};
+        wchar_t account_buf[16] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -1189,6 +1268,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"sharedResourceExclusions", exclusions_buf, _countof(exclusions_buf));
         json_get_string(json, L"vpnId", vpn_buf, _countof(vpn_buf));
         json_get_string(json, L"preinstallApps", apps_buf, _countof(apps_buf));
+        json_get_string(json, L"accountMode", account_buf, _countof(account_buf));
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -1203,6 +1283,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.shared_resource_exclusions = exclusions_buf;
         cfg.vpn_id = vpn_buf;
         cfg.preinstall_apps = apps_buf;
+        cfg.domain_member = !is_tpl && _wcsicmp(account_buf, L"managed") == 0;
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
@@ -1537,6 +1618,7 @@ static void on_webview2_message(const wchar_t *json)
             json_get_string(json, L"windowsIsoPath", config.windows_iso_path, _countof(config.windows_iso_path));
             json_get_string(json, L"windowsImageName", config.windows_image_name, _countof(config.windows_image_name));
             json_get_string(json, L"productKey", config.product_key, _countof(config.product_key));
+            json_get_bool(json, L"enableDomain", &config.enable_domain);
             config.data_size_gb = 256;
             if (json_get_int(json, L"dataSizeGb", &value)) config.data_size_gb = (DWORD)value;
             if (json_get_int(json, L"ramMb", &value)) config.ram_mb = (DWORD)value;
@@ -1556,6 +1638,26 @@ static void on_webview2_message(const wchar_t *json)
           if (FAILED(hr)) jb_string(&sj,L"message",message);
           jb_object_end(&sj);webview2_post(out); }
         send_full_state();
+    } else if (wcsncmp(action, L"domain", 6) == 0) {
+        DomainWork *work = (DomainWork *)calloc(1, sizeof(*work));
+        HANDLE thread = NULL;
+        if (work) {
+            wcscpy_s(work->action, _countof(work->action), action);
+            json_get_string(json, L"name", work->name, _countof(work->name));
+            json_get_string(json, L"password", work->password, _countof(work->password));
+            json_get_string(json, L"groups", work->groups, _countof(work->groups));
+            json_get_bool(json, L"setPassword", &work->set_password);
+            work->enabled = TRUE;
+            json_get_bool(json, L"enabled", &work->enabled);
+            thread = CreateThread(NULL, 0, domain_work_thread, work, 0, NULL);
+            if (!thread) {
+                work->result = HRESULT_FROM_WIN32(GetLastError());
+                SecureZeroMemory(work->password, sizeof(work->password));
+                finish_domain_work(work);
+                free(work);
+            }
+        }
+        if (thread) CloseHandle(thread);
     } else if (wcscmp(action, L"openSharedApplianceTerminal") == 0) {
         HRESULT hr = asb_shared_appliance_open_terminal();
         if (FAILED(hr)) send_manage_result(0, hr);
@@ -1882,6 +1984,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_DOMAIN_DONE:
+    {
+        DomainWork *work = (DomainWork *)lp;
+        if (work) {
+            finish_domain_work(work);
+            free(work->json);
+            free(work);
+        }
+        return 0;
+    }
     case WM_HOST_RESOURCE_DONE:
     {
         HostResourceWork *work = (HostResourceWork *)lp;

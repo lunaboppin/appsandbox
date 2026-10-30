@@ -69,6 +69,7 @@ typedef struct {
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *vpn_id;         /* WireGuard config for ASB_NET_VPN */
     const wchar_t *preinstall_apps; /* Windows: comma-separated winget IDs installed after first sign-in */
+    BOOL   domain_member;          /* Windows: managed account, joins the AppSandbox domain */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -285,6 +286,15 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 /* Stop the appliance and delete its disks, data and saved config (unconfigured
    afterwards). ERROR_BUSY while clients or host mounts use it. */
 ASB_API HRESULT asb_shared_appliance_delete(void);
+/* AppSandbox domain on the Server Core appliance (see shared_appliance.h). */
+#define ASB_DOMAIN_JSON_MAX ASB_DOMAIN_REPLY_MAX
+ASB_API HRESULT asb_domain_setup(void);
+ASB_API HRESULT asb_domain_list(char *json, size_t chars, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_user_set(const wchar_t *name, const wchar_t *password, BOOL enabled,
+                                    const wchar_t *groups, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_user_delete(const wchar_t *name, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars);
 /* ---- WireGuard VPN configs ---- */
 ASB_API int asb_vpn_config_count(void);
 ASB_API BOOL asb_vpn_config_get(int index, AsbVpnConfigInfo *out);

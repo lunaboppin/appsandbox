@@ -1910,9 +1910,13 @@ static void keep_only_appsandbox_display(void)
 static void send_reply(AsbConn *s, const char *tag, const char *msg)
 {
     if (tag[0]) {
-        char rb[512];
-        sprintf_s(rb, sizeof(rb), "%s%s", tag, msg);
+        /* Sized to the reply: domain_list returns kilobytes of JSON. */
+        size_t size = strlen(tag) + strlen(msg) + 1;
+        char *rb = (char *)malloc(size);
+        if (!rb) return;
+        sprintf_s(rb, size, "%s%s", tag, msg);
         send_line(s, rb);
+        free(rb);
     } else {
         send_line(s, msg);
     }
@@ -2082,6 +2086,270 @@ static int run_agent_powershell(const wchar_t *script_path, DWORD timeout_ms)
         TerminateProcess(pi.hProcess, ERROR_TIMEOUT); ec = ERROR_TIMEOUT;
     } else if (!GetExitCodeProcess(pi.hProcess, &ec)) ec = GetLastError();
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return (int)ec;
+}
+
+/* ---- AppSandbox domain ----
+   On the Server Core appliance: promote it to the domain controller and
+   manage its users and groups. On a managed client VM: join the domain.
+   Arguments arrive ':'-separated (passwords and group names base64) and
+   reach the scripts only through ASB_DOM_* environment variables. Each
+   script prints "result:<text>" (or "json:<text>" for the list). */
+#define DOMAIN_OUT_MAX 32768
+
+static BOOL domain_field_ok(const char *v, const char *extra, size_t max_len)
+{
+    size_t n = strlen(v), i;
+    if (n > max_len) return FALSE;
+    for (i = 0; i < n; i++)
+        if (!isalnum((unsigned char)v[i]) && !strchr(extra, v[i])) return FALSE;
+    return TRUE;
+}
+
+/* Split "a:b::c" in place, keeping empty fields. */
+static int domain_split(char *s, char **fields, int max)
+{
+    int n = 0;
+    fields[n++] = s;
+    for (; *s && n < max; s++)
+        if (*s == ':') { *s = '\0'; fields[n++] = s + 1; }
+    return n;
+}
+
+static const char DOMAIN_PROMOTE_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " if((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4){ Write-Output 'result:already'; exit 0 }\r\n"
+        " $pw=AsbText $env:ASB_DOM_PW\r\n"
+        " Install-WindowsFeature AD-Domain-Services -IncludeManagementTools | Out-Null\r\n"
+        " # The built-in Administrator becomes the domain's; it needs a password and to be enabled.\r\n"
+        " $adm=Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1\r\n"
+        " $a=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/'+$adm.Name+',user'); $a.SetPassword($pw); $a.UserFlags.Value=([int]$a.UserFlags.Value -band (-bnot 0x2)); $a.SetInfo()\r\n"
+        " Import-Module ADDSDeployment\r\n"
+        " $s=ConvertTo-SecureString $pw -AsPlainText -Force\r\n"
+        " Install-ADDSForest -DomainName $env:ASB_DOM_FQDN -DomainNetbiosName $env:ASB_DOM_NB -SafeModeAdministratorPassword $s -InstallDns -NoRebootOnCompletion -Force -WarningAction SilentlyContinue | Out-Null\r\n"
+        " Write-Output 'result:promoted'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_FINISH_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $pw=AsbText $env:ASB_DOM_PW\r\n"
+        " $d=$null\r\n"
+        " for($i=0;$i -lt 90 -and -not $d;$i++){ try{ $d=Get-ADDomain }catch{ Start-Sleep -Seconds 10 } }\r\n"
+        " if(-not $d){ throw 'Active Directory did not start.' }\r\n"
+        " # Any password is acceptable: no complexity, length, history, expiry or lockout.\r\n"
+        " Set-ADDefaultDomainPasswordPolicy -Identity $d.DistinguishedName -ComplexityEnabled $false -MinPasswordLength 0 -PasswordHistoryCount 0 -MinPasswordAge 0 -MaxPasswordAge 0 -LockoutThreshold 0\r\n"
+        " $n=$env:ASB_DOM_USER\r\n"
+        " $sec=ConvertTo-SecureString $pw -AsPlainText -Force\r\n"
+        " $u=Get-ADUser -Filter 'SamAccountName -eq $n'\r\n"
+        " if(-not $u){ New-ADUser -Name $n -SamAccountName $n -UserPrincipalName ($n+'@'+$d.DNSRoot) -AccountPassword $sec -Enabled $true -PasswordNeverExpires $true }\r\n"
+        " else{ Set-ADAccountPassword -Identity $u -Reset -NewPassword $sec; Enable-ADAccount -Identity $u }\r\n"
+        " Add-ADGroupMember -Identity 'Domain Admins' -Members $n\r\n"
+        " # Clients reach DNS, Kerberos, LDAP and the rest only over the private share network.\r\n"
+        " $net=($env:ASB_MANAGEMENT_HOST -replace '\\.\\d+$','.0')+'/24'\r\n"
+        " Get-NetFirewallRule -DisplayName 'AppSandbox Domain' -ErrorAction SilentlyContinue | Remove-NetFirewallRule\r\n"
+        " New-NetFirewallRule -DisplayName 'AppSandbox Domain' -Direction Inbound -Action Allow -RemoteAddress $net -Profile Any | Out-Null\r\n"
+        " Write-Output 'result:ready'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_LIST_PS[] =
+        "function AsbRid($g){ [int]($g.SID.Value.Split('-')[-1]) }\r\n"
+        "function AsbManageable($g){ (AsbRid $g) -ge 1000 -or $g.Name -eq 'Domain Admins' }\r\n"
+        "function AsbSystemGroup($g){ (AsbRid $g) -lt 1000 -or @('DnsAdmins','DnsUpdateProxy') -contains $g.Name }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $hide=@('krbtgt','Guest','DefaultAccount','AppSandboxShare')\r\n"
+        " $users=@(Get-ADUser -Filter * -Properties MemberOf | Where-Object { $hide -notcontains $_.SamAccountName } | Sort-Object SamAccountName | ForEach-Object { [ordered]@{ name=$_.SamAccountName; enabled=[bool]$_.Enabled; groups=@($_.MemberOf | ForEach-Object { (($_ -split ',')[0]).Substring(3) }) } })\r\n"
+        " $groups=@(Get-ADGroup -Filter * | Where-Object { AsbManageable $_ } | Sort-Object Name | ForEach-Object { [ordered]@{ name=$_.Name; system=[bool](AsbSystemGroup $_) } })\r\n"
+        " Write-Output ('json:' + (ConvertTo-Json -InputObject ([ordered]@{ users=$users; groups=$groups }) -Depth 4 -Compress))\r\n"
+        " exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_USER_SET_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "function AsbRid($g){ [int]($g.SID.Value.Split('-')[-1]) }\r\n"
+        "function AsbManageable($g){ (AsbRid $g) -ge 1000 -or $g.Name -eq 'Domain Admins' }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $n=$env:ASB_DOM_USER\r\n"
+        " $d=Get-ADDomain\r\n"
+        " $sec=$null\r\n"
+        " if($env:ASB_DOM_PWSET -eq '1'){ $pw=AsbText $env:ASB_DOM_PW; if($pw.Length){ $sec=ConvertTo-SecureString $pw -AsPlainText -Force } else { $sec=New-Object Security.SecureString } }\r\n"
+        " $u=Get-ADUser -Filter 'SamAccountName -eq $n'\r\n"
+        " if(-not $u){\r\n"
+        "  if($null -eq $sec){ throw 'A new user needs a password (it can be empty).' }\r\n"
+        "  New-ADUser -Name $n -SamAccountName $n -UserPrincipalName ($n+'@'+$d.DNSRoot) -AccountPassword $sec -Enabled $true -PasswordNeverExpires $true\r\n"
+        "  $u=Get-ADUser -Filter 'SamAccountName -eq $n'\r\n"
+        " } elseif($null -ne $sec){ Set-ADAccountPassword -Identity $u -Reset -NewPassword $sec }\r\n"
+        " if($env:ASB_DOM_ENABLED -eq '1'){ Enable-ADAccount -Identity $u } else { Disable-ADAccount -Identity $u }\r\n"
+        " $want=@((AsbText $env:ASB_DOM_GROUPS) -split ',' | Where-Object { $_ })\r\n"
+        " $have=@((Get-ADUser -Identity $u -Properties MemberOf).MemberOf | ForEach-Object { (($_ -split ',')[0]).Substring(3) })\r\n"
+        " foreach($g in @(Get-ADGroup -Filter * | Where-Object { AsbManageable $_ })){\r\n"
+        "  $in=$have -contains $g.Name; $should=$want -contains $g.Name\r\n"
+        "  if($should -and -not $in){ Add-ADGroupMember -Identity $g -Members $u }\r\n"
+        "  elseif($in -and -not $should){ Remove-ADGroupMember -Identity $g -Members $u -Confirm:$false }\r\n"
+        " }\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_USER_DELETE_PS[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " Remove-ADUser -Identity $env:ASB_DOM_USER -Confirm:$false\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_GROUP_ADD_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $g=AsbText $env:ASB_DOM_GROUP\r\n"
+        " New-ADGroup -Name $g -SamAccountName $g -GroupScope Global -GroupCategory Security\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_GROUP_DELETE_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "function AsbRid($g){ [int]($g.SID.Value.Split('-')[-1]) }\r\n"
+        "function AsbSystemGroup($g){ (AsbRid $g) -lt 1000 -or @('DnsAdmins','DnsUpdateProxy') -contains $g.Name }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $g=Get-ADGroup -Identity (AsbText $env:ASB_DOM_GROUP)\r\n"
+        " if(AsbSystemGroup $g){ throw 'Built-in groups cannot be deleted.' }\r\n"
+        " Remove-ADGroup -Identity $g -Confirm:$false\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_JOIN_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $cs=Get-CimInstance Win32_ComputerSystem\r\n"
+        " $dc=$env:ASB_DOM_DC\r\n"
+        " $prefix=($dc -replace '\\.\\d+$','.')\r\n"
+        " $a=Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress.StartsWith($prefix) } | Select-Object -First 1\r\n"
+        " if(-not $a){ throw 'This VM has no network link to the domain controller.' }\r\n"
+        " # The share adapter's DNS is reset on every boot; point it, and the domain's names, at the DC.\r\n"
+        " Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses $dc\r\n"
+        " Get-DnsClientNrptRule | Where-Object { $_.Namespace -contains $env:ASB_DOM_FQDN } | ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force }\r\n"
+        " Add-DnsClientNrptRule -Namespace ('.'+$env:ASB_DOM_FQDN),$env:ASB_DOM_FQDN -NameServers $dc | Out-Null\r\n"
+        " Clear-DnsClientCache\r\n"
+        " if($cs.PartOfDomain -and $cs.Domain -eq $env:ASB_DOM_FQDN){ Write-Output 'result:already'; exit 0 }\r\n"
+        " $cred=New-Object System.Management.Automation.PSCredential($env:ASB_DOM_USER,(ConvertTo-SecureString (AsbText $env:ASB_DOM_PW) -AsPlainText -Force))\r\n"
+        " $last='not attempted'\r\n"
+        " for($i=0;$i -lt 12;$i++){ try{ Add-Computer -DomainName $env:ASB_DOM_FQDN -Credential $cred -Force -ErrorAction Stop; $last=$null; break }catch{ $last=$_.Exception.Message; Start-Sleep -Seconds 10 } }\r\n"
+        " if($last){ throw $last }\r\n"
+        " # Domain users administer their sandbox, as the local user does on a local VM.\r\n"
+        " try{ $g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); $g.Add('WinNT://'+$env:ASB_DOM_NB+'/Domain Users') }catch{}\r\n"
+        " Write-Output 'result:joined'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+
+static const char *const DOMAIN_ENV[] = {
+    "ASB_DOM_NB", "ASB_DOM_FQDN", "ASB_DOM_PW", "ASB_DOM_USER", "ASB_DOM_PWSET",
+    "ASB_DOM_ENABLED", "ASB_DOM_GROUPS", "ASB_DOM_GROUP", "ASB_DOM_DC",
+    "ASB_MANAGEMENT_HOST", NULL
+};
+
+/* Run a domain script; reply gets "ok", "ok:<data>" or "error:<message>". */
+static void run_domain_script(const char *script, DWORD timeout_ms,
+                              char *reply, size_t reply_size)
+{
+    wchar_t path[MAX_PATH];
+    char *out = (char *)malloc(DOMAIN_OUT_MAX), *line, *next, *result = NULL, *json = NULL;
+    int ec, i;
+    if (!out) { strcpy_s(reply, reply_size, "error:out of memory"); return; }
+    out[0] = '\0';
+    swprintf_s(path, MAX_PATH, L"C:\\ProgramData\\AppSandbox\\domain-%lu.ps1", GetCurrentThreadId());
+    ec = write_agent_script(path, script);
+    if (!ec) ec = run_agent_powershell_out(path, timeout_ms, out, DOMAIN_OUT_MAX);
+    DeleteFileW(path);
+    for (i = 0; DOMAIN_ENV[i]; i++) SetEnvironmentVariableA(DOMAIN_ENV[i], NULL);
+    for (line = out; line && *line; line = next) {
+        next = strpbrk(line, "\r\n");
+        if (next) { *next++ = '\0'; while (*next == '\r' || *next == '\n') next++; }
+        if (strncmp(line, "result:", 7) == 0) result = line + 7;
+        else if (strncmp(line, "json:", 5) == 0) json = line + 5;
+    }
+    if (ec == 0 && json) sprintf_s(reply, reply_size, "ok:%s", json);
+    else if (ec == 0 && result && (strcmp(result, "ok") == 0 || strcmp(result, "ready") == 0))
+        strcpy_s(reply, reply_size, "ok");
+    else if (ec == 0 && result) sprintf_s(reply, reply_size, "ok:%s", result);
+    else sprintf_s(reply, reply_size, "error:%.400s", result ? result : "the script failed to run");
+    agent_log("Domain: %.200s", strncmp(reply, "ok:{", 4) == 0 ? "list" : reply);
+    SecureZeroMemory(out, DOMAIN_OUT_MAX);
+    free(out);
+}
+
+static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
+{
+    char *f[8];
+    int n;
+    if (strcmp(cmd, "domain_list") == 0) {
+        run_domain_script(DOMAIN_LIST_PS, 120000, reply, reply_size);
+        return;
+    }
+    if (strncmp(cmd, "domain_promote:", 15) == 0) {
+        n = domain_split(cmd + 15, f, 8);       /* NB, FQDN, pw */
+        if (n != 3 || !domain_field_ok(f[0], "-", 15) || !domain_field_ok(f[1], ".-", 200) ||
+            !domain_field_ok(f[2], "+/=", 600)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_NB", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_FQDN", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[2]);
+        run_domain_script(DOMAIN_PROMOTE_PS, 45 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_finish:", 14) == 0) {
+        n = domain_split(cmd + 14, f, 8);       /* user, pw */
+        if (n != 2 || !domain_field_ok(f[0], "._-", 20) || !domain_field_ok(f[1], "+/=", 600))
+            goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[1]);
+        SetEnvironmentVariableW(L"ASB_MANAGEMENT_HOST", g_shared_management_ip);
+        run_domain_script(DOMAIN_FINISH_PS, 20 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_user_set:", 16) == 0) {
+        n = domain_split(cmd + 16, f, 8);       /* user, pwset, pw, enabled, groups */
+        if (n != 5 || !domain_field_ok(f[0], "._-", 20) || !domain_field_ok(f[1], "", 1) ||
+            !domain_field_ok(f[2], "+/=", 600) || !domain_field_ok(f[3], "", 1) ||
+            !domain_field_ok(f[4], "+/=", 1500)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_PWSET", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[2]);
+        SetEnvironmentVariableA("ASB_DOM_ENABLED", f[3]);
+        SetEnvironmentVariableA("ASB_DOM_GROUPS", f[4]);
+        run_domain_script(DOMAIN_USER_SET_PS, 120000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_user_delete:", 19) == 0) {
+        if (!*(cmd + 19) || !domain_field_ok(cmd + 19, "._-", 20)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", cmd + 19);
+        run_domain_script(DOMAIN_USER_DELETE_PS, 60000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_group_add:", 17) == 0 ||
+               strncmp(cmd, "domain_group_delete:", 20) == 0) {
+        BOOL add = cmd[13] == 'a';
+        char *arg = cmd + (add ? 17 : 20);
+        if (!*arg || !domain_field_ok(arg, "+/=", 200)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_GROUP", arg);
+        run_domain_script(add ? DOMAIN_GROUP_ADD_PS : DOMAIN_GROUP_DELETE_PS, 60000,
+                          reply, reply_size);
+    } else if (strncmp(cmd, "domain_join:", 12) == 0) {
+        n = domain_split(cmd + 12, f, 8);       /* FQDN, NB, dc, NB\user, pw */
+        if (n != 5 || !domain_field_ok(f[0], ".-", 200) || !domain_field_ok(f[1], "-", 15) ||
+            !domain_field_ok(f[2], ".", 15) || !domain_field_ok(f[3], "\\._-", 40) ||
+            !domain_field_ok(f[4], "+/=", 600)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_FQDN", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_NB", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_DC", f[2]);
+        SetEnvironmentVariableA("ASB_DOM_USER", f[3]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[4]);
+        run_domain_script(DOMAIN_JOIN_PS, 5 * 60 * 1000, reply, reply_size);
+        if (strcmp(reply, "ok:joined") == 0) {
+            /* The join takes effect at the next boot. */
+            STARTUPINFOW si = { sizeof(si) };
+            PROCESS_INFORMATION pi;
+            wchar_t restart[] = L"shutdown.exe /r /t 15 /c \"Joining the AppSandbox domain\"";
+            if (CreateProcessW(NULL, restart, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                               NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
+    } else {
+        strcpy_s(reply, reply_size, "error:unknown");
+    }
+    return;
+invalid:
+    strcpy_s(reply, reply_size, "error:invalid arguments");
 }
 
 /* ---- VB-CABLE fallback audio device ----
@@ -2569,7 +2837,9 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         "$last=''\r\n"
         "$h=($remote -split '\\\\')[2]\r\n"
         "$secure=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force\r\n"
-        "$cred=[System.Management.Automation.PSCredential]::new(($h+'\\'+$env:ASB_SMB_USER),$secure)\r\n"
+        "$u=$env:ASB_SMB_USER\r\n"
+        "if(-not $u.Contains('\\')){$u=$h+'\\'+$u}\r\n"
+        "$cred=[System.Management.Automation.PSCredential]::new($u,$secure)\r\n"
         "$code=1\r\n"
         "for($attempt=0;$attempt -lt 8;$attempt++){\r\n"
         " try{\r\n"
@@ -2595,7 +2865,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         " if($attempt -lt 7){Start-Sleep -Milliseconds 1000}\r\n"
         "}\r\n"
         "if(-not $last){$last='mapped drive was not readable'}\r\n"
-        "Write-Output ('map failed user=' + $h + '\\' + $env:ASB_SMB_USER + ' target=' + $remote + ': ' + $last)\r\n"
+        "Write-Output ('map failed user=' + $u + ' target=' + $remote + ': ' + $last)\r\n"
         "$t=Test-NetConnection -ComputerName $h -Port 445 -WarningAction SilentlyContinue\r\n"
         "Write-Output ('tcp445=' + $t.TcpTestSucceeded + ' src=' + $t.SourceAddress.IPAddress)\r\n"
         "foreach($ln in @('Microsoft-Windows-SMBClient/Connectivity','Microsoft-Windows-SMBClient/Security','Microsoft-Windows-SMBClient/Operational')){\r\n"
@@ -3109,6 +3379,8 @@ static void handle_client(AsbConn *client)
         if (strncmp(cmd, "shared_smb_map:", 15) == 0 ||
             strncmp(cmd, "appliance_account:", 18) == 0)
             agent_log("Command: shared_smb_map:<redacted>");
+        else if (strncmp(cmd, "domain_", 7) == 0)
+            agent_log("Command: %.20s<redacted>", cmd);
         else
             agent_log("Command: %s", buf);
 
@@ -3289,6 +3561,16 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (strncmp(cmd, "domain_", 7) == 0) {
+            char *reply = (char *)malloc(DOMAIN_OUT_MAX + 64);
+            if (reply) {
+                handle_domain_command(cmd, reply, DOMAIN_OUT_MAX + 64);
+                REPLY(reply);
+                free(reply);
+            } else {
+                REPLY("error:out of memory");
+            }
         }
         else if (strncmp(cmd, "install_apps:", 13) == 0) {
             if (queue_apps(cmd + 13)) {

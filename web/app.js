@@ -92,6 +92,7 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
+    applyAccountModeUI();
     updateCreateButtons();
 }
 
@@ -113,6 +114,7 @@ window.onHostMessage = function(msg) {
         case 'createStorageBrowseResult': document.getElementById('storage-parent').value = msg.path || ''; break;
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
+        case 'domainResult': onDomainResult(msg); break;
         case 'vpnConfigResult': onVpnConfigResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
@@ -148,6 +150,8 @@ function onFullState(msg) {
     lastStorageParent = msg.lastStorageParent || lastStorageParent;
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
+    if (document.getElementById('domain-overlay').classList.contains('active')) renderDomain();
+    applyAccountModeUI();
     vpnConfigs = msg.vpnConfigs || [];
     vpnGateway = msg.vpnGateway || {};
     renderVpnSettings();
@@ -475,6 +479,237 @@ function gatherPreinstallApps() {
     return ids.join(',');
 }
 
+/* ---- AppSandbox domain (Windows Server Core appliance) ---- */
+
+var domainData = { users: [], groups: [] };
+var domainEditing = null;      /* user being edited, or null for a new one */
+var domainBusy = false;
+
+function domainState() {
+    var s = sharedAppliance || {};
+    if (!s.configured) return 'none';
+    if (s.backend !== 'server_core') return 'unsupported';
+    if (s.domainBusy) return 'busy';
+    return s.domainEnabled ? 'ready' : 'off';
+}
+
+function openDomainModal() {
+    document.getElementById('domain-overlay').classList.add('active');
+    clearDomainUser();
+    renderDomain();
+    if (domainState() === 'ready') refreshDomain();
+}
+
+function closeDomainModal() {
+    document.getElementById('domain-overlay').classList.remove('active');
+}
+
+function renderDomain() {
+    var state = domainState(), s = sharedAppliance || {};
+    var status = document.getElementById('domain-status');
+    if (!status) return;
+    status.textContent = {
+        none: 'Set up the shared appliance (Windows Server Core) under Shared Resources first.',
+        unsupported: 'The domain needs the Windows Server Core shared appliance; this one runs Ubuntu.',
+        busy: 'Setting up the domain controller: ' + (s.progressText || 'working...'),
+        off: 'The appliance is not a domain controller yet. Setting it up installs Active Directory and restarts the appliance (about 15 minutes); shared drives keep working.',
+        ready: 'Domain ' + (s.domainName || '') + ' — users here sign in to managed VMs. Any password is accepted.' + (domainBusy ? ' Working...' : '')
+    }[state];
+    document.getElementById('domain-setup-row').style.display = state === 'off' ? '' : 'none';
+    document.getElementById('domain-manage').style.display = state === 'ready' ? '' : 'none';
+    if (state !== 'ready') return;
+
+    var users = document.getElementById('domain-user-list');
+    users.innerHTML = '';
+    (domainData.users || []).forEach(function(u) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = u.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        meta.textContent = (u.enabled ? 'Enabled' : 'Disabled') + ((u.groups || []).length ? ' · ' + u.groups.join(', ') : '');
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        var edit = document.createElement('button');
+        edit.type = 'button'; edit.textContent = 'Edit';
+        edit.onclick = function() { editDomainUser(u.name); };
+        var del = document.createElement('button');
+        del.type = 'button'; del.textContent = 'Delete'; del.className = 'danger';
+        del.onclick = function() { deleteDomainUser(u.name); };
+        actions.append(edit, del);
+        row.append(details, actions);
+        users.appendChild(row);
+    });
+
+    var groups = document.getElementById('domain-group-list');
+    groups.innerHTML = '';
+    (domainData.groups || []).forEach(function(g) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = g.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        meta.textContent = g.system ? 'Built-in' : 'Group';
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        if (!g.system) {
+            var del = document.createElement('button');
+            del.type = 'button'; del.textContent = 'Delete'; del.className = 'danger';
+            del.onclick = function() { deleteDomainGroup(g.name); };
+            actions.appendChild(del);
+        }
+        row.append(details, actions);
+        groups.appendChild(row);
+    });
+    renderDomainUserGroups();
+}
+
+function renderDomainUserGroups() {
+    var box = document.getElementById('domain-user-groups');
+    var user = domainEditing && (domainData.users || []).find(function(u) { return u.name === domainEditing; });
+    var have = user ? (user.groups || []) : [];
+    box.innerHTML = '';
+    (domainData.groups || []).forEach(function(g) {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.dataset.group = g.name;
+        cb.checked = have.indexOf(g.name) >= 0;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + g.name));
+        box.appendChild(label);
+    });
+}
+
+function clearDomainUser() {
+    domainEditing = null;
+    var name = document.getElementById('domain-user-name');
+    name.value = ''; name.disabled = false;
+    var pass = document.getElementById('domain-user-pass');
+    pass.value = ''; pass.placeholder = 'Any password (it can be empty)';
+    document.getElementById('domain-user-enabled').checked = true;
+    document.getElementById('btn-domain-user-save').textContent = 'Add User';
+    renderDomainUserGroups();
+}
+
+function editDomainUser(userName) {
+    var user = (domainData.users || []).find(function(u) { return u.name === userName; });
+    if (!user) return;
+    domainEditing = userName;
+    var name = document.getElementById('domain-user-name');
+    name.value = userName; name.disabled = true;
+    var pass = document.getElementById('domain-user-pass');
+    pass.value = ''; pass.placeholder = 'Leave empty to keep the current password';
+    document.getElementById('domain-user-enabled').checked = !!user.enabled;
+    document.getElementById('btn-domain-user-save').textContent = 'Save User';
+    renderDomainUserGroups();
+}
+
+function domainSend(action, payload) {
+    domainBusy = true;
+    renderDomain();
+    sendCmd(action, payload || {});
+}
+
+function refreshDomain() { if (domainState() === 'ready') domainSend('domainList'); }
+
+function setupDomain() {
+    showModal('Set up domain controller',
+        'Install Active Directory on the shared appliance and make it the domain controller of ' + ((sharedAppliance || {}).domainName || 'the AppSandbox domain') + '? The appliance restarts once; this takes about 15 minutes. Password rules are turned off so any password works.',
+        'Set Up', { confirmClass: 'primary' }).then(function(ok) {
+        if (ok) domainSend('domainSetup');
+    });
+}
+
+function saveDomainUser() {
+    var name = document.getElementById('domain-user-name').value.trim();
+    var pass = document.getElementById('domain-user-pass').value;
+    if (!/^[A-Za-z0-9._-]{1,20}$/.test(name)) {
+        sendCmd('log', { message: 'User names are up to 20 letters, digits, ".", "_" or "-".' });
+        return;
+    }
+    var groups = [];
+    document.querySelectorAll('#domain-user-groups input[data-group]').forEach(function(cb) {
+        if (cb.checked) groups.push(cb.dataset.group);
+    });
+    domainSend('domainUserSet', {
+        name: name,
+        password: pass,
+        /* A new user always gets a password (possibly empty); an edit keeps
+           the current one unless a new one was typed. */
+        setPassword: domainEditing === null || pass.length > 0,
+        enabled: document.getElementById('domain-user-enabled').checked,
+        groups: groups.join(',')
+    });
+}
+
+function deleteDomainUser(name) {
+    showModal('Delete user', 'Delete the domain user "' + name + '"? Their profiles on managed VMs stay, but they can no longer sign in.', 'Delete')
+        .then(function(ok) { if (ok) domainSend('domainUserDelete', { name: name }); });
+}
+
+function addDomainGroup() {
+    var name = document.getElementById('domain-group-name').value.trim();
+    if (!/^[A-Za-z0-9._ -]{1,64}$/.test(name)) {
+        sendCmd('log', { message: 'Group names are up to 64 letters, digits, spaces, ".", "_" or "-".' });
+        return;
+    }
+    domainSend('domainGroupAdd', { name: name });
+}
+
+function deleteDomainGroup(name) {
+    showModal('Delete group', 'Delete the group "' + name + '"?', 'Delete')
+        .then(function(ok) { if (ok) domainSend('domainGroupDelete', { name: name }); });
+}
+
+function onDomainResult(msg) {
+    domainBusy = false;
+    if (!msg.success) {
+        showModal('Domain', msg.message || 'The request failed.', 'OK');
+        renderDomain();
+        return;
+    }
+    if (msg.action === 'domainList') {
+        try { domainData = JSON.parse(msg.data || '{}'); } catch (e) { domainData = { users: [], groups: [] }; }
+        if (!Array.isArray(domainData.users)) domainData.users = [];
+        if (!Array.isArray(domainData.groups)) domainData.groups = [];
+        renderDomain();
+        return;
+    }
+    if (msg.action === 'domainSetup') { renderDomain(); return; }
+    if (msg.action === 'domainUserSet') clearDomainUser();
+    if (msg.action === 'domainGroupAdd') document.getElementById('domain-group-name').value = '';
+    refreshDomain();
+}
+
+/* Create dialog: Managed is offered once the domain exists. */
+function applyAccountModeUI() {
+    var select = document.getElementById('account-mode');
+    if (!select) return;
+    var isWindows = document.getElementById('os-type').value === 'Windows';
+    var ready = domainState() === 'ready';
+    var managedOption = select.querySelector('option[value="managed"]');
+    managedOption.disabled = !ready;
+    if (!ready || !isWindows) select.value = 'local';
+    var managed = select.value === 'managed';
+    document.querySelectorAll('.local-account').forEach(function(el) {
+        el.style.display = managed ? 'none' : '';
+    });
+    document.getElementById('account-mode-info').textContent = managed
+        ? 'Joins ' + (sharedAppliance.domainName || 'the domain') + '; sign in with a domain user.'
+        : (ready ? '' : 'Managed needs the domain controller (Domain).');
+}
+
 function gatherConfig() {
     var osType = document.getElementById('os-type').value;
     /* Same ISO-picker path for Windows and Linux. The cloud-image
@@ -503,7 +738,8 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked,
-        preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : ''
+        preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : '',
+        accountMode: osType === 'Windows' ? document.getElementById('account-mode').value : 'local'
     };
 }
 
@@ -596,6 +832,13 @@ function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
+    if (cfg.accountMode === 'managed') {
+        if (cfg.preinstallApps === null) return;
+        sendCmd('createVm', cfg);
+        clearCreateForm();
+        closeCreateModal();
+        return;
+    }
     var userErr = validateUsername(cfg.adminUser);
     if (userErr) { sendCmd('log', { message: userErr }); return; }
     var passErr = validatePassword(cfg.adminPass);
@@ -619,6 +862,7 @@ function onCreateTemplate() {
         return;
     }
     cfg.isTemplate = true;
+    cfg.accountMode = 'local';
     sendCmd('createVm', cfg);
     clearCreateForm();
     closeCreateModal();
@@ -633,6 +877,7 @@ function openCreateModal() {
     document.getElementById('storage-parent').value = lastStorageParent;
     renderCreateSharedResources();
     renderCreateApps();
+    applyAccountModeUI();
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
@@ -1369,8 +1614,9 @@ function renderSettingsResources(){
 function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked};if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
 function onSharedResourceResult(msg){if(msg.id&&hostResourceBusy[msg.id]){delete hostResourceBusy[msg.id];renderSettingsResources();}if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 
-function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?(s.backend||'appliance'):'Not configured')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;}
-function appliancePayload(){return{backend:document.getElementById('appliance-backend').value,storageParent:document.getElementById('appliance-storage-parent').value.trim(),dataSizeGb:Number(document.getElementById('appliance-data-size').value),adminUser:document.getElementById('appliance-admin-user').value.trim(),adminPassword:document.getElementById('appliance-admin-pass').value,ramMb:Number(document.getElementById('appliance-ram').value),cpuCores:Number(document.getElementById('appliance-cpu').value),windowsIsoPath:document.getElementById('appliance-server-iso').value.trim(),windowsImageName:document.getElementById('appliance-server-image').value.trim(),productKey:document.getElementById('appliance-product-key').value};}
+function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?(s.backend||'appliance'):'Not configured')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;applyApplianceBackendUI();}
+function appliancePayload(){return{backend:document.getElementById('appliance-backend').value,storageParent:document.getElementById('appliance-storage-parent').value.trim(),dataSizeGb:Number(document.getElementById('appliance-data-size').value),adminUser:document.getElementById('appliance-admin-user').value.trim(),adminPassword:document.getElementById('appliance-admin-pass').value,ramMb:Number(document.getElementById('appliance-ram').value),cpuCores:Number(document.getElementById('appliance-cpu').value),windowsIsoPath:document.getElementById('appliance-server-iso').value.trim(),windowsImageName:document.getElementById('appliance-server-image').value.trim(),productKey:document.getElementById('appliance-product-key').value,enableDomain:document.getElementById('appliance-backend').value==='server_core'&&document.getElementById('appliance-domain').checked};}
+function applyApplianceBackendUI(){var core=document.getElementById('appliance-backend').value==='server_core';document.querySelectorAll('.appliance-domain-row').forEach(function(el){el.style.display=core?'':'none';});if(sharedAppliance&&sharedAppliance.domainEnabled)document.getElementById('appliance-domain').checked=true;}
 function setupSharedAppliance(){sendCmd('setupSharedAppliance',appliancePayload());}
 function startSharedAppliance(){sendCmd('startSharedAppliance');}
 function stopSharedAppliance(){sendCmd('stopSharedAppliance');}

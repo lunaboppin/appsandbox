@@ -1388,6 +1388,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         instance->is_template = config->is_template;
         instance->is_appliance = config->is_appliance;
         instance->secure_boot_off = config->secure_boot_off;
+        instance->domain_member = config->domain_member;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
@@ -1509,6 +1510,7 @@ HRESULT hcs_create_vm_with_endpoints(const VmConfig *config,
         instance->is_template = config->is_template;
         instance->is_appliance = config->is_appliance;
         instance->secure_boot_off = config->secure_boot_off;
+        instance->domain_member = config->domain_member;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));

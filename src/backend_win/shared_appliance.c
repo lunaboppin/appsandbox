@@ -118,6 +118,20 @@ static SharedApplianceGlobal g_appliance;
    Guarded by g_appliance.cs. */
 static wchar_t g_unc_host_mounts[ASB_MAX_SHARED_RESOURCES][ASB_SHARED_ID_CHARS];
 
+static HRESULT domain_promote_internal(void);
+
+/* The SMB service account as clients and the host name it. A domain
+   controller has no local accounts, so there it is the domain's account. */
+static void smb_service_user(const char *server_ip, wchar_t *out, size_t chars)
+{
+    if (g_appliance.status.domain_enabled)
+        swprintf_s(out, chars, L"%S\\%s", ASB_DOMAIN_NETBIOS, APPLIANCE_SERVICE_USER);
+    else if (server_ip)
+        swprintf_s(out, chars, L"%S\\%s", server_ip, APPLIANCE_SERVICE_USER);
+    else
+        wcscpy_s(out, chars, APPLIANCE_SERVICE_USER);
+}
+
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
 static HRESULT reconcile_internal(void);
 static volatile LONG g_setup_invalid_parameter;
@@ -347,6 +361,7 @@ static HRESULT save_config_locked(void)
     fwprintf(file, L"DataSizeGB=%lu\n", g_appliance.status.data_size_gb);
     fwprintf(file, L"RamMB=%lu\n", g_appliance.status.ram_mb);
     fwprintf(file, L"CpuCores=%lu\n", g_appliance.status.cpu_cores);
+    fwprintf(file, L"DomainEnabled=%d\n", g_appliance.status.domain_enabled ? 1 : 0);
     fflush(file);
     FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(file)));
     fclose(file);
@@ -531,6 +546,7 @@ static void load_config(void)
         else if (wcsncmp(line, L"DataSizeGB=", 11) == 0) g_appliance.status.data_size_gb = _wtoi(line + 11);
         else if (wcsncmp(line, L"RamMB=", 6) == 0) g_appliance.status.ram_mb = _wtoi(line + 6);
         else if (wcsncmp(line, L"CpuCores=", 9) == 0) g_appliance.status.cpu_cores = _wtoi(line + 9);
+        else if (wcsncmp(line, L"DomainEnabled=", 14) == 0) g_appliance.status.domain_enabled = _wtoi(line + 14) != 0;
     }
     fclose(file);
     if (g_appliance.status.configured) {
@@ -1530,6 +1546,11 @@ static DWORD WINAPI setup_worker(LPVOID parameter)
     wchar_t archived[MAX_PATH];
     SYSTEMTIME now;
 
+    /* A new OS disk is not a domain controller until promoted again. */
+    EnterCriticalSection(&g_appliance.cs);
+    g_appliance.status.domain_enabled = FALSE;
+    LeaveCriticalSection(&g_appliance.cs);
+
     if (args->rebuild && args->switch_backend &&
         GetFileAttributesW(g_appliance.status.data_vhdx_path) != INVALID_FILE_ATTRIBUTES) {
         GetLocalTime(&now);
@@ -1591,6 +1612,10 @@ static DWORD WINAPI setup_worker(LPVOID parameter)
     g_appliance.status.busy = FALSE;
     save_config_locked();
     LeaveCriticalSection(&g_appliance.cs);
+    /* Optional domain controller (Server Core only). A failure leaves a
+       working appliance; the Domain dialog can try again. */
+    if (args->config.enable_domain && args->config.backend == ASB_APPLIANCE_BACKEND_SERVER_CORE)
+        domain_promote_internal();
     SecureZeroMemory(&args->config.admin_password, sizeof(args->config.admin_password));
     SecureZeroMemory(&args->config.product_key, sizeof(args->config.product_key));
     HeapFree(GetProcessHeap(), 0, args);
@@ -1869,8 +1894,10 @@ HRESULT shared_appliance_prepare_client(const VmConfig *config,
     HRESULT hr;
     if (!endpoint_guid || !runtime) return E_INVALIDARG;
     endpoint_guid[0] = L'\0';
-    if (!config || config->shared_resource_count <= 0 ||
-        _wcsicmp(config->os_type, L"Windows") != 0) return S_FALSE;
+    if (!config || _wcsicmp(config->os_type, L"Windows") != 0) return S_FALSE;
+    /* Managed VMs need the link for the domain controller even without shares. */
+    if (config->shared_resource_count <= 0 &&
+        !(config->domain_member && g_appliance.status.domain_enabled)) return S_FALSE;
     /* Bring a stopped appliance up on demand. The pending count and the
        generation bump keep an idle stop from firing while this start waits;
        callers are background start threads, never the UI thread. */
@@ -2281,8 +2308,7 @@ static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL 
     if (mount) {
         hr = load_credentials(admin, _countof(admin), password, _countof(password));
         if (FAILED(hr)) return hr;
-        swprintf_s(qualified, _countof(qualified), L"%S\\%s",
-                   shared_appliance_server_ip(), APPLIANCE_SERVICE_USER);
+        smb_service_user(shared_appliance_server_ip(), qualified, _countof(qualified));
         SetEnvironmentVariableW(L"ASB_SMB_PASSWORD", password);
         SetEnvironmentVariableW(L"ASB_SMB_USER", qualified);
     }
@@ -2564,7 +2590,7 @@ BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,
     hr = load_credentials(admin, _countof(admin), password, password_chars);
     SecureZeroMemory(admin, sizeof(admin));
     if (FAILED(hr)) return FALSE;
-    wcscpy_s(user, user_chars, APPLIANCE_SERVICE_USER);
+    smb_service_user(NULL, user, user_chars);
     return TRUE;
 }
 
@@ -2573,4 +2599,313 @@ const char *shared_appliance_server_ip(void)
     static char ip[32];
     sprintf_s(ip, sizeof(ip), "%s.2", hcn_share_subnet_base());
     return ip;
+}
+
+/* ---- AppSandbox domain ---- */
+
+/* UTF-8 then base64: passwords and group names reach the guest script
+   through environment variables, untouched by any quoting. */
+static void b64_utf8(const wchar_t *text, char *out, size_t out_chars)
+{
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char utf8[1024];
+    int n = 0, i;
+    size_t o = 0;
+    if (text && text[0])
+        n = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof(utf8), NULL, NULL) - 1;
+    if (n < 0) n = 0;
+    for (i = 0; i < n && o + 5 < out_chars; i += 3) {
+        unsigned v = (unsigned)(unsigned char)utf8[i] << 16;
+        if (i + 1 < n) v |= (unsigned)(unsigned char)utf8[i + 1] << 8;
+        if (i + 2 < n) v |= (unsigned)(unsigned char)utf8[i + 2];
+        out[o++] = table[(v >> 18) & 63];
+        out[o++] = table[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? table[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? table[v & 63] : '=';
+    }
+    out[o] = '\0';
+    SecureZeroMemory(utf8, sizeof(utf8));
+}
+
+/* sAMAccountName rules, narrowed to ASCII: up to 20 characters for users;
+   groups may also have inner spaces and up to 64. */
+static BOOL domain_name_valid(const wchar_t *name, BOOL group)
+{
+    size_t n = name ? wcslen(name) : 0, i;
+    if (!n || n > (group ? 64u : 20u)) return FALSE;
+    for (i = 0; i < n; i++) {
+        wchar_t c = name[i];
+        if (!((c < 128 && iswalnum(c)) || c == L'.' || c == L'_' || c == L'-' ||
+              (group && c == L' ')))
+            return FALSE;
+    }
+    return name[0] != L' ' && name[n - 1] != L' ' && name[n - 1] != L'.';
+}
+
+/* Accounts the appliance itself depends on. */
+static BOOL domain_protected_user(const wchar_t *name)
+{
+    return _wcsicmp(name, g_appliance.status.admin_user) == 0 ||
+           _wcsicmp(name, L"Administrator") == 0 ||
+           _wcsicmp(name, APPLIANCE_SERVICE_USER) == 0 ||
+           _wcsicmp(name, L"krbtgt") == 0;
+}
+
+static void domain_message(wchar_t *message, size_t chars, const char *text)
+{
+    if (message && chars)
+        MultiByteToWideChar(CP_UTF8, 0, text, -1, message, (int)chars);
+}
+
+static HRESULT domain_send(const char *command, char *reply, int reply_max,
+                           DWORD timeout_ms, wchar_t *message, size_t message_chars)
+{
+    HRESULT hr;
+    if (message && message_chars) message[0] = L'\0';
+    reply[0] = '\0';
+    if (!g_appliance.status.domain_enabled) {
+        domain_message(message, message_chars,
+                       "The shared appliance is not a domain controller.");
+        return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    }
+    hr = shared_appliance_start(TRUE, APPLIANCE_CLIENT_START_TIMEOUT_MS);
+    if (FAILED(hr)) {
+        domain_message(message, message_chars, "The shared appliance could not be started.");
+        return hr;
+    }
+    if (appliance_send(command, reply, reply_max, timeout_ms)) return S_OK;
+    domain_message(message, message_chars,
+                   strncmp(reply, "error:", 6) == 0 ? reply + 6
+                   : reply[0] ? reply : "The appliance did not answer.");
+    return E_FAIL;
+}
+
+/* Promote the Server Core appliance: AD DS with DNS, restart, then the
+   password policy (no complexity, length, history, expiry or lockout), the
+   appliance admin as a Domain Admin and a firewall opening for the client
+   subnet. Runs on setup_worker or the Domain dialog's worker. */
+static HRESULT domain_promote_internal(void)
+{
+    wchar_t admin_password[256], smb_password[256];
+    char password_b64[512], user[160], command[1024], reply[512];
+    HRESULT hr;
+
+    EnterCriticalSection(&g_appliance.cs);
+    g_appliance.status.domain_busy = TRUE;
+    LeaveCriticalSection(&g_appliance.cs);
+    admin_password[0] = smb_password[0] = L'\0';
+    password_b64[0] = '\0';
+
+    if (g_appliance.status.backend != ASB_APPLIANCE_BACKEND_SERVER_CORE) {
+        hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        goto done;
+    }
+    set_progress(70, L"Domain: starting the appliance...");
+    hr = shared_appliance_start(TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+    if (FAILED(hr)) goto done;
+    hr = load_credentials(admin_password, _countof(admin_password),
+                          smb_password, _countof(smb_password));
+    if (FAILED(hr)) goto done;
+    b64_utf8(admin_password, password_b64, sizeof(password_b64));
+    WideCharToMultiByte(CP_UTF8, 0, g_appliance.status.admin_user, -1,
+                        user, sizeof(user), NULL, NULL);
+
+    set_progress(75, L"Domain: installing Active Directory and promoting the appliance "
+                     L"(this can take 15 minutes)...");
+    sprintf_s(command, sizeof(command), "domain_promote:%s:%s:%s",
+              ASB_DOMAIN_NETBIOS, ASB_DOMAIN_FQDN, password_b64);
+    if (!appliance_send(command, reply, sizeof(reply), 45ul * 60ul * 1000ul)) {
+        ui_log(L"Domain: promotion failed (%S).", reply[0] ? reply : "no reply");
+        hr = E_FAIL;
+        goto done;
+    }
+    if (strcmp(reply, "ok:promoted") == 0) {
+        set_progress(85, L"Domain: restarting the appliance as the domain controller...");
+        shared_appliance_stop(FALSE);
+        hr = start_internal(FALSE, TRUE, APPLIANCE_SETUP_TIMEOUT_MS);
+        if (FAILED(hr)) goto done;
+    }
+
+    set_progress(92, L"Domain: applying the password policy and admin account...");
+    sprintf_s(command, sizeof(command), "domain_finish:%s:%s", user, password_b64);
+    if (!appliance_send(command, reply, sizeof(reply), 20ul * 60ul * 1000ul)) {
+        ui_log(L"Domain: finishing the domain controller failed (%S).",
+               reply[0] ? reply : "no reply");
+        hr = E_FAIL;
+        goto done;
+    }
+    EnterCriticalSection(&g_appliance.cs);
+    g_appliance.status.domain_enabled = TRUE;
+    save_config_locked();
+    LeaveCriticalSection(&g_appliance.cs);
+    set_progress(100, L"Domain: " ASB_DOMAIN_FQDN L" is ready.");
+    hr = S_OK;
+done:
+    SecureZeroMemory(admin_password, sizeof(admin_password));
+    SecureZeroMemory(smb_password, sizeof(smb_password));
+    SecureZeroMemory(password_b64, sizeof(password_b64));
+    SecureZeroMemory(command, sizeof(command));
+    EnterCriticalSection(&g_appliance.cs);
+    g_appliance.status.domain_busy = FALSE;
+    if (FAILED(hr)) set_error_locked(hr, L"Domain controller setup failed");
+    LeaveCriticalSection(&g_appliance.cs);
+    return hr;
+}
+
+static DWORD WINAPI domain_setup_worker(LPVOID unused)
+{
+    (void)unused;
+    domain_promote_internal();
+    return 0;
+}
+
+HRESULT shared_appliance_domain_setup(void)
+{
+    HANDLE thread;
+    EnterCriticalSection(&g_appliance.cs);
+    if (!g_appliance.status.configured ||
+        g_appliance.status.backend != ASB_APPLIANCE_BACKEND_SERVER_CORE) {
+        LeaveCriticalSection(&g_appliance.cs);
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    if (g_appliance.status.domain_enabled) {
+        LeaveCriticalSection(&g_appliance.cs);
+        return S_FALSE;
+    }
+    if (g_appliance.status.domain_busy || g_appliance.status.busy) {
+        LeaveCriticalSection(&g_appliance.cs);
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+    g_appliance.status.domain_busy = TRUE;
+    LeaveCriticalSection(&g_appliance.cs);
+    thread = CreateThread(NULL, 0, domain_setup_worker, NULL, 0, NULL);
+    if (!thread) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        EnterCriticalSection(&g_appliance.cs);
+        g_appliance.status.domain_busy = FALSE;
+        LeaveCriticalSection(&g_appliance.cs);
+        return hr;
+    }
+    CloseHandle(thread);
+    return S_OK;
+}
+
+HRESULT shared_appliance_domain_list(char *json, size_t chars,
+                                     wchar_t *message, size_t message_chars)
+{
+    char *reply;
+    HRESULT hr;
+    if (!json || !chars) return E_INVALIDARG;
+    json[0] = '\0';
+    reply = (char *)HeapAlloc(GetProcessHeap(), 0, ASB_DOMAIN_REPLY_MAX);
+    if (!reply) return E_OUTOFMEMORY;
+    hr = domain_send("domain_list", reply, ASB_DOMAIN_REPLY_MAX, 120000,
+                     message, message_chars);
+    if (SUCCEEDED(hr))
+        strncpy_s(json, chars, strncmp(reply, "ok:", 3) == 0 ? reply + 3 : "{}", _TRUNCATE);
+    HeapFree(GetProcessHeap(), 0, reply);
+    return hr;
+}
+
+HRESULT shared_appliance_domain_user_set(const wchar_t *name, const wchar_t *password,
+                                         BOOL enabled, const wchar_t *groups,
+                                         wchar_t *message, size_t message_chars)
+{
+    char command[2048], user[64], password_b64[512], groups_b64[1536], reply[1024];
+    wchar_t list[1024], *group, *next = NULL;
+    HRESULT hr;
+    if (!domain_name_valid(name, FALSE)) {
+        domain_message(message, message_chars,
+                       "User names are up to 20 letters, digits, '.', '_' or '-'.");
+        return E_INVALIDARG;
+    }
+    if (!enabled && domain_protected_user(name)) {
+        domain_message(message, message_chars, "This account is used by AppSandbox and stays enabled.");
+        return E_ACCESSDENIED;
+    }
+    wcscpy_s(list, _countof(list), groups ? groups : L"");
+    for (group = wcstok_s(list, L",", &next); group; group = wcstok_s(NULL, L",", &next)) {
+        if (!domain_name_valid(group, TRUE)) {
+            domain_message(message, message_chars, "A group name is not valid.");
+            return E_INVALIDARG;
+        }
+    }
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, user, sizeof(user), NULL, NULL);
+    b64_utf8(password ? password : L"", password_b64, sizeof(password_b64));
+    b64_utf8(groups ? groups : L"", groups_b64, sizeof(groups_b64));
+    sprintf_s(command, sizeof(command), "domain_user_set:%s:%d:%s:%d:%s",
+              user, password ? 1 : 0, password_b64, enabled ? 1 : 0, groups_b64);
+    hr = domain_send(command, reply, sizeof(reply), 120000, message, message_chars);
+    SecureZeroMemory(command, sizeof(command));
+    SecureZeroMemory(password_b64, sizeof(password_b64));
+    return hr;
+}
+
+HRESULT shared_appliance_domain_user_delete(const wchar_t *name,
+                                            wchar_t *message, size_t message_chars)
+{
+    char command[128], user[64], reply[1024];
+    if (!domain_name_valid(name, FALSE)) return E_INVALIDARG;
+    if (domain_protected_user(name)) {
+        domain_message(message, message_chars, "This account is used by AppSandbox and can't be deleted.");
+        return E_ACCESSDENIED;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, user, sizeof(user), NULL, NULL);
+    sprintf_s(command, sizeof(command), "domain_user_delete:%s", user);
+    return domain_send(command, reply, sizeof(reply), 60000, message, message_chars);
+}
+
+static BOOL domain_protected_group(const wchar_t *name)
+{
+    return _wcsicmp(name, L"Domain Admins") == 0 || _wcsicmp(name, L"Domain Users") == 0 ||
+           _wcsicmp(name, L"DnsAdmins") == 0 || _wcsicmp(name, L"DnsUpdateProxy") == 0;
+}
+
+HRESULT shared_appliance_domain_group_add(const wchar_t *name,
+                                          wchar_t *message, size_t message_chars)
+{
+    char command[256], group_b64[192], reply[1024];
+    if (!domain_name_valid(name, TRUE)) {
+        domain_message(message, message_chars,
+                       "Group names are up to 64 letters, digits, spaces, '.', '_' or '-'.");
+        return E_INVALIDARG;
+    }
+    b64_utf8(name, group_b64, sizeof(group_b64));
+    sprintf_s(command, sizeof(command), "domain_group_add:%s", group_b64);
+    return domain_send(command, reply, sizeof(reply), 60000, message, message_chars);
+}
+
+HRESULT shared_appliance_domain_group_delete(const wchar_t *name,
+                                             wchar_t *message, size_t message_chars)
+{
+    char command[256], group_b64[192], reply[1024];
+    if (!domain_name_valid(name, TRUE)) return E_INVALIDARG;
+    if (domain_protected_group(name)) {
+        domain_message(message, message_chars, "Built-in groups can't be deleted.");
+        return E_ACCESSDENIED;
+    }
+    b64_utf8(name, group_b64, sizeof(group_b64));
+    sprintf_s(command, sizeof(command), "domain_group_delete:%s", group_b64);
+    return domain_send(command, reply, sizeof(reply), 60000, message, message_chars);
+}
+
+BOOL shared_appliance_domain_join_command(const char *dc_ip, char *command, size_t chars)
+{
+    wchar_t admin_password[256], smb_password[256];
+    char user[160], password_b64[512];
+    if (!g_appliance.status.domain_enabled || !dc_ip || !dc_ip[0]) return FALSE;
+    if (FAILED(load_credentials(admin_password, _countof(admin_password),
+                                smb_password, _countof(smb_password))))
+        return FALSE;
+    WideCharToMultiByte(CP_UTF8, 0, g_appliance.status.admin_user, -1,
+                        user, sizeof(user), NULL, NULL);
+    b64_utf8(admin_password, password_b64, sizeof(password_b64));
+    sprintf_s(command, chars, "domain_join:%s:%s:%s:%s\\%s:%s",
+              ASB_DOMAIN_FQDN, ASB_DOMAIN_NETBIOS, dc_ip, ASB_DOMAIN_NETBIOS,
+              user, password_b64);
+    SecureZeroMemory(admin_password, sizeof(admin_password));
+    SecureZeroMemory(smb_password, sizeof(smb_password));
+    SecureZeroMemory(password_b64, sizeof(password_b64));
+    return TRUE;
 }
