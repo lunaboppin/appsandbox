@@ -24,6 +24,7 @@
 #include <shobjidl.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -173,8 +174,19 @@ typedef struct {
 } BsInput;
 #pragma pack(pop)
 
+/* Session 0 has no mouse or keyboard: SendInput "succeeds" there and nothing
+   happens. So input is delivered as window messages, the way the input
+   system would: mouse to the window holding capture or under the pointer,
+   keys to the focus of the window last clicked. The input thread shares
+   the target thread's input state (AttachThreadInput + SetKeyboardState),
+   so Shift, Ctrl and Alt read as held and TranslateMessage makes the right
+   characters. */
 static POINT g_mouse;
-static int   g_input_posting = -1;   /* -1 unknown, 0 SendInput works, 1 posting messages */
+static BYTE  g_keys[256];   /* keys and buttons the host holds, as GetKeyboardState has them */
+static HWND  g_active;      /* top-level window last clicked; keys go to its focus */
+static DWORD g_attached;    /* thread whose input state the input thread shares */
+static struct { HWND hwnd; int button; DWORD time; POINT pt; } g_last_down;
+static struct { HWND hwnd; LRESULT hit; POINT start; RECT rect; } g_drag;   /* title bar or border */
 
 static BOOL send_all(AsbConn *c, const void *buf, int len)
 {
@@ -200,94 +212,256 @@ static BOOL recv_all(AsbConn *c, void *buf, int len)
     return TRUE;
 }
 
-/* SendInput may be refused in session 0 (it has no input devices); then
-   mouse and keys are posted to the window under the pointer / with focus,
-   which covers ordinary windows and consoles. */
-static BOOL send_input(INPUT *in)
+static void share_input_with(HWND w)
 {
-    UINT ok;
-    if (g_input_posting == 1) return FALSE;
-    ok = SendInput(1, in, sizeof(*in));
-    if (g_input_posting == -1) {
-        g_input_posting = ok ? 0 : 1;
-        bs_log(ok ? "Input: SendInput works here."
-                  : "Input: SendInput refused (%lu); posting messages instead.", GetLastError());
-    }
-    return ok != 0;
+    DWORD tid = w ? GetWindowThreadProcessId(w, NULL) : 0;
+    if (tid == g_attached) return;
+    if (g_attached) AttachThreadInput(GetCurrentThreadId(), g_attached, FALSE);
+    g_attached = 0;
+    if (tid && tid != GetCurrentThreadId() && AttachThreadInput(GetCurrentThreadId(), tid, TRUE))
+        g_attached = tid;
 }
 
-static void post_mouse(UINT msg, WPARAM keys, LPARAM extra_high)
+static void apply_key_state(HWND w)
 {
-    POINT pt = g_mouse;
-    HWND w = WindowFromPoint(pt);
-    if (!w) return;
-    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
-        SetForegroundWindow(GetAncestor(w, GA_ROOT));
-    if (msg == WM_MOUSEWHEEL) {
-        PostMessageW(w, msg, MAKEWPARAM(0, (short)extra_high), MAKELPARAM(pt.x, pt.y));
-        return;
-    }
-    ScreenToClient(w, &pt);
-    PostMessageW(w, msg, keys, MAKELPARAM(pt.x, pt.y));
+    share_input_with(w);
+    SetKeyboardState(g_keys);
 }
 
-static HWND focus_window(void)
+static WPARAM mouse_keys(void)
+{
+    WPARAM k = 0;
+    if (g_keys[VK_LBUTTON] & 0x80) k |= MK_LBUTTON;
+    if (g_keys[VK_RBUTTON] & 0x80) k |= MK_RBUTTON;
+    if (g_keys[VK_MBUTTON] & 0x80) k |= MK_MBUTTON;
+    if (g_keys[VK_SHIFT] & 0x80)   k |= MK_SHIFT;
+    if (g_keys[VK_CONTROL] & 0x80) k |= MK_CONTROL;
+    return k;
+}
+
+/* Bring the clicked window forward, as a real click would. */
+static void activate(HWND w)
+{
+    HWND root = GetAncestor(w, GA_ROOT), fg = GetForegroundWindow();
+    if (!root || (GetWindowLongPtrW(root, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
+    g_active = root;
+    if (fg == root) return;
+    if (fg) share_input_with(fg);   /* sharing the foreground's input lets it move */
+    SetForegroundWindow(root);
+    share_input_with(root);
+    BringWindowToTop(root);
+    SetActiveWindow(root);
+}
+
+static HWND capture_of(HWND w, BOOL *menu)
 {
     GUITHREADINFO gti;
     ZeroMemory(&gti, sizeof(gti));
     gti.cbSize = sizeof(gti);
-    if (GetGUIThreadInfo(0, &gti) && gti.hwndFocus) return gti.hwndFocus;
-    return GetForegroundWindow();
+    if (!w || !IsWindow(w) || !GetGUIThreadInfo(GetWindowThreadProcessId(w, NULL), &gti)) return NULL;
+    *menu = (gti.flags & GUI_INMENUMODE) != 0;
+    return gti.hwndCapture;
+}
+
+/* The window holding capture (a pressed button, a scroll bar, an open
+   menu) gets the mouse wherever it is; menus take screen coordinates. */
+static HWND mouse_capture(HWND under, BOOL *menu)
+{
+    HWND cap;
+    *menu = FALSE;
+    cap = capture_of(g_active, menu);
+    if (!cap) cap = capture_of(under, menu);
+    return cap;
+}
+
+static LRESULT hit_test(HWND w, POINT pt)
+{
+    DWORD_PTR hit = HTCLIENT;
+    if (!SendMessageTimeoutW(w, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y), SMTO_ABORTIFHUNG, 100, &hit))
+        return HTCLIENT;
+    return (LRESULT)hit;
+}
+
+static BOOL in_client(LRESULT hit)
+{
+    return hit == HTCLIENT || hit == HTNOWHERE || hit == HTERROR || hit == HTTRANSPARENT;
+}
+
+static void post_mouse(HWND w, UINT msg, WPARAM wp, POINT pt, BOOL screen)
+{
+    if (!screen) ScreenToClient(w, &pt);
+    PostMessageW(w, msg, wp, MAKELPARAM(pt.x, pt.y));
+}
+
+static void drag_to(POINT pt)
+{
+    RECT r = g_drag.rect;
+    LRESULT h = g_drag.hit;
+    int dx = pt.x - g_drag.start.x, dy = pt.y - g_drag.start.y;
+    int minw = GetSystemMetrics(SM_CXMINTRACK), minh = GetSystemMetrics(SM_CYMINTRACK);
+    if (h == HTCAPTION) {
+        OffsetRect(&r, dx, dy);
+    } else {
+        if (h == HTLEFT || h == HTTOPLEFT || h == HTBOTTOMLEFT)
+            r.left = min(r.left + dx, r.right - minw);
+        if (h == HTRIGHT || h == HTTOPRIGHT || h == HTBOTTOMRIGHT)
+            r.right = max(r.right + dx, r.left + minw);
+        if (h == HTTOP || h == HTTOPLEFT || h == HTTOPRIGHT)
+            r.top = min(r.top + dy, r.bottom - minh);
+        if (h == HTBOTTOM || h == HTBOTTOMLEFT || h == HTBOTTOMRIGHT)
+            r.bottom = max(r.bottom + dy, r.top + minh);
+    }
+    SetWindowPos(g_drag.hwnd, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | (h == HTCAPTION ? SWP_NOSIZE : 0));
+}
+
+static void mouse_move(int x, int y)
+{
+    POINT pt;
+    HWND w, cap;
+    BOOL menu;
+    LRESULT hit;
+    g_mouse.x = x;
+    g_mouse.y = y;
+    SetCursorPos(x, y);
+    pt = g_mouse;
+    if (g_drag.hwnd) {
+        drag_to(pt);
+        return;
+    }
+    w = WindowFromPoint(pt);
+    if ((cap = mouse_capture(w, &menu)) != NULL) {
+        post_mouse(cap, WM_MOUSEMOVE, mouse_keys(), pt, menu);
+        return;
+    }
+    if (!w) return;
+    hit = hit_test(w, pt);
+    if (in_client(hit)) post_mouse(w, WM_MOUSEMOVE, mouse_keys(), pt, FALSE);
+    else PostMessageW(w, WM_NCMOUSEMOVE, (WPARAM)hit, MAKELPARAM(pt.x, pt.y));
+}
+
+static void mouse_button(int b, BOOL down)
+{
+    static const int  vk[]    = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON };
+    static const UINT cdown[] = { WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN };
+    static const UINT cup[]   = { WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP };
+    static const UINT cdbl[]  = { WM_LBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_MBUTTONDBLCLK };
+    static const UINT ndown[] = { WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_NCMBUTTONDOWN };
+    static const UINT nup[]   = { WM_NCLBUTTONUP, WM_NCRBUTTONUP, WM_NCMBUTTONUP };
+    static const UINT ndbl[]  = { WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDBLCLK, WM_NCMBUTTONDBLCLK };
+    POINT pt = g_mouse;
+    HWND w, cap, root;
+    BOOL menu, dbl = FALSE;
+    LRESULT hit;
+
+    g_keys[vk[b]] = down ? 0x80 : 0;
+    if (g_drag.hwnd && b == 0 && !down) {
+        g_drag.hwnd = NULL;
+        return;
+    }
+    w = WindowFromPoint(pt);
+    if ((cap = mouse_capture(w, &menu)) != NULL) {
+        apply_key_state(cap);
+        post_mouse(cap, down ? cdown[b] : cup[b], mouse_keys(), pt, menu);
+        return;
+    }
+    if (!w) return;
+    hit = hit_test(w, pt);
+    if (down) {
+        DWORD now = GetTickCount();
+        dbl = g_last_down.hwnd == w && g_last_down.button == b &&
+              now - g_last_down.time <= GetDoubleClickTime() &&
+              abs(pt.x - g_last_down.pt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) / 2 &&
+              abs(pt.y - g_last_down.pt.y) <= GetSystemMetrics(SM_CYDOUBLECLK) / 2;
+        g_last_down.hwnd = dbl ? NULL : w;   /* a third click starts over */
+        g_last_down.button = b;
+        g_last_down.time = now;
+        g_last_down.pt = pt;
+        activate(w);
+    }
+    apply_key_state(w);
+    if (in_client(hit)) {
+        UINT msg = !down ? cup[b]
+                 : (dbl && (GetClassLongPtrW(w, GCL_STYLE) & CS_DBLCLKS)) ? cdbl[b] : cdown[b];
+        post_mouse(w, msg, mouse_keys(), pt, FALSE);
+        return;
+    }
+    /* The title bar, borders and caption buttons track a real mouse in
+       their own loops, so moving, sizing and the buttons are done here. */
+    root = GetAncestor(w, GA_ROOT);
+    if (b == 0 && (hit == HTCAPTION || (hit >= HTLEFT && hit <= HTBOTTOMRIGHT))) {
+        if (down && dbl && hit == HTCAPTION)
+            PostMessageW(root, WM_SYSCOMMAND, IsZoomed(root) ? SC_RESTORE : SC_MAXIMIZE, 0);
+        else if (down && !IsZoomed(root)) {
+            g_drag.hwnd = root;
+            g_drag.hit = hit;
+            g_drag.start = pt;
+            GetWindowRect(root, &g_drag.rect);
+        }
+        return;
+    }
+    if (b == 0 && (hit == HTCLOSE || hit == HTMINBUTTON || hit == HTMAXBUTTON)) {
+        if (!down)
+            PostMessageW(root, WM_SYSCOMMAND, hit == HTCLOSE ? SC_CLOSE : hit == HTMINBUTTON ? SC_MINIMIZE
+                                              : IsZoomed(root) ? SC_RESTORE : SC_MAXIMIZE, 0);
+        return;
+    }
+    PostMessageW(w, !down ? nup[b] : dbl ? ndbl[b] : ndown[b], (WPARAM)hit, MAKELPARAM(pt.x, pt.y));
+}
+
+static void mouse_wheel(int delta)
+{
+    HWND w = WindowFromPoint(g_mouse), cap;
+    BOOL menu;
+    if ((cap = mouse_capture(w, &menu)) != NULL) w = cap;
+    if (!w) return;
+    apply_key_state(w);
+    PostMessageW(w, WM_MOUSEWHEEL, MAKEWPARAM(mouse_keys(), (short)delta), MAKELPARAM(g_mouse.x, g_mouse.y));
+}
+
+static HWND key_window(void)
+{
+    GUITHREADINFO gti;
+    HWND top = (g_active && IsWindow(g_active)) ? g_active : GetForegroundWindow();
+    if (!top) return NULL;
+    ZeroMemory(&gti, sizeof(gti));
+    gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(GetWindowThreadProcessId(top, NULL), &gti)) {
+        if (gti.hwndFocus) return gti.hwndFocus;
+        if (gti.hwndActive) return gti.hwndActive;
+    }
+    return top;
+}
+
+static void key_event(int vk, int scan, int flags)
+{
+    BOOL up = (flags & 1) != 0, ext = (flags & 2) != 0, was, alt, sys;
+    BYTE held = up ? 0 : 0x80;
+    HWND w;
+    LPARAM lp;
+    if (vk <= 0 || vk > 0xFE) return;
+    was = (g_keys[vk] & 0x80) != 0;
+    if (!up && !was) g_keys[vk] ^= 1;   /* the toggle bit, as Caps Lock keeps it */
+    g_keys[vk] = (BYTE)((g_keys[vk] & 1) | held);
+    if (vk == VK_SHIFT) g_keys[(scan & 0xFF) == 0x36 ? VK_RSHIFT : VK_LSHIFT] = held;
+    else if (vk == VK_CONTROL) g_keys[ext ? VK_RCONTROL : VK_LCONTROL] = held;
+    else if (vk == VK_MENU) g_keys[ext ? VK_RMENU : VK_LMENU] = held;
+    if ((w = key_window()) == NULL) return;
+    alt = (g_keys[VK_MENU] & 0x80) != 0 || vk == VK_MENU;
+    sys = vk == VK_F10 || (alt && !(g_keys[VK_CONTROL] & 0x80));
+    lp = 1 | ((LPARAM)(scan & 0xFF) << 16) | (ext ? (LPARAM)1 << 24 : 0) |
+         (sys && alt ? (LPARAM)1 << 29 : 0) | (up || was ? (LPARAM)1 << 30 : 0) | (up ? (LPARAM)1 << 31 : 0);
+    apply_key_state(w);
+    PostMessageW(w, up ? (sys ? WM_SYSKEYUP : WM_KEYUP) : (sys ? WM_SYSKEYDOWN : WM_KEYDOWN), (WPARAM)vk, lp);
 }
 
 static void inject(const BsInput *in)
 {
-    INPUT i;
-    ZeroMemory(&i, sizeof(i));
     switch (in->type) {
-    case BS_IN_MOVE:
-        g_mouse.x = in->a;
-        g_mouse.y = in->b;
-        SetCursorPos(in->a, in->b);
-        if (g_input_posting == 1) post_mouse(WM_MOUSEMOVE, 0, 0);
-        break;
-    case BS_IN_BUTTON:
-    {
-        static const DWORD down[] = { MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN };
-        static const DWORD up[]   = { MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP };
-        static const UINT  wdown[] = { WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN };
-        static const UINT  wup[]   = { WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP };
-        static const WPARAM key[]  = { MK_LBUTTON, MK_RBUTTON, MK_MBUTTON };
-        int b = in->a;
-        if (b < 0 || b > 2) break;
-        SetCursorPos(g_mouse.x, g_mouse.y);
-        i.type = INPUT_MOUSE;
-        i.mi.dwFlags = in->b ? down[b] : up[b];
-        if (!send_input(&i))
-            post_mouse(in->b ? wdown[b] : wup[b], in->b ? key[b] : 0, 0);
-        break;
-    }
-    case BS_IN_WHEEL:
-        i.type = INPUT_MOUSE;
-        i.mi.dwFlags = MOUSEEVENTF_WHEEL;
-        i.mi.mouseData = (DWORD)in->a;
-        if (!send_input(&i)) post_mouse(WM_MOUSEWHEEL, 0, in->a);
-        break;
-    case BS_IN_KEY:
-    {
-        BOOL up = (in->c & 1) != 0;
-        i.type = INPUT_KEYBOARD;
-        i.ki.wVk = (WORD)in->a;
-        i.ki.wScan = (WORD)in->b;
-        i.ki.dwFlags = (up ? KEYEVENTF_KEYUP : 0) | ((in->c & 2) ? KEYEVENTF_EXTENDEDKEY : 0);
-        if (!send_input(&i)) {
-            HWND w = focus_window();
-            LPARAM lp = 1 | ((LPARAM)(in->b & 0xFF) << 16) | ((in->c & 2) ? (1 << 24) : 0) |
-                        (up ? ((LPARAM)3 << 30) : 0);
-            if (w) PostMessageW(w, up ? WM_KEYUP : WM_KEYDOWN, (WPARAM)in->a, lp);
-        }
-        break;
-    }
+    case BS_IN_MOVE:   mouse_move(in->a, in->b); break;
+    case BS_IN_BUTTON: if (in->a >= 0 && in->a <= 2) mouse_button(in->a, in->b != 0); break;
+    case BS_IN_WHEEL:  mouse_wheel(in->a); break;
+    case BS_IN_KEY:    key_event(in->a, in->b, in->c); break;
     }
 }
 
@@ -369,9 +543,16 @@ static DWORD WINAPI viewer_input_thread(LPVOID param)
 {
     BsViewer *v = (BsViewer *)param;
     BsInput in;
+    MSG m;
+    SetThreadDesktop(g_desk);
+    PeekMessageW(&m, NULL, 0, 0, PM_NOREMOVE);   /* a message queue, to share input state */
+    bs_log("Input: delivered as window messages (session %lu has no mouse or keyboard).", g_session);
     while (recv_all(v->conn, &in, sizeof(in))) {
         if (in.magic == BS_INPUT_MAGIC) inject(&in);
     }
+    share_input_with(NULL);
+    ZeroMemory(g_keys, sizeof(g_keys));
+    g_drag.hwnd = NULL;
     InterlockedExchange(&v->closed, 1);
     return 0;
 }

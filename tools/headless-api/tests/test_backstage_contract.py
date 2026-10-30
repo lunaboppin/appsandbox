@@ -6,7 +6,7 @@ shows, so the signed-in user and the sign-in screen never see it and
 everything it opens runs there too. The shell (taskbar, tools, Explorer
 file view) streams its screen to the host over ASB_CH_BACKSTAGE (8) as
 changed bands of BGRA rows, and injects the host's mouse and keyboard
-(SendInput, or posted messages if session 0 refuses it). The host's
+(posted as window messages; session 0 has no input devices). The host's
 Backstage window (vm_backstage.c) starts the session through the agent,
 connects to :0008, draws it and sends input; it opens from the display
 window's floating menu or title-bar menu.
@@ -44,7 +44,12 @@ def main() -> None:
     assert "PrintWindow(vw.list[i], dc, PW_RENDERFULLCONTENT)" in shell
     assert "EnumDesktopWindows(g_desk, collect_visible" in shell
     assert 'view_status(v, L"Connected; waiting for the picture...");' in view
-    assert "SendInput(1, in, sizeof(*in))" in shell and "PostMessageW(w, up ? WM_KEYUP : WM_KEYDOWN" in shell
+    # Session 0 has no input devices: everything is posted as window messages,
+    # with the target thread's key state shared so Shift/Ctrl/Alt count.
+    assert "SendInput(" not in shell
+    assert "AttachThreadInput(GetCurrentThreadId(), tid, TRUE)" in shell and "SetKeyboardState(g_keys);" in shell
+    assert "WM_NCHITTEST" in shell and "WM_LBUTTONDBLCLK" in shell and "SC_CLOSE" in shell
+    assert "PostMessageW(w, up ? (sys ? WM_SYSKEYUP : WM_KEYUP) : (sys ? WM_SYSKEYDOWN : WM_KEYDOWN)" in shell
     assert "SHGetKnownFolderPath(ids[i], KF_FLAG_CREATE" in shell   # SYSTEM Desktop exists
     assert "CLSID_ExplorerBrowser" in shell and "EnumDesktopWindows(g_desk" in shell
     for tool in ('L"cmd.exe"', 'L"powershell.exe"', 'L"taskmgr.exe"', 'L"regedit.exe"', 'L"services.msc"'):
