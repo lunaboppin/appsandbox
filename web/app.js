@@ -152,8 +152,13 @@ function onFullState(msg) {
     sharedAppliance = msg.sharedAppliance || {};
     if (document.getElementById('domain-overlay').classList.contains('active')) {
         renderDomain();
-        /* Became ready while the dialog was open: load the users. */
-        if (domainState() === 'ready' && !domainLoaded && !domainBusy) domainSend('domainList');
+        /* Became ready while the dialog was open: load the users, once.
+           A failed load shows its error and waits for Refresh; retrying on
+           every status update would loop, since each reply sends one. */
+        if (domainState() === 'ready' && !domainLoaded && !domainBusy) {
+            domainLoaded = true;
+            domainSend('domainList');
+        }
     }
     applyAccountModeUI();
     vpnConfigs = msg.vpnConfigs || [];
@@ -486,6 +491,7 @@ function gatherPreinstallApps() {
 /* ---- AppSandbox domain (Windows Server Core appliance) ---- */
 
 var domainData = { users: [], groups: [] };
+var DOMAIN_VM_ADMINS = 'AppSandbox VM Admins';
 var domainEditing = null;      /* user being edited, or null for a new one */
 var domainBusy = false;
 
@@ -536,7 +542,10 @@ function renderDomain() {
         name.textContent = u.name;
         var meta = document.createElement('span');
         meta.className = 'settings-resource-meta';
-        meta.textContent = (u.enabled ? 'Enabled' : 'Disabled') + ((u.groups || []).length ? ' · ' + u.groups.join(', ') : '');
+        var others = (u.groups || []).filter(function(g) { return g !== DOMAIN_VM_ADMINS; });
+        meta.textContent = (u.enabled ? 'Enabled' : 'Disabled') +
+            ((u.groups || []).indexOf(DOMAIN_VM_ADMINS) >= 0 ? ' · VM administrator' : ' · Standard user on VMs') +
+            (others.length ? ' · ' + others.join(', ') : '');
         details.append(name, meta);
         var actions = document.createElement('div');
         actions.className = 'settings-resource-actions';
@@ -585,6 +594,9 @@ function renderDomainUserGroups() {
     var have = user ? (user.groups || []) : [];
     box.innerHTML = '';
     (domainData.groups || []).forEach(function(g) {
+        /* Internal groups (DnsAdmins...) aren't offered; VM admin rights
+           have their own checkbox. Domain Admins stays: it is real power. */
+        if (g.name === DOMAIN_VM_ADMINS || (g.system && g.name !== 'Domain Admins')) return;
         var label = document.createElement('label');
         var cb = document.createElement('input');
         cb.type = 'checkbox';
@@ -603,7 +615,10 @@ function clearDomainUser() {
     var pass = document.getElementById('domain-user-pass');
     pass.value = ''; pass.placeholder = 'Any password (it can be empty)';
     document.getElementById('domain-user-enabled').checked = true;
+    document.getElementById('domain-user-vmadmin').checked = true;
     document.getElementById('btn-domain-user-save').textContent = 'Add User';
+    document.getElementById('domain-user-editing').textContent = '';
+    document.getElementById('btn-domain-user-cancel').style.display = 'none';
     renderDomainUserGroups();
 }
 
@@ -616,7 +631,10 @@ function editDomainUser(userName) {
     var pass = document.getElementById('domain-user-pass');
     pass.value = ''; pass.placeholder = 'Leave empty to keep the current password';
     document.getElementById('domain-user-enabled').checked = !!user.enabled;
+    document.getElementById('domain-user-vmadmin').checked = (user.groups || []).indexOf(DOMAIN_VM_ADMINS) >= 0;
     document.getElementById('btn-domain-user-save').textContent = 'Save User';
+    document.getElementById('domain-user-editing').textContent = 'Editing ' + userName;
+    document.getElementById('btn-domain-user-cancel').style.display = '';
     renderDomainUserGroups();
 }
 
@@ -650,6 +668,14 @@ function saveDomainUser() {
     var groups = [];
     document.querySelectorAll('#domain-user-groups input[data-group]').forEach(function(cb) {
         if (cb.checked) groups.push(cb.dataset.group);
+    });
+    if (document.getElementById('domain-user-vmadmin').checked) groups.push(DOMAIN_VM_ADMINS);
+    /* Keep internal groups the editor doesn't show (e.g. DnsAdmins). */
+    var editing = domainEditing && (domainData.users || []).find(function(u) { return u.name === domainEditing; });
+    (editing ? editing.groups || [] : []).forEach(function(g) {
+        var info = (domainData.groups || []).find(function(x) { return x.name === g; });
+        if (info && info.system && g !== 'Domain Admins' && g !== DOMAIN_VM_ADMINS && groups.indexOf(g) < 0)
+            groups.push(g);
     });
     domainSend('domainUserSet', {
         name: name,
@@ -1632,7 +1658,7 @@ function renderSettingsResources(){
 function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked};if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
 function onSharedResourceResult(msg){if(msg.id&&hostResourceBusy[msg.id]){delete hostResourceBusy[msg.id];renderSettingsResources();}if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 
-function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?(s.backend||'appliance'):'Not configured')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;applyApplianceBackendUI();}
+function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?({ubuntu:'Ubuntu / Samba',server_core:'Windows Server Core'}[s.backend]||'Appliance'):'Not configured')+(s.domainEnabled?' · domain controller for '+(s.domainName||'the AppSandbox domain'):'')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;applyApplianceBackendUI();}
 function appliancePayload(){return{backend:document.getElementById('appliance-backend').value,storageParent:document.getElementById('appliance-storage-parent').value.trim(),dataSizeGb:Number(document.getElementById('appliance-data-size').value),adminUser:document.getElementById('appliance-admin-user').value.trim(),adminPassword:document.getElementById('appliance-admin-pass').value,ramMb:Number(document.getElementById('appliance-ram').value),cpuCores:Number(document.getElementById('appliance-cpu').value),windowsIsoPath:document.getElementById('appliance-server-iso').value.trim(),windowsImageName:document.getElementById('appliance-server-image').value.trim(),productKey:document.getElementById('appliance-product-key').value,enableDomain:document.getElementById('appliance-backend').value==='server_core'&&document.getElementById('appliance-domain').checked};}
 function applyApplianceBackendUI(){var core=document.getElementById('appliance-backend').value==='server_core';document.querySelectorAll('.appliance-domain-row').forEach(function(el){el.style.display=core?'':'none';});if(sharedAppliance&&sharedAppliance.domainEnabled)document.getElementById('appliance-domain').checked=true;}
 function setupSharedAppliance(){sendCmd('setupSharedAppliance',appliancePayload());}

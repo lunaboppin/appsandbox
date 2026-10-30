@@ -600,7 +600,21 @@ td.editing select {
     .settings-resource-row { grid-template-columns:1fr; }
     .settings-resource-actions { justify-content:flex-start; }
 }
-.resource-editor { grid-template-columns:100px 1fr; }
+/* Settings / Domain editors: the label column fits the longest label, rows
+   share one gap (inputs drop the modal's stacked-form margins), and on a
+   narrow window labels sit above their fields. */
+.resource-editor { grid-template-columns:minmax(100px, max-content) minmax(0, 1fr); gap:6px 10px; }
+.resource-editor > label:not(.manage-check) { white-space:nowrap; }
+.manage-modal .resource-editor input:not([type="checkbox"]), .manage-modal .resource-editor select { margin:0; }
+.resource-editor > label.manage-check { justify-content:flex-start; }
+.domain-user-access { display:flex; flex-wrap:wrap; gap:6px 18px; }
+.domain-user-editing { margin-right:auto; align-self:center; font-size:12px; color:var(--text-dim); }
+.manage-modal fieldset .modal-buttons { margin-top:12px; }
+.modal-buttons { flex-wrap:wrap; }
+@media (max-width: 560px) {
+    .resource-editor { grid-template-columns:minmax(0, 1fr); gap:2px; }
+    .resource-editor > label:not(.manage-check) { text-align:left; padding-top:6px; }
+}
 .prereq-progress {
     margin-top: 12px;
     height: 6px;

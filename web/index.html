@@ -304,11 +304,16 @@
                 <div class="form-grid resource-editor">
                     <label for="domain-user-name">User name:</label><input id="domain-user-name" maxlength="20" spellcheck="false" autocomplete="off">
                     <label for="domain-user-pass">Password:</label><input id="domain-user-pass" type="password" autocomplete="new-password">
+                    <label>Access:</label>
+                    <div class="domain-user-access">
+                        <label class="manage-check" title="Members of the AppSandbox VM Admins group are local administrators on every managed VM."><input type="checkbox" id="domain-user-vmadmin" checked> Administrator on managed VMs</label>
+                        <label class="manage-check" title="A disabled user can't sign in anywhere."><input type="checkbox" id="domain-user-enabled" checked> Enabled</label>
+                    </div>
                     <label>Groups:</label><div id="domain-user-groups" class="app-check-grid"></div>
-                    <label></label><label class="manage-check" style="text-align:left"><input type="checkbox" id="domain-user-enabled" checked> Enabled</label>
                 </div>
                 <div class="modal-buttons">
-                    <button type="button" onclick="clearDomainUser()">New</button>
+                    <span id="domain-user-editing" class="domain-user-editing"></span>
+                    <button type="button" id="btn-domain-user-cancel" onclick="clearDomainUser()" title="Stop editing and go back to adding a new user.">Cancel</button>
                     <button type="button" class="primary" id="btn-domain-user-save" onclick="saveDomainUser()">Add User</button>
                 </div>
             </fieldset>

@@ -2859,7 +2859,8 @@ HRESULT shared_appliance_domain_user_delete(const wchar_t *name,
 static BOOL domain_protected_group(const wchar_t *name)
 {
     return _wcsicmp(name, L"Domain Admins") == 0 || _wcsicmp(name, L"Domain Users") == 0 ||
-           _wcsicmp(name, L"DnsAdmins") == 0 || _wcsicmp(name, L"DnsUpdateProxy") == 0;
+           _wcsicmp(name, L"DnsAdmins") == 0 || _wcsicmp(name, L"DnsUpdateProxy") == 0 ||
+           _wcsicmp(name, L"AppSandbox VM Admins") == 0;
 }
 
 HRESULT shared_appliance_domain_group_add(const wchar_t *name,
