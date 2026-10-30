@@ -494,6 +494,9 @@ var domainData = { users: [], groups: [] };
 var DOMAIN_VM_ADMINS = 'AppSandbox VM Admins';
 var domainEditing = null;      /* user being edited, or null for a new one */
 var domainBusy = false;
+var domainPhase = '';          /* 'loading' or 'saving' while a request runs */
+var domainError = '';          /* why the last load failed */
+var domainHaveData = false;    /* a user list has arrived */
 
 function domainState() {
     var s = sharedAppliance || {};
@@ -524,10 +527,10 @@ function renderDomain() {
         unsupported: 'The domain needs the Windows Server Core shared appliance; this one runs Ubuntu.',
         busy: 'Setting up the domain controller: ' + (s.progressText || 'working...'),
         off: 'The appliance is not a domain controller yet. Setting it up installs Active Directory and restarts the appliance (about 15 minutes); shared drives keep working.',
-        ready: 'Domain ' + (s.domainName || '') + ' — users here sign in to managed VMs. Any password is accepted.' + (domainBusy ? ' Working...' : '')
+        ready: domainStatusText(s)
     }[state];
     document.getElementById('domain-setup-row').style.display = state === 'off' ? '' : 'none';
-    document.getElementById('domain-manage').style.display = state === 'ready' ? '' : 'none';
+    document.getElementById('domain-manage').style.display = state === 'ready' && domainHaveData ? '' : 'none';
     if (state !== 'ready') return;
 
     var users = document.getElementById('domain-user-list');
@@ -638,8 +641,23 @@ function editDomainUser(userName) {
     renderDomainUserGroups();
 }
 
+/* What the dialog is doing, in the order a first open goes through it. */
+function domainStatusText(s) {
+    var domain = 'Domain ' + (s.domainName || '');
+    if (domainBusy && !s.ready)
+        return 'Starting the shared appliance: ' + (s.progressText || 'starting...') +
+               ' This can take a couple of minutes.';
+    if (domainPhase === 'loading')
+        return 'Loading users and groups from Active Directory... Right after the appliance starts, this can take a minute or two.';
+    if (domainPhase === 'saving') return 'Saving the change on the domain controller...';
+    if (domainError) return 'Could not load the domain: ' + domainError + ' Press Refresh to try again.';
+    return domain + ' — users here sign in to managed VMs. Any password is accepted.';
+}
+
 function domainSend(action, payload) {
     domainBusy = true;
+    domainPhase = action === 'domainList' ? 'loading' : 'saving';
+    domainError = '';
     renderDomain();
     sendCmd(action, payload || {});
 }
@@ -709,13 +727,17 @@ function deleteDomainGroup(name) {
 
 function onDomainResult(msg) {
     domainBusy = false;
+    domainPhase = '';
     if (!msg.success) {
-        showModal('Domain', msg.message || 'The request failed.', 'OK');
+        if (msg.action === 'domainList') domainError = msg.message || 'the request failed.';
+        else showModal('Domain', msg.message || 'The request failed.', 'OK');
         renderDomain();
         return;
     }
     if (msg.action === 'domainList') {
         domainLoaded = true;
+        domainHaveData = true;
+        domainError = '';
         try { domainData = JSON.parse(msg.data || '{}'); } catch (e) { domainData = { users: [], groups: [] }; }
         if (!Array.isArray(domainData.users)) domainData.users = [];
         if (!Array.isArray(domainData.groups)) domainData.groups = [];

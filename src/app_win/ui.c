@@ -1103,6 +1103,37 @@ typedef struct {
     char *json;                 /* domainList reply */
 } DomainWork;
 
+static DWORD WINAPI domain_start_appliance_thread(LPVOID unused)
+{
+    (void)unused;
+    return (DWORD)asb_shared_appliance_start(TRUE, 10 * 60 * 1000);
+}
+
+/* Domain requests need the appliance running. Start it here rather than
+   inside the request, so the page can show its progress while it boots. */
+static HRESULT domain_ensure_appliance(wchar_t *message, size_t message_chars)
+{
+    SharedApplianceStatus s;
+    HANDLE thread;
+    DWORD code = (DWORD)E_FAIL;
+    asb_shared_appliance_get_status(&s);
+    if (s.ready) return S_OK;
+    thread = CreateThread(NULL, 0, domain_start_appliance_thread, NULL, 0, NULL);
+    if (!thread) return HRESULT_FROM_WIN32(GetLastError());
+    PostMessageW(g_hwnd_main, WM_DOMAIN_PROGRESS, 0, 0);
+    while (WaitForSingleObject(thread, 2000) == WAIT_TIMEOUT)
+        PostMessageW(g_hwnd_main, WM_DOMAIN_PROGRESS, 0, 0);
+    GetExitCodeThread(thread, &code);
+    CloseHandle(thread);
+    PostMessageW(g_hwnd_main, WM_DOMAIN_PROGRESS, 0, 0);
+    if (FAILED((HRESULT)code)) {
+        asb_shared_appliance_get_status(&s);
+        swprintf_s(message, message_chars, L"The shared appliance could not be started%s%s",
+                   s.last_error[0] ? L": " : L".", s.last_error);
+    }
+    return (HRESULT)code;
+}
+
 static DWORD WINAPI domain_work_thread(LPVOID param)
 {
     DomainWork *w = (DomainWork *)param;
@@ -1124,6 +1155,8 @@ static DWORD WINAPI domain_work_thread(LPVOID param)
                          s.last_error[0] ? s.last_error : L"Setting up the domain controller failed; see the log.");
             }
         }
+    } else if (FAILED(w->result = domain_ensure_appliance(w->message, _countof(w->message)))) {
+        /* message says why; nothing else to do */
     } else if (wcscmp(w->action, L"domainList") == 0) {
         w->json = (char *)malloc(ASB_DOMAIN_JSON_MAX);
         w->result = w->json

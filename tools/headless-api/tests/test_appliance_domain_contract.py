@@ -103,6 +103,11 @@ def main() -> None:
     assert "PostMessageW(g_hwnd_main, WM_DOMAIN_PROGRESS, 0, 0);" in ui
     assert "} while (s.domain_busy);" in ui
     assert "sendCmd('getState');" in js
+    # Opening the dialog starts the appliance, with its progress shown.
+    assert "domain_ensure_appliance(w->message, _countof(w->message))" in ui
+    assert "asb_shared_appliance_start(TRUE, 10 * 60 * 1000)" in ui
+    assert "'Starting the shared appliance: '" in js
+    assert "Loading users and groups from Active Directory" in js
     # The automatic load runs once (a failure must not loop), and the AD
     # scripts wait for ADWS, which starts minutes after the DC boots.
     auto = js[js.index("Became ready while the dialog was open"):]
