@@ -988,32 +988,36 @@ static void refresh_guest_display_driver(wchar_t drive, const wchar_t *source_di
 
 /* The session helpers the agent spawns live beside it in the guest. They are
    refreshed with it, best-effort and only where the guest already has them,
-   so a fix to one (e.g. the input helper) reaches existing VMs too. */
+   so a fix to one (e.g. the input helper) reaches existing VMs too. Those
+   marked '+' came later and are added where they are missing. */
 static void refresh_guest_helpers(wchar_t drive, const wchar_t *source_dir)
 {
     static const wchar_t *helpers[] = {
         L"appsandbox-input.exe", L"appsandbox-clipboard.exe",
         L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe",
-        L"appsandbox-displays.exe", NULL
+        L"appsandbox-displays.exe", L"+appsandbox-backstage.exe", NULL
     };
     wchar_t source[MAX_PATH], dest[MAX_PATH], temp[MAX_PATH];
     BYTE a[32], b[32];
     int i;
     for (i = 0; helpers[i]; i++) {
-        swprintf_s(source, MAX_PATH, L"%s\\%s", source_dir, helpers[i]);
-        swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\%s", drive, helpers[i]);
+        BOOL add = helpers[i][0] == L'+';
+        const wchar_t *name = helpers[i] + (add ? 1 : 0);
+        swprintf_s(source, MAX_PATH, L"%s\\%s", source_dir, name);
+        swprintf_s(dest, MAX_PATH, L"%c:\\Windows\\AppSandbox\\%s", drive, name);
         if (GetFileAttributesW(source) == INVALID_FILE_ATTRIBUTES ||
-            GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) continue;
-        if (SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
+            (!add && GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES)) continue;
+        if (GetFileAttributesW(dest) != INVALID_FILE_ATTRIBUTES &&
+            SUCCEEDED(sha256_file(source, a)) && SUCCEEDED(sha256_file(dest, b)) &&
             memcmp(a, b, 32) == 0) continue;
         swprintf_s(temp, MAX_PATH, L"%s.new", dest);
         if (!CopyFileW(source, temp, FALSE) ||
             !MoveFileExW(temp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            asb_log(L"Guest helper refresh: %s failed (%lu).", helpers[i], GetLastError());
+            asb_log(L"Guest helper refresh: %s failed (%lu).", name, GetLastError());
             DeleteFileW(temp);
             continue;
         }
-        asb_log(L"Guest helper refresh: updated %s.", helpers[i]);
+        asb_log(L"Guest helper refresh: updated %s.", name);
     }
     refresh_guest_display_driver(drive, source_dir);
 }
@@ -1082,7 +1086,7 @@ static void guest_payload_stamp(wchar_t *out, size_t chars)
 {
     static const wchar_t *files[] = {
         L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-audio.exe",
-        L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys",
+        L"appsandbox-backstage.exe", L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys",
         L"*AppSandboxVDD.inf", L"*AppSandboxVAD.inf", NULL   /* '*' = in the drivers folder */
     };
     wchar_t module[MAX_PATH], dir[MAX_PATH], drivers_dir[MAX_PATH], path[MAX_PATH], *slash;
@@ -1118,7 +1122,7 @@ static void guest_payload_stamp_path(const wchar_t *vhdx_path, wchar_t *out, siz
 
 static BOOL guest_payload_current(const wchar_t *vhdx_path, const wchar_t *stamp)
 {
-    wchar_t path[MAX_PATH], saved[128] = L"";
+    wchar_t path[MAX_PATH], saved[256] = L"";
     FILE *f;
     guest_payload_stamp_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"r") != 0 || !f) return FALSE;
@@ -1593,7 +1597,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
 
     if (args->config.shared_resource_count == 0 && args->network_mode != NET_VPN &&
         vm->install_complete && _wcsicmp(vm->os_type, L"Windows") == 0) {
-        wchar_t stamp[128];
+        wchar_t stamp[256];
         guest_payload_stamp(stamp, _countof(stamp));
         if (stamp[0] && !guest_payload_current(vm->vhdx_path, stamp)) {
             hr = upgrade_windows_agent_offline(vm->vhdx_path);

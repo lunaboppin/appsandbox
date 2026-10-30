@@ -16,6 +16,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Disposable VMs:** every start begins from a clean checkpoint and throws away the last session's changes.
 - **Templates** for creating Windows VMs from a prepared state instead of reinstalling.
 - **Per-VM management:** installer media, storage relocation, grow-only disk resizing, Secure Boot and display preferences. The whole VM tree can be placed on any fixed NTFS/ReFS volume.
+- **Backstage session:** like ScreenConnect's Backstage, open a SYSTEM shell on a desktop of its own inside a Windows VM, from the display window's title-bar menu. It has a taskbar with Command Prompt, PowerShell, Task Manager, Registry Editor and more, plus an Explorer file browser. The signed-in desktop keeps running untouched.
 - **Nested virtualization,** so Docker, WSL and Claude Cowork run inside the VM.
 
 ### Display, input and sound
@@ -87,7 +88,7 @@ This repo also aims to be a working example of creating full desktop VMs program
 
 ## Tips
 
-- **[Windows] Hotkeys and audio:** to enable hotkeys or mute the VM's audio, open the VM's display and right-click its title bar.
+- **[Windows] Hotkeys, audio and Backstage:** to enable hotkeys, mute the VM's audio or open or leave the Backstage session, open the VM's display and right-click its title bar.
 - **[Windows] Remote access:** need high-performance remote desktop into your VM? [Phaze](https://phaze.app) works well.
 - **[Windows] Check GPU-PV:** run `gpu-test.exe` ([gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip)) inside a Windows VM. It shows six rotating cubes, one each for D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan; any API that fails won't show its cube. Some games and apps still don't detect GPU-PV correctly even when every API works.
 
