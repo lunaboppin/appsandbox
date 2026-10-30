@@ -105,6 +105,8 @@ typedef struct {
     BOOL        auto_open_display; /* TRUE = open IDD display whenever it becomes ready */
     BOOL        secure_boot_off;  /* TRUE = start without Secure Boot so test-signed kernel drivers load */
     BOOL        domain_member;    /* TRUE = managed: domain users sign in, joins at every boot */
+    wchar_t     disposable_snap[64];   /* GUID of the clean checkpoint every start begins from; empty = off */
+    wchar_t     disposable_branch[64]; /* branch the last disposable start created (deleted at the next) */
     DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */
     volatile LONG management_busy; /* serializes stopped-VM media/storage/disk operations */
     wchar_t     config_passthrough[4096]; /* unrecognized vms.cfg keys */

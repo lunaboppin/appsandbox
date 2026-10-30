@@ -50,11 +50,11 @@ static HRESULT save_locked(void)
         fwprintf(f,
             L"[Resource]\nId=%s\nName=%s\nLegacyHostPath=%s\n"
             L"DriveLetter=%c\nHostDriveLetter=%c\nEnabled=%d\nReadOnly=%d\n"
-            L"StorageKind=appliance\nRetainedData=%d\n",
+            L"StorageKind=appliance\nRetainedData=%d\nGroups=%s\n",
             r->id, r->name, r->legacy_host_path,
             r->drive_letter, r->host_drive_letter ? r->host_drive_letter : L'-',
             r->enabled ? 1 : 0, r->read_only ? 1 : 0,
-            r->retained_data ? 1 : 0);
+            r->retained_data ? 1 : 0, r->groups);
     }
     fflush(f);
     FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
@@ -112,6 +112,8 @@ void shared_resources_init(void)
                 cur->read_only = _wtoi(line + 9) != 0;
             else if (cur && wcsncmp(line, L"RetainedData=", 13) == 0)
                 cur->retained_data = _wtoi(line + 13) != 0;
+            else if (cur && wcsncmp(line, L"Groups=", 7) == 0)
+                wcsncpy_s(cur->groups, _countof(cur->groups), line + 7, _TRUNCATE);
         }
         fclose(f);
     }
@@ -158,6 +160,11 @@ static HRESULT validate_info(const AsbSharedResourceInfo *in, int ignore,
             return E_INVALIDARG;
     }
     wcscpy_s(normalized->storage_kind, _countof(normalized->storage_kind), L"appliance");
+    /* Domain group names: letters, digits, spaces, '.', '_', '-', comma-separated. */
+    for (i = 0; normalized->groups[i]; i++) {
+        wchar_t c = normalized->groups[i];
+        if (!((c < 128 && iswalnum(c)) || wcschr(L" ._-,", c))) return E_INVALIDARG;
+    }
     normalized->host_path[0] = L'\0';
     normalized->legacy_host_path[0] = L'\0';
     for (i = 0; i < g_resource_count; i++) if (i != ignore) {
@@ -298,6 +305,7 @@ int shared_resources_build_attachments(const wchar_t *os_type, const wchar_t *ex
         out[n].drive_letter = r->drive_letter;
         out[n].host_drive_letter = r->host_drive_letter;
         out[n].read_only = r->read_only;
+        wcscpy_s(out[n].groups, _countof(out[n].groups), r->groups);
         wcscpy_s(out[n].mapping_result, _countof(out[n].mapping_result), L"pending");
         n++;
     }

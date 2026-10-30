@@ -79,7 +79,7 @@ def main() -> None:
     assert "/Domain Users')" not in join
     assert join.count("/AppSandbox VM Admins')") == 2
     assert join.index("/AppSandbox VM Admins')") < join.index("result:already")
-    assert agent.count("New-ADGroup -Name 'AppSandbox VM Admins'") == 2
+    assert agent.count("New-ADGroup -Name 'AppSandbox VM Admins'") == 3   # finish, list, ensure
     assert "if (document.getElementById('domain-user-vmadmin').checked) groups.push(DOMAIN_VM_ADMINS);" in js
     assert 'cfg.domain_member = !is_tpl && _wcsicmp(account_buf, L"managed") == 0;' in ui
     assert 'id="account-mode"' in html and "managedOption.disabled = !ready;" in js
@@ -112,7 +112,7 @@ def main() -> None:
     # scripts wait for ADWS, which starts minutes after the DC boots.
     auto = js[js.index("Became ready while the dialog was open"):]
     assert auto.index("domainLoaded = true;") < auto.index("domainSend('domainList');")
-    assert agent.count("Start-Service ADWS") == 5
+    assert agent.count("Start-Service ADWS") == 6   # five management scripts + ensure
     # Remote management can't fail readiness on a DC whose Kerberos is starting.
     assert "}catch{Write-Output 'storage: remote management is not ready yet" in agent
     print("[ok] appliance domain controller and managed VMs contract")

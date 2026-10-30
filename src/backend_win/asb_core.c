@@ -571,6 +571,9 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"SecureBootOff=1\n");
         if (g_vms[i].domain_member)
             fwprintf(f, L"DomainMember=1\n");
+        if (g_vms[i].disposable_snap[0])
+            fwprintf(f, L"DisposableSnap=%s\nDisposableBranch=%s\n",
+                     g_vms[i].disposable_snap, g_vms[i].disposable_branch);
         if (g_vms[i].guest_grow_target_gb)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
@@ -710,6 +713,10 @@ static void load_vm_list(void)
             vm->secure_boot_off = (_wtoi(line + 14) != 0);
         else if (wcsncmp(line, L"DomainMember=", 13) == 0)
             vm->domain_member = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"DisposableSnap=", 15) == 0)
+            wcsncpy_s(vm->disposable_snap, _countof(vm->disposable_snap), line + 15, _TRUNCATE);
+        else if (wcsncmp(line, L"DisposableBranch=", 17) == 0)
+            wcsncpy_s(vm->disposable_branch, _countof(vm->disposable_branch), line + 17, _TRUNCATE);
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
@@ -4043,6 +4050,43 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         }
     }
 
+    /* Disposable: every normal start (or a start from the clean checkpoint
+       itself) boots a new branch of the clean checkpoint, and the branch the
+       last session ran on is deleted with everything it changed. */
+    if (inst->disposable_snap[0] && snap_idx == -1) {
+        SnapshotTree *tree = &g_snap_trees[idx];
+        int node = -1, i, b;
+        for (i = 0; i < tree->count; i++)
+            if (tree->nodes[i].valid && _wcsicmp(tree->nodes[i].guid, inst->disposable_snap) == 0)
+                node = i;
+        if (node < 0) {
+            asb_log(L"\"%s\": the clean checkpoint for disposable starts is gone; starting normally.",
+                    inst->name);
+        } else {
+            wchar_t previous[64];
+            HRESULT dhr;
+            wcscpy_s(previous, _countof(previous), inst->disposable_branch);
+            dhr = snapshot_new_branch(tree, inst, node);
+            if (FAILED(dhr)) {
+                asb_log(L"Error: could not create a clean copy for \"%s\" (0x%08X).", inst->name, dhr);
+                InterlockedExchange(&inst->management_busy, 0);
+                if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+                return dhr;
+            }
+            b = tree->nodes[node].branch_count - 1;
+            wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+                     tree->nodes[node].branches[b].guid);
+            for (i = 0; previous[0] && i < tree->nodes[node].branch_count; i++)
+                if (_wcsicmp(tree->nodes[node].branches[i].guid, previous) == 0) {
+                    snapshot_delete_branch(tree, inst, node, i);
+                    break;
+                }
+            asb_log(L"\"%s\" is disposable: starting from a clean copy of \"%s\".",
+                    inst->name, tree->nodes[node].name);
+            save_vm_list();
+        }
+    }
+
     /* Switch to snapshot/base branch before booting */
     if (snap_idx >= 0 || snap_idx == -2) {
         HRESULT hr;
@@ -4577,6 +4621,44 @@ ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member)
         ? L"\"%s\" will join the " L"" ASB_DOMAIN_NETBIOS L" domain at its next start%s."
         : L"\"%s\" is no longer managed%s; it stays joined until removed in Windows.",
         inst->name, inst->running ? L" (restart it)" : L"");
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* Disposable VM: on turns the VM's current state into the "Disposable clean
+   state" checkpoint that every later start begins from (the VM must be
+   stopped); off keeps the checkpoint and the current branch. */
+ASB_API HRESULT asb_vm_set_disposable(AsbVm vm, BOOL enabled)
+{
+    VmInstance *inst;
+    SnapshotTree *tree;
+    HRESULT hr;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    tree = &g_snap_trees[idx];
+    if (!enabled) {
+        inst->disposable_snap[0] = L'\0';
+        inst->disposable_branch[0] = L'\0';
+        asb_log(L"\"%s\" is no longer disposable; it keeps changes again.", inst->name);
+    } else {
+        if (inst->running) {
+            asb_log(L"Shut \"%s\" down before making it disposable.", inst->name);
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+        hr = asb_snap_take(vm, L"Disposable clean state");
+        if (FAILED(hr)) return hr;
+        wcscpy_s(inst->disposable_snap, _countof(inst->disposable_snap),
+                 tree->nodes[tree->count - 1].guid);
+        /* The branch the checkpoint switched to is this session's; the next
+           start replaces it. */
+        wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+                 tree->nodes[tree->count - 1].branch_count > 0
+                     ? tree->nodes[tree->count - 1].branches[tree->nodes[tree->count - 1].branch_count - 1].guid
+                     : L"");
+        asb_log(L"\"%s\" is disposable: every start begins from its current state.", inst->name);
+    }
     if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
     if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
     return S_OK;

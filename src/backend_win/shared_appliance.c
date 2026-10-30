@@ -119,6 +119,9 @@ static SharedApplianceGlobal g_appliance;
 static wchar_t g_unc_host_mounts[ASB_MAX_SHARED_RESOURCES][ASB_SHARED_ID_CHARS];
 
 static HRESULT domain_promote_internal(void);
+static void b64_utf8(const wchar_t *text, char *out, size_t out_chars);
+/* domain_ensure (home share, roaming-files policy, homes) ran this session. */
+static volatile LONG g_domain_ensured;
 
 /* The SMB service account as clients and the host name it. A domain
    controller has no local accounts, so there it is the domain's account. */
@@ -1843,8 +1846,16 @@ static HRESULT reconcile_internal(void)
     for (i = 0; i < count; ++i) {
         char share[128];
         WideCharToMultiByte(CP_UTF8, 0, resources[i].share_name, -1, share, sizeof(share), NULL, NULL);
-        sprintf_s(command, sizeof(command), "appliance_reconcile:%s:%s",
-                  share, resources[i].read_only ? "ro" : "rw");
+        if (resources[i].groups[0] && g_appliance.status.domain_enabled) {
+            /* Only these domain groups (plus the host's service account). */
+            char groups_b64[600];
+            b64_utf8(resources[i].groups, groups_b64, sizeof(groups_b64));
+            sprintf_s(command, sizeof(command), "appliance_reconcile:%s:%s:%s",
+                      share, resources[i].read_only ? "ro" : "rw", groups_b64);
+        } else {
+            sprintf_s(command, sizeof(command), "appliance_reconcile:%s:%s",
+                      share, resources[i].read_only ? "ro" : "rw");
+        }
         if (!appliance_send(command, response, sizeof(response), 30000)) {
             ui_log(L"Shared appliance: publishing share %S failed (%S).",
                    share, response[0] ? response : "no reply");
@@ -2740,6 +2751,12 @@ static HRESULT domain_promote_internal(void)
     g_appliance.status.domain_enabled = TRUE;
     save_config_locked();
     LeaveCriticalSection(&g_appliance.cs);
+    set_progress(96, L"Domain: setting up home folders and roaming files...");
+    if (appliance_send("domain_ensure", reply, sizeof(reply), 10ul * 60ul * 1000ul))
+        InterlockedExchange(&g_domain_ensured, 1);
+    else
+        ui_log(L"Domain: home folder setup failed (%S); it is retried when the Domain dialog opens.",
+               reply[0] ? reply : "no reply");
     set_progress(100, L"Domain: " ASB_DOMAIN_FQDN L" is ready.");
     hr = S_OK;
 done:
@@ -2801,6 +2818,17 @@ HRESULT shared_appliance_domain_list(char *json, size_t chars,
     json[0] = '\0';
     reply = (char *)HeapAlloc(GetProcessHeap(), 0, ASB_DOMAIN_REPLY_MAX);
     if (!reply) return E_OUTOFMEMORY;
+    /* Home share, roaming-files policy, VM Admins group and every user's
+       home folder: once per session, so domains promoted before these
+       existed get them too. A failure is logged; the list still loads. */
+    if (!g_domain_ensured) {
+        if (SUCCEEDED(domain_send("domain_ensure", reply, ASB_DOMAIN_REPLY_MAX,
+                                  10ul * 60ul * 1000ul, message, message_chars)))
+            InterlockedExchange(&g_domain_ensured, 1);
+        else
+            ui_log(L"Domain: home folder / roaming files setup failed (%s).",
+                   message && message[0] ? message : L"no reply");
+    }
     hr = domain_send("domain_list", reply, ASB_DOMAIN_REPLY_MAX, 120000,
                      message, message_chars);
     if (SUCCEEDED(hr))

@@ -150,6 +150,7 @@ function onFullState(msg) {
     lastStorageParent = msg.lastStorageParent || lastStorageParent;
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
+    if (document.getElementById('resource-groups')) applyResourceDomainUI();
     if (document.getElementById('domain-overlay').classList.contains('active')) {
         renderDomain();
         /* Became ready while the dialog was open: load the users, once.
@@ -648,7 +649,7 @@ function domainStatusText(s) {
         return 'Starting the shared appliance: ' + (s.progressText || 'starting...') +
                ' This can take a couple of minutes.';
     if (domainPhase === 'loading')
-        return 'Loading users and groups from Active Directory... Right after the appliance starts, this can take a minute or two.';
+        return 'Loading users and groups from Active Directory... Right after the appliance starts this can take a minute or two, and the first time it also sets up home folders (H:) and roaming files.';
     if (domainPhase === 'saving') return 'Saving the change on the domain controller...';
     if (domainError) return 'Could not load the domain: ' + domainError + ' Press Refresh to try again.';
     return domain + ' — users here sign in to managed VMs. Any password is accepted.';
@@ -1574,6 +1575,7 @@ function refreshManageVm(forceFields) {
     document.getElementById('manage-domain-section').style.display =
         vm.osType === 'Windows' && !vm.isTemplate ? '' : 'none';
     document.getElementById('manage-domain-member').checked = !!vm.domainMember;
+    document.getElementById('manage-disposable').checked = !!vm.disposable;
     document.getElementById('manage-domain-hint').textContent = domainState() === 'ready' || vm.domainMember
         ? 'Joins ' + (sharedAppliance.domainName || 'the domain') + ' at the next start (restart a running VM); domain users can then sign in, and its local accounts keep working. Turning this off stops AppSandbox joining it, but it stays in the domain until removed in Windows.'
         : 'Set up the domain controller (Domain) to join this VM to it.';
@@ -1592,6 +1594,9 @@ function refreshManageVm(forceFields) {
     setManageDisabled('manage-disk-grow', !stoppedIdle || hasChildren);
     setManageDisabled('manage-auto-display', managePending);
     setManageDisabled('manage-secure-boot', managePending);
+    /* Turning it on checkpoints the disk, so the VM must be off; off is always allowed. */
+    setManageDisabled('manage-disposable', managePending ||
+        (!(vms[manageVmIndex] || {}).disposable && !!(vms[manageVmIndex] || {}).running));
     setManageDisabled('manage-domain-member', managePending ||
         (domainState() !== 'ready' && !(vms[manageVmIndex] || {}).domainMember));
     onManageCheckpointSelection();
@@ -1631,8 +1636,10 @@ function renderManageSharedResources(vm) {
 function openSettingsModal(){populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
 function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}
-function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-editor-title').textContent='Add shared resource';}
-function editResource(id){var r=sharedResources.find(function(x){return x.id===id;});if(!r)return;populateResourceLetters();document.getElementById('resource-id').value=r.id;document.getElementById('resource-name').value=r.name;document.getElementById('resource-letter').value=r.driveLetter;document.getElementById('resource-host-letter').value=r.hostDriveLetter||'';document.getElementById('resource-enabled').checked=!!r.enabled;document.getElementById('resource-readonly').checked=!!r.readOnly;document.getElementById('resource-editor-title').textContent='Edit shared resource';}
+function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-groups').value='';applyResourceDomainUI();document.getElementById('resource-editor-title').textContent='Add shared resource';}
+/* The groups field only means something once the appliance is a domain controller. */
+function applyResourceDomainUI(){var on=!!(sharedAppliance&&sharedAppliance.domainEnabled)||!!document.getElementById('resource-groups').value;document.querySelectorAll('.resource-domain-row').forEach(function(el){el.style.display=on?'':'none';});}
+function editResource(id){var r=sharedResources.find(function(x){return x.id===id;});if(!r)return;populateResourceLetters();document.getElementById('resource-id').value=r.id;document.getElementById('resource-name').value=r.name;document.getElementById('resource-letter').value=r.driveLetter;document.getElementById('resource-host-letter').value=r.hostDriveLetter||'';document.getElementById('resource-enabled').checked=!!r.enabled;document.getElementById('resource-readonly').checked=!!r.readOnly;document.getElementById('resource-groups').value=r.groups||'';applyResourceDomainUI();document.getElementById('resource-editor-title').textContent='Edit shared resource';}
 function renderSettingsResources(){
     var box=document.getElementById('settings-resource-list');
     if(!box)return;
@@ -1647,7 +1654,7 @@ function renderSettingsResources(){
         name.textContent=r.driveLetter+': '+r.name;
         var meta=document.createElement('span');
         meta.className='settings-resource-meta';
-        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.enabled?'':' · Disabled')+(r.hostMounted?' · Mounted on host'+(r.hostDriveLetter?' as '+r.hostDriveLetter+':':''):'')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
+        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.groups?' · Only for '+r.groups:'')+(r.enabled?'':' · Disabled')+(r.hostMounted?' · Mounted on host'+(r.hostDriveLetter?' as '+r.hostDriveLetter+':':''):'')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
         details.append(name,meta);
         var actions=document.createElement('div');
         actions.className='settings-resource-actions';
@@ -1677,7 +1684,7 @@ function renderSettingsResources(){
     });
     if(!box.children.length)box.textContent='No shared resources configured.';
 }
-function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked};if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
+function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked,groups:document.getElementById('resource-groups').value.split(',').map(function(g){return g.trim();}).filter(function(g){return g;}).join(',')};if(!/^[A-Za-z0-9 ._,-]*$/.test(payload.groups)){showModal('Shared resource','Domain group names use letters, digits, spaces, ".", "_" or "-", separated by commas.','OK',{confirmClass:'primary'});return;}if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
 function onSharedResourceResult(msg){if(msg.id&&hostResourceBusy[msg.id]){delete hostResourceBusy[msg.id];renderSettingsResources();}if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 
 function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?({ubuntu:'Ubuntu / Samba',server_core:'Windows Server Core'}[s.backend]||'Appliance'):'Not configured')+(s.domainEnabled?' · domain controller for '+(s.domainName||'the AppSandbox domain'):'')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;applyApplianceBackendUI();}
@@ -1857,6 +1864,20 @@ function growManageDisk() {
         managePending = true; refreshManageVm(false);
         sendCmd('resizeVmDisk', {vmIndex: manageVmIndex, sizeGb: size});
     });
+}
+
+function saveManageDisposable() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-disposable');
+    function send(enabled) {
+        managePending = true; refreshManageVm(false);
+        sendCmd('setVmDisposable', { vmIndex: manageVmIndex, enabled: enabled });
+    }
+    if (!box.checked) { send(false); return; }
+    box.checked = false;
+    showModal('Make this VM disposable',
+        'Checkpoint this VM as it is now and start every session from that clean copy? Anything saved inside the VM since its last start is thrown away at the next start, except on H: and shared drives.',
+        'Make Disposable', { confirmClass: 'primary' }).then(function(ok) { if (ok) send(true); });
 }
 
 function saveManageDomainMember() {

@@ -551,6 +551,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             wchar_t user_w[128], password_w[128];
             char user[256], password[256];
             char net_cmd[128];
+            char user_drives[1024];
             HRESULT cred_hr;
             vm->shared_resource_error[0] = L'\0';
             sprintf_s(net_cmd, sizeof(net_cmd), "shared_net:%s:%s",
@@ -616,10 +617,28 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
             WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);
             WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
+            user_drives[0] = '\0';
             for (ri = 0; ri < vm->shared_resource_count; ri++) {
                 char map_cmd[1024], share[64];
                 HcsSharedResource *r = &vm->shared_resources[ri];
                 if (_wcsicmp(r->mapping_result, L"unavailable") == 0) continue;
+                /* Restricted to domain groups: never mapped machine-wide with
+                   the service account. Managed VMs map it per user at sign-in
+                   with the user's own credentials, so the appliance decides. */
+                if (r->groups[0]) {
+                    if (vm->domain_member) {
+                        size_t used = strlen(user_drives);
+                        sprintf_s(user_drives + used, sizeof(user_drives) - used, "%s%c=%S",
+                                  used ? "," : "", (char)r->drive_letter, r->share_name);
+                        wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"per-user");
+                        r->failure[0] = L'\0';
+                    } else {
+                        wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"unavailable");
+                        wcscpy_s(r->failure, _countof(r->failure),
+                                 L"Restricted to domain groups; only managed VMs map it.");
+                    }
+                    continue;
+                }
                 WideCharToMultiByte(CP_UTF8, 0, r->share_name, -1,
                                     share, sizeof(share), NULL, NULL);
                 sprintf_s(map_cmd, sizeof(map_cmd), "shared_smb_map:%c:%s:%s:%s:%s",
@@ -653,6 +672,16 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             SecureZeroMemory(password, sizeof(password));
             SecureZeroMemory(user_w, sizeof(user_w));
             SecureZeroMemory(user, sizeof(user));
+            /* Per-user drives (sent even when empty, to clear a stale list). */
+            if (vm->domain_member) {
+                char drives_cmd[1100];
+                sprintf_s(drives_cmd, sizeof(drives_cmd), "user_drives:%s", user_drives);
+                n = send_tagged_cmd(s, vm, &conn->cmd_seq, drives_cmd, buf, sizeof(buf), 30000);
+                if (n <= 0) goto disconnected;
+                if (user_drives[0])
+                    ui_log(L"\"%s\": group-restricted drives map at sign-in for members (%S).",
+                           vm->name, user_drives);
+            }
             notify_agent_status(vm);
         }
 shared_mapping_done:

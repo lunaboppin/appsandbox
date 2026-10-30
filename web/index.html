@@ -260,6 +260,12 @@
             <small id="manage-domain-hint"></small>
         </fieldset>
 
+        <fieldset id="manage-disposable-section">
+            <legend>Disposable</legend>
+            <label class="manage-check"><input type="checkbox" id="manage-disposable" onchange="saveManageDisposable()"> Start from a clean copy every time</label>
+            <small>Turning this on checkpoints the VM as it is now (shut it down first). Every start then begins from that checkpoint and throws away the last session's changes. On managed VMs, domain users keep their Desktop, Documents, Downloads and Pictures (on H:), and shared drives keep their files. To change the clean copy: turn this off, make the change, shut down, turn it on again.</small>
+        </fieldset>
+
         <fieldset id="manage-secure-boot-section">
             <legend>Secure Boot</legend>
             <label class="manage-check"><input type="checkbox" id="manage-secure-boot" onchange="saveManageSecureBoot()"> Start this VM with Secure Boot</label>
@@ -394,6 +400,11 @@
                 <label for="resource-letter">Drive letter:</label><select id="resource-letter"></select>
                 <label for="resource-host-letter">Optional host letter:</label><select id="resource-host-letter"><option value="">Not mounted</option></select>
                 <label>Options:</label><div><label class="manage-check"><input type="checkbox" id="resource-enabled" checked> Enabled</label> <label class="manage-check"><input type="checkbox" id="resource-readonly"> Read-only</label></div>
+                <label for="resource-groups" class="resource-domain-row">Domain groups:</label>
+                <div class="resource-domain-row">
+                    <input id="resource-groups" maxlength="255" spellcheck="false" placeholder="Everyone (or e.g. Gamers, Dev)">
+                    <small>Limits this drive to members of these domain groups. They get it as their own drive on managed VMs; local VMs don't map it.</small>
+                </div>
             </div>
             <div class="modal-buttons"><button type="button" onclick="clearResourceEditor()" title="Clear the shared resource editor and prepare a new resource.">Clear</button><button type="button" class="primary" onclick="saveResourceEditor()" title="Save this shared resource definition.">Save</button></div>
         </fieldset>

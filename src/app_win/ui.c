@@ -260,6 +260,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"autoOpenDisplay", v->auto_open_display);
     jb_bool(jb, L"secureBoot", !v->secure_boot_off);
     jb_bool(jb, L"domainMember", v->domain_member);
+    jb_bool(jb, L"disposable", v->disposable_snap[0] != L'\0');
     jb_bool(jb, L"managementBusy", asb_vm_management_busy(asb_vm_get(i)));
     jb_int(jb, L"guestGrowTargetGb", (int)v->guest_grow_target_gb);
     jb_string(jb, L"sharedResourceExclusions", v->shared_resource_exclusions);
@@ -580,6 +581,7 @@ static void send_full_state(void)
               jb_string(&jb, L"hostDriveLetter", letter); }
             jb_bool(&jb, L"enabled", r.enabled);
             jb_bool(&jb, L"readOnly", r.read_only);
+            jb_string(&jb, L"groups", r.groups);
             jb_bool(&jb, L"hostMounted", asb_shared_resource_host_mounted(r.id));
             jb_string(&jb, L"availability", appliance.ready ? L"available" : L"unavailable");
             jb_int(&jb, L"applianceState", appliance.state);
@@ -1613,6 +1615,7 @@ static void on_webview2_message(const wchar_t *json)
         { wchar_t hdl[8]={0}; json_get_string(json,L"hostDriveLetter",hdl,_countof(hdl)); r.host_drive_letter=towupper(hdl[0]); }
         if(!json_get_bool(json,L"enabled",&r.enabled))r.enabled=TRUE;
         json_get_bool(json,L"readOnly",&r.read_only);
+        json_get_string(json,L"groups",r.groups,_countof(r.groups));
         json_get_bool(json,L"confirmPermissions",&confirm);
         hr=id[0]?asb_shared_resource_update(id,&r,confirm)
                 :asb_shared_resource_create(&r,confirm,created,_countof(created));
@@ -1746,6 +1749,11 @@ static void on_webview2_message(const wchar_t *json)
         int vi; BOOL enabled = TRUE; HRESULT hr = E_INVALIDARG;
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
             hr = asb_vm_set_secure_boot(asb_vm_get(vi), enabled);
+        send_manage_result(0, hr); send_vm_list();
+    } else if (wcscmp(action, L"setVmDisposable") == 0) {
+        int vi; BOOL enabled = FALSE; HRESULT hr = E_INVALIDARG;
+        if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
+            hr = asb_vm_set_disposable(asb_vm_get(vi), enabled);
         send_manage_result(0, hr); send_vm_list();
     } else if (wcscmp(action, L"setVmDomainMember") == 0) {
         int vi; BOOL member = FALSE; HRESULT hr = E_INVALIDARG;
