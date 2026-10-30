@@ -42,6 +42,9 @@ def main() -> None:
     assert promote.index('"domain_promote:%s:%s:%s"') < promote.index("shared_appliance_stop(FALSE);") \
         < promote.index('"domain_finish:%s:%s"')
     assert "Install-ADDSForest -DomainName $env:ASB_DOM_FQDN" in agent
+    # The local policy is relaxed before the Administrator/DSRM passwords are set.
+    pr = agent[agent.index("static const char DOMAIN_PROMOTE_PS[]"):]
+    assert pr.index("PasswordComplexity = 0") < pr.index("$a.SetPassword($pw)") < pr.index("Install-ADDSForest")
     assert "-ComplexityEnabled $false -MinPasswordLength 0 -PasswordHistoryCount 0" in agent
     assert "Add-ADGroupMember -Identity 'Domain Admins' -Members $n" in agent
 
