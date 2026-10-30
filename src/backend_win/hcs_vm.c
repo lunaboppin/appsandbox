@@ -1207,13 +1207,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        bind(AF_VSOCK, port=N) ends up registered as the corresponding
        <N>-FACB-... GUID on the host side. Same security descriptors
        for both. Ports 1–6 cover agent + frame + input + audio + the
-       two clipboard channels. */
+       two clipboard channels; 8 is the Backstage session's screen. */
     {
         wchar_t entry[256];
         wchar_t guid_str[64];
         unsigned port;
         service_table[0] = L'\0';
-        for (port = 1; port <= 6; port++) {
+        for (port = 1; port <= 8; port++) {
+            if (port == 7) continue;   /* SSH: works without an entry; left as it was */
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"

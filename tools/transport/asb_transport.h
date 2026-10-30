@@ -29,6 +29,7 @@ extern "C" {
 #define ASB_CH_CLIPBOARD        5
 #define ASB_CH_CLIPBOARD_READER 6
 #define ASB_CH_SSH              7
+#define ASB_CH_BACKSTAGE        8      /* Backstage session screen + input (session 0) */
 #define ASB_CH_9P               50001
 
 /* ================================================================================

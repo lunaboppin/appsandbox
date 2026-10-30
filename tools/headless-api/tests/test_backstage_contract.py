@@ -1,13 +1,15 @@
-"""Contract: Backstage session, a SYSTEM shell on its own desktop in a VM.
+"""Contract: Backstage session (hidden SYSTEM session) and the floating menu.
 
-Like ScreenConnect's Backstage. "Backstage Session (SYSTEM)" in the display
-window's title-bar menu sends the agent "backstage", which toggles it. The
-agent starts appsandbox-backstage.exe as SYSTEM in the console session; that
-creates the AppSandboxBackstage desktop, starts itself on it (--shell) and
-switches the screen there, then holds the running mutex. The shell has a
-taskbar (tools, open windows, Exit) and an Explorer file view, and on leaving
-only switches back while its own desktop is still showing, so it never skips
-the lock screen. Existing VMs get the helper added at their next start.
+Like ScreenConnect's Backstage: the agent starts appsandbox-backstage.exe as
+SYSTEM in session 0 on WinSta0\\Default, which the VM's own screen never
+shows, so the signed-in user and the sign-in screen never see it and
+everything it opens runs there too. The shell (taskbar, tools, Explorer
+file view) streams its screen to the host over ASB_CH_BACKSTAGE (8) as
+changed bands of BGRA rows, and injects the host's mouse and keyboard
+(SendInput, or posted messages if session 0 refuses it). The host's
+Backstage window (vm_backstage.c) starts the session through the agent,
+connects to :0008, draws it and sends input; it opens from the display
+window's floating menu or title-bar menu.
 """
 from pathlib import Path
 
@@ -23,52 +25,51 @@ def main() -> None:
     proj = read("tools/agent/appsandbox-backstage.vcxproj")
     sln = read("AppSandbox.sln")
     agent = read("tools/agent/agent.c")
+    transport = read("tools/transport/asb_transport.h")
     core = read("src/backend_win/asb_core.c")
     disk = read("src/backend_win/disk_util.c")
+    hcs = read("src/backend_win/hcs_vm.c")
     idd = read("src/backend_win/vm_display_idd.c")
+    view = read("src/backend_win/vm_backstage.c")
+    app_proj = read("AppSandbox.vcxproj")
 
-    # Shell: own desktop, SYSTEM tools, Explorer view, safe return.
-    for name in ('L"AppSandboxBackstage"', 'L"Global\\\\AppSandboxBackstageExit"',
-                 'L"Global\\\\AppSandboxBackstageRunning"'):
-        assert name in shell, name
-    assert "CreateDesktopW(BACKSTAGE_DESKTOP" in shell and 'L"\\"%s\\" --shell"' in shell
-    assert "si.lpDesktop = desktop;" in shell
-    assert "SwitchDesktop(g_desk)" in shell
-    assert "_wcsicmp(now, BACKSTAGE_DESKTOP) != 0" in shell
-    assert "CLSID_ExplorerBrowser" in shell and "EBO_SHOWFRAMES" in shell
-    assert "IShellView_TranslateAccelerator" in shell
-    assert "EnumDesktopWindows(g_desk" in shell
+    # Guest shell: session 0, no desktop switching, streams and injects.
+    assert "SwitchDesktop" not in shell
+    assert "#define ASB_CH_BACKSTAGE        8" in transport
+    assert "asb_listen(ASB_CH_BACKSTAGE)" in shell
+    assert "BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);" in shell
+    assert "memcmp(cur + off, prev + off, bytes) == 0" in shell
+    assert "SendInput(1, in, sizeof(*in))" in shell and "PostMessageW(w, up ? WM_KEYUP : WM_KEYDOWN" in shell
+    assert "SHGetKnownFolderPath(ids[i], KF_FLAG_CREATE" in shell   # SYSTEM Desktop exists
+    assert "CLSID_ExplorerBrowser" in shell and "EnumDesktopWindows(g_desk" in shell
     for tool in ('L"cmd.exe"', 'L"powershell.exe"', 'L"taskmgr.exe"', 'L"regedit.exe"', 'L"services.msc"'):
         assert tool in shell, tool
-    assert "<SubSystem>Windows</SubSystem>" in proj and '<ClCompile Include="appsandbox-backstage.c" />' in proj
+    assert "<SubSystem>Windows</SubSystem>" in proj and "asb_transport.c" in proj
     assert sln.count("{F6A7B8C9-D0E1-2345-F012-6789012345AB}") >= 4
 
-    # Agent: toggle, SYSTEM in the console session, waits for the mutex.
-    assert 'strcmp(cmd, "backstage") == 0' in agent
-    assert "static void backstage_toggle(" in agent
-    assert 'strcpy_s(reply, cap, "ok:left");' in agent and 'strcpy_s(reply, cap, "ok:entered");' in agent
-    assert agent.count("BACKSTAGE_RUNNING_MUTEX") >= 3
+    # Agent: starts it in session 0 on the interactive window station.
+    start = agent[agent.index("static void backstage_start("):]
+    start = start[:start.index("\n}\n")]
+    assert 'si.lpDesktop = L"WinSta0\\\\Default";' in start
+    assert "SetTokenInformation" not in start and "CreateProcessW(exe_path" in start
+    assert 'strcmp(cmd, "backstage") == 0 || strcmp(cmd, "backstage_stop") == 0' in agent
 
-    # Host: staged into new VMs, added to existing ones, menu item.
-    assert 'L"+appsandbox-backstage.exe"' in core
-    assert "BOOL add = helpers[i][0] == L'+';" in core
-    assert 'L"appsandbox-backstage.exe", L"*AppSandboxVDD.dll"' in core
-    assert disk.count("appsandbox-backstage.exe") >= 6
-    assert "#define IDM_BACKSTAGE" in idd and 'vm_agent_send(ask->vm, "backstage"' in idd
-    # The switch uses a handle opened with switch rights; failures say why.
-    assert "g_desk = OpenDesktopW(BACKSTAGE_DESKTOP, 0, FALSE, GENERIC_ALL);" in shell
-    assert "GetExitCodeProcess(pi.hProcess, &code)" in agent and "backstage.log" in agent
-    assert "WM_IDD_BACKSTAGE_DONE" in idd
+    # Host: channel 8 allowed, helper staged, viewer window, menus.
+    assert "for (port = 1; port <= 8; port++)" in hcs
+    assert 'L"+appsandbox-backstage.exe"' in core and disk.count("appsandbox-backstage.exe") >= 6
+    assert "hcs_service_guid(v->os_type, BS_CHANNEL, &addr.ServiceId);" in view
+    assert 'vm_agent_send(v->vm, "backstage", reply' in view
+    assert "StretchDIBits(" in view and "bs_send_input(v, BS_IN_KEY" in view
+    assert '<ClCompile Include="src\\backend_win\\vm_backstage.c" />' in app_proj
+    assert "vm_backstage_open(d->vm, d->hInstance);" in idd
 
-    # Floating menu: a tab on the top edge opens a panel with every option,
-    # sent as the title-bar menu's own commands; it hides while captured.
+    # Floating menu: a tab on the top edge opens a panel with every option.
     assert "static void idd_fab_create(VmDisplayIdd *d)" in idd and "idd_fab_create(d);" in idd
     assert "WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED" in idd
     assert "PostMessageW(d->hwnd, WM_SYSCOMMAND, cmd, 0);" in idd
     for cmd in ("IDM_CAPTURE_MOUSE", "IDM_GAME_MODE", "IDM_XMIT_HOTKEYS", "IDM_AUDIO_MUTE",
                 "IDM_BACKSTAGE", "IDM_SHOW_CONSOLE", "IDM_SHOW_LOG"):
         assert "rows[n].cmd = %s;" % cmd in idd, cmd
-    assert "want = !d->captured && IsWindowVisible(d->hwnd) && !IsIconic(d->hwnd);" in idd
     print("[ok] backstage session and floating menu contract")
 
 

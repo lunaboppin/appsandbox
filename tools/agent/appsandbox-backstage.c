@@ -1,22 +1,24 @@
 /*
  * appsandbox-backstage.exe — Backstage session for AppSandbox.
  *
- * Like ScreenConnect's Backstage: a SYSTEM shell on a Windows desktop of its
- * own in the console session, for working on the VM beside the signed-in
- * user's desktop (which keeps running, untouched) or before anyone signs in.
+ * Like ScreenConnect's Backstage: a SYSTEM shell in session 0, the services
+ * session, which has a screen of its own that nothing in the VM shows. The
+ * signed-in user (or the sign-in screen) never sees it, and everything it
+ * opens runs there too, as SYSTEM.
  *
- * The agent starts it as SYSTEM in the console session. That first instance
- * creates the AppSandboxBackstage desktop and starts itself again on it
- * (--shell), so every program the shell opens lands there too. The shell
- * switches the screen and input to that desktop, shows a taskbar with tools
- * and an Explorer file browser, and switches back when Exit Backstage is
- * clicked or the agent sets the exit event. Programs left open stay on the
- * desktop and are there again the next time.
+ * The agent starts it in session 0 on WinSta0\Default. It shows a taskbar
+ * with tools, open windows and Exit, and an Explorer file browser, and it
+ * streams that screen to the host's Backstage window over its own channel
+ * (ASB_CH_BACKSTAGE): bands of rows that changed, as raw BGRA. The host's
+ * mouse and keyboard come back on the same connection and are injected
+ * here. Exit Backstage, or the agent's exit event, ends it; programs left
+ * open keep running in session 0 and are there again next time.
  *
  * Logs to C:\Windows\AppSandbox\backstage.log (beside agent.log).
  */
 
 #define COBJMACROS
+#include "../transport/asb_transport.h"
 #include <windows.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -29,10 +31,10 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 /* Shared with the agent (agent.c). */
-#define BACKSTAGE_DESKTOP       L"AppSandboxBackstage"
 #define BACKSTAGE_EXIT_EVENT    L"Global\\AppSandboxBackstageExit"
 #define BACKSTAGE_RUNNING_MUTEX L"Global\\AppSandboxBackstageRunning"
 
@@ -72,7 +74,7 @@
 #define CLR_DIM      RGB(0x8d, 0xa2, 0xb8)
 
 static HDESK   g_desk;
-static wchar_t g_prev_desktop[64] = L"Default";
+static DWORD   g_session;
 static HWND    g_bg, g_bar;
 static HFONT   g_font, g_font_bold, g_font_title;
 static HANDLE  g_exit_event;
@@ -102,87 +104,296 @@ static void bs_log(const char *fmt, ...)
     fclose(f);
 }
 
-/* ---- Desktops ---- */
+/* ---- SYSTEM profile ---- */
 
-static BOOL input_desktop_name(wchar_t *name, DWORD chars)
+/* The SYSTEM profile has no Desktop, Documents or Downloads folder until
+   something makes one, and Explorer's view reports Desktop "unavailable". */
+static void ensure_profile_folders(void)
 {
-    HDESK desk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
-    BOOL ok;
-    name[0] = L'\0';
-    if (!desk) return FALSE;
-    ok = GetUserObjectInformationW(desk, UOI_NAME, name, chars * sizeof(wchar_t), NULL);
-    CloseDesktop(desk);
-    return ok;
+    const KNOWNFOLDERID *ids[] = { &FOLDERID_Desktop, &FOLDERID_Documents, &FOLDERID_Downloads };
+    int i;
+    for (i = 0; i < (int)(sizeof(ids) / sizeof(ids[0])); i++) {
+        PWSTR path = NULL;
+        if (SUCCEEDED(SHGetKnownFolderPath(ids[i], KF_FLAG_CREATE, NULL, &path)))
+            SHCreateDirectoryExW(NULL, path, NULL);
+        if (path) CoTaskMemFree(path);
+    }
 }
 
-/* Back to the desktop that was showing before, but only while ours is still
-   the one showing: if Windows moved to its own (locking does) it stays there,
-   so leaving Backstage never skips the lock screen. */
-static void switch_back(void)
+/* Session 0's screen starts small; take the largest mode up to 1920x1080. */
+static void choose_screen_mode(void)
 {
-    wchar_t now[64];
-    HDESK prev;
-    if (!input_desktop_name(now, _countof(now)) || _wcsicmp(now, BACKSTAGE_DESKTOP) != 0) {
-        bs_log("Leaving Backstage; %ls is showing, so it stays.", now[0] ? now : L"another desktop");
-        return;
-    }
-    prev = OpenDesktopW(g_prev_desktop, 0, FALSE, DESKTOP_SWITCHDESKTOP);
-    if (!prev || !SwitchDesktop(prev)) {
-        bs_log("SwitchDesktop(%ls) failed: %lu", g_prev_desktop, GetLastError());
-        if (prev) CloseDesktop(prev);
-        return;
-    }
-    CloseDesktop(prev);
-    bs_log("Switched back to %ls.", g_prev_desktop);
-}
-
-/* First instance: make the desktop and start the shell on it. */
-static int launch_shell(void)
-{
-    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 16], desktop[64];
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    HDESK desk = CreateDesktopW(BACKSTAGE_DESKTOP, NULL, NULL, 0, GENERIC_ALL, NULL);
-    if (!desk) {
-        bs_log("CreateDesktop failed: %lu", GetLastError());
-        return 2;
-    }
-    GetModuleFileNameW(NULL, exe, MAX_PATH);
-    swprintf_s(cmd, _countof(cmd), L"\"%s\" --shell", exe);
-    swprintf_s(desktop, _countof(desktop), L"WinSta0\\%s", BACKSTAGE_DESKTOP);
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.lpDesktop = desktop;
-    ZeroMemory(&pi, sizeof(pi));
-    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        bs_log("Starting the shell failed: %lu", GetLastError());
-        CloseDesktop(desk);
-        return 3;
-    }
-    /* Wait until the shell shows its desktop (it takes the running mutex) or
-       gives up; its exit code becomes ours, so the agent can say why. */
-    {
-        DWORD code = 6;   /* timed out */
-        int i;
-        for (i = 0; i < 150; i++) {
-            HANDLE running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
-            if (running) {
-                CloseHandle(running);
-                code = 0;
-                break;
-            }
-            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
-                GetExitCodeProcess(pi.hProcess, &code);
-                if (code == 0) code = 5;   /* ended without showing */
-                break;
-            }
+    DEVMODEW dm, best;
+    DWORD i;
+    BOOL found = FALSE;
+    LONG r;
+    ZeroMemory(&best, sizeof(best));
+    for (i = 0; ; i++) {
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(NULL, i, &dm)) break;
+        if (dm.dmBitsPerPel != 32 || dm.dmPelsWidth > 1920 || dm.dmPelsHeight > 1080) continue;
+        if (!found || dm.dmPelsWidth * dm.dmPelsHeight > best.dmPelsWidth * best.dmPelsHeight) {
+            best = dm;
+            found = TRUE;
         }
-        if (code) bs_log("The shell did not come up (code %lu).", code);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        CloseDesktop(desk);
-        return (int)code;
     }
+    if (!found) return;
+    best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+    r = ChangeDisplaySettingsW(&best, 0);
+    bs_log("Screen %lux%lu (%s).", best.dmPelsWidth, best.dmPelsHeight,
+           r == DISP_CHANGE_SUCCESSFUL ? "set" : "could not change; kept the current size");
+}
+
+/* ---- Streaming to the host's Backstage window ---- */
+
+#define BS_FRAME_MAGIC  0x52465342u   /* "BSFR" little-endian */
+#define BS_INPUT_MAGIC  0x4E495342u   /* "BSIN" little-endian */
+#define BS_BAND         32            /* rows per band compared and sent */
+#define BS_FRAME_MS     50
+
+#define BS_IN_MOVE      1   /* a=x b=y */
+#define BS_IN_BUTTON    2   /* a=0 left,1 right,2 middle  b=1 down,0 up */
+#define BS_IN_WHEEL     3   /* a=delta */
+#define BS_IN_KEY       4   /* a=vk b=scan c=flags (1 up, 2 extended) */
+
+#pragma pack(push, 1)
+typedef struct {
+    UINT32 magic;
+    UINT32 width;
+    UINT32 height;
+    UINT32 y;
+    UINT32 rows;     /* rows * width * 4 bytes of BGRA follow */
+} BsFrameHeader;
+
+typedef struct {
+    UINT32 magic;
+    UINT32 type;
+    INT32  a, b, c;
+} BsInput;
+#pragma pack(pop)
+
+static POINT g_mouse;
+static int   g_input_posting = -1;   /* -1 unknown, 0 SendInput works, 1 posting messages */
+
+static BOOL send_all(AsbConn *c, const void *buf, int len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        int n = asb_send(c, p, len);
+        if (n <= 0) return FALSE;
+        p += n;
+        len -= n;
+    }
+    return TRUE;
+}
+
+static BOOL recv_all(AsbConn *c, void *buf, int len)
+{
+    char *p = (char *)buf;
+    while (len > 0) {
+        int n = asb_recv(c, p, len);
+        if (n <= 0) return FALSE;
+        p += n;
+        len -= n;
+    }
+    return TRUE;
+}
+
+/* SendInput may be refused in session 0 (it has no input devices); then
+   mouse and keys are posted to the window under the pointer / with focus,
+   which covers ordinary windows and consoles. */
+static BOOL send_input(INPUT *in)
+{
+    UINT ok;
+    if (g_input_posting == 1) return FALSE;
+    ok = SendInput(1, in, sizeof(*in));
+    if (g_input_posting == -1) {
+        g_input_posting = ok ? 0 : 1;
+        bs_log(ok ? "Input: SendInput works here."
+                  : "Input: SendInput refused (%lu); posting messages instead.", GetLastError());
+    }
+    return ok != 0;
+}
+
+static void post_mouse(UINT msg, WPARAM keys, LPARAM extra_high)
+{
+    POINT pt = g_mouse;
+    HWND w = WindowFromPoint(pt);
+    if (!w) return;
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
+        SetForegroundWindow(GetAncestor(w, GA_ROOT));
+    if (msg == WM_MOUSEWHEEL) {
+        PostMessageW(w, msg, MAKEWPARAM(0, (short)extra_high), MAKELPARAM(pt.x, pt.y));
+        return;
+    }
+    ScreenToClient(w, &pt);
+    PostMessageW(w, msg, keys, MAKELPARAM(pt.x, pt.y));
+}
+
+static HWND focus_window(void)
+{
+    GUITHREADINFO gti;
+    ZeroMemory(&gti, sizeof(gti));
+    gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(0, &gti) && gti.hwndFocus) return gti.hwndFocus;
+    return GetForegroundWindow();
+}
+
+static void inject(const BsInput *in)
+{
+    INPUT i;
+    ZeroMemory(&i, sizeof(i));
+    switch (in->type) {
+    case BS_IN_MOVE:
+        g_mouse.x = in->a;
+        g_mouse.y = in->b;
+        SetCursorPos(in->a, in->b);
+        if (g_input_posting == 1) post_mouse(WM_MOUSEMOVE, 0, 0);
+        break;
+    case BS_IN_BUTTON:
+    {
+        static const DWORD down[] = { MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN };
+        static const DWORD up[]   = { MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP };
+        static const UINT  wdown[] = { WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN };
+        static const UINT  wup[]   = { WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP };
+        static const WPARAM key[]  = { MK_LBUTTON, MK_RBUTTON, MK_MBUTTON };
+        int b = in->a;
+        if (b < 0 || b > 2) break;
+        SetCursorPos(g_mouse.x, g_mouse.y);
+        i.type = INPUT_MOUSE;
+        i.mi.dwFlags = in->b ? down[b] : up[b];
+        if (!send_input(&i))
+            post_mouse(in->b ? wdown[b] : wup[b], in->b ? key[b] : 0, 0);
+        break;
+    }
+    case BS_IN_WHEEL:
+        i.type = INPUT_MOUSE;
+        i.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        i.mi.mouseData = (DWORD)in->a;
+        if (!send_input(&i)) post_mouse(WM_MOUSEWHEEL, 0, in->a);
+        break;
+    case BS_IN_KEY:
+    {
+        BOOL up = (in->c & 1) != 0;
+        i.type = INPUT_KEYBOARD;
+        i.ki.wVk = (WORD)in->a;
+        i.ki.wScan = (WORD)in->b;
+        i.ki.dwFlags = (up ? KEYEVENTF_KEYUP : 0) | ((in->c & 2) ? KEYEVENTF_EXTENDEDKEY : 0);
+        if (!send_input(&i)) {
+            HWND w = focus_window();
+            LPARAM lp = 1 | ((LPARAM)(in->b & 0xFF) << 16) | ((in->c & 2) ? (1 << 24) : 0) |
+                        (up ? ((LPARAM)3 << 30) : 0);
+            if (w) PostMessageW(w, up ? WM_KEYUP : WM_KEYDOWN, (WPARAM)in->a, lp);
+        }
+        break;
+    }
+    }
+}
+
+typedef struct {
+    AsbConn *conn;
+    volatile LONG closed;
+} BsViewer;
+
+static DWORD WINAPI viewer_input_thread(LPVOID param)
+{
+    BsViewer *v = (BsViewer *)param;
+    BsInput in;
+    while (recv_all(v->conn, &in, sizeof(in))) {
+        if (in.magic == BS_INPUT_MAGIC) inject(&in);
+    }
+    InterlockedExchange(&v->closed, 1);
+    return 0;
+}
+
+/* Send the screen until the viewer goes away: everything first, then only
+   the bands of rows that changed. */
+static void serve_viewer(AsbConn *conn)
+{
+    BsViewer v;
+    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = NULL;
+    BYTE *cur = NULL, *prev = NULL;
+    int w = 0, h = 0, y;
+    HANDLE input;
+
+    v.conn = conn;
+    v.closed = 0;
+    input = CreateThread(NULL, 0, viewer_input_thread, &v, 0, NULL);
+    while (!v.closed && !g_exiting) {
+        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        BOOL full = FALSE;
+        if (sw <= 0 || sh <= 0) { Sleep(BS_FRAME_MS); continue; }
+        if (!bmp || sw != w || sh != h) {
+            BITMAPINFO bi;
+            if (bmp) DeleteObject(bmp);
+            free(prev);
+            ZeroMemory(&bi, sizeof(bi));
+            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth = sw;
+            bi.bmiHeader.biHeight = -sh;           /* top-down */
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&cur, NULL, 0);
+            prev = (BYTE *)malloc((size_t)sw * sh * 4);
+            if (!bmp || !prev) break;
+            SelectObject(mem, bmp);
+            w = sw;
+            h = sh;
+            full = TRUE;
+        }
+        BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);
+        GdiFlush();
+        for (y = 0; y < h; y += BS_BAND) {
+            int rows = (h - y < BS_BAND) ? h - y : BS_BAND;
+            size_t off = (size_t)y * w * 4, bytes = (size_t)rows * w * 4;
+            BsFrameHeader hdr;
+            if (!full && memcmp(cur + off, prev + off, bytes) == 0) continue;
+            hdr.magic = BS_FRAME_MAGIC;
+            hdr.width = (UINT32)w;
+            hdr.height = (UINT32)h;
+            hdr.y = (UINT32)y;
+            hdr.rows = (UINT32)rows;
+            if (!send_all(conn, &hdr, sizeof(hdr)) || !send_all(conn, cur + off, (int)bytes)) {
+                InterlockedExchange(&v.closed, 1);
+                break;
+            }
+            memcpy(prev + off, cur + off, bytes);
+        }
+        Sleep(BS_FRAME_MS);
+    }
+    /* The input thread ends when the host closes its side. */
+    if (input) {
+        WaitForSingleObject(input, 5000);
+        CloseHandle(input);
+    }
+    asb_close(conn);
+    if (bmp) DeleteObject(bmp);
+    free(prev);
+    DeleteDC(mem);
+    ReleaseDC(NULL, screen);
+}
+
+static DWORD WINAPI stream_thread(LPVOID unused)
+{
+    AsbListener *l;
+    (void)unused;
+    if (asb_transport_init() != 0 || (l = asb_listen(ASB_CH_BACKSTAGE)) == NULL) {
+        bs_log("Could not listen for the host's Backstage window.");
+        return 0;
+    }
+    while (!g_exiting) {
+        AsbConn *c = asb_accept(l, 1000);
+        if (!c) continue;
+        asb_set_timeout(c, 0, 10000);
+        bs_log("Host Backstage window connected.");
+        serve_viewer(c);
+        bs_log("Host Backstage window disconnected.");
+    }
+    asb_close_listener(l);
+    return 0;
 }
 
 /* ---- Launching tools ---- */
@@ -568,7 +779,6 @@ static void leave_backstage(void)
     HWND w;
     if (g_exiting) return;
     g_exiting = TRUE;
-    switch_back();
     /* Close our own file windows (the Explorer view needs its teardown);
        other programs stay on the desktop for next time. */
     while ((w = FindWindowExW(NULL, NULL, L"AsbBackstageFiles", NULL)) != NULL)
@@ -695,9 +905,9 @@ static LRESULT CALLBACK bg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DrawTextW(dc, L"Backstage", -1, &title, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
         swprintf_s(line, _countof(line),
                    L"NT AUTHORITY\\SYSTEM on %s (session %lu)\n"
-                   L"The %s desktop keeps running unchanged. Exit Backstage returns to it.",
-                   computer, session,
-                   _wcsicmp(g_prev_desktop, L"Default") == 0 ? L"signed-in" : L"sign-in");
+                   L"Hidden from the VM's own screen: the signed-in user and the sign-in "
+                   L"screen never see Backstage. Programs opened here run here.",
+                   computer, session);
         sub = rc; sub.top = title.bottom + 8; sub.left += 40; sub.right -= 40;
         SelectObject(dc, g_font);
         SetTextColor(dc, CLR_DIM);
@@ -733,8 +943,7 @@ static void register_class(const wchar_t *name, WNDPROC proc, HBRUSH background)
 
 static int run_shell(void)
 {
-    HANDLE running, watcher;
-    wchar_t name[64];
+    HANDLE running, thread;
     MSG msg;
 
     running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
@@ -742,25 +951,14 @@ static int run_shell(void)
         CloseHandle(running);
         return 0;
     }
-    if (input_desktop_name(name, _countof(name)) && name[0] &&
-        _wcsicmp(name, BACKSTAGE_DESKTOP) != 0)
-        wcscpy_s(g_prev_desktop, _countof(g_prev_desktop), name);
-
-    /* Opened by name for switch rights; the handle the process started with
-       may not carry DESKTOP_SWITCHDESKTOP. */
-    g_desk = OpenDesktopW(BACKSTAGE_DESKTOP, 0, FALSE, GENERIC_ALL);
-    if (!g_desk) {
-        bs_log("OpenDesktop(%ls) failed: %lu", BACKSTAGE_DESKTOP, GetLastError());
-        return 7;
-    }
-    if (!SwitchDesktop(g_desk)) {
-        bs_log("SwitchDesktop to Backstage failed: %lu (showing %ls)", GetLastError(), g_prev_desktop);
-        return 4;
-    }
-    bs_log("Backstage shown (was %ls).", g_prev_desktop);
     running = CreateMutexW(NULL, FALSE, BACKSTAGE_RUNNING_MUTEX);
+    ProcessIdToSessionId(GetCurrentProcessId(), &g_session);
+    g_desk = GetThreadDesktop(GetCurrentThreadId());
+    bs_log("Backstage started in session %lu.", g_session);
+    choose_screen_mode();
 
     OleInitialize(NULL);
+    ensure_profile_folders();
     g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                          CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_font_bold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
@@ -780,9 +978,11 @@ static int run_shell(void)
 
     g_exit_event = OpenEventW(SYNCHRONIZE, FALSE, BACKSTAGE_EXIT_EVENT);
     if (g_exit_event) {
-        watcher = CreateThread(NULL, 0, exit_watch_thread, NULL, 0, NULL);
-        if (watcher) CloseHandle(watcher);
+        thread = CreateThread(NULL, 0, exit_watch_thread, NULL, 0, NULL);
+        if (thread) CloseHandle(thread);
     }
+    thread = CreateThread(NULL, 0, stream_thread, NULL, 0, NULL);
+    if (thread) CloseHandle(thread);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (files_pretranslate(&msg)) continue;
@@ -797,12 +997,6 @@ static int run_shell(void)
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
-    (void)inst; (void)prev; (void)show;
-    if (cmd && wcsstr(cmd, L"--shell")) return run_shell();
-    {
-        DWORD session = 0;
-        ProcessIdToSessionId(GetCurrentProcessId(), &session);
-        bs_log("Opening Backstage in session %lu.", session);
-    }
-    return launch_shell();
+    (void)inst; (void)prev; (void)cmd; (void)show;
+    return run_shell();
 }

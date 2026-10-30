@@ -876,32 +876,44 @@ static void kill_input_helper(void)
 }
 
 /* ---- Backstage session (appsandbox-backstage.exe) ----
-   A SYSTEM shell on its own desktop in the console session, like
-   ScreenConnect's Backstage. The command toggles it: started here, it
-   switches the screen to its desktop and holds the running mutex; asked
-   again, the exit event sends it back to the desktop that was showing. */
+   A SYSTEM shell in session 0, like ScreenConnect's Backstage: session 0
+   has a screen of its own that the VM never shows, so the signed-in user
+   and the sign-in screen never see it. The shell streams that screen to the
+   host's Backstage window itself (ASB_CH_BACKSTAGE). "backstage" starts it
+   if it isn't running; "backstage_stop" ends it through the exit event. */
 #define BACKSTAGE_EXIT_EVENT    L"Global\\AppSandboxBackstageExit"
 #define BACKSTAGE_RUNNING_MUTEX L"Global\\AppSandboxBackstageRunning"
 
 static HANDLE g_backstage_exit;
 
-static void backstage_toggle(char *reply, size_t cap)
+static BOOL backstage_running(void)
 {
-    HANDLE cur_token = NULL, dup_token = NULL, running;
+    HANDLE running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
+    if (!running) return FALSE;
+    CloseHandle(running);
+    return TRUE;
+}
+
+static void backstage_stop(char *reply, size_t cap)
+{
+    if (g_backstage_exit && backstage_running()) {
+        SetEvent(g_backstage_exit);
+        agent_log("Backstage: asked to close.");
+    }
+    strcpy_s(reply, cap, "ok:stopped");
+}
+
+static void backstage_start(char *reply, size_t cap)
+{
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t exe_path[MAX_PATH], cmd[MAX_PATH + 8], *slash;
-    DWORD session_id = WTSGetActiveConsoleSessionId();
     int waited;
 
     if (!g_backstage_exit)
         g_backstage_exit = CreateEventW(NULL, TRUE, FALSE, BACKSTAGE_EXIT_EVENT);
-    running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
-    if (running) {
-        CloseHandle(running);
-        if (g_backstage_exit) SetEvent(g_backstage_exit);
-        agent_log("Backstage: leaving.");
-        strcpy_s(reply, cap, "ok:left");
+    if (backstage_running()) {
+        strcpy_s(reply, cap, "ok:running");
         return;
     }
     if (!g_backstage_exit) {
@@ -909,10 +921,6 @@ static void backstage_toggle(char *reply, size_t cap)
         return;
     }
     ResetEvent(g_backstage_exit);
-    if (session_id == 0xFFFFFFFF || session_id == 0) {
-        strcpy_s(reply, cap, "error:Windows has no console session yet");
-        return;
-    }
 
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
     slash = wcsrchr(exe_path, L'\\');
@@ -924,64 +932,37 @@ static void backstage_toggle(char *reply, size_t cap)
     }
     swprintf_s(cmd, _countof(cmd), L"\"%s\"", exe_path);
 
-    /* SYSTEM token placed in the console session, as for the input helper */
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token) ||
-        !DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
-                          SecurityImpersonation, TokenPrimary, &dup_token) ||
-        !SetTokenInformation(dup_token, TokenSessionId, &session_id, sizeof(session_id))) {
-        sprintf_s(reply, cap, "error:could not prepare the session token (%lu)", GetLastError());
-        if (cur_token) CloseHandle(cur_token);
-        if (dup_token) CloseHandle(dup_token);
-        return;
-    }
-    CloseHandle(cur_token);
-
+    /* Our own SYSTEM token, staying in session 0, on its interactive
+       window station rather than the service one we run on. */
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.lpDesktop = L"WinSta0\\Default";
     ZeroMemory(&pi, sizeof(pi));
-    if (!CreateProcessAsUserW(dup_token, exe_path, cmd, NULL, NULL, FALSE, 0,
-                              NULL, NULL, &si, &pi)) {
+    if (!CreateProcessW(exe_path, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         sprintf_s(reply, cap, "error:could not start the Backstage shell (%lu)", GetLastError());
-        CloseHandle(dup_token);
         return;
     }
-    CloseHandle(dup_token);
     CloseHandle(pi.hThread);
 
-    /* The launcher exits once the shell has shown its desktop (0) or with
-       the shell's reason for giving up. */
-    for (waited = 0; waited < 20000; waited += 100) {
+    /* The shell takes the running mutex as it starts. */
+    for (waited = 0; waited < 15000; waited += 100) {
         DWORD code = 0;
-        running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
-        if (running) {
-            CloseHandle(running);
+        if (backstage_running()) {
             CloseHandle(pi.hProcess);
-            agent_log("Backstage: shown in session %lu.", session_id);
-            strcpy_s(reply, cap, "ok:entered");
+            agent_log("Backstage: started in session 0.");
+            strcpy_s(reply, cap, "ok:started");
             return;
         }
-        if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0 &&
-            GetExitCodeProcess(pi.hProcess, &code) && code != 0) {
-            char last[160] = "";
-            FILE *f;
-            /* The shell's last log line says what failed. */
-            if (fopen_s(&f, "C:\\Windows\\AppSandbox\\backstage.log", "r") == 0 && f) {
-                char line[160];
-                while (fgets(line, sizeof(line), f)) strcpy_s(last, sizeof(last), line);
-                fclose(f);
-                last[strcspn(last, "\r\n")] = '\0';
-            }
+        if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+            GetExitCodeProcess(pi.hProcess, &code);
             CloseHandle(pi.hProcess);
-            agent_log("Backstage: failed (code %lu): %s", code, last);
-            sprintf_s(reply, cap, "error:the Backstage desktop could not be shown (code %lu). %s",
-                      code, last);
+            sprintf_s(reply, cap, "error:the Backstage shell ended at start (code %lu); "
+                      "see C:\\Windows\\AppSandbox\\backstage.log in the VM", code);
             return;
         }
     }
     CloseHandle(pi.hProcess);
-    agent_log("Backstage: the desktop did not come up in time.");
-    strcpy_s(reply, cap, "error:the Backstage desktop did not come up in time "
+    strcpy_s(reply, cap, "error:the Backstage shell did not start in time "
                          "(see C:\\Windows\\AppSandbox\\backstage.log in the VM)");
 }
 
@@ -3889,9 +3870,10 @@ static void handle_client(AsbConn *client)
                 REPLY("error:out of memory");
             }
         }
-        else if (strcmp(cmd, "backstage") == 0) {
+        else if (strcmp(cmd, "backstage") == 0 || strcmp(cmd, "backstage_stop") == 0) {
             char reply[256];
-            backstage_toggle(reply, sizeof(reply));
+            if (strcmp(cmd, "backstage") == 0) backstage_start(reply, sizeof(reply));
+            else backstage_stop(reply, sizeof(reply));
             REPLY(reply);
         }
         else if (strcmp(cmd, "lab_start") == 0 || strcmp(cmd, "lab_stop") == 0 ||

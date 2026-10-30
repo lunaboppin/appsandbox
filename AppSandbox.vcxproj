@@ -210,6 +210,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\app_win\main.c" />
     <ClCompile Include="src\app_win\ui.c" />
     <ClCompile Include="src\backend_win\vm_display.c" />
+    <ClCompile Include="src\backend_win\vm_backstage.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
     <ClCompile Include="src\backend_win\vm_display_auto.c" />
     <ClCompile Include="src\app_win\webview2_bridge.c" />
@@ -227,6 +228,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\hcn_network.h" />
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vm_display.h" />
+    <ClInclude Include="src\backend_win\vm_backstage.h" />
     <ClInclude Include="src\backend_win\vm_display_idd.h" />
     <ClInclude Include="src\backend_win\vm_display_auto.h" />
   </ItemGroup>
