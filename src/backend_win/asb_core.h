@@ -68,6 +68,7 @@ typedef struct {
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *vpn_id;         /* WireGuard config for ASB_NET_VPN */
+    const wchar_t *preinstall_apps; /* Windows: comma-separated winget IDs installed after first sign-in */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */

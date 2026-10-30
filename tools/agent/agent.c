@@ -2194,6 +2194,213 @@ static void ensure_fallback_audio(void)
     if (t) CloseHandle(t);
 }
 
+/* ---- App preinstall ----
+   The host sends "install_apps:<id>,<id>" (winget package IDs chosen when the
+   VM was created). They queue in apps-pending.txt and install with winget in
+   the signed-in user's session, elevated through the user's linked token, so
+   per-user apps (Claude, Steam, VS Code) land in that profile and machine-wide
+   ones need no UAC prompt. Failures stay queued and retry at the next few
+   service starts; App Installer can take a while to register on a new
+   account, so the script waits for winget first. */
+#define APPS_DIR      L"C:\\ProgramData\\AppSandbox"
+#define APPS_PENDING  APPS_DIR L"\\apps-pending.txt"
+#define APPS_RESULT   APPS_DIR L"\\apps-result.txt"
+#define APPS_ATTEMPTS APPS_DIR L"\\apps-attempts.txt"
+#define APPS_SCRIPT   APPS_DIR L"\\apps-install.ps1"
+#define APPS_MAX_RUNS 3
+
+static volatile LONG g_apps_running;
+
+/* winget IDs are Publisher.Name: letters, digits and . + _ - only, which also
+   keeps them safe to pass through the script and command line. */
+static BOOL valid_winget_id(const char *id, size_t len)
+{
+    size_t i;
+    if (len == 0 || len > 100) return FALSE;
+    for (i = 0; i < len; i++) {
+        char c = id[i];
+        if (!isalnum((unsigned char)c) && c != '.' && c != '+' && c != '_' && c != '-')
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL apps_pending(void)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    return GetFileAttributesExW(APPS_PENDING, GetFileExInfoStandard, &fa) &&
+           (fa.nFileSizeLow || fa.nFileSizeHigh);
+}
+
+/* Elevated token for the console user, waiting for a sign-in. */
+static HANDLE wait_for_user_token(void)
+{
+    for (;;) {
+        HANDLE user = NULL;
+        DWORD session = WTSGetActiveConsoleSessionId();
+        if (session != 0xFFFFFFFF && WTSQueryUserToken(session, &user)) {
+            TOKEN_LINKED_TOKEN linked;
+            DWORD len = 0;
+            if (GetTokenInformation(user, TokenLinkedToken, &linked, sizeof(linked), &len)) {
+                CloseHandle(user);
+                return linked.LinkedToken;   /* primary: the agent holds SeTcbPrivilege */
+            }
+            return user;                     /* UAC off: already the full token */
+        }
+        if (WaitForSingleObject(g_stop_event, 15000) == WAIT_OBJECT_0) return NULL;
+    }
+}
+
+static DWORD WINAPI apps_install_thread(LPVOID param)
+{
+    static const char script[] =
+        "$ErrorActionPreference='Continue'\r\n"
+        "$dir='C:\\ProgramData\\AppSandbox'\r\n"
+        "$pending=Join-Path $dir 'apps-pending.txt'\r\n"
+        "$log=Join-Path $dir 'apps-install.log'\r\n"
+        "$result=Join-Path $dir 'apps-result.txt'\r\n"
+        "function Log($m){ Add-Content -Path $log -Value ('[' + (Get-Date -Format s) + '] ' + $m) }\r\n"
+        "$ids=@(Get-Content $pending -ErrorAction SilentlyContinue | ForEach-Object { $_.Trim() } | Where-Object { $_ })\r\n"
+        "if(-not $ids){ exit 0 }\r\n"
+        "$winget=$null\r\n"
+        "for($i=0;$i -lt 60 -and -not $winget;$i++){\r\n"
+        " $winget=(Get-Command winget.exe -ErrorAction SilentlyContinue).Source\r\n"
+        " if(-not $winget){\r\n"
+        "  if($i -eq 0){ try { Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop } catch { Log ('App Installer registration: ' + $_.Exception.Message) } }\r\n"
+        "  Start-Sleep -Seconds 10\r\n"
+        " }\r\n"
+        "}\r\n"
+        "if(-not $winget){ Log 'winget is not available'; Set-Content -Path $result -Value 'nowinget'; exit 2 }\r\n"
+        "& $winget source update --disable-interactivity | Out-Null\r\n"
+        "$ok=@(); $failed=@()\r\n"
+        "foreach($id in $ids){\r\n"
+        " Log ('Installing ' + $id)\r\n"
+        " & $winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-File -Append -FilePath $log -Encoding utf8\r\n"
+        " $code=$LASTEXITCODE\r\n"
+        " # 0x8A15002B: no newer version, 0x8A150061: already installed\r\n"
+        " if($code -eq 0 -or $code -eq -1978335189 -or $code -eq -1978335135){ $ok+=$id } else { Log ($id + ' failed (' + $code + ')'); $failed+=$id }\r\n"
+        "}\r\n"
+        "Set-Content -Path $pending -Value $failed\r\n"
+        "Set-Content -Path $result -Value @(('ok ' + ($ok -join ', ')), ('failed ' + ($failed -join ', ')))\r\n"
+        "exit 0\r\n";
+    HANDLE token;
+    LPVOID env = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[512], sysdir[MAX_PATH];
+    DWORD ec = (DWORD)-1;
+    int runs = 0;
+    FILE *f;
+    (void)param;
+
+    if (_wfopen_s(&f, APPS_ATTEMPTS, L"r") == 0 && f) {
+        if (fscanf_s(f, "%d", &runs) != 1) runs = 0;
+        fclose(f);
+    }
+    if (runs >= APPS_MAX_RUNS) {
+        agent_log("Apps: giving up after %d runs; still pending are left in apps-pending.txt.", runs);
+        agent_log_to_host("Some apps could not be installed after %d tries; see "
+                          "C:\\ProgramData\\AppSandbox\\apps-install.log in the VM.", runs);
+        DeleteFileW(APPS_PENDING);
+        DeleteFileW(APPS_ATTEMPTS);
+        InterlockedExchange(&g_apps_running, 0);
+        return 0;
+    }
+    if (write_agent_script(APPS_SCRIPT, script)) {
+        InterlockedExchange(&g_apps_running, 0);
+        return 0;
+    }
+    agent_log("Apps: waiting for a signed-in user to install the queued apps.");
+    token = wait_for_user_token();
+    if (!token) { InterlockedExchange(&g_apps_running, 0); return 0; }
+    if (_wfopen_s(&f, APPS_ATTEMPTS, L"w") == 0 && f) {
+        fprintf(f, "%d", runs + 1);
+        fclose(f);
+    }
+    DeleteFileW(APPS_RESULT);
+    if (!CreateEnvironmentBlock(&env, token, FALSE)) env = NULL;
+    get_agent_powershell_directory(sysdir, _countof(sysdir));
+    swprintf_s(cmd, _countof(cmd),
+               L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+               L"-WindowStyle Hidden -File \"%s\"", APPS_SCRIPT);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    agent_log_to_host("Installing the apps chosen for this VM with winget...");
+    if (CreateProcessAsUserW(token, NULL, cmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                             env, sysdir, &si, &pi)) {
+        HANDLE waits[2] = { pi.hProcess, g_stop_event };
+        if (WaitForMultipleObjects(2, waits, FALSE, 2 * 60 * 60 * 1000) == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &ec);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        agent_log("Apps: CreateProcessAsUserW failed (%lu).", GetLastError());
+    }
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(token);
+
+    if (_wfopen_s(&f, APPS_RESULT, L"r") == 0 && f) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            size_t n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+            if (strncmp(line, "ok ", 3) == 0 && line[3]) {
+                agent_log("Apps installed: %s", line + 3);
+                agent_log_to_host("Installed apps: %s", line + 3);
+            } else if (strncmp(line, "failed ", 7) == 0 && line[7]) {
+                agent_log("Apps failed: %s", line + 7);
+                agent_log_to_host("Could not install: %s (retried at the next start)", line + 7);
+            } else if (strcmp(line, "nowinget") == 0) {
+                agent_log_to_host("winget is not available in the VM yet; apps install at the next start.");
+            }
+        }
+        fclose(f);
+    } else {
+        agent_log("Apps: installer exit=%lu with no result.", ec);
+    }
+    if (!apps_pending()) DeleteFileW(APPS_ATTEMPTS);
+    InterlockedExchange(&g_apps_running, 0);
+    return 0;
+}
+
+static void start_app_install(void)
+{
+    HANDLE t;
+    if (!apps_pending() || InterlockedExchange(&g_apps_running, 1)) return;
+    t = CreateThread(NULL, 0, apps_install_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    else InterlockedExchange(&g_apps_running, 0);
+}
+
+/* Queue the validated IDs from "id,id,..." behind any already pending. */
+static BOOL queue_apps(const char *list)
+{
+    const char *p = list;
+    FILE *f;
+    int queued = 0;
+    CreateDirectoryW(APPS_DIR, NULL);
+    if (_wfopen_s(&f, APPS_PENDING, L"a") != 0 || !f) return FALSE;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (valid_winget_id(p, len)) {
+            fprintf(f, "%.*s\n", (int)len, p);
+            queued++;
+        } else if (len) {
+            agent_log("Apps: ignoring invalid package ID.");
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    fclose(f);
+    DeleteFileW(APPS_ATTEMPTS);   /* a new request gets fresh tries */
+    agent_log("Apps: queued %d package(s).", queued);
+    return TRUE;
+}
+
 static int configure_shared_nic(const char *mac_a, const char *ip_a)
 {
     static const char script[] =
@@ -3128,6 +3335,14 @@ static void handle_client(AsbConn *client)
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
         }
+        else if (strncmp(cmd, "install_apps:", 13) == 0) {
+            if (queue_apps(cmd + 13)) {
+                REPLY("ok");
+                start_app_install();
+            } else {
+                REPLY("error:queue_failed");
+            }
+        }
         else if (strncmp(cmd, "grow_root:", 10) == 0) {
             REPLY(grow_root_partition() ? "ok" : "error:guest_grow_failed");
         }
@@ -3593,6 +3808,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Under Secure Boot it can't; give the VM VB-CABLE instead */
     ensure_fallback_audio();
+
+    /* Finish installing apps chosen at creation that are still queued */
+    start_app_install();
 
     /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
     ensure_hyperv_video_disabled(NULL);

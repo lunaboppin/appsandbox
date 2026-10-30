@@ -518,6 +518,26 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             notify_agent_status(vm);
         }
 
+        /* Apps chosen at creation: hand them to the agent, which installs
+           them after sign-in and retries failures itself. Kept here until
+           the agent has queued them (an older agent says unknown; the
+           refreshed one at the next start takes them). */
+        if (vm->preinstall_apps[0] && !vm->is_template) {
+            char apps_cmd[1200];
+            sprintf_s(apps_cmd, sizeof(apps_cmd), "install_apps:%S", vm->preinstall_apps);
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, apps_cmd, buf, sizeof(buf), 15000);
+            if (n <= 0) goto disconnected;
+            if (strcmp(buf, "ok") == 0) {
+                ui_log(L"Queued apps for \"%s\": %s. They install after you sign in.",
+                       vm->name, vm->preinstall_apps);
+                vm->preinstall_apps[0] = L'\0';
+                asb_save();
+            } else {
+                ui_log(L"The agent in \"%s\" could not queue apps (%S); retrying at the next start.",
+                       vm->name, buf);
+            }
+        }
+
         /* Configure the independent host-only NIC, then recreate signed global
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */

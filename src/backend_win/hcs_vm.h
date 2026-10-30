@@ -134,6 +134,7 @@ typedef struct {
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
+    wchar_t     preinstall_apps[1024]; /* winget IDs not yet handed to the guest agent */
     HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
     int         shared_resource_count;
     wchar_t     shared_resource_transport[16]; /* smb or unavailable */

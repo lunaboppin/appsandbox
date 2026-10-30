@@ -422,6 +422,59 @@ onNetModeChange();
 
 /* ---- Create VM ---- */
 
+/* Apps offered in the create dialog (winget package IDs). */
+var PREINSTALL_APPS = [
+    { id: 'Anthropic.Claude',            name: 'Claude' },
+    { id: 'Valve.Steam',                 name: 'Steam' },
+    { id: 'Microsoft.VisualStudioCode',  name: 'VS Code' },
+    { id: 'Notepad++.Notepad++',         name: 'Notepad++' },
+    { id: 'voidtools.Everything',        name: 'Everything' },
+    { id: '7zip.7zip',                   name: '7-Zip' },
+    { id: 'Google.Chrome',               name: 'Chrome' },
+    { id: 'Mozilla.Firefox',             name: 'Firefox' },
+    { id: 'Discord.Discord',             name: 'Discord' },
+    { id: 'VideoLAN.VLC',                name: 'VLC' },
+    { id: 'Git.Git',                     name: 'Git' },
+    { id: 'Python.Python.3.13',          name: 'Python 3.13' },
+    { id: 'Microsoft.PowerToys',         name: 'PowerToys' },
+    { id: 'OBSProject.OBSStudio',        name: 'OBS Studio' },
+    { id: 'EpicGames.EpicGamesLauncher', name: 'Epic Games' }
+];
+var WINGET_ID_RE = /^[A-Za-z0-9.+_-]{1,100}$/;
+
+function renderCreateApps() {
+    var list = document.getElementById('create-app-list');
+    if (!list || list.childElementCount) return;
+    PREINSTALL_APPS.forEach(function(app) {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.dataset.appId = app.id;
+        label.title = app.id;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + app.name));
+        list.appendChild(label);
+    });
+}
+
+/* Checked apps plus typed IDs; null (after logging why) if a typed ID is invalid. */
+function gatherPreinstallApps() {
+    var ids = [];
+    document.querySelectorAll('#create-app-list input[data-app-id]').forEach(function(cb) {
+        if (cb.checked) ids.push(cb.dataset.appId);
+    });
+    var extra = document.getElementById('create-app-extra').value.split(/[\s,;]+/);
+    for (var i = 0; i < extra.length; i++) {
+        if (!extra[i]) continue;
+        if (!WINGET_ID_RE.test(extra[i])) {
+            sendCmd('log', { message: '"' + extra[i] + '" is not a winget package ID (letters, digits and . + _ - only).' });
+            return null;
+        }
+        if (ids.indexOf(extra[i]) < 0) ids.push(extra[i]);
+    }
+    return ids.join(',');
+}
+
 function gatherConfig() {
     var osType = document.getElementById('os-type').value;
     /* Same ISO-picker path for Windows and Linux. The cloud-image
@@ -449,7 +502,8 @@ function gatherConfig() {
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
-        sshDeployKey: document.getElementById('ssh-deploy-key').checked
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : ''
     };
 }
 
@@ -550,6 +604,7 @@ function onCreateVm() {
         sendCmd('log', { message: 'Passwords do not match.' });
         return;
     }
+    if (cfg.preinstallApps === null) return;
     sendCmd('createVm', cfg);
     clearCreateForm();
     closeCreateModal();
@@ -577,6 +632,7 @@ function openCreateModal() {
     document.getElementById('image-path').value = '';
     document.getElementById('storage-parent').value = lastStorageParent;
     renderCreateSharedResources();
+    renderCreateApps();
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
