@@ -62,6 +62,20 @@ The **Malware Lab** button builds an isolated, disposable Windows VM for running
 - A Windows 10/11 or Ubuntu ISO for each VM you create.
 - For the shared appliance or domain: a Windows Server ISO (for the Server Core appliance), or nothing extra for the Ubuntu one.
 
+## Installing and updating
+
+Download `AppSandbox-<version>-win-x64-setup.exe` from [Releases](https://github.com/lunaboppin/appsandbox/releases) and run it. It installs to Program Files, adds a Start Menu shortcut (and a desktop one if you tick it) and an entry in Apps & features. No driver or service is installed on your PC: the drivers it carries are copied into your VMs when they're provisioned.
+
+**Updates:** App Sandbox checks GitHub once a day, and when a newer release exists it shows a notice at the top of the window. The **Updates** button shows your version, checks on demand, and has the settings for automatic checks and for including pre-releases (off by default).
+
+**Your VMs are safe from updates.** Installing closes App Sandbox, and closing it stops every VM, so an update never starts while a VM is running or being built. You're told which VMs are in the way; the update downloads and then waits, and installs by itself once they've all been shut down. App Sandbox then reopens.
+
+**What's checked:** a download must match the SHA-256 GitHub reports for it and carry an intact signature from a certificate pinned in App Sandbox, and its file version must be the one the release advertises. Anything else is deleted and not run.
+
+**Uninstalling** from Apps & features asks whether to also delete your VMs and settings, and keeps them unless you say otherwise. A copy unzipped by hand or built from source doesn't update itself; it links to the release page instead.
+
+See [`tools/installer/README.md`](tools/installer/README.md) to build the installer or make a release.
+
 ## Why it doesn't need Hyper-V
 
 App Sandbox doesn't use Hyper-V or Hyper-V Manager. It creates and runs VMs through the Windows **Host Compute System (HCS)** and **Host Compute Network (HCN)** APIs, which need only *Virtual Machine Platform*, the same Windows feature WSL2 uses. Hyper-V is limited to Windows 11 Pro and Enterprise; Virtual Machine Platform is available on Home too, so you don't need a Pro licence on the host.

@@ -1,0 +1,92 @@
+name: CI
+
+# Builds and tests every push to main and every pull request on GitHub's own
+# machines. Needs no secrets, signing token or self-hosted runner.
+# Signed releases are separate: see build-windows.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Contract tests
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check source lists
+        run: python tools/check-sources.py
+      - name: Run contract tests
+        run: python tools/headless-api/tests/run_static.py
+
+  build:
+    name: Build, updater and installer (x64)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: microsoft/setup-msbuild@v2
+
+      # The WDK's test signing needs a certificate; a new one each run proves nothing
+      # depends on a particular machine's. It signs only what this job builds and throws away.
+      - name: Create a throwaway test certificate
+        id: cert
+        shell: powershell
+        run: |
+          $cert = New-SelfSignedCertificate -Subject 'CN=AppSandbox CI Test' -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(2)
+          "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build
+        shell: powershell
+        env:
+          # The package project signs and zips with the EV token; there is none here.
+          ASB_SKIP_PACKAGE_PROJECT: '1'
+        run: |
+          msbuild AppSandbox.sln /m /nologo /v:minimal /p:Configuration=Release /p:Platform=x64 /p:SignMode=TestSign "/p:TestCertificate=CN=AppSandbox CI Test | ${{ steps.cert.outputs.thumbprint }}"
+          if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)." }
+
+      - name: Run tests against the build
+        run: python tools/headless-api/tests/run_static.py
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup install failed (exit $LASTEXITCODE)." }
+
+      - name: Build the installer
+        shell: powershell
+        run: |
+          & .\tools\installer\build-installer.ps1 -TestCerts -SignThumbprint '${{ steps.cert.outputs.thumbprint }}'
+
+      # This machine is disposable and elevated, so the real per-machine installer can
+      # be run: install, upgrade, refusal while the app runs, uninstall.
+      - name: Install, upgrade and uninstall
+        shell: powershell
+        run: |
+          $setup = Get-ChildItem .\bin\Release\installer -Filter 'AppSandbox-*-setup.exe' | Select-Object -First 1
+          & .\tools\installer\test-install.ps1 -Setup $setup.FullName
+
+      - name: Keep the installer for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppSandbox-installer-ci-unsupported
+          path: bin/Release/installer/AppSandbox-*-setup.exe
+          if-no-files-found: error
+          retention-days: 7

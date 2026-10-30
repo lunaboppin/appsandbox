@@ -16,6 +16,7 @@
 #include "vm_display_auto.h"
 #include "vm_agent.h"
 #include "webview2_bridge.h"
+#include "update_ui.h"
 #include "prereq.h"
 #include <dwmapi.h>
 #include <commdlg.h>
@@ -1331,10 +1332,14 @@ static void on_webview2_message(const wchar_t *json)
     if (!json_get_string(json, L"action", action, 64))
         return;
 
+    if (update_ui_handle_action(action, json))
+        return;
+
     if (wcscmp(action, L"uiReady") == 0) {
         /* JS has loaded and registered its message listener; deliver any
          * messages queued before WebView2 was ready (e.g. early ui_log lines). */
         webview2_flush_queue();
+        update_ui_on_ready(g_hwnd_main);
         if (!prereq_check_all()) {
             webview2_post(L"{\"type\":\"prereqRequired\"}");
             return;
@@ -2066,6 +2071,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         send_vm_list();
+        update_ui_on_vm_state();
         return 0;
     }
 
@@ -2082,6 +2088,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_vm_displays[count] = NULL;
         send_vm_list();
         send_templates();
+        update_ui_on_vm_state();
         return 0;
     }
 
@@ -2300,6 +2307,17 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (msg_text) { ui_show_alert(msg_text); free(msg_text); }
         return 0;
     }
+
+    case WM_UPDATE_EVENT:
+        update_ui_on_event(wp, lp);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == ASB_UPDATE_TIMER_ID) {
+            update_ui_on_timer();
+            return 0;
+        }
+        break;
 
     case WM_TRAYICON:
         if (lp == WM_LBUTTONDBLCLK) {

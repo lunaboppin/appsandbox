@@ -1,5 +1,10 @@
 # AppSandbox — Code Signing & Release Packaging
 
+> The installer and how releases reach the auto-updater are covered in
+> [`tools/installer/README.md`](../installer/README.md). Run `make-release.ps1 -Installer`
+> to build the EV-signed installer along with the zip. Its certificate must be pinned in
+> `src/app_win/update_config.h`, or installed copies will refuse the update.
+
 How to produce a fully-signed AppSandbox release: every binary we build is
 **EV Authenticode-signed**, the two drivers are **Microsoft attestation-signed**,
 and the result is zipped for distribution.

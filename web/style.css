@@ -635,3 +635,18 @@ td.editing select {
     color: #888;
     text-align: center;
 }
+
+/* Update notice */
+.update-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+}
+.update-banner-actions { display: flex; gap: 6px; }
+.update-error { color: #e06c6c; }
