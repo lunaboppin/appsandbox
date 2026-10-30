@@ -39,6 +39,11 @@ def main() -> None:
     assert "asb_listen(ASB_CH_BACKSTAGE)" in shell
     assert "BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);" in shell
     assert "memcmp(cur + off, prev + off, bytes) == 0" in shell
+    # Session 0's screen copies as black, so windows paint themselves.
+    assert "g_capture_mode = frame_is_black(cur, w, h) ? 2 : 1;" in shell
+    assert "PrintWindow(vw.list[i], dc, PW_RENDERFULLCONTENT)" in shell
+    assert "EnumDesktopWindows(g_desk, collect_visible" in shell
+    assert 'view_status(v, L"Connected; waiting for the picture...");' in view
     assert "SendInput(1, in, sizeof(*in))" in shell and "PostMessageW(w, up ? WM_KEYUP : WM_KEYDOWN" in shell
     assert "SHGetKnownFolderPath(ids[i], KF_FLAG_CREATE" in shell   # SYSTEM Desktop exists
     assert "CLSID_ExplorerBrowser" in shell and "EnumDesktopWindows(g_desk" in shell

@@ -291,6 +291,75 @@ static void inject(const BsInput *in)
     }
 }
 
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+
+/* 0 not checked yet, 1 the screen can be copied, 2 windows are painted one by one */
+static int g_capture_mode;
+
+/* True when nothing but black came back; our backdrop is never black. */
+static BOOL frame_is_black(const BYTE *px, int w, int h)
+{
+    size_t i, n = (size_t)w * h;
+    for (i = 0; i < n; i += 97)
+        if (px[i * 4] | px[i * 4 + 1] | px[i * 4 + 2]) return FALSE;
+    return TRUE;
+}
+
+typedef struct { HWND list[96]; int count; } VisibleWindows;
+
+static BOOL CALLBACK collect_visible(HWND hwnd, LPARAM lp)
+{
+    VisibleWindows *vw = (VisibleWindows *)lp;
+    if (vw->count < (int)(sizeof(vw->list) / sizeof(vw->list[0])) &&
+        IsWindowVisible(hwnd) && !IsIconic(hwnd))
+        vw->list[vw->count++] = hwnd;
+    return TRUE;
+}
+
+/* Session 0's screen is never drawn anywhere, so copying it gives black.
+   Instead each window paints itself (PrintWindow) and they are stacked
+   bottom to top, as they would appear. */
+static void compose_windows(HDC mem, int w, int h)
+{
+    VisibleWindows vw;
+    RECT all = { 0, 0, w, h };
+    int i;
+    FillRect(mem, &all, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    vw.count = 0;
+    EnumDesktopWindows(g_desk, collect_visible, (LPARAM)&vw);   /* top first */
+    for (i = vw.count - 1; i >= 0; i--) {
+        RECT r;
+        int ww, wh;
+        BITMAPINFO bi;
+        BYTE *bits = NULL;
+        HBITMAP bmp;
+        HDC dc;
+        if (!GetWindowRect(vw.list[i], &r)) continue;
+        ww = r.right - r.left;
+        wh = r.bottom - r.top;
+        if (ww <= 0 || wh <= 0 || ww > 8192 || wh > 8192) continue;
+        if (r.right <= 0 || r.bottom <= 0 || r.left >= w || r.top >= h) continue;
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = ww;
+        bi.bmiHeader.biHeight = -wh;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        bmp = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+        if (!bmp) continue;
+        dc = CreateCompatibleDC(mem);
+        SelectObject(dc, bmp);
+        if (!PrintWindow(vw.list[i], dc, PW_RENDERFULLCONTENT))
+            PrintWindow(vw.list[i], dc, 0);
+        BitBlt(mem, r.left, r.top, ww, wh, dc, 0, 0, SRCCOPY);
+        DeleteDC(dc);
+        DeleteObject(bmp);
+    }
+}
+
 typedef struct {
     AsbConn *conn;
     volatile LONG closed;
@@ -344,8 +413,20 @@ static void serve_viewer(AsbConn *conn)
             h = sh;
             full = TRUE;
         }
-        BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);
-        GdiFlush();
+        if (g_capture_mode != 2) {
+            BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);
+            GdiFlush();
+            if (g_capture_mode == 0) {
+                g_capture_mode = frame_is_black(cur, w, h) ? 2 : 1;
+                bs_log(g_capture_mode == 2
+                       ? "Capture: the screen copies as black; painting each window instead."
+                       : "Capture: copying the screen.");
+            }
+        }
+        if (g_capture_mode == 2) {
+            compose_windows(mem, w, h);
+            GdiFlush();
+        }
         for (y = 0; y < h; y += BS_BAND) {
             int rows = (h - y < BS_BAND) ? h - y : BS_BAND;
             size_t off = (size_t)y * w * 4, bytes = (size_t)rows * w * 4;
