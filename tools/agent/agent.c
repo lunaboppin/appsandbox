@@ -948,21 +948,40 @@ static void backstage_toggle(char *reply, size_t cap)
     }
     CloseHandle(dup_token);
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
 
-    /* The shell takes the mutex once its desktop is showing. */
-    for (waited = 0; waited < 15000; waited += 100) {
+    /* The launcher exits once the shell has shown its desktop (0) or with
+       the shell's reason for giving up. */
+    for (waited = 0; waited < 20000; waited += 100) {
+        DWORD code = 0;
         running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
         if (running) {
             CloseHandle(running);
+            CloseHandle(pi.hProcess);
             agent_log("Backstage: shown in session %lu.", session_id);
             strcpy_s(reply, cap, "ok:entered");
             return;
         }
-        Sleep(100);
+        if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0 &&
+            GetExitCodeProcess(pi.hProcess, &code) && code != 0) {
+            char last[160] = "";
+            FILE *f;
+            /* The shell's last log line says what failed. */
+            if (fopen_s(&f, "C:\\Windows\\AppSandbox\\backstage.log", "r") == 0 && f) {
+                char line[160];
+                while (fgets(line, sizeof(line), f)) strcpy_s(last, sizeof(last), line);
+                fclose(f);
+                last[strcspn(last, "\r\n")] = '\0';
+            }
+            CloseHandle(pi.hProcess);
+            agent_log("Backstage: failed (code %lu): %s", code, last);
+            sprintf_s(reply, cap, "error:the Backstage desktop could not be shown (code %lu). %s",
+                      code, last);
+            return;
+        }
     }
-    agent_log("Backstage: the desktop did not come up (see backstage.log).");
-    strcpy_s(reply, cap, "error:the Backstage desktop could not be shown "
+    CloseHandle(pi.hProcess);
+    agent_log("Backstage: the desktop did not come up in time.");
+    strcpy_s(reply, cap, "error:the Backstage desktop did not come up in time "
                          "(see C:\\Windows\\AppSandbox\\backstage.log in the VM)");
 }
 

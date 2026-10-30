@@ -159,11 +159,30 @@ static int launch_shell(void)
         CloseDesktop(desk);
         return 3;
     }
-    WaitForInputIdle(pi.hProcess, 10000);   /* it holds the desktop open from here */
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseDesktop(desk);
-    return 0;
+    /* Wait until the shell shows its desktop (it takes the running mutex) or
+       gives up; its exit code becomes ours, so the agent can say why. */
+    {
+        DWORD code = 6;   /* timed out */
+        int i;
+        for (i = 0; i < 150; i++) {
+            HANDLE running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
+            if (running) {
+                CloseHandle(running);
+                code = 0;
+                break;
+            }
+            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+                GetExitCodeProcess(pi.hProcess, &code);
+                if (code == 0) code = 5;   /* ended without showing */
+                break;
+            }
+        }
+        if (code) bs_log("The shell did not come up (code %lu).", code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseDesktop(desk);
+        return (int)code;
+    }
 }
 
 /* ---- Launching tools ---- */
@@ -727,7 +746,13 @@ static int run_shell(void)
         _wcsicmp(name, BACKSTAGE_DESKTOP) != 0)
         wcscpy_s(g_prev_desktop, _countof(g_prev_desktop), name);
 
-    g_desk = GetThreadDesktop(GetCurrentThreadId());
+    /* Opened by name for switch rights; the handle the process started with
+       may not carry DESKTOP_SWITCHDESKTOP. */
+    g_desk = OpenDesktopW(BACKSTAGE_DESKTOP, 0, FALSE, GENERIC_ALL);
+    if (!g_desk) {
+        bs_log("OpenDesktop(%ls) failed: %lu", BACKSTAGE_DESKTOP, GetLastError());
+        return 7;
+    }
     if (!SwitchDesktop(g_desk)) {
         bs_log("SwitchDesktop to Backstage failed: %lu (showing %ls)", GetLastError(), g_prev_desktop);
         return 4;
@@ -774,5 +799,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     (void)inst; (void)prev; (void)show;
     if (cmd && wcsstr(cmd, L"--shell")) return run_shell();
+    {
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        bs_log("Opening Backstage in session %lu.", session);
+    }
     return launch_shell();
 }
