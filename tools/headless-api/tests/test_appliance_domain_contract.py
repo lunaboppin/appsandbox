@@ -87,6 +87,10 @@ def main() -> None:
     assert 'onclick="openDomainModal()"' in html
     assert "static DWORD WINAPI domain_work_thread(" in ui and "WM_DOMAIN_DONE" in ui
     assert "case 'domainResult': onDomainResult(msg); break;" in js
+    # Setup progress and its end reach the page; Refresh re-reads the status.
+    assert "PostMessageW(g_hwnd_main, WM_DOMAIN_PROGRESS, 0, 0);" in ui
+    assert "} while (s.domain_busy);" in ui
+    assert "sendCmd('getState');" in js
     print("[ok] appliance domain controller and managed VMs contract")
 
 

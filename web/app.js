@@ -150,7 +150,11 @@ function onFullState(msg) {
     lastStorageParent = msg.lastStorageParent || lastStorageParent;
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
-    if (document.getElementById('domain-overlay').classList.contains('active')) renderDomain();
+    if (document.getElementById('domain-overlay').classList.contains('active')) {
+        renderDomain();
+        /* Became ready while the dialog was open: load the users. */
+        if (domainState() === 'ready' && !domainLoaded && !domainBusy) domainSend('domainList');
+    }
     applyAccountModeUI();
     vpnConfigs = msg.vpnConfigs || [];
     vpnGateway = msg.vpnGateway || {};
@@ -494,6 +498,7 @@ function domainState() {
 }
 
 function openDomainModal() {
+    domainLoaded = false;
     document.getElementById('domain-overlay').classList.add('active');
     clearDomainUser();
     renderDomain();
@@ -621,7 +626,11 @@ function domainSend(action, payload) {
     sendCmd(action, payload || {});
 }
 
-function refreshDomain() { if (domainState() === 'ready') domainSend('domainList'); }
+function refreshDomain() {
+    sendCmd('getState');   /* the status may have moved on since the page last heard */
+    if (domainState() === 'ready') domainSend('domainList');
+}
+var domainLoaded = false;
 
 function setupDomain() {
     showModal('Set up domain controller',
@@ -680,6 +689,7 @@ function onDomainResult(msg) {
         return;
     }
     if (msg.action === 'domainList') {
+        domainLoaded = true;
         try { domainData = JSON.parse(msg.data || '{}'); } catch (e) { domainData = { users: [], groups: [] }; }
         if (!Array.isArray(domainData.users)) domainData.users = [];
         if (!Array.isArray(domainData.groups)) domainData.groups = [];

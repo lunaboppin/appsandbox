@@ -70,6 +70,7 @@ static VmDisplay *g_appliance_display = NULL;
 #define WM_VM_MANAGE_DONE     (WM_APP + 19)
 #define WM_HOST_RESOURCE_DONE (WM_APP + 20)
 #define WM_DOMAIN_DONE        (WM_APP + 21)
+#define WM_DOMAIN_PROGRESS    (WM_APP + 22)
 
 #define MANAGE_OP_MOVE_STORAGE 1
 #define MANAGE_OP_RESIZE_DISK  2
@@ -1106,7 +1107,23 @@ static DWORD WINAPI domain_work_thread(LPVOID param)
 {
     DomainWork *w = (DomainWork *)param;
     if (wcscmp(w->action, L"domainSetup") == 0) {
+        /* The promotion runs on the appliance's own worker for many minutes.
+           Follow it here so the page sees its progress and the real result
+           instead of a busy status nothing ever clears. */
+        SharedApplianceStatus s;
         w->result = asb_domain_setup();
+        if (w->result == S_OK) {
+            do {
+                PostMessageW(g_hwnd_main, WM_DOMAIN_PROGRESS, 0, 0);
+                Sleep(3000);
+                asb_shared_appliance_get_status(&s);
+            } while (s.domain_busy);
+            if (!s.domain_enabled) {
+                w->result = E_FAIL;
+                wcscpy_s(w->message, _countof(w->message),
+                         s.last_error[0] ? s.last_error : L"Setting up the domain controller failed; see the log.");
+            }
+        }
     } else if (wcscmp(w->action, L"domainList") == 0) {
         w->json = (char *)malloc(ASB_DOMAIN_JSON_MAX);
         w->result = w->json
@@ -1989,6 +2006,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_DOMAIN_PROGRESS:
+        send_full_state();
+        return 0;
     case WM_DOMAIN_DONE:
     {
         DomainWork *work = (DomainWork *)lp;
