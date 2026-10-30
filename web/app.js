@@ -606,7 +606,7 @@ function createLabVm() {
     if (!iso) { showModal('Malware Lab', 'Choose a Windows ISO to build the lab VM from.', 'OK', { confirmClass: 'primary' }); return; }
     var net = document.getElementById('lab-network').value;
     sendCmd('createVm', {
-        name: name, osType: 'Windows', imagePath: iso, templateName: '', storageParent: '',
+        name: name, osType: 'Windows', imagePath: iso, templateName: '', storageParent: lastStorageParent || '',
         sharedResourceExclusions: '', hddGb: parseInt(document.getElementById('lab-disk').value, 10) || 64,
         ramMb: alignRamMb(parseInt(document.getElementById('lab-ram').value, 10) || 8192),
         cpuCores: parseInt(document.getElementById('lab-cpu').value, 10) || 4,

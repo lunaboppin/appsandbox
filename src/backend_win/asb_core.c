@@ -3655,8 +3655,14 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             swprintf_s(storage_parent, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
             CreateDirectoryW(storage_parent, NULL);
         } else {
-            const wchar_t *requested = config->storage_parent && config->storage_parent[0]
-                ? config->storage_parent : storage_parent;
+            /* The default gets its own buffer: validate_storage_parent writes
+               the normalised path into storage_parent, which must not also be
+               the path it is reading. */
+            wchar_t default_parent[MAX_PATH];
+            const wchar_t *requested;
+            wcscpy_s(default_parent, MAX_PATH, storage_parent);
+            requested = config->storage_parent && config->storage_parent[0]
+                ? config->storage_parent : default_parent;
             hr = validate_storage_parent(requested, cfg.hdd_gb,
                                          storage_parent, _countof(storage_parent));
             if (FAILED(hr)) {
