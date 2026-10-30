@@ -1,113 +1,103 @@
 <img width="1028" height="446" alt="App Sandbox" src="https://github.com/user-attachments/assets/f66dcaff-201e-4cf5-8e23-bc480338f353" />
 
-
 # App Sandbox
 
-App Sandbox is a virtual machine app for Windows that's focused on performance and ease of use.
+App Sandbox is a virtual machine app for Windows that's focused on performance and ease of use. Point it at a Windows or Ubuntu ISO and it builds the disk, runs an unattended install and boots the VM, with GPU acceleration, sound, clipboard and a fast display out of the box.
 
-Features:
-- Works on Windows 11 Home or Pro, without Hyper-V
-- Windows 11 or Ubuntu 26.04 LTS VM Support
-- Zero touch install
-- Copy and Paste
-- 2 Channel Audio
-- GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
-- GPU Hardware Video Decoder/Encoder support
-- SSH via Hyper-V socket proxy (no network required)
-- Checkpoints and branches
-- Per-VM management for installer media, storage relocation, grow-only disk resizing, and display auto-open preferences
-- Creation-time placement of the complete VM tree (disk, resources, checkpoints, branches, and metadata) on a selected fixed NTFS/ReFS volume
-- Global host folders exposed to Windows guests as deterministic Virtual SMB drives, with per-VM opt-outs and read-only/read-write modes
-- Fixed 1080P60 display, with displayless starts by default and an explicit monitor button
-- Host to client hot-key support
-- Provision and boot with / without internet
-- Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
-- Headless mode: a scriptable local HTTP/JSON API + dependency-free Python SDK (`asb.py`) for creating and driving GPU-accelerated VMs programmatically
+It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and open source (MIT), with prebuilt EV-signed binaries on the [Releases](https://github.com/jamesstringer90/appsandbox/releases) page.
 
-Requirements:
-Windows 11 with an x64 Processor
+## Features
 
-## About App Sandbox
+### Virtual machines
+- **Windows 11 and Ubuntu 26.04 LTS** guests, installed with zero touch from your own ISO. Windows VMs get the **Pro** edition from the ISO.
+- **Apps on first boot:** pick apps when creating a Windows VM (Claude, Steam, VS Code, Notepad++, Everything, 7-Zip and more, or any winget ID) and they install after the first sign-in.
+- **Tidy new installs:** new Windows VMs start with a clean taskbar (just Edge and File Explorer, no search box, widgets or Copilot).
+- **Checkpoints and branches:** freeze a VM's state and fork independent working copies from it.
+- **Disposable VMs:** every start begins from a clean checkpoint and throws away the last session's changes.
+- **Templates** for creating Windows VMs from a prepared state instead of reinstalling.
+- **Per-VM management:** installer media, storage relocation, grow-only disk resizing, Secure Boot and display preferences. The whole VM tree can be placed on any fixed NTFS/ReFS volume.
+- **Nested virtualization,** so Docker, WSL and Claude Cowork run inside the VM.
 
-App Sandbox creates and runs full desktop virtual machines — Windows 11 and Ubuntu.
-It is free and open-source (MIT), distributed as prebuilt EV-signed binaries on its
-[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is driven two
-ways: from a graphical UI, or programmatically through a headless daemon with a
-dependency-free Python SDK (`asb.py`). Either way you pick an OS, point it at an installer
-image, and App Sandbox provisions the disk, runs an unattended install, and boots the
-guest. You supply a Windows or Ubuntu ISO. It runs on a Windows 11 (x64) PC, including laptops.
+### Display, input and sound
+- **Virtual display (IddCx) at 1080p60**, with frames sent as compact NV12 when most of the screen changes (games, video) and losslessly otherwise.
+- **Game mode:** the mouse is captured when a game hides the cursor, raw relative mouse input is passed through, and Ctrl+Alt releases it. Keyboard hotkeys can be passed to the guest too.
+- **2-channel audio** from the VM, using App Sandbox's own audio driver or, when Secure Boot blocks it, VB-CABLE, installed automatically.
+- **Copy and paste** between host and guest.
 
-**Runs on Windows 11 Home, without Hyper-V.** App Sandbox does not use Hyper-V
-or Hyper-V Manager; it creates and runs VMs through the Windows Host Compute System (HCS)
-and Host Compute Network (HCN) APIs, which require only the *Virtual Machine Platform*
-feature. Hyper-V is limited to Windows 11 Pro and Enterprise, while Virtual Machine
-Platform is available on Windows 11 Home, so a Windows 11 Pro license is not required.
-Virtual Machine Platform is the same Windows feature WSL2 uses.
+### GPU
+- **GPU acceleration via paravirtualization (GPU-PV):** the host's own GPU is shared with the VM, the same way WSL2 does it, with no passthrough or second GPU. Windows guests get DirectX 12, OpenGL, Vulkan, CUDA and OpenCL; Ubuntu guests the same minus DirectX.
+- **Hardware video decode and encode.**
 
-**What you can use it for:**
-- A full Windows or Ubuntu **desktop** VM — a complete graphical OS with GPU acceleration
-  (OpenGL, Vulkan, CUDA) — for building and testing your own software on a clean install.
-- Running a program in a VM, kept separate from your main OS and files.
-- Developing and testing Windows drivers: a built-in **Test Mode** enables test-signing
-  inside the guest, so the host's Secure Boot and boot configuration are left unchanged.
-- Running a computer-use AI agent (such as Claude's computer use model) in its own VM. App
-  Sandbox provides the desktop and the VM; the agent's own model loop runs inside the guest.
-  Several agents can run at once, each in its own VM, on a single laptop or desktop.
-- Creating GPU-accelerated (**GPU-PV**) VMs, from the GUI or the headless API.
-- Scripting the VM lifecycle from code — create, snapshot, branch, SSH into, and delete
-  GPU-accelerated VMs — with the Python SDK.
+### Shared drives and storage
+- **Shared drives** live on a small hidden **shared appliance** VM (Ubuntu with Samba, or Windows Server Core) and appear in every Windows VM as drive letters, read/write or read-only, with per-VM opt-outs.
+- **Mount Host** maps a shared drive in File Explorer on your PC too.
 
-**Headless API.** 
-`appsandbox.exe --headless` starts a
-single-owner daemon that hosts the same core as the GUI and exposes it as a Docker-style
-local HTTP/JSON API on `127.0.0.1`. The stdlib-only Python SDK
-(`asb.py`) wraps it: create GPU-accelerated VMs (GPU-PV is a `gpuMode` create option), SSH
-in over an auto-deployed key (Windows or Ubuntu guests), snapshot and branch them,
-open the live display, and run several at once — how many run concurrently is bounded by host
-CPU, RAM, and GPU memory, not by a fixed limit. The daemon is single-host — it drives VMs on
-the machine it runs on and does not provision cloud VMs; for CI, run it on a self-hosted
-runner. Provisioning a VM runs a full unattended install; snapshots, branches, and templates
-(Windows guests only) start a new VM from a provisioned state instead of reinstalling. A VM persists
-until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
-forks a writable disk from it to run divergent actions. The full API reference and runnable
-examples are in [`tools/headless-api/`](tools/headless-api/).
+### Networking
+- **NAT, external, internal or no network** per VM.
+- **WireGuard VPN:** import a `.conf` from your VPN provider and pick it as a VM's network. That VM's traffic goes only through the tunnel; if the tunnel drops, the VM goes offline instead of leaking.
+- **SSH** into any VM over a Hyper-V socket, with no network needed.
 
-`POST /v1/vms` accepts an optional `storageParent`. Shared-drive
-definitions are managed through `/v1/shared-resources`; a VM can include or
-exclude one through `/v1/vms/{name}/shared-resources/{id}`. The Python client
-exposes the same operations. Removing a definition or deleting a VM never
-deletes the shared host folder or its contents.
+### AppSandbox domain (optional)
+With the Windows Server Core appliance, App Sandbox can run its own **Active Directory domain**:
+- **Domain dialog:** manage users and groups (any password is accepted), including who is an administrator on the VMs.
+- **Managed VMs:** create a VM as *Managed*, or switch an existing one, and it joins the domain; domain users sign in to it.
+- **Roaming files:** each user's Desktop, Documents, Downloads and Pictures live on their own **H:** home drive on the appliance, so they follow them to every managed VM, disposable ones included.
+- **Per-group shared drives:** limit a shared drive to domain groups, so only members get it.
 
-**How it works:** this repo also aims to be a working example of creating full desktop VMs
-programmatically with the Windows HCS/HCN APIs. App Sandbox submits a hand-built HCS machine document to `computecore.dll` /
-`computenetwork.dll` — the HCS/HCN layer that also underlies WSL2 and Windows Sandbox —
-rather than going through Hyper-V Manager. GPU acceleration uses GPU paravirtualization
-(GPU-PV) to share the host's installed GPU with the guest — the same WSL2 path, not a
-dedicated passthrough (no VFIO/IOMMU, no second GPU). Windows guests get DirectX 12, OpenGL,
-Vulkan, CUDA, and OpenCL; Ubuntu guests the same minus DirectX. A custom
-**IddCx** indirect display driver and a virtual audio device carry the screen and sound, and
-guest↔host clipboard, audio, input, and SSH run over **Hyper-V sockets**. Guest disks are
-built by an in-repo tool with support for ext4, squashfs, qcow2, and VHDX. Linux (Ubuntu) guests reach the GPU through a custom
-DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa build. The
-app is native C with an HTML/JS UI (WebView2).
+### Malware Lab
+The **Malware Lab** button builds an isolated, disposable Windows VM for running suspicious files: no shared drives, domain or clipboard, and network off (or through a VPN). Start an analysis, run the sample, and stop it to get an HTML report like an online sandbox's, with:
+- a screenshot timeline;
+- a process tree with command lines;
+- every file created, modified or deleted;
+- every registry key and value added or changed, with autostart locations highlighted;
+- every network connection.
 
-# Tips:
-[Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
+### Headless API
+`appsandbox.exe --headless` starts a local HTTP/JSON API (Docker-style, on `127.0.0.1`), and the dependency-free Python SDK (`asb.py`) drives it: create GPU-accelerated VMs, SSH in over an auto-deployed key, snapshot and branch, open the live display, and run several at once. See [`tools/headless-api/`](tools/headless-api/) for the full reference and examples.
 
-[Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
+## Requirements
 
-[Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.
+- Windows 11 (Home or Pro) on an x64 processor, with the **Virtual Machine Platform** feature (App Sandbox offers to enable it).
+- A Windows 10/11 or Ubuntu ISO for each VM you create.
+- For the shared appliance or domain: a Windows Server ISO (for the Server Core appliance), or nothing extra for the Ubuntu one.
+
+## Why it doesn't need Hyper-V
+
+App Sandbox doesn't use Hyper-V or Hyper-V Manager. It creates and runs VMs through the Windows **Host Compute System (HCS)** and **Host Compute Network (HCN)** APIs, which need only *Virtual Machine Platform*, the same Windows feature WSL2 uses. Hyper-V is limited to Windows 11 Pro and Enterprise; Virtual Machine Platform is available on Home too, so you don't need a Pro licence on the host.
+
+## What you can use it for
+
+- A full Windows or Ubuntu **desktop** with GPU acceleration, for building and testing your software on a clean install.
+- **Gaming** in a VM, with GPU-PV, game mode and low-latency display.
+- Running a program kept apart from your main OS and files, in a disposable VM or the Malware Lab.
+- A small **multi-user setup:** several people, each with their own domain account and files, on shared VMs.
+- Running a computer-use AI agent (such as Claude's computer use) in its own VM. Several agents can run at once, each in its own VM.
+- Scripting the VM lifecycle from code with the headless API and Python SDK, for example on a self-hosted CI runner.
+
+## How it works
+
+This repo also aims to be a working example of creating full desktop VMs programmatically with the HCS/HCN APIs:
+- **VMs:** App Sandbox submits a hand-built HCS machine document to `computecore.dll` / `computenetwork.dll`, the layer that also underlies WSL2 and Windows Sandbox.
+- **GPU:** acceleration uses GPU paravirtualization (GPU-PV) to share the host's installed GPU with the guest.
+- **Display and sound:** a custom **IddCx** indirect display driver and virtual audio device carry the screen and sound.
+- **Guest channels:** clipboard, audio, input, SSH and the guest agent run over **Hyper-V sockets**.
+- **Disks:** guest disks are built by an in-repo tool supporting ext4, squashfs, qcow2 and VHDX.
+- **Linux GPU:** Ubuntu guests reach the GPU through a custom DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl` and a custom Mesa build.
+- **App:** native C, with an HTML/JS UI in WebView2.
+
+## Tips
+
+- **[Windows] Hotkeys and audio:** to enable hotkeys or mute the VM's audio, open the VM's display and right-click its title bar.
+- **[Windows] Remote access:** need high-performance remote desktop into your VM? [Phaze](https://phaze.app) works well.
+- **[Windows] Check GPU-PV:** run `gpu-test.exe` ([gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip)) inside a Windows VM. It shows six rotating cubes, one each for D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan; any API that fails won't show its cube. Some games and apps still don't detect GPU-PV correctly even when every API works.
 
 ## License
 
 AppSandbox is licensed under the [MIT License](LICENSE) — Copyright (c) 2026 James Stringer.
 
-It bundles third-party components that are **not** covered by the MIT license and
-retain their own terms — most notably the Microsoft WSL2 `dxgkrnl` GPU driver
-(GPL-2.0) and the embedded XZ decoder (0BSD). See
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list. AppSandbox's
-own Linux DRM kernel module (`tools/linux/asb_drm/`) is dual-licensed MIT OR
-GPL-2.0 so it can resolve the kernel's GPL-only symbols.
+It bundles third-party components that are **not** covered by the MIT license and keep their own terms, most notably the Microsoft WSL2 `dxgkrnl` GPU driver (GPL-2.0) and the embedded XZ decoder (0BSD). See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list. AppSandbox's own Linux DRM kernel module (`tools/linux/asb_drm/`) is dual-licensed MIT OR GPL-2.0 so it can use the kernel's GPL-only symbols.
+
+VB-CABLE, which App Sandbox can download into a VM for sound, is donationware by [VB-Audio](https://vb-cable.com) and is not bundled.
 
 ## Acknowledgements
 
