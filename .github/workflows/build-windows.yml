@@ -1,8 +1,8 @@
 name: Signed release
 
 # Builds with the EV token on the self-hosted signing runner, so it only runs when
-# asked. Everyday builds and tests are in ci.yml. Test-signed releases are made by
-# hand: see "Releasing" in tools/installer/README.md.
+# asked. Everyday builds and tests are in ci.yml, and test-signed releases are
+# published by release.yml.
 
 on:
   workflow_dispatch:

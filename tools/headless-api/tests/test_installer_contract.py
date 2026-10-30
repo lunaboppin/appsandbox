@@ -34,6 +34,7 @@ def main() -> None:
     targets = read("Directory.Build.targets")
     ci = read(".github/workflows/ci.yml")
     signed = read(".github/workflows/build-windows.yml")
+    auto = read(".github/workflows/release.yml")
     main_c = read("src/app_win/main.c")
 
     # One version: Directory.Build.props. The installer script holds none of its own,
@@ -170,6 +171,30 @@ def main() -> None:
     assert "--draft" in signed
     assert not re.search(r"gh release (create|edit)(?!.*--draft)", signed)
     assert "already published" in signed
+
+    # Automatic release: only from main, only for a version with no release, and only
+    # after the signed installer has been installed and removed.
+    trigger = section(auto, "\non:", "permissions:")
+    assert "branches: [main]" in trigger and "pull_request" not in trigger
+    assert "paths:" not in trigger  # merging a fix must retry a release that failed
+    assert "needed == 'true'" in section(auto, "  build:", "runs-on:")
+    assert "already exists" in auto
+    # The key is only reachable through the main-only environment, and write access to
+    # the repo only exists in the job that never sees it.
+    build_job = section(auto, "  build:", "  install:")
+    assert "environment: release" in build_job
+    assert "secrets.RELEASE_SIGNING_PFX_BASE64" in build_job
+    assert auto.count("secrets.") == 2
+    publish = auto[auto.index("  publish:"):]
+    assert "contents: write" in publish and "contents: write" not in auto[:auto.index("  publish:")]
+    assert "[plan, install]" in publish
+    assert "test-install.ps1" in section(auto, "  install:", "  publish:")
+    assert "if: always()" in build_job and "-DeleteKey" in build_job
+    # It signs with a certificate the app accepts: the pin is that certificate's SHA-256.
+    assert "SIGNING_THUMBPRINT: 6546C03C0B5C55CD8688FCC203AD5598844C89C2" in auto
+    assert "18A05C560707077AF685CE0DA874F2820E27724B2302F4250EA5A80BBB903032" in config
+    # Full releases, or installed copies wouldn't be offered them by default.
+    assert "--prerelease" not in publish and "--draft" not in publish
 
     print("[ok] installer, updater and CI contract")
 

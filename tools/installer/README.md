@@ -15,16 +15,13 @@ The result is `bin\Release\installer\AppSandbox-<version>-win-x64-setup.exe`, pl
 
 ## Releasing
 
-Change the version in `Directory.Build.props`, build, then make a **draft**:
+**Change the version in `Directory.Build.props` and merge to `main`.** The *Release* workflow (`release.yml`) sees a version with no release yet, builds and test-signs it, installs and uninstalls the signed installer, then publishes `v<version>` as a full release. Installed copies are offered it at their next check, so the version bump is the decision to ship. Merges that don't change the version release nothing. If the workflow fails, nothing is published; fix it and re-run, or merge the fix.
 
-- **Test-signed** (the current setup, on the PC holding the test certificate):
-  ```
-  .\tools\installer\build-installer.ps1 -SignThumbprint 6546C03C0B5C55CD8688FCC203AD5598844C89C2 -TestCerts
-  gh release create v0.1.7.0 bin\Release\installer\AppSandbox-0.1.7.0-win-x64-setup.exe --draft --prerelease --title "App Sandbox 0.1.7.0"
-  ```
-- **EV-signed:** run the *Signed release* workflow with a `release_tag`. It needs the self-hosted runner and YubiKey, and makes the draft for you.
+The signing key is in the `release` environment's secrets (`RELEASE_SIGNING_PFX_BASE64`, `RELEASE_SIGNING_PFX_PASSWORD`), and that environment only accepts `main`. Anyone who can push to `main` can therefore ship an update that runs as administrator on every installed PC.
 
-Nothing reaches users until someone publishes the draft. The app finds a release through its asset, which must be named exactly as above, so a release without one is ignored. A pre-release is offered only to people who turned on **Include pre-releases**; publish it as a full release to offer it to everyone.
+**EV-signed:** run the *Signed release* workflow with a `release_tag`. It needs the self-hosted runner and YubiKey, and makes a draft to publish by hand.
+
+The app finds a release through its asset, which must be named `AppSandbox-<version>-win-x64-setup.exe`, so a release without one is ignored. A pre-release is offered only to people who turned on **Include pre-releases**.
 
 ## Signing and the update check
 

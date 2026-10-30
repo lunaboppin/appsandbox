@@ -1,0 +1,162 @@
+name: Release
+
+# Publishes a release when main's version has none yet. Bumping the version in
+# Directory.Build.props and merging is the whole process: installed copies are
+# offered the update from the moment the publish job finishes.
+#
+# The signing key lives in the "release" environment, which only main can use. An
+# installer signed with it runs as administrator on every installed PC.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Test-signed drivers and installer. Must match the pin in src/app_win/update_config.h.
+  SIGNING_THUMBPRINT: 6546C03C0B5C55CD8688FCC203AD5598844C89C2
+  SIGNING_SUBJECT: CN=WDKTestCert Luna AppSandbox
+
+jobs:
+  plan:
+    name: Is this version released?
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      needed: ${{ steps.plan.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the version with existing releases
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          for group in ET.parse('Directory.Build.props').getroot().findall('PropertyGroup'):
+              if group.find('AsbVersionMajor') is not None:
+                  print('.'.join(group.find('AsbVersion' + p).text.strip() for p in ('Major', 'Minor', 'Patch', 'Revision')))
+          ")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version already exists; nothing to release."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Releasing v$version."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build and sign
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
+    # The WDK comes with this image, not with windows-2025.
+    runs-on: windows-2022
+    environment: release
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Import the signing certificate
+        shell: powershell
+        env:
+          PFX_BASE64: ${{ secrets.RELEASE_SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.RELEASE_SIGNING_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX_BASE64) { throw 'The release environment has no RELEASE_SIGNING_PFX_BASE64 secret.' }
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+          $password = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+          Remove-Item $pfx -Force
+          if (-not (Test-Path "Cert:\CurrentUser\My\$env:SIGNING_THUMBPRINT")) { throw 'The secret holds a different certificate from SIGNING_THUMBPRINT.' }
+
+      - name: Build
+        shell: powershell
+        env:
+          # The package project signs and zips with the EV token; there is none here.
+          ASB_SKIP_PACKAGE_PROJECT: '1'
+        run: |
+          msbuild AppSandbox.sln /m /nologo /v:minimal /p:Configuration=Release /p:Platform=x64 /p:SignMode=TestSign "/p:TestCertificate=$env:SIGNING_SUBJECT | $env:SIGNING_THUMBPRINT"
+          if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)." }
+
+      - name: Run tests against the build
+        run: python tools/headless-api/tests/run_static.py
+
+      - name: Build and sign the installer
+        shell: powershell
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup install failed (exit $LASTEXITCODE)." }
+          & .\tools\installer\build-installer.ps1 -TestCerts -SignThumbprint $env:SIGNING_THUMBPRINT
+
+      - name: Remove the signing certificate
+        if: always()
+        shell: powershell
+        run: Remove-Item "Cert:\CurrentUser\My\$env:SIGNING_THUMBPRINT" -DeleteKey -ErrorAction SilentlyContinue
+
+      - name: Keep the installer for the next jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-installer
+          path: |
+            bin/Release/installer/AppSandbox-*-setup.exe
+            bin/Release/installer/AppSandbox-*-setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  install:
+    name: Install, upgrade and uninstall
+    needs: build
+    # The build's windows-2022 is below the installer's Windows 11 minimum.
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-installer
+          path: installer
+      - name: Install, upgrade and uninstall
+        shell: powershell
+        run: |
+          $setup = Get-ChildItem .\installer -Filter 'AppSandbox-*-setup.exe' | Select-Object -First 1
+          & .\tools\installer\test-install.ps1 -Setup $setup.FullName
+
+  publish:
+    name: Publish the release
+    # Only after the signed installer itself has been installed and removed.
+    needs: [plan, install]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-installer
+          path: installer
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          setup="installer/AppSandbox-$VERSION-win-x64-setup.exe"
+          if [ ! -f "$setup" ]; then
+            echo "::error::Expected $setup, built from version $VERSION."
+            exit 1
+          fi
+          (cd installer && tr -d '\r' < "$(basename "$setup").sha256" | sha256sum -c -)
+          gh release create "v$VERSION" installer/* --target "$GITHUB_SHA" --title "App Sandbox $VERSION" --generate-notes --latest
