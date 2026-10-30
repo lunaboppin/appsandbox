@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include "p9copy.h"
+#include "lab_recorder.h"
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -1910,9 +1911,13 @@ static void keep_only_appsandbox_display(void)
 static void send_reply(AsbConn *s, const char *tag, const char *msg)
 {
     if (tag[0]) {
-        char rb[512];
-        sprintf_s(rb, sizeof(rb), "%s%s", tag, msg);
+        /* Sized to the reply: domain_list returns kilobytes of JSON. */
+        size_t size = strlen(tag) + strlen(msg) + 1;
+        char *rb = (char *)malloc(size);
+        if (!rb) return;
+        sprintf_s(rb, size, "%s%s", tag, msg);
         send_line(s, rb);
+        free(rb);
     } else {
         send_line(s, msg);
     }
@@ -2082,6 +2087,455 @@ static int run_agent_powershell(const wchar_t *script_path, DWORD timeout_ms)
         TerminateProcess(pi.hProcess, ERROR_TIMEOUT); ec = ERROR_TIMEOUT;
     } else if (!GetExitCodeProcess(pi.hProcess, &ec)) ec = GetLastError();
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return (int)ec;
+}
+
+/* ---- AppSandbox domain ----
+   On the Server Core appliance: promote it to the domain controller and
+   manage its users and groups. On a managed client VM: join the domain.
+   Arguments arrive ':'-separated (passwords and group names base64) and
+   reach the scripts only through ASB_DOM_* environment variables. Each
+   script prints "result:<text>" (or "json:<text>" for the list). */
+#define DOMAIN_OUT_MAX 32768
+
+static BOOL domain_field_ok(const char *v, const char *extra, size_t max_len)
+{
+    size_t n = strlen(v), i;
+    if (n > max_len) return FALSE;
+    for (i = 0; i < n; i++)
+        if (!isalnum((unsigned char)v[i]) && !strchr(extra, v[i])) return FALSE;
+    return TRUE;
+}
+
+/* Share names (asb_<hex>$): letters, digits, '_' and '$'. */
+static BOOL domain_field_ok_n(const char *v, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (!isalnum((unsigned char)v[i]) && v[i] != '_' && v[i] != '$') return FALSE;
+    return n > 0;
+}
+
+/* Split "a:b::c" in place, keeping empty fields. */
+static int domain_split(char *s, char **fields, int max)
+{
+    int n = 0;
+    fields[n++] = s;
+    for (; *s && n < max; s++)
+        if (*s == ':') { *s = '\0'; fields[n++] = s + 1; }
+    return n;
+}
+
+static const char DOMAIN_PROMOTE_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " if((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4){ Write-Output 'result:already'; exit 0 }\r\n"
+        " $pw=AsbText $env:ASB_DOM_PW\r\n"
+        " Install-WindowsFeature AD-Domain-Services -IncludeManagementTools | Out-Null\r\n"
+        " # The local policy may require complex passwords, which the appliance password need not\r\n"
+        " # meet; the domain drops these rules anyway. Relax them first so the Administrator and\r\n"
+        " # recovery (DSRM) passwords below are accepted.\r\n"
+        " $inf=Join-Path $env:TEMP 'asb-secpol.inf'; $sdb=Join-Path $env:TEMP 'asb-secpol.sdb'\r\n"
+        " secedit /export /cfg $inf /areas SECURITYPOLICY | Out-Null\r\n"
+        " (Get-Content $inf) -replace '^PasswordComplexity\\s*=.*','PasswordComplexity = 0' -replace '^MinimumPasswordLength\\s*=.*','MinimumPasswordLength = 0' -replace '^PasswordHistorySize\\s*=.*','PasswordHistorySize = 0' | Set-Content $inf -Encoding Unicode\r\n"
+        " secedit /configure /db $sdb /cfg $inf /areas SECURITYPOLICY /quiet | Out-Null\r\n"
+        " Remove-Item $inf,$sdb -Force -ErrorAction SilentlyContinue\r\n"
+        " # The built-in Administrator becomes the domain's; it needs a password and to be enabled.\r\n"
+        " $adm=Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1\r\n"
+        " $a=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/'+$adm.Name+',user'); $a.SetPassword($pw); $a.UserFlags.Value=([int]$a.UserFlags.Value -band (-bnot 0x2)); $a.SetInfo()\r\n"
+        " Import-Module ADDSDeployment\r\n"
+        " $s=ConvertTo-SecureString $pw -AsPlainText -Force\r\n"
+        " Install-ADDSForest -DomainName $env:ASB_DOM_FQDN -DomainNetbiosName $env:ASB_DOM_NB -SafeModeAdministratorPassword $s -InstallDns -NoRebootOnCompletion -Force -WarningAction SilentlyContinue | Out-Null\r\n"
+        " Write-Output 'result:promoted'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_FINISH_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $pw=AsbText $env:ASB_DOM_PW\r\n"
+        " $d=$null\r\n"
+        " for($i=0;$i -lt 90 -and -not $d;$i++){ try{ $d=Get-ADDomain }catch{ Start-Sleep -Seconds 10 } }\r\n"
+        " if(-not $d){ throw 'Active Directory did not start.' }\r\n"
+        " # Any password is acceptable: no complexity, length, history, expiry or lockout.\r\n"
+        " Set-ADDefaultDomainPasswordPolicy -Identity $d.DistinguishedName -ComplexityEnabled $false -MinPasswordLength 0 -PasswordHistoryCount 0 -MinPasswordAge 0 -MaxPasswordAge 0 -LockoutThreshold 0\r\n"
+        " $n=$env:ASB_DOM_USER\r\n"
+        " $sec=ConvertTo-SecureString $pw -AsPlainText -Force\r\n"
+        " $u=Get-ADUser -Filter 'SamAccountName -eq $n'\r\n"
+        " if(-not $u){ New-ADUser -Name $n -SamAccountName $n -UserPrincipalName ($n+'@'+$d.DNSRoot) -AccountPassword $sec -Enabled $true -PasswordNeverExpires $true }\r\n"
+        " else{ Set-ADAccountPassword -Identity $u -Reset -NewPassword $sec; Enable-ADAccount -Identity $u }\r\n"
+        " Add-ADGroupMember -Identity 'Domain Admins' -Members $n\r\n"
+        " if(-not (Get-ADGroup -Filter \"Name -eq 'AppSandbox VM Admins'\" -ErrorAction SilentlyContinue)){ New-ADGroup -Name 'AppSandbox VM Admins' -SamAccountName 'AppSandbox VM Admins' -GroupScope Global -GroupCategory Security -Description 'Administrators on every managed AppSandbox VM' }\r\n"
+        " # Clients reach DNS, Kerberos, LDAP and the rest only over the private share network.\r\n"
+        " $net=($env:ASB_MANAGEMENT_HOST -replace '\\.\\d+$','.0')+'/24'\r\n"
+        " Get-NetFirewallRule -DisplayName 'AppSandbox Domain' -ErrorAction SilentlyContinue | Remove-NetFirewallRule\r\n"
+        " New-NetFirewallRule -DisplayName 'AppSandbox Domain' -Direction Inbound -Action Allow -RemoteAddress $net -Profile Any | Out-Null\r\n"
+        " Write-Output 'result:ready'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_LIST_PS[] =
+        "function AsbRid($g){ [int]($g.SID.Value.Split('-')[-1]) }\r\n"
+        "function AsbManageable($g){ (AsbRid $g) -ge 1000 -or $g.Name -eq 'Domain Admins' }\r\n"
+        "function AsbSystemGroup($g){ (AsbRid $g) -lt 1000 -or @('DnsAdmins','DnsUpdateProxy','AppSandbox VM Admins') -contains $g.Name }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
+        " if(-not (Get-ADGroup -Filter \"Name -eq 'AppSandbox VM Admins'\" -ErrorAction SilentlyContinue)){ New-ADGroup -Name 'AppSandbox VM Admins' -SamAccountName 'AppSandbox VM Admins' -GroupScope Global -GroupCategory Security -Description 'Administrators on every managed AppSandbox VM' }\r\n"
+        " $hide=@('krbtgt','Guest','DefaultAccount','AppSandboxShare')\r\n"
+        " $users=@(Get-ADUser -Filter * -Properties MemberOf | Where-Object { $hide -notcontains $_.SamAccountName } | Sort-Object SamAccountName | ForEach-Object { [ordered]@{ name=$_.SamAccountName; enabled=[bool]$_.Enabled; groups=@($_.MemberOf | ForEach-Object { (($_ -split ',')[0]).Substring(3) }) } })\r\n"
+        " $groups=@(Get-ADGroup -Filter * | Where-Object { AsbManageable $_ } | Sort-Object Name | ForEach-Object { [ordered]@{ name=$_.Name; system=[bool](AsbSystemGroup $_) } })\r\n"
+        " Write-Output ('json:' + (ConvertTo-Json -InputObject ([ordered]@{ users=$users; groups=$groups }) -Depth 4 -Compress))\r\n"
+        " exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_USER_SET_PS[] =
+        "function AsbHome($sam){\r\n"
+        " $d=Get-ADDomain\r\n"
+        " $root='C:\\AppSandboxData\\Users'\r\n"
+        " New-Item -ItemType Directory -Force -Path $root | Out-Null\r\n"
+        " $h=Join-Path $root $sam\r\n"
+        " foreach($f in 'Desktop','Documents','Downloads','Pictures'){ New-Item -ItemType Directory -Force -Path (Join-Path $h $f) | Out-Null }\r\n"
+        " $acl=New-Object System.Security.AccessControl.DirectorySecurity\r\n"
+        " $acl.SetAccessRuleProtection($true,$false)\r\n"
+        " foreach($who in @('NT AUTHORITY\\SYSTEM','BUILTIN\\Administrators',($d.NetBIOSName+'\\'+$sam))){\r\n"
+        "  $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($who,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))\r\n"
+        " }\r\n"
+        " Set-Acl -LiteralPath $h -AclObject $acl\r\n"
+        " $unc='\\\\'+[System.Net.Dns]::GetHostName()+'.'+$d.DNSRoot+'\\Users$\\'+$sam\r\n"
+        " Set-ADUser -Identity $sam -HomeDirectory $unc -HomeDrive 'H:'\r\n"
+        "}\r\n"
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "function AsbRid($g){ [int]($g.SID.Value.Split('-')[-1]) }\r\n"
+        "function AsbManageable($g){ (AsbRid $g) -ge 1000 -or $g.Name -eq 'Domain Admins' }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
+        " $n=$env:ASB_DOM_USER\r\n"
+        " $d=Get-ADDomain\r\n"
+        " $sec=$null\r\n"
+        " if($env:ASB_DOM_PWSET -eq '1'){ $pw=AsbText $env:ASB_DOM_PW; if($pw.Length){ $sec=ConvertTo-SecureString $pw -AsPlainText -Force } else { $sec=New-Object Security.SecureString } }\r\n"
+        " $u=Get-ADUser -Filter 'SamAccountName -eq $n'\r\n"
+        " if(-not $u){\r\n"
+        "  if($null -eq $sec){ throw 'A new user needs a password (it can be empty).' }\r\n"
+        "  New-ADUser -Name $n -SamAccountName $n -UserPrincipalName ($n+'@'+$d.DNSRoot) -AccountPassword $sec -Enabled $true -PasswordNeverExpires $true\r\n"
+        "  $u=Get-ADUser -Filter 'SamAccountName -eq $n'\r\n"
+        " } elseif($null -ne $sec){ Set-ADAccountPassword -Identity $u -Reset -NewPassword $sec }\r\n"
+        " if($env:ASB_DOM_ENABLED -eq '1'){ Enable-ADAccount -Identity $u } else { Disable-ADAccount -Identity $u }\r\n"
+        " $want=@((AsbText $env:ASB_DOM_GROUPS) -split ',' | Where-Object { $_ })\r\n"
+        " $have=@((Get-ADUser -Identity $u -Properties MemberOf).MemberOf | ForEach-Object { (($_ -split ',')[0]).Substring(3) })\r\n"
+        " foreach($g in @(Get-ADGroup -Filter * | Where-Object { AsbManageable $_ })){\r\n"
+        "  $in=$have -contains $g.Name; $should=$want -contains $g.Name\r\n"
+        "  if($should -and -not $in){ Add-ADGroupMember -Identity $g -Members $u }\r\n"
+        "  elseif($in -and -not $should){ Remove-ADGroupMember -Identity $g -Members $u -Confirm:$false }\r\n"
+        " }\r\n"
+        " # Their home folder (H:) with the roaming Desktop, Documents, Downloads and Pictures.\r\n"
+        " try{ AsbHome $n }catch{ Write-Output ('result:Saved, but the home folder failed: ' + $_.Exception.Message); exit 0 }\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_USER_DELETE_PS[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
+        " Remove-ADUser -Identity $env:ASB_DOM_USER -Confirm:$false\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_GROUP_ADD_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
+        " $g=AsbText $env:ASB_DOM_GROUP\r\n"
+        " New-ADGroup -Name $g -SamAccountName $g -GroupScope Global -GroupCategory Security\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_GROUP_DELETE_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "function AsbRid($g){ [int]($g.SID.Value.Split('-')[-1]) }\r\n"
+        "function AsbSystemGroup($g){ (AsbRid $g) -lt 1000 -or @('DnsAdmins','DnsUpdateProxy','AppSandbox VM Admins') -contains $g.Name }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
+        " $g=Get-ADGroup -Identity (AsbText $env:ASB_DOM_GROUP)\r\n"
+        " if(AsbSystemGroup $g){ throw 'Built-in groups cannot be deleted.' }\r\n"
+        " Remove-ADGroup -Identity $g -Confirm:$false\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+static const char DOMAIN_JOIN_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $cs=Get-CimInstance Win32_ComputerSystem\r\n"
+        " $dc=$env:ASB_DOM_DC\r\n"
+        " $prefix=($dc -replace '\\.\\d+$','.')\r\n"
+        " $a=Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress.StartsWith($prefix) } | Select-Object -First 1\r\n"
+        " if(-not $a){ throw 'This VM has no network link to the domain controller.' }\r\n"
+        " # The share adapter's DNS is reset on every boot; point it, and the domain's names, at the DC.\r\n"
+        " Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses $dc\r\n"
+        " Get-DnsClientNrptRule | Where-Object { $_.Namespace -contains $env:ASB_DOM_FQDN } | ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force }\r\n"
+        " Add-DnsClientNrptRule -Namespace ('.'+$env:ASB_DOM_FQDN),$env:ASB_DOM_FQDN -NameServers $dc | Out-Null\r\n"
+        " Clear-DnsClientCache\r\n"
+        " # Members of the domain's VM Admins group administer every managed VM. Re-applied on\r\n"
+        " # every boot, so VMs joined before the group existed pick it up too.\r\n"
+        " if($cs.PartOfDomain -and $cs.Domain -eq $env:ASB_DOM_FQDN){\r\n"
+        "  try{ $g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); $g.Add('WinNT://'+$env:ASB_DOM_NB+'/AppSandbox VM Admins') }catch{}\r\n"
+        "  Write-Output 'result:already'; exit 0\r\n"
+        " }\r\n"
+        " $sku=(Get-CimInstance Win32_OperatingSystem).OperatingSystemSKU\r\n"
+        " if(@(98,99,100,101) -contains $sku){ throw ('This VM runs ' + (Get-CimInstance Win32_OperatingSystem).Caption + ', which cannot join a domain. Upgrade it to Pro (Settings > System > Activation > Change product key), or create a new VM: new VMs install Pro.') }\r\n"
+        " $cred=New-Object System.Management.Automation.PSCredential($env:ASB_DOM_USER,(ConvertTo-SecureString (AsbText $env:ASB_DOM_PW) -AsPlainText -Force))\r\n"
+        " $last='not attempted'\r\n"
+        " for($i=0;$i -lt 12;$i++){ try{ Add-Computer -DomainName $env:ASB_DOM_FQDN -Credential $cred -Force -ErrorAction Stop; $last=$null; break }catch{ $last=$_.Exception.Message; Start-Sleep -Seconds 10 } }\r\n"
+        " if($last){ throw $last }\r\n"
+        " # Members of VM Admins administer this VM (applied again after the restart, at the next boot).\r\n"
+        " try{ $g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); $g.Add('WinNT://'+$env:ASB_DOM_NB+'/AppSandbox VM Admins') }catch{}\r\n"
+        " Write-Output 'result:joined'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+
+static const char DOMAIN_ENSURE_PS[] =
+        "function AsbHome($sam){\r\n"
+        " $d=Get-ADDomain\r\n"
+        " $root='C:\\AppSandboxData\\Users'\r\n"
+        " New-Item -ItemType Directory -Force -Path $root | Out-Null\r\n"
+        " $h=Join-Path $root $sam\r\n"
+        " foreach($f in 'Desktop','Documents','Downloads','Pictures'){ New-Item -ItemType Directory -Force -Path (Join-Path $h $f) | Out-Null }\r\n"
+        " $acl=New-Object System.Security.AccessControl.DirectorySecurity\r\n"
+        " $acl.SetAccessRuleProtection($true,$false)\r\n"
+        " foreach($who in @('NT AUTHORITY\\SYSTEM','BUILTIN\\Administrators',($d.NetBIOSName+'\\'+$sam))){\r\n"
+        "  $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($who,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))\r\n"
+        " }\r\n"
+        " Set-Acl -LiteralPath $h -AclObject $acl\r\n"
+        " $unc='\\\\'+[System.Net.Dns]::GetHostName()+'.'+$d.DNSRoot+'\\Users$\\'+$sam\r\n"
+        " Set-ADUser -Identity $sam -HomeDirectory $unc -HomeDrive 'H:'\r\n"
+        "}\r\n"
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
+        " $d=Get-ADDomain\r\n"
+        " if(-not (Get-ADGroup -Filter \"Name -eq 'AppSandbox VM Admins'\" -ErrorAction SilentlyContinue)){ New-ADGroup -Name 'AppSandbox VM Admins' -SamAccountName 'AppSandbox VM Admins' -GroupScope Global -GroupCategory Security -Description 'Administrators on every managed AppSandbox VM' }\r\n"
+        " # Users$: one home folder per user. Users may only list the top level; each home is theirs.\r\n"
+        " $root='C:\\AppSandboxData\\Users'\r\n"
+        " New-Item -ItemType Directory -Force -Path $root | Out-Null\r\n"
+        " $acl=New-Object System.Security.AccessControl.DirectorySecurity\r\n"
+        " $acl.SetAccessRuleProtection($true,$false)\r\n"
+        " $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\\SYSTEM','FullControl','ContainerInherit,ObjectInherit','None','Allow')))\r\n"
+        " $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators','FullControl','ContainerInherit,ObjectInherit','None','Allow')))\r\n"
+        " $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(($d.NetBIOSName+'\\Domain Users'),'ReadAndExecute','None','None','Allow')))\r\n"
+        " Set-Acl -LiteralPath $root -AclObject $acl\r\n"
+        " if(-not (Get-SmbShare -Name 'Users$' -ErrorAction SilentlyContinue)){ New-SmbShare -Name 'Users$' -Path $root -FullAccess ($d.NetBIOSName+'\\Domain Users'),'BUILTIN\\Administrators' -FolderEnumerationMode AccessBased | Out-Null }\r\n"
+        " # Roaming files: Desktop, Documents, Downloads and Pictures live in the user's home (H:).\r\n"
+        " if(-not (Get-Module -ListAvailable GroupPolicy)){ Install-WindowsFeature GPMC | Out-Null }\r\n"
+        " Import-Module GroupPolicy\r\n"
+        " $name='AppSandbox Roaming Files'\r\n"
+        " if(-not (Get-GPO -Name $name -ErrorAction SilentlyContinue)){ New-GPO -Name $name -Comment 'Desktop, Documents, Downloads and Pictures on the AppSandbox appliance (H:)' | Out-Null }\r\n"
+        " if(-not ((Get-GPInheritance -Target $d.DistinguishedName).GpoLinks | Where-Object { $_.DisplayName -eq $name })){ New-GPLink -Name $name -Target $d.DistinguishedName | Out-Null }\r\n"
+        " $k='HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders'\r\n"
+        " $map=[ordered]@{ 'Desktop'='Desktop'; '{754AC886-DF64-4CBA-86B5-F7FBF4FBCEF5}'='Desktop'; 'Personal'='Documents'; '{F42EE2D3-909F-4907-8871-4C22FC0BF756}'='Documents'; '{374DE290-123F-4565-9164-39C4925E467B}'='Downloads'; 'My Pictures'='Pictures'; '{0DDD015D-B06C-45D5-8C4C-F59713854639}'='Pictures' }\r\n"
+        " foreach($v in $map.Keys){\r\n"
+        "  $want='%HOMESHARE%\\'+$map[$v]\r\n"
+        "  $cur=Get-GPRegistryValue -Name $name -Key $k -ValueName $v -ErrorAction SilentlyContinue\r\n"
+        "  if(-not $cur -or $cur.Value -ne $want){ Set-GPRegistryValue -Name $name -Key $k -ValueName $v -Type ExpandString -Value $want | Out-Null }\r\n"
+        " }\r\n"
+        " # Apply user policy before the desktop appears, so the first sign-in is redirected too.\r\n"
+        " Set-GPRegistryValue -Name $name -Key 'HKLM\\Software\\Policies\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon' -ValueName 'SyncForegroundPolicy' -Type DWord -Value 1 | Out-Null\r\n"
+        " # Disposable VMs roll back to an old machine password; keep it so their trust survives.\r\n"
+        " Set-GPRegistryValue -Name $name -Key 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters' -ValueName 'DisablePasswordChange' -Type DWord -Value 1 | Out-Null\r\n"
+        " $hide=@('krbtgt','Guest','DefaultAccount','AppSandboxShare')\r\n"
+        " foreach($u in @(Get-ADUser -Filter * | Where-Object { $hide -notcontains $_.SamAccountName })){ AsbHome $u.SamAccountName }\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+
+static const char *const DOMAIN_ENV[] = {
+    "ASB_DOM_NB", "ASB_DOM_FQDN", "ASB_DOM_PW", "ASB_DOM_USER", "ASB_DOM_PWSET",
+    "ASB_DOM_ENABLED", "ASB_DOM_GROUPS", "ASB_DOM_GROUP", "ASB_DOM_DC",
+    "ASB_MANAGEMENT_HOST", NULL
+};
+
+/* Run a domain script; reply gets "ok", "ok:<data>" or "error:<message>". */
+static void run_domain_script(const char *script, DWORD timeout_ms,
+                              char *reply, size_t reply_size)
+{
+    wchar_t path[MAX_PATH];
+    char *out = (char *)malloc(DOMAIN_OUT_MAX), *line, *next, *result = NULL, *json = NULL;
+    int ec, i;
+    if (!out) { strcpy_s(reply, reply_size, "error:out of memory"); return; }
+    out[0] = '\0';
+    swprintf_s(path, MAX_PATH, L"C:\\ProgramData\\AppSandbox\\domain-%lu.ps1", GetCurrentThreadId());
+    ec = write_agent_script(path, script);
+    if (!ec) ec = run_agent_powershell_out(path, timeout_ms, out, DOMAIN_OUT_MAX);
+    DeleteFileW(path);
+    for (i = 0; DOMAIN_ENV[i]; i++) SetEnvironmentVariableA(DOMAIN_ENV[i], NULL);
+    for (line = out; line && *line; line = next) {
+        next = strpbrk(line, "\r\n");
+        if (next) { *next++ = '\0'; while (*next == '\r' || *next == '\n') next++; }
+        if (strncmp(line, "result:", 7) == 0) result = line + 7;
+        else if (strncmp(line, "json:", 5) == 0) json = line + 5;
+    }
+    if (ec == 0 && json) sprintf_s(reply, reply_size, "ok:%s", json);
+    else if (ec == 0 && result && (strcmp(result, "ok") == 0 || strcmp(result, "ready") == 0))
+        strcpy_s(reply, reply_size, "ok");
+    else if (ec == 0 && result) sprintf_s(reply, reply_size, "ok:%s", result);
+    else sprintf_s(reply, reply_size, "error:%.400s", result ? result : "the script failed to run");
+    agent_log("Domain: %.200s", strncmp(reply, "ok:{", 4) == 0 ? "list" : reply);
+    SecureZeroMemory(out, DOMAIN_OUT_MAX);
+    free(out);
+}
+
+static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
+{
+    char *f[8];
+    int n;
+    if (strcmp(cmd, "domain_list") == 0) {
+        run_domain_script(DOMAIN_LIST_PS, 120000, reply, reply_size);
+        return;
+    }
+    if (strncmp(cmd, "domain_promote:", 15) == 0) {
+        n = domain_split(cmd + 15, f, 8);       /* NB, FQDN, pw */
+        if (n != 3 || !domain_field_ok(f[0], "-", 15) || !domain_field_ok(f[1], ".-", 200) ||
+            !domain_field_ok(f[2], "+/=", 600)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_NB", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_FQDN", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[2]);
+        run_domain_script(DOMAIN_PROMOTE_PS, 45 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_finish:", 14) == 0) {
+        n = domain_split(cmd + 14, f, 8);       /* user, pw */
+        if (n != 2 || !domain_field_ok(f[0], "._-", 20) || !domain_field_ok(f[1], "+/=", 600))
+            goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[1]);
+        SetEnvironmentVariableW(L"ASB_MANAGEMENT_HOST", g_shared_management_ip);
+        run_domain_script(DOMAIN_FINISH_PS, 20 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_user_set:", 16) == 0) {
+        n = domain_split(cmd + 16, f, 8);       /* user, pwset, pw, enabled, groups */
+        if (n != 5 || !domain_field_ok(f[0], "._-", 20) || !domain_field_ok(f[1], "", 1) ||
+            !domain_field_ok(f[2], "+/=", 600) || !domain_field_ok(f[3], "", 1) ||
+            !domain_field_ok(f[4], "+/=", 1500)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_PWSET", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[2]);
+        SetEnvironmentVariableA("ASB_DOM_ENABLED", f[3]);
+        SetEnvironmentVariableA("ASB_DOM_GROUPS", f[4]);
+        run_domain_script(DOMAIN_USER_SET_PS, 120000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_user_delete:", 19) == 0) {
+        if (!*(cmd + 19) || !domain_field_ok(cmd + 19, "._-", 20)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", cmd + 19);
+        run_domain_script(DOMAIN_USER_DELETE_PS, 60000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_group_add:", 17) == 0 ||
+               strncmp(cmd, "domain_group_delete:", 20) == 0) {
+        BOOL add = cmd[13] == 'a';
+        char *arg = cmd + (add ? 17 : 20);
+        if (!*arg || !domain_field_ok(arg, "+/=", 200)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_GROUP", arg);
+        run_domain_script(add ? DOMAIN_GROUP_ADD_PS : DOMAIN_GROUP_DELETE_PS, 60000,
+                          reply, reply_size);
+    } else if (strcmp(cmd, "domain_ensure") == 0) {
+        run_domain_script(DOMAIN_ENSURE_PS, 10 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_join:", 12) == 0) {
+        n = domain_split(cmd + 12, f, 8);       /* FQDN, NB, dc, NB\user, pw */
+        if (n != 5 || !domain_field_ok(f[0], ".-", 200) || !domain_field_ok(f[1], "-", 15) ||
+            !domain_field_ok(f[2], ".", 15) || !domain_field_ok(f[3], "\\._-", 40) ||
+            !domain_field_ok(f[4], "+/=", 600)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_FQDN", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_NB", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_DC", f[2]);
+        SetEnvironmentVariableA("ASB_DOM_USER", f[3]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[4]);
+        run_domain_script(DOMAIN_JOIN_PS, 5 * 60 * 1000, reply, reply_size);
+        if (strcmp(reply, "ok:joined") == 0) {
+            /* The join takes effect at the next boot. */
+            STARTUPINFOW si = { sizeof(si) };
+            PROCESS_INFORMATION pi;
+            wchar_t restart[] = L"shutdown.exe /r /t 15 /c \"Joining the AppSandbox domain\"";
+            if (CreateProcessW(NULL, restart, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                               NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
+    } else {
+        strcpy_s(reply, reply_size, "error:unknown");
+    }
+    return;
+invalid:
+    strcpy_s(reply, reply_size, "error:invalid arguments");
+}
+
+/* ---- Group-restricted shared drives (managed VMs) ----
+   The host sends "user_drives:R=asb_x$,S=asb_y$". They are mapped in the
+   signed-in user's session with the user's own credentials, at sign-in and
+   when the list arrives; a user outside the allowed groups simply gets no
+   drive, because the appliance refuses the connection. */
+#define USER_DRIVES_LIST   L"C:\\ProgramData\\AppSandbox\\user-drives.txt"
+#define USER_DRIVES_SCRIPT L"C:\\ProgramData\\AppSandbox\\user-drives.ps1"
+
+static const char USER_DRIVES_PS[] =
+        "# Group-restricted shared drives, mapped as the signed-in user so the appliance decides.\r\n"
+        "$list='C:\\ProgramData\\AppSandbox\\user-drives.txt'\r\n"
+        "if(-not (Test-Path $list)){ exit 0 }\r\n"
+        "$s=$env:LOGONSERVER\r\n"
+        "if(-not $s){ try{ $s='\\\\'+([System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain().FindDomainController().Name) }catch{ exit 0 } }\r\n"
+        "foreach($line in Get-Content $list){\r\n"
+        " $p=$line.Split('=')\r\n"
+        " if($p.Count -ne 2){ continue }\r\n"
+        " $l=$p[0]+':'\r\n"
+        " if(Test-Path ($l+'\\')){ continue }\r\n"
+        " & net.exe use $l ($s+'\\'+$p[1]) /persistent:no 2>&1 | Out-Null\r\n"
+        "}\r\n";
+
+static DWORD WINAPI user_drives_thread(LPVOID param)
+{
+    DWORD session = (DWORD)(ULONG_PTR)param;
+    HANDLE token = NULL;
+    LPVOID env = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[512];
+    Sleep(3000);   /* let the new session settle */
+    if (GetFileAttributesW(USER_DRIVES_LIST) == INVALID_FILE_ATTRIBUTES) return 0;
+    if (session == 0xFFFFFFFF || !WTSQueryUserToken(session, &token)) return 0;
+    if (write_agent_script(USER_DRIVES_SCRIPT, USER_DRIVES_PS)) { CloseHandle(token); return 0; }
+    if (!CreateEnvironmentBlock(&env, token, FALSE)) env = NULL;
+    swprintf_s(cmd, _countof(cmd),
+               L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+               L"-WindowStyle Hidden -File \"%s\"", USER_DRIVES_SCRIPT);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    if (CreateProcessAsUserW(token, NULL, cmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                             env, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        agent_log("User drives: CreateProcessAsUserW failed (%lu).", GetLastError());
+    }
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(token);
+    return 0;
+}
+
+static void map_user_drives(DWORD session)
+{
+    HANDLE t = CreateThread(NULL, 0, user_drives_thread, (LPVOID)(ULONG_PTR)session, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
+/* "R=asb_x$,S=asb_y$" -> one "R=asb_x$" per line; empty clears the list. */
+static BOOL set_user_drives(const char *list)
+{
+    const char *p = list;
+    FILE *f;
+    if (!*list) { DeleteFileW(USER_DRIVES_LIST); return TRUE; }
+    CreateDirectoryW(L"C:\\ProgramData\\AppSandbox", NULL);
+    if (_wfopen_s(&f, USER_DRIVES_LIST, L"w") != 0 || !f) return FALSE;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len >= 3 && len < 64 && isalpha((unsigned char)p[0]) && p[1] == '=' &&
+            domain_field_ok_n(p + 2, len - 2))
+            fprintf(f, "%c=%.*s\n", toupper((unsigned char)p[0]), (int)(len - 2), p + 2);
+        if (!end) break;
+        p = end + 1;
+    }
+    fclose(f);
+    return TRUE;
 }
 
 /* ---- VB-CABLE fallback audio device ----
@@ -2569,7 +3023,9 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         "$last=''\r\n"
         "$h=($remote -split '\\\\')[2]\r\n"
         "$secure=ConvertTo-SecureString $env:ASB_SMB_PASSWORD -AsPlainText -Force\r\n"
-        "$cred=[System.Management.Automation.PSCredential]::new(($h+'\\'+$env:ASB_SMB_USER),$secure)\r\n"
+        "$u=$env:ASB_SMB_USER\r\n"
+        "if(-not $u.Contains('\\')){$u=$h+'\\'+$u}\r\n"
+        "$cred=[System.Management.Automation.PSCredential]::new($u,$secure)\r\n"
         "$code=1\r\n"
         "for($attempt=0;$attempt -lt 8;$attempt++){\r\n"
         " try{\r\n"
@@ -2595,7 +3051,7 @@ static int map_smb_drive_global(const char *letter_a, const char *host_a,
         " if($attempt -lt 7){Start-Sleep -Milliseconds 1000}\r\n"
         "}\r\n"
         "if(-not $last){$last='mapped drive was not readable'}\r\n"
-        "Write-Output ('map failed user=' + $h + '\\' + $env:ASB_SMB_USER + ' target=' + $remote + ': ' + $last)\r\n"
+        "Write-Output ('map failed user=' + $u + ' target=' + $remote + ': ' + $last)\r\n"
         "$t=Test-NetConnection -ComputerName $h -Port 445 -WarningAction SilentlyContinue\r\n"
         "Write-Output ('tcp445=' + $t.TcpTestSucceeded + ' src=' + $t.SourceAddress.IPAddress)\r\n"
         "foreach($ln in @('Microsoft-Windows-SMBClient/Connectivity','Microsoft-Windows-SMBClient/Security','Microsoft-Windows-SMBClient/Operational')){\r\n"
@@ -2826,9 +3282,14 @@ static DWORD appliance_prepare_storage(char *thumbprint, size_t thumbprint_chars
         L"Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Confirm:$false -ErrorAction Stop; "
         L"$cert=Get-ChildItem Cert:\\LocalMachine\\My | Where-Object FriendlyName -eq 'AppSandbox Shared Appliance Management' | Select-Object -First 1; "
         L"if(-not $cert){$cert=New-SelfSignedCertificate -DnsName 'AppSandbox.SharedAppliance' -FriendlyName 'AppSandbox Shared Appliance Management' -CertStoreLocation 'Cert:\\LocalMachine\\My' -KeyExportPolicy NonExportable -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(10) -ErrorAction Stop}; "
+        /* Remote management is only for the Terminal button. On a domain
+           controller WinRM's own local connection fails until Kerberos is up
+           after boot; that must not fail readiness (and so the shares). */
+        L"try{ "
         L"Enable-PSRemoting -SkipNetworkProfileCheck -Force -ErrorAction Stop; "
         L"Get-ChildItem WSMan:\\localhost\\Listener | Where-Object {$_.Keys -contains 'Transport=HTTPS'} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "
-        L"New-Item -Path WSMan:\\localhost\\Listener -Transport HTTPS -Address * -CertificateThumbPrint $cert.Thumbprint -Force -ErrorAction Stop | Out-Null; "
+        L"New-Item -Path WSMan:\\localhost\\Listener -Transport HTTPS -Address * -CertificateThumbPrint $cert.Thumbprint -Force -ErrorAction Stop | Out-Null "
+        L"}catch{Write-Output 'storage: remote management is not ready yet; it is set up again at the next readiness check'}; "
         L"if(Get-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management' -ErrorAction SilentlyContinue){Remove-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management'}; "
         L"New-NetFirewallRule -DisplayName 'AppSandbox Shared Appliance Management' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5986 -RemoteAddress $env:ASB_MANAGEMENT_HOST -Profile Any | Out-Null; "
         /* The private share adapter has no gateway, so Windows classifies it as
@@ -2888,20 +3349,23 @@ static DWORD appliance_set_account(const char *arguments)
        absent from trimmed Windows images, and a missing cmdlet exits the whole
        script with a bare 1 that says nothing. ADSI is part of the OS.
        No double quotes: the caller wraps this script in them.
-       0x10000 = DONT_EXPIRE_PASSWD, 0x2 = ACCOUNTDISABLE. */
+       0x10000 = DONT_EXPIRE_PASSWD, 0x2 = ACCOUNTDISABLE.
+       On a domain controller this lands in Active Directory, which is still
+       starting for a minute or two after boot, so it retries for ~150 s. */
     rc = run_powershell_wait(
-        L"try{"
+        L"$ok=$false; $err=$null; for($k=0;$k -lt 30 -and -not $ok;$k++){ try{"
         L"$n=$env:ASB_APPLIANCE_USER; $p=$env:ASB_APPLIANCE_PASSWORD; $c=$env:COMPUTERNAME; "
         L"$root=[ADSI]('WinNT://'+$c); $u=$null; "
         L"try{$t=[ADSI]('WinNT://'+$c+'/'+$n+',user'); if($t.Name){$u=$t}}catch{$u=$null}; "
         L"if(-not $u){$u=$root.Create('User',$n)}; "
         L"$u.SetPassword($p); $u.SetInfo(); "
         L"$f=[int]$u.UserFlags.Value; "
-        L"$u.UserFlags.Value=(($f -bor 0x10000) -band (-bnot 0x2)); $u.SetInfo()"
-        L"}catch{$e=([int]$_.Exception.HResult -band 0xffff); if($e -eq 0){$e=1}; exit $e}; "
+        L"$u.UserFlags.Value=(($f -bor 0x10000) -band (-bnot 0x2)); $u.SetInfo(); $ok=$true"
+        L"}catch{$err=$_; Start-Sleep -Seconds 5} }; "
+        L"if(-not $ok){$e=([int]$err.Exception.HResult -band 0xffff); if($e -eq 0){$e=1}; exit $e}; "
         L"try{$g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); "
         L"$g.Remove(('WinNT://'+$env:COMPUTERNAME+'/'+$env:ASB_APPLIANCE_USER+',user'))}catch{}; "
-        L"exit 0", 30000);
+        L"exit 0", 180000);
     if (rc == ERROR_SUCCESS) {
         BYTE sid[SECURITY_MAX_SID_SIZE];
         wchar_t domain[256];
@@ -2942,29 +3406,39 @@ static DWORD appliance_set_account(const char *arguments)
 
 static DWORD appliance_reconcile_share(const char *arguments)
 {
-    char copy[256], *separator;
-    wchar_t share[128], directory[128], script[2048];
+    char copy[1024], *separator, *groups;
+    wchar_t share[128], directory[128], script[4096];
     BOOL read_only;
     strcpy_s(copy, sizeof(copy), arguments);
     separator = strchr(copy, ':');
     if (!separator) return ERROR_INVALID_PARAMETER;
     *separator++ = '\0';
+    /* Optional: base64 list of the domain groups allowed (domain controller only). */
+    groups = strchr(separator, ':');
+    if (groups) *groups++ = '\0';
     if (!appliance_token_valid(copy) ||
-        (strcmp(separator, "ro") != 0 && strcmp(separator, "rw") != 0))
+        (strcmp(separator, "ro") != 0 && strcmp(separator, "rw") != 0) ||
+        (groups && !domain_field_ok(groups, "+/=", 800)))
         return ERROR_INVALID_PARAMETER;
+    SetEnvironmentVariableA("ASB_SHARE_GROUPS", groups && *groups ? groups : NULL);
     read_only = strcmp(separator, "ro") == 0;
     MultiByteToWideChar(CP_UTF8, 0, copy, -1, share, _countof(share));
     wcscpy_s(directory, _countof(directory), share);
     { wchar_t *dollar = wcschr(directory, L'$'); if (dollar) *dollar = L'\0'; }
     swprintf_s(script, _countof(script),
         L"try{ "
-        L"$p='C:\\AppSandboxData\\%s'; New-Item -ItemType Directory -Force -Path $p | Out-Null; "
+        L"$p='C:\\AppSandboxData\\%s'; $rights='%s'; New-Item -ItemType Directory -Force -Path $p | Out-Null; "
         L"$acl=Get-Acl -LiteralPath $p; "
         L"$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
-        L"'AppSandboxShare','%s','ContainerInherit,ObjectInherit','None','Allow'); "
-        L"$acl.SetAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl; "
+        L"'AppSandboxShare',$rights,'ContainerInherit,ObjectInherit','None','Allow'); "
+        L"$acl.SetAccessRule($rule); $who=@('AppSandboxShare'); "
+        /* Group-restricted: the share admits only these groups (and the
+           host's service account), so members map it with their own login. */
+        L"if($env:ASB_SHARE_GROUPS){ foreach($g in (([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:ASB_SHARE_GROUPS))) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })){ "
+        L"$q=$env:USERDOMAIN+'\\'+$g; $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($q,$rights,'ContainerInherit,ObjectInherit','None','Allow'))); $who+=$q } }; "
+        L"Set-Acl -LiteralPath $p -AclObject $acl; "
         L"if(Get-SmbShare -Name '%s' -ErrorAction SilentlyContinue){Remove-SmbShare -Name '%s' -Force}; "
-        L"New-SmbShare -Name '%s' -Path $p -%sAccess 'AppSandboxShare' -EncryptData:$false | Out-Null; "
+        L"New-SmbShare -Name '%s' -Path $p -%sAccess $who -EncryptData:$false | Out-Null; "
         L"$s=Get-SmbShare -Name '%s' -ErrorAction Stop; "
         L"Write-Output ('share=' + $s.Name + ' path=' + $s.Path + ' scope=' + $s.ScopeName + ' pathok=' + (Test-Path -LiteralPath $s.Path)); "
         L"exit 0}catch{Write-Output ('share error: ' + $_.Exception.Message); exit 1}",
@@ -2973,6 +3447,7 @@ static DWORD appliance_reconcile_share(const char *arguments)
     {
         char out[1024];
         DWORD rc = (DWORD)run_powershell_capture(script, 30000, out, sizeof(out));
+        SetEnvironmentVariableA("ASB_SHARE_GROUPS", NULL);
         if (out[0]) {
             char *line = out, *nl;
             while (line && *line) {
@@ -3109,6 +3584,10 @@ static void handle_client(AsbConn *client)
         if (strncmp(cmd, "shared_smb_map:", 15) == 0 ||
             strncmp(cmd, "appliance_account:", 18) == 0)
             agent_log("Command: shared_smb_map:<redacted>");
+        else if (strncmp(cmd, "domain_", 7) == 0)
+            agent_log("Command: %.20s<redacted>", cmd);
+        else if (strncmp(cmd, "lab_chunk:", 10) == 0)
+            ;   /* report transfer: one per 18 KB, not worth a log line each */
         else
             agent_log("Command: %s", buf);
 
@@ -3289,6 +3768,37 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (strncmp(cmd, "domain_", 7) == 0) {
+            char *reply = (char *)malloc(DOMAIN_OUT_MAX + 64);
+            if (reply) {
+                handle_domain_command(cmd, reply, DOMAIN_OUT_MAX + 64);
+                REPLY(reply);
+                free(reply);
+            } else {
+                REPLY("error:out of memory");
+            }
+        }
+        else if (strcmp(cmd, "lab_start") == 0 || strcmp(cmd, "lab_stop") == 0 ||
+                 strncmp(cmd, "lab_chunk:", 10) == 0) {
+            /* Malware lab recorder (lab_recorder.c). */
+            char *reply = (char *)malloc(LAB_CHUNK_BYTES * 2);
+            if (!reply) { REPLY("error:out of memory"); }
+            else {
+                if (strcmp(cmd, "lab_start") == 0) lab_start(reply, LAB_CHUNK_BYTES * 2);
+                else if (strcmp(cmd, "lab_stop") == 0) lab_stop(reply, LAB_CHUNK_BYTES * 2);
+                else lab_chunk((size_t)_strtoui64(cmd + 10, NULL, 10), reply, LAB_CHUNK_BYTES * 2);
+                REPLY(reply);
+                free(reply);
+            }
+        }
+        else if (strncmp(cmd, "user_drives:", 12) == 0) {
+            if (set_user_drives(cmd + 12)) {
+                REPLY("ok");
+                map_user_drives(WTSGetActiveConsoleSessionId());
+            } else {
+                REPLY("error:write_failed");
+            }
         }
         else if (strncmp(cmd, "install_apps:", 13) == 0) {
             if (queue_apps(cmd + 13)) {
@@ -3701,6 +4211,8 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
             kill_clipboard_reader();
             if (sid != 0xFFFFFFFF)
                 spawn_clipboard_reader_in_session(sid);
+            if (event_type == WTS_SESSION_LOGON)
+                map_user_drives(sid);
         }
         return NO_ERROR;
     }
@@ -3766,6 +4278,8 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Finish installing apps chosen at creation that are still queued */
     start_app_install();
+
+    lab_init(agent_log);
 
     /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
     ensure_hyperv_video_disabled(NULL);

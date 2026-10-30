@@ -17,6 +17,7 @@ typedef struct {
     BOOL enabled;
     BOOL read_only;
     BOOL retained_data;
+    wchar_t groups[256];              /* domain groups allowed, comma-separated; empty = everyone */
 } AsbSharedResourceInfo;
 
 typedef struct {
@@ -27,6 +28,7 @@ typedef struct {
     wchar_t host_drive_letter;
     BOOL read_only;
     BOOL smb_acl_created;
+    wchar_t groups[256];              /* non-empty: per-user, domain groups only */
     wchar_t mapping_result[32];
     wchar_t failure[128];
 } HcsSharedResource;

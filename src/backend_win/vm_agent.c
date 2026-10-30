@@ -54,7 +54,7 @@ typedef struct AgentConn {
     volatile BOOL  cmd_pending;
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
     char           cmd[2048];
-    char           rsp[256];
+    char           rsp[ASB_DOMAIN_REPLY_MAX]; /* domain_list replies with JSON */
     DWORD          cmd_timeout_ms; /* How long the guest may take on cmd */
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
 } AgentConn;
@@ -457,7 +457,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
        cleanly. Pointer freshness is now guaranteed for the body of
        each iteration; we never stash a stale &g_vms[idx]. */
     while (!conn->stop && (vm = asb_find_vm_by_id(conn->vm_id)) != NULL) {
-        char buf[256];
+        /* A line longer than the buffer would be split and the rest read as
+           the next message; the agent's log: lines run to ~1 KB. */
+        char buf[8192];
         int n;
         BOOL nat_configured = FALSE;
         SOCKET s;
@@ -541,13 +543,15 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Configure the independent host-only NIC, then recreate signed global
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */
-        if (vm->shared_resource_count > 0 &&
-            _wcsicmp(vm->shared_resource_transport, L"appliance") == 0 &&
+        if (((vm->shared_resource_count > 0 &&
+              _wcsicmp(vm->shared_resource_transport, L"appliance") == 0) ||
+             vm->domain_member) &&
             vm->share_ip[0] && vm->share_host_ip[0] && vm->share_mac[0]) {
             int ri;
             wchar_t user_w[128], password_w[128];
             char user[256], password[256];
             char net_cmd[128];
+            char user_drives[1024];
             HRESULT cred_hr;
             vm->shared_resource_error[0] = L'\0';
             sprintf_s(net_cmd, sizeof(net_cmd), "shared_net:%s:%s",
@@ -578,6 +582,27 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 goto disconnected;
             nat_configured = TRUE;
 
+            /* Managed VMs join the domain over this link. Sent every boot:
+               the guest answers "already" at once when joined, and a VM
+               rolled back to a checkpoint from before the join rejoins. */
+            if (vm->domain_member) {
+                char join_cmd[1024];
+                if (shared_appliance_domain_join_command(vm->share_host_ip,
+                                                         join_cmd, sizeof(join_cmd))) {
+                    n = send_tagged_cmd(s, vm, &conn->cmd_seq, join_cmd, buf, sizeof(buf), 300000);
+                    SecureZeroMemory(join_cmd, sizeof(join_cmd));
+                    if (n <= 0) goto disconnected;
+                    if (strcmp(buf, "ok:joined") == 0)
+                        ui_log(L"\"%s\" joined the %S domain and restarts to finish.",
+                               vm->name, ASB_DOMAIN_NETBIOS);
+                    else if (strcmp(buf, "ok:already") != 0)
+                        ui_log(L"Joining \"%s\" to the domain failed (%S).", vm->name, buf);
+                } else {
+                    ui_log(L"\"%s\" is managed, but the shared appliance is not a domain controller.",
+                           vm->name);
+                }
+            }
+
             cred_hr = shared_appliance_get_smb_credentials(
                 user_w, _countof(user_w), password_w, _countof(password_w))
                 ? S_OK : HRESULT_FROM_WIN32(ERROR_LOGON_FAILURE);
@@ -592,10 +617,28 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
             WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);
             WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
+            user_drives[0] = '\0';
             for (ri = 0; ri < vm->shared_resource_count; ri++) {
                 char map_cmd[1024], share[64];
                 HcsSharedResource *r = &vm->shared_resources[ri];
                 if (_wcsicmp(r->mapping_result, L"unavailable") == 0) continue;
+                /* Restricted to domain groups: never mapped machine-wide with
+                   the service account. Managed VMs map it per user at sign-in
+                   with the user's own credentials, so the appliance decides. */
+                if (r->groups[0]) {
+                    if (vm->domain_member) {
+                        size_t used = strlen(user_drives);
+                        sprintf_s(user_drives + used, sizeof(user_drives) - used, "%s%c=%S",
+                                  used ? "," : "", (char)r->drive_letter, r->share_name);
+                        wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"per-user");
+                        r->failure[0] = L'\0';
+                    } else {
+                        wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"unavailable");
+                        wcscpy_s(r->failure, _countof(r->failure),
+                                 L"Restricted to domain groups; only managed VMs map it.");
+                    }
+                    continue;
+                }
                 WideCharToMultiByte(CP_UTF8, 0, r->share_name, -1,
                                     share, sizeof(share), NULL, NULL);
                 sprintf_s(map_cmd, sizeof(map_cmd), "shared_smb_map:%c:%s:%s:%s:%s",
@@ -629,6 +672,16 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             SecureZeroMemory(password, sizeof(password));
             SecureZeroMemory(user_w, sizeof(user_w));
             SecureZeroMemory(user, sizeof(user));
+            /* Per-user drives (sent even when empty, to clear a stale list). */
+            if (vm->domain_member) {
+                char drives_cmd[1100];
+                sprintf_s(drives_cmd, sizeof(drives_cmd), "user_drives:%s", user_drives);
+                n = send_tagged_cmd(s, vm, &conn->cmd_seq, drives_cmd, buf, sizeof(buf), 30000);
+                if (n <= 0) goto disconnected;
+                if (user_drives[0])
+                    ui_log(L"\"%s\": group-restricted drives map at sign-in for members (%S).",
+                           vm->name, user_drives);
+            }
             notify_agent_status(vm);
         }
 shared_mapping_done:
@@ -847,10 +900,12 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 {
     AgentConn *conn = find_conn(instance);
     BOOL ok;
+    BOOL quiet = command && strncmp(command, "lab_chunk:", 10) == 0;
     BOOL redact = command &&
         (strncmp(command, "appliance_account:", 18) == 0 ||
          strncmp(command, "shared_smb_map:", 15) == 0 ||
-         strncmp(command, "vpn_set:", 8) == 0);
+         strncmp(command, "vpn_set:", 8) == 0 ||
+         strncmp(command, "domain_", 7) == 0);
 
     if (!conn || !instance->agent_online) {
         ui_log(L"Agent: not connected to \"%s\"", instance->name);
@@ -891,8 +946,9 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
 
     ok = (strcmp(conn->rsp, "ok") == 0 || strncmp(conn->rsp, "ok:", 3) == 0);
-    if (redact) ui_log(L"Agent: credential-bearing command -> %S", conn->rsp);
-    else ui_log(L"Agent: %S -> %S", command, conn->rsp);
+    if (quiet) ;
+    else if (redact) ui_log(L"Agent: credential-bearing command -> %.120S", conn->rsp);
+    else ui_log(L"Agent: %S -> %.300S", command, conn->rsp);
     return ok;
 }
 

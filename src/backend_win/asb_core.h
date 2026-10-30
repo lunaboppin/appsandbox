@@ -69,6 +69,8 @@ typedef struct {
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *vpn_id;         /* WireGuard config for ASB_NET_VPN */
     const wchar_t *preinstall_apps; /* Windows: comma-separated winget IDs installed after first sign-in */
+    BOOL   domain_member;          /* Windows: managed account, joins the AppSandbox domain */
+    BOOL   lab_mode;               /* Windows: malware lab VM (isolated, disposable, recorded runs) */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -194,6 +196,14 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
 ASB_API HRESULT asb_vm_set_installer_iso(AsbVm vm, const wchar_t *path);
 ASB_API HRESULT asb_vm_set_auto_open_display(AsbVm vm, BOOL enabled);
 ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled);
+ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member);
+ASB_API HRESULT asb_vm_set_disposable(AsbVm vm, BOOL enabled);
+/* Malware lab: record an analysis run, then build its report (blocking,
+   minutes: call from a worker). report_html receives the report's path. */
+ASB_API HRESULT asb_lab_start(AsbVm vm, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_lab_stop(AsbVm vm, wchar_t *report_html, size_t report_chars,
+                             wchar_t *message, size_t message_chars);
+ASB_API void asb_lab_reports_dir(AsbVm vm, wchar_t *out, size_t chars);
 ASB_API HRESULT asb_vm_resize_disk(AsbVm vm, DWORD new_size_gb);
 ASB_API HRESULT asb_vm_move_storage(AsbVm vm, const wchar_t *destination_parent);
 
@@ -285,6 +295,15 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 /* Stop the appliance and delete its disks, data and saved config (unconfigured
    afterwards). ERROR_BUSY while clients or host mounts use it. */
 ASB_API HRESULT asb_shared_appliance_delete(void);
+/* AppSandbox domain on the Server Core appliance (see shared_appliance.h). */
+#define ASB_DOMAIN_JSON_MAX ASB_DOMAIN_REPLY_MAX
+ASB_API HRESULT asb_domain_setup(void);
+ASB_API HRESULT asb_domain_list(char *json, size_t chars, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_user_set(const wchar_t *name, const wchar_t *password, BOOL enabled,
+                                    const wchar_t *groups, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_user_delete(const wchar_t *name, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size_t message_chars);
+ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars);
 /* ---- WireGuard VPN configs ---- */
 ASB_API int asb_vpn_config_count(void);
 ASB_API BOOL asb_vpn_config_get(int index, AsbVpnConfigInfo *out);

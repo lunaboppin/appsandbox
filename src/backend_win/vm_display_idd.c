@@ -36,6 +36,8 @@
 #include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
+#include <wincodec.h>
+#pragma comment(lib, "windowscodecs.lib")
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -905,6 +907,89 @@ static void idd_nv12_to_bgra(const BYTE *src, UINT w, UINT h, BYTE *dst, UINT ds
     }
 }
 
+/* ---- Malware lab screenshots ----
+   While the VM records an analysis run, the newest frame is saved as a JPEG
+   at most every 2 s and only when the screen changed, named by the time
+   into the run (screenshots\shot_<ms>.jpg) for the report's timeline. */
+static BOOL idd_save_jpeg(const wchar_t *path, const BYTE *bgra, UINT w, UINT h, UINT stride)
+{
+    IWICImagingFactory *factory = NULL;
+    IWICStream *stream = NULL;
+    IWICBitmapEncoder *encoder = NULL;
+    IWICBitmapFrameEncode *frame = NULL;
+    IPropertyBag2 *props = NULL;
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+    BYTE *bgr = (BYTE *)malloc((size_t)w * 3 * h);
+    BOOL ok = FALSE;
+    UINT x, y;
+    if (!bgr) return FALSE;
+    for (y = 0; y < h; y++) {
+        const BYTE *s = bgra + (size_t)y * stride;
+        BYTE *d = bgr + (size_t)y * w * 3;
+        for (x = 0; x < w; x++, s += 4, d += 3) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
+    }
+    if (SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_IWICImagingFactory, (void **)&factory)) &&
+        SUCCEEDED(factory->lpVtbl->CreateStream(factory, &stream)) &&
+        SUCCEEDED(stream->lpVtbl->InitializeFromFilename(stream, path, GENERIC_WRITE)) &&
+        SUCCEEDED(factory->lpVtbl->CreateEncoder(factory, &GUID_ContainerFormatJpeg, NULL, &encoder)) &&
+        SUCCEEDED(encoder->lpVtbl->Initialize(encoder, (IStream *)stream, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(encoder->lpVtbl->CreateNewFrame(encoder, &frame, &props))) {
+        PROPBAG2 option;
+        VARIANT value;
+        ZeroMemory(&option, sizeof(option));
+        option.pstrName = (LPOLESTR)L"ImageQuality";
+        VariantInit(&value);
+        value.vt = VT_R4;
+        value.fltVal = 0.8f;
+        props->lpVtbl->Write(props, 1, &option, &value);
+        ok = SUCCEEDED(frame->lpVtbl->Initialize(frame, props)) &&
+             SUCCEEDED(frame->lpVtbl->SetSize(frame, w, h)) &&
+             SUCCEEDED(frame->lpVtbl->SetPixelFormat(frame, &format)) &&
+             IsEqualGUID(&format, &GUID_WICPixelFormat24bppBGR) &&
+             SUCCEEDED(frame->lpVtbl->WritePixels(frame, h, w * 3, w * 3 * h, bgr)) &&
+             SUCCEEDED(frame->lpVtbl->Commit(frame)) &&
+             SUCCEEDED(encoder->lpVtbl->Commit(encoder));
+    }
+    if (props) props->lpVtbl->Release(props);
+    if (frame) frame->lpVtbl->Release(frame);
+    if (encoder) encoder->lpVtbl->Release(encoder);
+    if (stream) stream->lpVtbl->Release(stream);
+    if (factory) factory->lpVtbl->Release(factory);
+    free(bgr);
+    return ok;
+}
+
+static void idd_lab_screenshot(VmDisplayIdd *d, ULONGLONG *last_tick, UINT64 *last_hash)
+{
+    ULONGLONG now = GetTickCount64();
+    BYTE *copy;
+    UINT w, h, stride, y;
+    UINT64 hash = 14695981039346656037ull;
+    wchar_t path[MAX_PATH];
+    VmInstance *vm = d->vm;
+    if (!vm || !vm->lab_running || now - *last_tick < 2000) return;
+    *last_tick = now;
+    EnterCriticalSection(&d->frame_cs);
+    w = d->frame_width; h = d->frame_height; stride = d->frame_stride;
+    copy = (d->frame_buf && w && h) ? (BYTE *)malloc((size_t)stride * h) : NULL;
+    if (copy) memcpy(copy, d->frame_buf, (size_t)stride * h);
+    LeaveCriticalSection(&d->frame_cs);
+    if (!copy) return;
+    for (y = 0; y < h; y += 7) {       /* sampled rows: cheap change check */
+        const BYTE *row = copy + (size_t)y * stride;
+        UINT x;
+        for (x = 0; x < stride; x += 64) { hash ^= row[x]; hash *= 1099511628211ull; }
+    }
+    if (hash != *last_hash) {
+        *last_hash = hash;
+        swprintf_s(path, MAX_PATH, L"%s\\screenshots\\shot_%07llu.jpg", vm->lab_dir, now - vm->lab_t0);
+        if (idd_save_jpeg(path, copy, w, h, stride))
+            InterlockedIncrement(&vm->lab_shots);
+    }
+    free(copy);
+}
+
 /* ---- Reliable recv: read exactly `len` bytes ---- */
 
 static BOOL recv_exact(SOCKET s, void *buf, int len)
@@ -1692,6 +1777,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     double perf_recv_ms = 0.0;
     UINT64 perf_bytes = 0;
     UINT perf_frames = 0, perf_full = 0, perf_nv12 = 0;
+    ULONGLONG lab_shot_tick = 0;      /* malware lab screenshots */
+    UINT64 lab_shot_hash = 0;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
     QueryPerformanceFrequency(&perf_freq);
@@ -1752,8 +1839,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
         }
 
-        /* Clipboard module (handles :0005 + :0006 internally) */
-        if (!d->clipboard) {
+        /* Clipboard module (handles :0005 + :0006 internally). A malware lab
+           VM gets none: nothing in it may read or fill the host clipboard. */
+        if (!d->clipboard && !(d->vm && d->vm->lab_mode)) {
             d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
                                                d->hwnd, clip_log_callback, d);
             if (d->clipboard)
@@ -2012,6 +2100,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Signal the window thread to repaint */
             if (d->hwnd && IsWindow(d->hwnd))
                 PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+
+            idd_lab_screenshot(d, &lab_shot_tick, &lab_shot_hash);
 
             /* Reconnect input socket if send_input flagged it dead */
             if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {

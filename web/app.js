@@ -92,6 +92,7 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
+    applyAccountModeUI();
     updateCreateButtons();
 }
 
@@ -103,7 +104,7 @@ window.onHostMessage = function(msg) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); break;
+        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); renderLab(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
@@ -113,6 +114,8 @@ window.onHostMessage = function(msg) {
         case 'createStorageBrowseResult': document.getElementById('storage-parent').value = msg.path || ''; break;
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
+        case 'domainResult': onDomainResult(msg); break;
+        case 'labResult': onLabResult(msg); break;
         case 'vpnConfigResult': onVpnConfigResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
@@ -148,6 +151,19 @@ function onFullState(msg) {
     lastStorageParent = msg.lastStorageParent || lastStorageParent;
     sharedResources = msg.sharedResources || [];
     sharedAppliance = msg.sharedAppliance || {};
+    if (document.getElementById('resource-groups')) applyResourceDomainUI();
+    renderLab();
+    if (document.getElementById('domain-overlay').classList.contains('active')) {
+        renderDomain();
+        /* Became ready while the dialog was open: load the users, once.
+           A failed load shows its error and waits for Refresh; retrying on
+           every status update would loop, since each reply sends one. */
+        if (domainState() === 'ready' && !domainLoaded && !domainBusy) {
+            domainLoaded = true;
+            domainSend('domainList');
+        }
+    }
+    applyAccountModeUI();
     vpnConfigs = msg.vpnConfigs || [];
     vpnGateway = msg.vpnGateway || {};
     renderVpnSettings();
@@ -322,6 +338,11 @@ function onDeleteTemplate(name) {
 /* ---- Browse result ---- */
 
 function onBrowseResult(path) {
+    if (labBrowsing) {
+        labBrowsing = false;
+        if (path) document.getElementById('lab-iso').value = path;
+        return;
+    }
     if (path) {
         document.getElementById('image-path').value = path;
         selectTemplate('', templateDefaultLabel());
@@ -475,6 +496,414 @@ function gatherPreinstallApps() {
     return ids.join(',');
 }
 
+/* ---- Malware lab ---- */
+
+var labBusy = {};          /* vmIndex -> 'Starting the recording...' etc. */
+var labBrowsing = false;
+var labTimer = null;
+
+function openLabModal() {
+    var sel = document.getElementById('lab-network');
+    sel.innerHTML = '';
+    var none = document.createElement('option');
+    none.value = 'none'; none.textContent = 'None (offline)';
+    sel.appendChild(none);
+    (vpnConfigs || []).forEach(function(c) {
+        var o = document.createElement('option');
+        o.value = 'vpn:' + c.id; o.textContent = 'VPN: ' + c.name;
+        sel.appendChild(o);
+    });
+    document.getElementById('lab-overlay').classList.add('active');
+    renderLab();
+    /* Recording counters (time, screenshots) come with each state refresh. */
+    if (!labTimer) labTimer = setInterval(function() {
+        if (!document.getElementById('lab-overlay').classList.contains('active')) { clearInterval(labTimer); labTimer = null; return; }
+        if (vms.some(function(v) { return v.labMode && v.labRunning; })) sendCmd('getState');
+    }, 3000);
+}
+
+function closeLabModal() { document.getElementById('lab-overlay').classList.remove('active'); }
+
+function browseLabIso() { labBrowsing = true; sendCmd('browseImage'); }
+
+function labButton(text, title, fn, cls) {
+    var b = document.createElement('button');
+    b.type = 'button'; b.textContent = text; b.title = title || '';
+    if (cls) b.className = cls;
+    b.onclick = fn;
+    return b;
+}
+
+function renderLab() {
+    var box = document.getElementById('lab-vm-list');
+    if (!box) return;
+    box.innerHTML = '';
+    var labs = [];
+    vms.forEach(function(v, i) { if (v.labMode) labs.push([v, i]); });
+    if (!labs.length) {
+        var p = document.createElement('div');
+        p.className = 'settings-resource-meta';
+        p.textContent = 'No lab VMs yet. Create one below.';
+        box.appendChild(p);
+        return;
+    }
+    labs.forEach(function(pair) {
+        var v = pair[0], i = pair[1];
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = v.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        var state = v.buildingVhdx ? 'Building Windows (' + (v.vhdxProgress || 0) + '%)'
+            : !v.installComplete ? (v.running ? 'Setting up Windows...' : 'Not set up yet')
+            : v.running ? (v.agentOnline ? 'Running' : 'Starting...') : 'Stopped';
+        if (v.labRunning) state = 'Recording for ' + v.labSeconds + ' s — ' + v.labShots + ' screenshots';
+        if (labBusy[i]) state = labBusy[i];
+        meta.textContent = state + ' · ' + (v.disposable ? 'starts from its clean copy' : 'clean copy saved at its next start after setup') +
+            ' · ' + vmNetworkLabel(v);
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        var busy = !!labBusy[i] || v.buildingVhdx;
+        if (!v.running) {
+            actions.appendChild(labButton('Start', 'Start the lab VM from its clean copy.', function() { sendCmd('startVm', { vmIndex: i }); }));
+            if (v.installComplete) actions.appendChild(labButton('Save Clean State', 'Make the VM as it is now the clean copy every start begins from.', function() {
+                showModal('Save clean state', 'Make "' + v.name + '" as it is now the clean copy that every start begins from?', 'Save', { confirmClass: 'primary' })
+                    .then(function(ok) { if (ok) sendCmd('labSaveClean', { vmIndex: i }); });
+            }));
+        } else {
+            actions.appendChild(labButton('Display', 'Open the lab VM\'s screen. Keep it open while recording to capture screenshots.', function() { sendCmd('connectIddVm', { vmIndex: i }); }));
+            if (v.labRunning)
+                actions.appendChild(labButton('Stop & Build Report', 'Stop recording and build the report.', function() {
+                    labBusy[i] = 'Building the report (diffing the registry and file journal)...'; renderLab();
+                    sendCmd('labStop', { vmIndex: i });
+                }, 'primary'));
+            else if (v.agentOnline && v.installComplete)
+                actions.appendChild(labButton('Start Analysis', 'Take a baseline, then record everything until you stop.', function() {
+                    labBusy[i] = 'Taking the baseline (registry, processes, network)...'; renderLab();
+                    sendCmd('connectIddVm', { vmIndex: i });
+                    sendCmd('labStart', { vmIndex: i });
+                }, 'primary'));
+            actions.appendChild(labButton('Shut Down', 'Shut the lab VM down; its next start is clean again.', function() { sendCmd('shutdownVm', { vmIndex: i }); }));
+        }
+        if (v.labReport) actions.appendChild(labButton('Open Report', 'Open the last analysis report.', function() { sendCmd('labOpenReport', { vmIndex: i }); }));
+        actions.appendChild(labButton('Reports', 'Open the folder with every report of this lab VM.', function() { sendCmd('labOpenFolder', { vmIndex: i }); }));
+        [].forEach.call(actions.children, function(b) { if (busy && b.textContent !== 'Reports' && b.textContent !== 'Open Report') b.disabled = true; });
+        row.append(details, actions);
+        box.appendChild(row);
+    });
+}
+
+function createLabVm() {
+    var name = document.getElementById('lab-name').value.trim();
+    var iso = document.getElementById('lab-iso').value.trim();
+    var nameErr = validateVmName(name);
+    if (nameErr) { showModal('Malware Lab', nameErr, 'OK', { confirmClass: 'primary' }); return; }
+    if (!iso) { showModal('Malware Lab', 'Choose a Windows ISO to build the lab VM from.', 'OK', { confirmClass: 'primary' }); return; }
+    var net = document.getElementById('lab-network').value;
+    sendCmd('createVm', {
+        name: name, osType: 'Windows', imagePath: iso, templateName: '', storageParent: lastStorageParent || '',
+        sharedResourceExclusions: '', hddGb: parseInt(document.getElementById('lab-disk').value, 10) || 64,
+        ramMb: alignRamMb(parseInt(document.getElementById('lab-ram').value, 10) || 8192),
+        cpuCores: parseInt(document.getElementById('lab-cpu').value, 10) || 4,
+        gpuMode: 1, networkMode: net === 'none' ? 0 : 4, netAdapter: '',
+        vpnId: net.indexOf('vpn:') === 0 ? net.slice(4) : '',
+        adminUser: 'analyst', adminPass: 'analyst', sshEnabled: false, sshDeployKey: false,
+        preinstallApps: '', accountMode: 'local', labMode: true
+    });
+    showModal('Malware Lab', 'Building "' + name + '" from the ISO. It starts by itself when Windows is installed; watch its progress here.', 'OK', { confirmClass: 'primary' });
+}
+
+function onLabResult(msg) {
+    delete labBusy[msg.vmIndex];
+    if (!msg.success) showModal('Malware Lab', msg.message || 'The request failed.', 'OK');
+    renderLab();
+}
+
+/* ---- AppSandbox domain (Windows Server Core appliance) ---- */
+
+var domainData = { users: [], groups: [] };
+var DOMAIN_VM_ADMINS = 'AppSandbox VM Admins';
+var domainEditing = null;      /* user being edited, or null for a new one */
+var domainBusy = false;
+var domainPhase = '';          /* 'loading' or 'saving' while a request runs */
+var domainError = '';          /* why the last load failed */
+var domainHaveData = false;    /* a user list has arrived */
+
+function domainState() {
+    var s = sharedAppliance || {};
+    if (!s.configured) return 'none';
+    if (s.backend !== 'server_core') return 'unsupported';
+    if (s.domainBusy) return 'busy';
+    return s.domainEnabled ? 'ready' : 'off';
+}
+
+function openDomainModal() {
+    domainLoaded = false;
+    document.getElementById('domain-overlay').classList.add('active');
+    clearDomainUser();
+    renderDomain();
+    if (domainState() === 'ready') refreshDomain();
+}
+
+function closeDomainModal() {
+    document.getElementById('domain-overlay').classList.remove('active');
+}
+
+function renderDomain() {
+    var state = domainState(), s = sharedAppliance || {};
+    var status = document.getElementById('domain-status');
+    if (!status) return;
+    status.textContent = {
+        none: 'Set up the shared appliance (Windows Server Core) under Shared Resources first.',
+        unsupported: 'The domain needs the Windows Server Core shared appliance; this one runs Ubuntu.',
+        busy: 'Setting up the domain controller: ' + (s.progressText || 'working...'),
+        off: 'The appliance is not a domain controller yet. Setting it up installs Active Directory and restarts the appliance (about 15 minutes); shared drives keep working.',
+        ready: domainStatusText(s)
+    }[state];
+    document.getElementById('domain-setup-row').style.display = state === 'off' ? '' : 'none';
+    document.getElementById('domain-manage').style.display = state === 'ready' && domainHaveData ? '' : 'none';
+    if (state !== 'ready') return;
+
+    var users = document.getElementById('domain-user-list');
+    users.innerHTML = '';
+    (domainData.users || []).forEach(function(u) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = u.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        var others = (u.groups || []).filter(function(g) { return g !== DOMAIN_VM_ADMINS; });
+        meta.textContent = (u.enabled ? 'Enabled' : 'Disabled') +
+            ((u.groups || []).indexOf(DOMAIN_VM_ADMINS) >= 0 ? ' · VM administrator' : ' · Standard user on VMs') +
+            (others.length ? ' · ' + others.join(', ') : '');
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        var edit = document.createElement('button');
+        edit.type = 'button'; edit.textContent = 'Edit';
+        edit.onclick = function() { editDomainUser(u.name); };
+        var del = document.createElement('button');
+        del.type = 'button'; del.textContent = 'Delete'; del.className = 'danger';
+        del.onclick = function() { deleteDomainUser(u.name); };
+        actions.append(edit, del);
+        row.append(details, actions);
+        users.appendChild(row);
+    });
+
+    var groups = document.getElementById('domain-group-list');
+    groups.innerHTML = '';
+    (domainData.groups || []).forEach(function(g) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var details = document.createElement('div');
+        details.className = 'settings-resource-details';
+        var name = document.createElement('span');
+        name.className = 'settings-resource-name';
+        name.textContent = g.name;
+        var meta = document.createElement('span');
+        meta.className = 'settings-resource-meta';
+        meta.textContent = g.system ? 'Built-in' : 'Group';
+        details.append(name, meta);
+        var actions = document.createElement('div');
+        actions.className = 'settings-resource-actions';
+        if (!g.system) {
+            var del = document.createElement('button');
+            del.type = 'button'; del.textContent = 'Delete'; del.className = 'danger';
+            del.onclick = function() { deleteDomainGroup(g.name); };
+            actions.appendChild(del);
+        }
+        row.append(details, actions);
+        groups.appendChild(row);
+    });
+    renderDomainUserGroups();
+}
+
+function renderDomainUserGroups() {
+    var box = document.getElementById('domain-user-groups');
+    var user = domainEditing && (domainData.users || []).find(function(u) { return u.name === domainEditing; });
+    var have = user ? (user.groups || []) : [];
+    box.innerHTML = '';
+    (domainData.groups || []).forEach(function(g) {
+        /* Internal groups (DnsAdmins...) aren't offered; VM admin rights
+           have their own checkbox. Domain Admins stays: it is real power. */
+        if (g.name === DOMAIN_VM_ADMINS || (g.system && g.name !== 'Domain Admins')) return;
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.dataset.group = g.name;
+        cb.checked = have.indexOf(g.name) >= 0;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + g.name));
+        box.appendChild(label);
+    });
+}
+
+function clearDomainUser() {
+    domainEditing = null;
+    var name = document.getElementById('domain-user-name');
+    name.value = ''; name.disabled = false;
+    var pass = document.getElementById('domain-user-pass');
+    pass.value = ''; pass.placeholder = 'Any password (it can be empty)';
+    document.getElementById('domain-user-enabled').checked = true;
+    document.getElementById('domain-user-vmadmin').checked = true;
+    document.getElementById('btn-domain-user-save').textContent = 'Add User';
+    document.getElementById('domain-user-editing').textContent = '';
+    document.getElementById('btn-domain-user-cancel').style.display = 'none';
+    renderDomainUserGroups();
+}
+
+function editDomainUser(userName) {
+    var user = (domainData.users || []).find(function(u) { return u.name === userName; });
+    if (!user) return;
+    domainEditing = userName;
+    var name = document.getElementById('domain-user-name');
+    name.value = userName; name.disabled = true;
+    var pass = document.getElementById('domain-user-pass');
+    pass.value = ''; pass.placeholder = 'Leave empty to keep the current password';
+    document.getElementById('domain-user-enabled').checked = !!user.enabled;
+    document.getElementById('domain-user-vmadmin').checked = (user.groups || []).indexOf(DOMAIN_VM_ADMINS) >= 0;
+    document.getElementById('btn-domain-user-save').textContent = 'Save User';
+    document.getElementById('domain-user-editing').textContent = 'Editing ' + userName;
+    document.getElementById('btn-domain-user-cancel').style.display = '';
+    renderDomainUserGroups();
+}
+
+/* What the dialog is doing, in the order a first open goes through it. */
+function domainStatusText(s) {
+    var domain = 'Domain ' + (s.domainName || '');
+    if (domainBusy && !s.ready)
+        return 'Starting the shared appliance: ' + (s.progressText || 'starting...') +
+               ' This can take a couple of minutes.';
+    if (domainPhase === 'loading')
+        return 'Loading users and groups from Active Directory... Right after the appliance starts this can take a minute or two, and the first time it also sets up home folders (H:) and roaming files.';
+    if (domainPhase === 'saving') return 'Saving the change on the domain controller...';
+    if (domainError) return 'Could not load the domain: ' + domainError + ' Press Refresh to try again.';
+    return domain + ' — users here sign in to managed VMs. Any password is accepted.';
+}
+
+function domainSend(action, payload) {
+    domainBusy = true;
+    domainPhase = action === 'domainList' ? 'loading' : 'saving';
+    domainError = '';
+    renderDomain();
+    sendCmd(action, payload || {});
+}
+
+function refreshDomain() {
+    sendCmd('getState');   /* the status may have moved on since the page last heard */
+    if (domainState() === 'ready') domainSend('domainList');
+}
+var domainLoaded = false;
+
+function setupDomain() {
+    showModal('Set up domain controller',
+        'Install Active Directory on the shared appliance and make it the domain controller of ' + ((sharedAppliance || {}).domainName || 'the AppSandbox domain') + '? The appliance restarts once; this takes about 15 minutes. Password rules are turned off so any password works.',
+        'Set Up', { confirmClass: 'primary' }).then(function(ok) {
+        if (ok) domainSend('domainSetup');
+    });
+}
+
+function saveDomainUser() {
+    var name = document.getElementById('domain-user-name').value.trim();
+    var pass = document.getElementById('domain-user-pass').value;
+    if (!/^[A-Za-z0-9._-]{1,20}$/.test(name)) {
+        sendCmd('log', { message: 'User names are up to 20 letters, digits, ".", "_" or "-".' });
+        return;
+    }
+    var groups = [];
+    document.querySelectorAll('#domain-user-groups input[data-group]').forEach(function(cb) {
+        if (cb.checked) groups.push(cb.dataset.group);
+    });
+    if (document.getElementById('domain-user-vmadmin').checked) groups.push(DOMAIN_VM_ADMINS);
+    /* Keep internal groups the editor doesn't show (e.g. DnsAdmins). */
+    var editing = domainEditing && (domainData.users || []).find(function(u) { return u.name === domainEditing; });
+    (editing ? editing.groups || [] : []).forEach(function(g) {
+        var info = (domainData.groups || []).find(function(x) { return x.name === g; });
+        if (info && info.system && g !== 'Domain Admins' && g !== DOMAIN_VM_ADMINS && groups.indexOf(g) < 0)
+            groups.push(g);
+    });
+    domainSend('domainUserSet', {
+        name: name,
+        password: pass,
+        /* A new user always gets a password (possibly empty); an edit keeps
+           the current one unless a new one was typed. */
+        setPassword: domainEditing === null || pass.length > 0,
+        enabled: document.getElementById('domain-user-enabled').checked,
+        groups: groups.join(',')
+    });
+}
+
+function deleteDomainUser(name) {
+    showModal('Delete user', 'Delete the domain user "' + name + '"? Their profiles on managed VMs stay, but they can no longer sign in.', 'Delete')
+        .then(function(ok) { if (ok) domainSend('domainUserDelete', { name: name }); });
+}
+
+function addDomainGroup() {
+    var name = document.getElementById('domain-group-name').value.trim();
+    if (!/^[A-Za-z0-9._ -]{1,64}$/.test(name)) {
+        sendCmd('log', { message: 'Group names are up to 64 letters, digits, spaces, ".", "_" or "-".' });
+        return;
+    }
+    domainSend('domainGroupAdd', { name: name });
+}
+
+function deleteDomainGroup(name) {
+    showModal('Delete group', 'Delete the group "' + name + '"?', 'Delete')
+        .then(function(ok) { if (ok) domainSend('domainGroupDelete', { name: name }); });
+}
+
+function onDomainResult(msg) {
+    domainBusy = false;
+    domainPhase = '';
+    if (!msg.success) {
+        if (msg.action === 'domainList') domainError = msg.message || 'the request failed.';
+        else showModal('Domain', msg.message || 'The request failed.', 'OK');
+        renderDomain();
+        return;
+    }
+    if (msg.action === 'domainList') {
+        domainLoaded = true;
+        domainHaveData = true;
+        domainError = '';
+        try { domainData = JSON.parse(msg.data || '{}'); } catch (e) { domainData = { users: [], groups: [] }; }
+        if (!Array.isArray(domainData.users)) domainData.users = [];
+        if (!Array.isArray(domainData.groups)) domainData.groups = [];
+        renderDomain();
+        return;
+    }
+    if (msg.action === 'domainSetup') { renderDomain(); return; }
+    if (msg.action === 'domainUserSet') clearDomainUser();
+    if (msg.action === 'domainGroupAdd') document.getElementById('domain-group-name').value = '';
+    refreshDomain();
+}
+
+/* Create dialog: Managed is offered once the domain exists. */
+function applyAccountModeUI() {
+    var select = document.getElementById('account-mode');
+    if (!select) return;
+    var isWindows = document.getElementById('os-type').value === 'Windows';
+    var ready = domainState() === 'ready';
+    var managedOption = select.querySelector('option[value="managed"]');
+    managedOption.disabled = !ready;
+    if (!ready || !isWindows) select.value = 'local';
+    var managed = select.value === 'managed';
+    document.querySelectorAll('.local-account').forEach(function(el) {
+        el.style.display = managed ? 'none' : '';
+    });
+    document.getElementById('account-mode-info').textContent = managed
+        ? 'Joins ' + (sharedAppliance.domainName || 'the domain') + '; sign in with a domain user.'
+        : (ready ? '' : 'Managed needs the domain controller (Domain).');
+}
+
 function gatherConfig() {
     var osType = document.getElementById('os-type').value;
     /* Same ISO-picker path for Windows and Linux. The cloud-image
@@ -503,7 +932,8 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked,
-        preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : ''
+        preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : '',
+        accountMode: osType === 'Windows' ? document.getElementById('account-mode').value : 'local'
     };
 }
 
@@ -596,6 +1026,13 @@ function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
+    if (cfg.accountMode === 'managed') {
+        if (cfg.preinstallApps === null) return;
+        sendCmd('createVm', cfg);
+        clearCreateForm();
+        closeCreateModal();
+        return;
+    }
     var userErr = validateUsername(cfg.adminUser);
     if (userErr) { sendCmd('log', { message: userErr }); return; }
     var passErr = validatePassword(cfg.adminPass);
@@ -619,6 +1056,7 @@ function onCreateTemplate() {
         return;
     }
     cfg.isTemplate = true;
+    cfg.accountMode = 'local';
     sendCmd('createVm', cfg);
     clearCreateForm();
     closeCreateModal();
@@ -633,6 +1071,7 @@ function openCreateModal() {
     document.getElementById('storage-parent').value = lastStorageParent;
     renderCreateSharedResources();
     renderCreateApps();
+    applyAccountModeUI();
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
@@ -1268,6 +1707,13 @@ function refreshManageVm(forceFields) {
     document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
     document.getElementById('manage-secure-boot-section').style.display = vm.osType === 'Windows' ? '' : 'none';
     document.getElementById('manage-secure-boot').checked = vm.secureBoot !== false;
+    document.getElementById('manage-domain-section').style.display =
+        vm.osType === 'Windows' && !vm.isTemplate ? '' : 'none';
+    document.getElementById('manage-domain-member').checked = !!vm.domainMember;
+    document.getElementById('manage-disposable').checked = !!vm.disposable;
+    document.getElementById('manage-domain-hint').textContent = domainState() === 'ready' || vm.domainMember
+        ? 'Joins ' + (sharedAppliance.domainName || 'the domain') + ' at the next start (restart a running VM); domain users can then sign in, and its local accounts keep working. Turning this off stops AppSandbox joining it, but it stays in the domain until removed in Windows.'
+        : 'Set up the domain controller (Domain) to join this VM to it.';
     var netSel = document.getElementById('manage-network');
     if (forceFields || document.activeElement !== netSel) {
         netSel.innerHTML = networkOptionsHtml();
@@ -1283,6 +1729,11 @@ function refreshManageVm(forceFields) {
     setManageDisabled('manage-disk-grow', !stoppedIdle || hasChildren);
     setManageDisabled('manage-auto-display', managePending);
     setManageDisabled('manage-secure-boot', managePending);
+    /* Turning it on checkpoints the disk, so the VM must be off; off is always allowed. */
+    setManageDisabled('manage-disposable', managePending ||
+        (!(vms[manageVmIndex] || {}).disposable && !!(vms[manageVmIndex] || {}).running));
+    setManageDisabled('manage-domain-member', managePending ||
+        (domainState() !== 'ready' && !(vms[manageVmIndex] || {}).domainMember));
     onManageCheckpointSelection();
 }
 
@@ -1320,8 +1771,10 @@ function renderManageSharedResources(vm) {
 function openSettingsModal(){populateResourceLetters();clearResourceEditor();renderSharedAppliance();renderSettingsResources();document.getElementById('settings-overlay').classList.add('active');}
 function closeSettingsModal(){document.getElementById('settings-overlay').classList.remove('active');}
 function populateResourceLetters(){var guest=document.getElementById('resource-letter'),host=document.getElementById('resource-host-letter');if(!guest.options.length)for(var c=68;c<=90;c++){var o=document.createElement('option');o.value=String.fromCharCode(c);o.textContent=o.value+':';guest.appendChild(o);}if(host.options.length===1)for(var h=68;h<=90;h++){var x=document.createElement('option');x.value=String.fromCharCode(h);x.textContent=x.value+':';host.appendChild(x);}}
-function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-editor-title').textContent='Add shared resource';}
-function editResource(id){var r=sharedResources.find(function(x){return x.id===id;});if(!r)return;populateResourceLetters();document.getElementById('resource-id').value=r.id;document.getElementById('resource-name').value=r.name;document.getElementById('resource-letter').value=r.driveLetter;document.getElementById('resource-host-letter').value=r.hostDriveLetter||'';document.getElementById('resource-enabled').checked=!!r.enabled;document.getElementById('resource-readonly').checked=!!r.readOnly;document.getElementById('resource-editor-title').textContent='Edit shared resource';}
+function clearResourceEditor(){document.getElementById('resource-id').value='';document.getElementById('resource-name').value='';document.getElementById('resource-letter').value='R';document.getElementById('resource-host-letter').value='';document.getElementById('resource-enabled').checked=true;document.getElementById('resource-readonly').checked=false;document.getElementById('resource-groups').value='';applyResourceDomainUI();document.getElementById('resource-editor-title').textContent='Add shared resource';}
+/* The groups field only means something once the appliance is a domain controller. */
+function applyResourceDomainUI(){var on=!!(sharedAppliance&&sharedAppliance.domainEnabled)||!!document.getElementById('resource-groups').value;document.querySelectorAll('.resource-domain-row').forEach(function(el){el.style.display=on?'':'none';});}
+function editResource(id){var r=sharedResources.find(function(x){return x.id===id;});if(!r)return;populateResourceLetters();document.getElementById('resource-id').value=r.id;document.getElementById('resource-name').value=r.name;document.getElementById('resource-letter').value=r.driveLetter;document.getElementById('resource-host-letter').value=r.hostDriveLetter||'';document.getElementById('resource-enabled').checked=!!r.enabled;document.getElementById('resource-readonly').checked=!!r.readOnly;document.getElementById('resource-groups').value=r.groups||'';applyResourceDomainUI();document.getElementById('resource-editor-title').textContent='Edit shared resource';}
 function renderSettingsResources(){
     var box=document.getElementById('settings-resource-list');
     if(!box)return;
@@ -1336,7 +1789,7 @@ function renderSettingsResources(){
         name.textContent=r.driveLetter+': '+r.name;
         var meta=document.createElement('span');
         meta.className='settings-resource-meta';
-        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.enabled?'':' · Disabled')+(r.hostMounted?' · Mounted on host'+(r.hostDriveLetter?' as '+r.hostDriveLetter+':':''):'')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
+        meta.textContent=(r.readOnly?'Read-only':'Read/write')+(r.groups?' · Only for '+r.groups:'')+(r.enabled?'':' · Disabled')+(r.hostMounted?' · Mounted on host'+(r.hostDriveLetter?' as '+r.hostDriveLetter+':':''):'')+(r.legacyHostPath?' · Legacy folder disconnected and untouched: '+r.legacyHostPath:'');
         details.append(name,meta);
         var actions=document.createElement('div');
         actions.className='settings-resource-actions';
@@ -1366,11 +1819,12 @@ function renderSettingsResources(){
     });
     if(!box.children.length)box.textContent='No shared resources configured.';
 }
-function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked};if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
+function saveResourceEditor(){var payload={id:document.getElementById('resource-id').value,name:document.getElementById('resource-name').value.trim(),driveLetter:document.getElementById('resource-letter').value,hostDriveLetter:document.getElementById('resource-host-letter').value,enabled:document.getElementById('resource-enabled').checked,readOnly:document.getElementById('resource-readonly').checked,groups:document.getElementById('resource-groups').value.split(',').map(function(g){return g.trim();}).filter(function(g){return g;}).join(',')};if(!/^[A-Za-z0-9 ._,-]*$/.test(payload.groups)){showModal('Shared resource','Domain group names use letters, digits, spaces, ".", "_" or "-", separated by commas.','OK',{confirmClass:'primary'});return;}if(!payload.name){showModal('Shared resource','A unique name is required.','OK',{confirmClass:'primary'});return;}sendCmd('saveSharedResource',payload);}
 function onSharedResourceResult(msg){if(msg.id&&hostResourceBusy[msg.id]){delete hostResourceBusy[msg.id];renderSettingsResources();}if(!msg.success)showModal('Shared resource error',msg.message||'The resource operation failed. Check the appliance state, name, and drive-letter collisions.','OK',{confirmClass:'primary'});else clearResourceEditor();}
 
-function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?(s.backend||'appliance'):'Not configured')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;}
-function appliancePayload(){return{backend:document.getElementById('appliance-backend').value,storageParent:document.getElementById('appliance-storage-parent').value.trim(),dataSizeGb:Number(document.getElementById('appliance-data-size').value),adminUser:document.getElementById('appliance-admin-user').value.trim(),adminPassword:document.getElementById('appliance-admin-pass').value,ramMb:Number(document.getElementById('appliance-ram').value),cpuCores:Number(document.getElementById('appliance-cpu').value),windowsIsoPath:document.getElementById('appliance-server-iso').value.trim(),windowsImageName:document.getElementById('appliance-server-image').value.trim(),productKey:document.getElementById('appliance-product-key').value};}
+function renderSharedAppliance(){var s=sharedAppliance||{},el=document.getElementById('appliance-status');if(!el)return;el.textContent=(s.configured?({ubuntu:'Ubuntu / Samba',server_core:'Windows Server Core'}[s.backend]||'Appliance'):'Not configured')+(s.domainEnabled?' · domain controller for '+(s.domainName||'the AppSandbox domain'):'')+' — '+(s.progressText||['Unconfigured','Provisioning','Stopped','Starting','Ready','Updating','Failed','Stopping'][s.state]||'Unknown')+(s.lastError?' — '+s.lastError:'');if(s.storageRoot&&!document.getElementById('appliance-storage-parent').value)document.getElementById('appliance-storage-parent').value=s.storageRoot.replace(/[\\/][^\\/]+$/,'');if(s.dataSizeGb)document.getElementById('appliance-data-size').value=s.dataSizeGb;if(s.ramMb)document.getElementById('appliance-ram').value=s.ramMb;if(s.cpuCores)document.getElementById('appliance-cpu').value=s.cpuCores;if(s.backend)document.getElementById('appliance-backend').value=s.backend;applyApplianceBackendUI();}
+function appliancePayload(){return{backend:document.getElementById('appliance-backend').value,storageParent:document.getElementById('appliance-storage-parent').value.trim(),dataSizeGb:Number(document.getElementById('appliance-data-size').value),adminUser:document.getElementById('appliance-admin-user').value.trim(),adminPassword:document.getElementById('appliance-admin-pass').value,ramMb:Number(document.getElementById('appliance-ram').value),cpuCores:Number(document.getElementById('appliance-cpu').value),windowsIsoPath:document.getElementById('appliance-server-iso').value.trim(),windowsImageName:document.getElementById('appliance-server-image').value.trim(),productKey:document.getElementById('appliance-product-key').value,enableDomain:document.getElementById('appliance-backend').value==='server_core'&&document.getElementById('appliance-domain').checked};}
+function applyApplianceBackendUI(){var core=document.getElementById('appliance-backend').value==='server_core';document.querySelectorAll('.appliance-domain-row').forEach(function(el){el.style.display=core?'':'none';});if(sharedAppliance&&sharedAppliance.domainEnabled)document.getElementById('appliance-domain').checked=true;}
 function setupSharedAppliance(){sendCmd('setupSharedAppliance',appliancePayload());}
 function startSharedAppliance(){sendCmd('startSharedAppliance');}
 function stopSharedAppliance(){sendCmd('stopSharedAppliance');}
@@ -1545,6 +1999,27 @@ function growManageDisk() {
         managePending = true; refreshManageVm(false);
         sendCmd('resizeVmDisk', {vmIndex: manageVmIndex, sizeGb: size});
     });
+}
+
+function saveManageDisposable() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-disposable');
+    function send(enabled) {
+        managePending = true; refreshManageVm(false);
+        sendCmd('setVmDisposable', { vmIndex: manageVmIndex, enabled: enabled });
+    }
+    if (!box.checked) { send(false); return; }
+    box.checked = false;
+    showModal('Make this VM disposable',
+        'Checkpoint this VM as it is now and start every session from that clean copy? Anything saved inside the VM since its last start is thrown away at the next start, except on H: and shared drives.',
+        'Make Disposable', { confirmClass: 'primary' }).then(function(ok) { if (ok) send(true); });
+}
+
+function saveManageDomainMember() {
+    if (manageVmIndex < 0) return;
+    var member = document.getElementById('manage-domain-member').checked;
+    managePending = true; refreshManageVm(false);
+    sendCmd('setVmDomainMember', { vmIndex: manageVmIndex, member: member });
 }
 
 function saveManageSecureBoot() {

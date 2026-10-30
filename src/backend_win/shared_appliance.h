@@ -28,6 +28,7 @@ typedef struct {
     wchar_t windows_iso_path[MAX_PATH];
     wchar_t windows_image_name[256];
     wchar_t product_key[64];
+    BOOL enable_domain;   /* Server Core only: promote to the AppSandbox domain controller */
 } SharedApplianceConfig;
 
 typedef struct {
@@ -38,6 +39,8 @@ typedef struct {
     BOOL ready;
     BOOL busy;
     BOOL update_available;
+    BOOL domain_enabled;  /* the appliance is the AppSandbox domain controller */
+    BOOL domain_busy;     /* promotion in progress */
     DWORD data_size_gb;
     DWORD ram_mb;
     DWORD cpu_cores;
@@ -100,6 +103,31 @@ VmInstance *shared_appliance_runtime(void);
 BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,
                                           wchar_t *password, size_t password_chars);
 const char *shared_appliance_server_ip(void);
+
+/* ---- AppSandbox domain (Windows Server Core appliance only) ----
+   Optional: the appliance becomes the domain controller of ASB_DOMAIN_FQDN,
+   without password complexity rules. Managed VMs join it; its users and
+   groups are managed from the host. Messages carry the appliance's error. */
+#define ASB_DOMAIN_FQDN    "appsandbox.internal"
+#define ASB_DOMAIN_NETBIOS "APPSANDBOX"
+#define ASB_DOMAIN_REPLY_MAX 32768
+HRESULT shared_appliance_domain_setup(void);
+HRESULT shared_appliance_domain_list(char *json, size_t chars,
+                                     wchar_t *message, size_t message_chars);
+/* password NULL leaves it unchanged; groups is the complete comma-separated
+   list of manageable groups the user should be in. */
+HRESULT shared_appliance_domain_user_set(const wchar_t *name, const wchar_t *password,
+                                         BOOL enabled, const wchar_t *groups,
+                                         wchar_t *message, size_t message_chars);
+HRESULT shared_appliance_domain_user_delete(const wchar_t *name,
+                                            wchar_t *message, size_t message_chars);
+HRESULT shared_appliance_domain_group_add(const wchar_t *name,
+                                          wchar_t *message, size_t message_chars);
+HRESULT shared_appliance_domain_group_delete(const wchar_t *name,
+                                             wchar_t *message, size_t message_chars);
+/* The credential-bearing domain_join command for a managed VM whose link to
+   the domain controller is dc_ip. FALSE when there is no domain. */
+BOOL shared_appliance_domain_join_command(const char *dc_ip, char *command, size_t chars);
 
 /* Shared with the VPN gateway, the other Ubuntu appliance VM. */
 HRESULT appliance_download_ubuntu_image(wchar_t *image_path, size_t image_chars);

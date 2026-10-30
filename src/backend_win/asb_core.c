@@ -6,6 +6,7 @@
  * registered through asb_set_*_callback().
  */
 
+#define _CRT_RAND_S   /* rand_s, for generated passwords */
 #include <winsock2.h>
 #include "asb_core.h"
 #include "hcs_vm.h"
@@ -568,6 +569,15 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"AutoOpenDisplay=1\n");
         if (g_vms[i].secure_boot_off)
             fwprintf(f, L"SecureBootOff=1\n");
+        if (g_vms[i].domain_member)
+            fwprintf(f, L"DomainMember=1\n");
+        if (g_vms[i].disposable_snap[0])
+            fwprintf(f, L"DisposableSnap=%s\nDisposableBranch=%s\n",
+                     g_vms[i].disposable_snap, g_vms[i].disposable_branch);
+        if (g_vms[i].lab_mode)
+            fwprintf(f, L"LabMode=1\n");
+        if (g_vms[i].lab_report[0])
+            fwprintf(f, L"LabReport=%s\n", g_vms[i].lab_report);
         if (g_vms[i].guest_grow_target_gb)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
@@ -705,6 +715,16 @@ static void load_vm_list(void)
             vm->auto_open_display = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"SecureBootOff=", 14) == 0)
             vm->secure_boot_off = (_wtoi(line + 14) != 0);
+        else if (wcsncmp(line, L"DomainMember=", 13) == 0)
+            vm->domain_member = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"DisposableSnap=", 15) == 0)
+            wcsncpy_s(vm->disposable_snap, _countof(vm->disposable_snap), line + 15, _TRUNCATE);
+        else if (wcsncmp(line, L"DisposableBranch=", 17) == 0)
+            wcsncpy_s(vm->disposable_branch, _countof(vm->disposable_branch), line + 17, _TRUNCATE);
+        else if (wcsncmp(line, L"LabMode=", 8) == 0)
+            vm->lab_mode = (_wtoi(line + 8) != 0);
+        else if (wcsncmp(line, L"LabReport=", 10) == 0)
+            wcsncpy_s(vm->lab_report, _countof(vm->lab_report), line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
@@ -1712,6 +1732,61 @@ typedef struct {
     BOOL     vhdx_created;
 } VhdxCreateArgs;
 
+/* Index of the plain "Windows 11 Pro" (or 10 Pro) image in a Windows ISO,
+   1 when there is none or the ISO can't be read. Index 1 on consumer ISOs is
+   Home, which can't join a domain (managed VMs) and lacks Pro features; the
+   N, Education and Workstations variants are skipped on purpose. */
+static int windows_pro_image_index(const wchar_t *iso_path)
+{
+    static const wchar_t script[] =
+        L"$i=1; $m=$null; try{ "
+        L"$m=Mount-DiskImage -ImagePath $env:ASB_ISO -StorageType ISO -PassThru -ErrorAction Stop; "
+        L"$l=($m | Get-Volume).DriveLetter; $w=$l+':\\sources\\install.wim'; "
+        L"if(-not (Test-Path $w)){ $w=$l+':\\sources\\install.esd' }; "
+        L"$p=Get-WindowsImage -ImagePath $w -ErrorAction Stop | Where-Object { $_.ImageName -match '^Windows \\d+ Pro$' } | Select-Object -First 1; "
+        L"if($p){ $i=$p.ImageIndex } "
+        L"}catch{} finally{ if($m){ Dismount-DiskImage -ImagePath $env:ASB_ISO | Out-Null } }; "
+        L"Write-Output $i";
+    wchar_t cmd[2048];
+    const wchar_t *ext = wcsrchr(iso_path, L'.');
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    char out[256];
+    DWORD got, total = 0;
+    int index = 1;
+
+    if (!ext || _wcsicmp(ext, L".iso") != 0) return 1;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 1;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    swprintf_s(cmd, _countof(cmd),
+               L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"%s\"", script);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    ZeroMemory(&pi, sizeof(pi));
+    SetEnvironmentVariableW(L"ASB_ISO", iso_path);
+    if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(wr);
+        wr = NULL;
+        while (total < sizeof(out) - 1 &&
+               ReadFile(rd, out + total, (DWORD)(sizeof(out) - 1 - total), &got, NULL) && got)
+            total += got;
+        WaitForSingleObject(pi.hProcess, 120000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    SetEnvironmentVariableW(L"ASB_ISO", NULL);
+    out[total] = '\0';
+    if (wr) CloseHandle(wr);
+    CloseHandle(rd);
+    index = atoi(out);
+    return index >= 1 && index <= 64 ? index : 1;
+}
+
 static DWORD WINAPI vhdx_create_thread(LPVOID param)
 {
     VhdxCreateArgs *args = (VhdxCreateArgs *)param;
@@ -1775,11 +1850,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         goto done;
     }
 
-    /* Build iso-patch command line */
-    swprintf_s(cmdline, 2048,
-        L"\"%s\\iso-patch.exe\" --to-vhdx \"%s\" 1 %lu --output \"%s\" --stage \"%s\"",
-        exe_dir, args->config.image_path, args->config.hdd_gb,
-        args->config.vhdx_path, manifest);
+    /* Build iso-patch command line: the Pro edition, not index 1 (Home). */
+    {
+        int image_index = windows_pro_image_index(args->config.image_path);
+        asb_log(L"Windows image: using index %d of the ISO%s.", image_index,
+                image_index == 1 ? L" (no plain Pro edition found, or not an ISO)" : L" (Pro)");
+        swprintf_s(cmdline, 2048,
+            L"\"%s\\iso-patch.exe\" --to-vhdx \"%s\" %d %lu --output \"%s\" --stage \"%s\"",
+            exe_dir, args->config.image_path, image_index, args->config.hdd_gb,
+            args->config.vhdx_path, manifest);
+    }
 
     /* Create pipe */
     sa.nLength = sizeof(sa);
@@ -3417,6 +3497,36 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
 
+    /* Managed: domain users sign in, so the local admin Windows setup needs
+       gets a generated password nobody has to know. */
+    if (config->domain_member) {
+        SharedApplianceStatus appliance;
+        unsigned int r;
+        int k;
+        static const wchar_t chars[] =
+            L"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+        if (_wcsicmp(cfg.os_type, L"Windows") != 0 || is_template_create) {
+            asb_log(L"Error: only Windows VMs (not templates) can be managed.");
+            return E_INVALIDARG;
+        }
+        shared_appliance_get_status(&appliance);
+        if (!appliance.domain_enabled) {
+            asb_log(L"Error: set up the domain controller (Domain) before creating managed VMs.");
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+        wcscpy_s(cfg.admin_user, 128, L"asbadmin");
+        for (k = 0; k < 20; k++) {
+            if (rand_s(&r) != 0) r = GetTickCount() * 2654435761u + (unsigned)k;
+            cfg.admin_pass[k] = chars[r % (_countof(chars) - 1)];
+        }
+        wcscpy_s(cfg.admin_pass + 20, 108, L"#7a");
+        cfg.domain_member = TRUE;
+    }
+    if (config->lab_mode && (_wcsicmp(cfg.os_type, L"Windows") != 0 || is_template_create)) {
+        asb_log(L"Error: a malware lab VM must be a Windows VM, not a template.");
+        return E_INVALIDARG;
+    }
+
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
@@ -3502,6 +3612,13 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
        install; Manage > Secure Boot can still turn it on. */
     cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);
     inst->secure_boot_off = cfg.secure_boot_off;
+    inst->domain_member = cfg.domain_member;
+    if (config->lab_mode) {
+        inst->lab_mode = TRUE;
+        inst->domain_member = cfg.domain_member = FALSE;
+        asb_log(L"\"%s\" is a malware lab VM: isolated from shared drives, the domain and the clipboard. "
+                L"Its state is saved as the clean copy at its first start after setup.", cfg.name);
+    }
 
     /* Apps to install after the first sign-in (Windows VMs, not templates,
        which are sysprepped). Kept until the agent has queued them. */
@@ -3538,8 +3655,14 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             swprintf_s(storage_parent, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
             CreateDirectoryW(storage_parent, NULL);
         } else {
-            const wchar_t *requested = config->storage_parent && config->storage_parent[0]
-                ? config->storage_parent : storage_parent;
+            /* The default gets its own buffer: validate_storage_parent writes
+               the normalised path into storage_parent, which must not also be
+               the path it is reading. */
+            wchar_t default_parent[MAX_PATH];
+            const wchar_t *requested;
+            wcscpy_s(default_parent, MAX_PATH, storage_parent);
+            requested = config->storage_parent && config->storage_parent[0]
+                ? config->storage_parent : default_parent;
             hr = validate_storage_parent(requested, cfg.hdd_gb,
                                          storage_parent, _countof(storage_parent));
             if (FAILED(hr)) {
@@ -3939,7 +4062,22 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         return HRESULT_FROM_WIN32(ERROR_BUSY);
     }
 
-    if (!allow_missing_shared_resources &&
+    /* Lab VM: the first start after setup saves the clean copy every later
+       start begins from (installs made before this shutdown are kept). */
+    if (inst->lab_mode && inst->install_complete && !inst->disposable_snap[0] &&
+        snap_idx == -1 && !inst->running) {
+        SnapshotTree *tree = &g_snap_trees[idx];
+        if (SUCCEEDED(snapshot_take(tree, inst, L"Lab clean state")) && tree->count > 0) {
+            SnapNode *node = &tree->nodes[tree->count - 1];
+            wcscpy_s(inst->disposable_snap, _countof(inst->disposable_snap), node->guid);
+            wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+                     node->branch_count ? node->branches[node->branch_count - 1].guid : L"");
+            asb_log(L"Lab: saved \"%s\" as its clean state; every start begins from it.", inst->name);
+            save_vm_list();
+        }
+    }
+
+    if (!inst->lab_mode && !allow_missing_shared_resources &&
         shared_resources_build_attachments(inst->os_type,
             inst->shared_resource_exclusions, inst->shared_resources,
             ASB_MAX_SHARED_RESOURCES) > 0) {
@@ -3948,6 +4086,43 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         if (!dependency_status.configured) {
             InterlockedExchange(&inst->management_busy, 0);
             return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+    }
+
+    /* Disposable: every normal start (or a start from the clean checkpoint
+       itself) boots a new branch of the clean checkpoint, and the branch the
+       last session ran on is deleted with everything it changed. */
+    if (inst->disposable_snap[0] && snap_idx == -1) {
+        SnapshotTree *tree = &g_snap_trees[idx];
+        int node = -1, i, b;
+        for (i = 0; i < tree->count; i++)
+            if (tree->nodes[i].valid && _wcsicmp(tree->nodes[i].guid, inst->disposable_snap) == 0)
+                node = i;
+        if (node < 0) {
+            asb_log(L"\"%s\": the clean checkpoint for disposable starts is gone; starting normally.",
+                    inst->name);
+        } else {
+            wchar_t previous[64];
+            HRESULT dhr;
+            wcscpy_s(previous, _countof(previous), inst->disposable_branch);
+            dhr = snapshot_new_branch(tree, inst, node);
+            if (FAILED(dhr)) {
+                asb_log(L"Error: could not create a clean copy for \"%s\" (0x%08X).", inst->name, dhr);
+                InterlockedExchange(&inst->management_busy, 0);
+                if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+                return dhr;
+            }
+            b = tree->nodes[node].branch_count - 1;
+            wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+                     tree->nodes[node].branches[b].guid);
+            for (i = 0; previous[0] && i < tree->nodes[node].branch_count; i++)
+                if (_wcsicmp(tree->nodes[node].branches[i].guid, previous) == 0) {
+                    snapshot_delete_branch(tree, inst, node, i);
+                    break;
+                }
+            asb_log(L"\"%s\" is disposable: starting from a clean copy of \"%s\".",
+                    inst->name, tree->nodes[node].name);
+            save_vm_list();
         }
     }
 
@@ -4001,8 +4176,10 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         args->config.secure_boot_off = inst->secure_boot_off;
+        args->config.domain_member = inst->domain_member && !inst->lab_mode;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
-        args->config.shared_resource_count = shared_resources_build_attachments(
+        /* Lab VMs never get shared drives (nor the appliance link with them). */
+        args->config.shared_resource_count = inst->lab_mode ? 0 : shared_resources_build_attachments(
             inst->os_type, inst->shared_resource_exclusions,
             args->config.shared_resources, ASB_MAX_SHARED_RESOURCES);
         args->config.allow_missing_shared_resources = allow_missing_shared_resources;
@@ -4460,6 +4637,250 @@ ASB_API HRESULT asb_vm_set_secure_boot(AsbVm vm, BOOL enabled)
     return S_OK;
 }
 
+/* Make an existing Windows VM managed: from its next start it gets the
+   appliance link and joins the domain (its local accounts keep working).
+   Turning it off only stops AppSandbox joining it; a joined VM stays in the
+   domain until it is removed in Windows. */
+ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member)
+{
+    VmInstance *inst;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    if (_wcsicmp(inst->os_type, L"Windows") != 0 || inst->is_template) return E_INVALIDARG;
+    if (member) {
+        SharedApplianceStatus appliance;
+        shared_appliance_get_status(&appliance);
+        if (!appliance.domain_enabled) {
+            asb_log(L"Error: set up the domain controller (Domain) before joining VMs to it.");
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+    }
+    inst->domain_member = member ? TRUE : FALSE;
+    asb_log(member
+        ? L"\"%s\" will join the " L"" ASB_DOMAIN_NETBIOS L" domain at its next start%s."
+        : L"\"%s\" is no longer managed%s; it stays joined until removed in Windows.",
+        inst->name, inst->running ? L" (restart it)" : L"");
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* ---- Malware lab ----
+   A lab VM is isolated at start (no shared drives, domain link or
+   clipboard). An analysis run asks the guest agent to record (files,
+   registry, processes, network: lab_recorder.c) while the display window
+   saves a screenshot whenever the screen changes; stopping fetches the
+   guest's JSON report and writes report.html next to the screenshots,
+   from the web\lab-report.html template. */
+
+#define LAB_REPORTS_ROOT L"C:\\ProgramData\\AppSandbox\\LabReports"
+
+ASB_API void asb_lab_reports_dir(AsbVm vm, wchar_t *out, size_t chars)
+{
+    VmInstance *inst = vm_inst(vm);
+    swprintf_s(out, chars, L"%s\\%s", LAB_REPORTS_ROOT, inst ? inst->name : L"");
+}
+
+ASB_API HRESULT asb_lab_start(AsbVm vm, wchar_t *message, size_t message_chars)
+{
+    VmInstance *inst = vm_inst(vm);
+    wchar_t dir[MAX_PATH], shots[MAX_PATH];
+    char reply[512] = "";
+    SYSTEMTIME t;
+    if (message && message_chars) message[0] = L'\0';
+    if (!inst || !inst->lab_mode) return E_INVALIDARG;
+    if (!inst->running || !inst->agent_online) {
+        swprintf_s(message, message_chars, L"Start the lab VM and wait for Windows to finish starting first.");
+        return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    }
+    if (inst->lab_running) return S_FALSE;
+    GetLocalTime(&t);
+    asb_lab_reports_dir(vm, dir, MAX_PATH);
+    CreateDirectoryW(L"C:\\ProgramData\\AppSandbox", NULL);
+    CreateDirectoryW(LAB_REPORTS_ROOT, NULL);
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(dir + wcslen(dir), MAX_PATH - wcslen(dir), L"\\%04u%02u%02u-%02u%02u%02u",
+               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(shots, MAX_PATH, L"%s\\screenshots", dir);
+    CreateDirectoryW(shots, NULL);
+    asb_log(L"Lab: \"%s\" is taking its baseline (registry, processes, network)...", inst->name);
+    if (!vm_agent_send(inst, "lab_start", reply, sizeof(reply), 5ul * 60ul * 1000ul)) {
+        swprintf_s(message, message_chars, L"The lab VM could not start recording: %S",
+                   strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
+        return E_FAIL;
+    }
+    wcscpy_s(inst->lab_dir, MAX_PATH, dir);
+    InterlockedExchange(&inst->lab_shots, 0);
+    inst->lab_t0 = GetTickCount64();
+    InterlockedExchange(&inst->lab_running, 1);
+    asb_log(L"Lab: recording \"%s\". Run the sample now; screenshots go to %s.", inst->name, dir);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* report.json + screenshots -> report.html: the template's LAB_DATA marker
+   comment becomes the data. "</" is escaped so no string ends the script. */
+static HRESULT lab_write_html(const wchar_t *dir, const char *json, size_t json_len,
+                              const wchar_t *vm_name, wchar_t *out_path, size_t out_chars)
+{
+    wchar_t module[MAX_PATH], tpl_path[MAX_PATH], find[MAX_PATH], *slash;
+    char *tpl = NULL, *marker, name8[512];
+    FILE *f = NULL, *o = NULL;
+    long tpl_len;
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    BOOL first = TRUE;
+    size_t i;
+    GetModuleFileNameW(g_dll_module, module, MAX_PATH);
+    slash = wcsrchr(module, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(tpl_path, MAX_PATH, L"%s\\web\\lab-report.html", module);
+    if (_wfopen_s(&f, tpl_path, L"rb") != 0 || !f) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    fseek(f, 0, SEEK_END);
+    tpl_len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    tpl = (char *)malloc((size_t)tpl_len + 1);
+    if (!tpl) { fclose(f); return E_OUTOFMEMORY; }
+    tpl[fread(tpl, 1, (size_t)tpl_len, f)] = '\0';
+    fclose(f);
+    marker = strstr(tpl, "/*LAB_DATA*/");
+    swprintf_s(out_path, out_chars, L"%s\\report.html", dir);
+    if (!marker || _wfopen_s(&o, out_path, L"wb") != 0 || !o) { free(tpl); return E_FAIL; }
+    fwrite(tpl, 1, (size_t)(marker - tpl), o);
+    fputs("window.LAB_REPORT=", o);
+    for (i = 0; i < json_len; i++) {
+        if (json[i] == '<' && i + 1 < json_len && json[i + 1] == '/') fputs("<\\", o);
+        else fputc(json[i], o);
+    }
+    WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, name8, sizeof(name8), NULL, NULL);
+    fputs(";\nwindow.LAB_META={\"vm\":\"", o);
+    for (i = 0; name8[i]; i++) { if (name8[i] == '"' || name8[i] == '\\' || name8[i] == '<') fputc('\\', o); fputc(name8[i], o); }
+    fputs("\"};\nwindow.LAB_SHOTS=[", o);
+    swprintf_s(find, MAX_PATH, L"%s\\screenshots\\shot_*.jpg", dir);
+    h = FindFirstFileW(find, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            unsigned long ms = wcstoul(fd.cFileName + 5, NULL, 10);
+            fprintf(o, "%s{\"file\":\"screenshots/%S\",\"ms\":%lu}", first ? "" : ",", fd.cFileName, ms);
+            first = FALSE;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    fputs("];\n", o);
+    fputs(marker + strlen("/*LAB_DATA*/"), o);
+    fclose(o);
+    free(tpl);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_lab_stop(AsbVm vm, wchar_t *report_html, size_t report_chars,
+                             wchar_t *message, size_t message_chars)
+{
+    VmInstance *inst = vm_inst(vm);
+    char *reply, cmd[64];
+    char *json = NULL;
+    size_t total = 0, cap = 0;
+    wchar_t json_path[MAX_PATH];
+    FILE *f;
+    HRESULT hr;
+    if (message && message_chars) message[0] = L'\0';
+    if (report_html && report_chars) report_html[0] = L'\0';
+    if (!inst || !inst->lab_mode || !inst->lab_running) return S_FALSE;
+    InterlockedExchange(&inst->lab_running, 0);   /* screenshots stop here */
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    reply = (char *)malloc(ASB_DOMAIN_REPLY_MAX);
+    if (!reply) return E_OUTOFMEMORY;
+    asb_log(L"Lab: \"%s\" is building the report (diffing the registry and file journal)...", inst->name);
+    if (!vm_agent_send(inst, "lab_stop", reply, ASB_DOMAIN_REPLY_MAX, 10ul * 60ul * 1000ul)) {
+        swprintf_s(message, message_chars, L"The lab VM could not build the report: %S",
+                   strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
+        free(reply);
+        return E_FAIL;
+    }
+    for (;;) {
+        BYTE *raw;
+        DWORD raw_len = 0;
+        const char *b64;
+        sprintf_s(cmd, sizeof(cmd), "lab_chunk:%zu", total);
+        if (!vm_agent_send(inst, cmd, reply, ASB_DOMAIN_REPLY_MAX, 60000) ||
+            strncmp(reply, "ok:", 3) != 0) {
+            swprintf_s(message, message_chars, L"Fetching the report from the lab VM failed.");
+            free(reply); free(json);
+            return E_FAIL;
+        }
+        b64 = reply + 3;
+        if (!*b64) break;
+        if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, NULL, &raw_len, NULL, NULL)) break;
+        if (total + raw_len + 1 > cap) {
+            char *nj;
+            cap = (total + raw_len + 1) * 2;
+            nj = (char *)realloc(json, cap);
+            if (!nj) { free(reply); free(json); return E_OUTOFMEMORY; }
+            json = nj;
+        }
+        raw = (BYTE *)json + total;
+        if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, raw, &raw_len, NULL, NULL)) break;
+        total += raw_len;
+    }
+    free(reply);
+    if (!json) { swprintf_s(message, message_chars, L"The lab VM returned an empty report."); return E_FAIL; }
+    json[total] = '\0';
+    swprintf_s(json_path, MAX_PATH, L"%s\\report.json", inst->lab_dir);
+    if (_wfopen_s(&f, json_path, L"wb") == 0 && f) { fwrite(json, 1, total, f); fclose(f); }
+    hr = lab_write_html(inst->lab_dir, json, total, inst->name, report_html, report_chars);
+    free(json);
+    if (FAILED(hr)) {
+        swprintf_s(message, message_chars, L"The report data is saved (%s), but report.html could not be written.", json_path);
+        return hr;
+    }
+    wcscpy_s(inst->lab_report, MAX_PATH, report_html);
+    save_vm_list();
+    asb_log(L"Lab: report for \"%s\" is ready (%ld screenshots): %s",
+            inst->name, inst->lab_shots, report_html);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
+/* Disposable VM: on turns the VM's current state into the "Disposable clean
+   state" checkpoint that every later start begins from (the VM must be
+   stopped); off keeps the checkpoint and the current branch. */
+ASB_API HRESULT asb_vm_set_disposable(AsbVm vm, BOOL enabled)
+{
+    VmInstance *inst;
+    SnapshotTree *tree;
+    HRESULT hr;
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    tree = &g_snap_trees[idx];
+    if (!enabled) {
+        inst->disposable_snap[0] = L'\0';
+        inst->disposable_branch[0] = L'\0';
+        asb_log(L"\"%s\" is no longer disposable; it keeps changes again.", inst->name);
+    } else {
+        if (inst->running) {
+            asb_log(L"Shut \"%s\" down before making it disposable.", inst->name);
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+        hr = asb_snap_take(vm, L"Disposable clean state");
+        if (FAILED(hr)) return hr;
+        wcscpy_s(inst->disposable_snap, _countof(inst->disposable_snap),
+                 tree->nodes[tree->count - 1].guid);
+        /* The branch the checkpoint switched to is this session's; the next
+           start replaces it. */
+        wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+                 tree->nodes[tree->count - 1].branch_count > 0
+                     ? tree->nodes[tree->count - 1].branches[tree->nodes[tree->count - 1].branch_count - 1].guid
+                     : L"");
+        asb_log(L"\"%s\" is disposable: every start begins from its current state.", inst->name);
+    }
+    if (!save_vm_list()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    return S_OK;
+}
+
 /* Keep only valid winget IDs (letters, digits, . + _ -), comma-separated. */
 static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t chars)
 {
@@ -4477,7 +4898,7 @@ static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t ch
                 ok = FALSE;
         if (ok && len && len <= 100 && used + len + 2 < chars) {
             if (used) out[used++] = L',';
-            wmemcpy(out + used, p, len);
+            memcpy(out + used, p, len * sizeof(wchar_t));
             used += len;
             out[used] = L'\0';
         }
@@ -5239,6 +5660,19 @@ ASB_API HRESULT asb_shared_appliance_rebuild(const SharedApplianceConfig *config
 { return shared_appliance_rebuild(config, switch_backend); }
 ASB_API HRESULT asb_shared_appliance_delete(void)
 { return shared_appliance_delete(); }
+ASB_API HRESULT asb_domain_setup(void)
+{ return shared_appliance_domain_setup(); }
+ASB_API HRESULT asb_domain_list(char *json, size_t chars, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_list(json, chars, message, message_chars); }
+ASB_API HRESULT asb_domain_user_set(const wchar_t *name, const wchar_t *password, BOOL enabled,
+                                    const wchar_t *groups, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_user_set(name, password, enabled, groups, message, message_chars); }
+ASB_API HRESULT asb_domain_user_delete(const wchar_t *name, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_user_delete(name, message, message_chars); }
+ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_group_add(name, message, message_chars); }
+ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_group_delete(name, message, message_chars); }
 /* ---- WireGuard VPN ---- */
 
 ASB_API int asb_vpn_config_count(void) { return vpn_configs_count(); }
