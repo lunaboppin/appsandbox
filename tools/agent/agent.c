@@ -2250,6 +2250,8 @@ static const char DOMAIN_JOIN_PS[] =
         "  try{ $g=[ADSI]('WinNT://'+$env:COMPUTERNAME+'/Administrators,group'); $g.Add('WinNT://'+$env:ASB_DOM_NB+'/AppSandbox VM Admins') }catch{}\r\n"
         "  Write-Output 'result:already'; exit 0\r\n"
         " }\r\n"
+        " $sku=(Get-CimInstance Win32_OperatingSystem).OperatingSystemSKU\r\n"
+        " if(@(98,99,100,101) -contains $sku){ throw ('This VM runs ' + (Get-CimInstance Win32_OperatingSystem).Caption + ', which cannot join a domain. Upgrade it to Pro (Settings > System > Activation > Change product key), or create a new VM: new VMs install Pro.') }\r\n"
         " $cred=New-Object System.Management.Automation.PSCredential($env:ASB_DOM_USER,(ConvertTo-SecureString (AsbText $env:ASB_DOM_PW) -AsPlainText -Force))\r\n"
         " $last='not attempted'\r\n"
         " for($i=0;$i -lt 12;$i++){ try{ Add-Computer -DomainName $env:ASB_DOM_FQDN -Credential $cred -Force -ErrorAction Stop; $last=$null; break }catch{ $last=$_.Exception.Message; Start-Sleep -Seconds 10 } }\r\n"

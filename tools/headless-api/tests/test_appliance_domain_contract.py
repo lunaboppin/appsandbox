@@ -69,6 +69,10 @@ def main() -> None:
     assert "Add-DnsClientNrptRule -Namespace ('.'+$env:ASB_DOM_FQDN)" in agent
     assert "Add-Computer -DomainName $env:ASB_DOM_FQDN -Credential $cred" in agent
     assert "shutdown.exe /r /t 15" in agent
+    # New Windows VMs install Pro (index 1 is Home, which can't join); Home says so.
+    assert "int image_index = windows_pro_image_index(args->config.image_path);" in core
+    assert "-match '^Windows \\\\d+ Pro$'" in core
+    assert "@(98,99,100,101) -contains $sku" in agent
     # VM admin rights come from the AppSandbox VM Admins group, applied every boot.
     join = agent[agent.index("static const char DOMAIN_JOIN_PS[]"):]
     join = join[:join.index("static const char *const DOMAIN_ENV[]")]

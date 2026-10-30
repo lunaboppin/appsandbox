@@ -1717,6 +1717,61 @@ typedef struct {
     BOOL     vhdx_created;
 } VhdxCreateArgs;
 
+/* Index of the plain "Windows 11 Pro" (or 10 Pro) image in a Windows ISO,
+   1 when there is none or the ISO can't be read. Index 1 on consumer ISOs is
+   Home, which can't join a domain (managed VMs) and lacks Pro features; the
+   N, Education and Workstations variants are skipped on purpose. */
+static int windows_pro_image_index(const wchar_t *iso_path)
+{
+    static const wchar_t script[] =
+        L"$i=1; $m=$null; try{ "
+        L"$m=Mount-DiskImage -ImagePath $env:ASB_ISO -StorageType ISO -PassThru -ErrorAction Stop; "
+        L"$l=($m | Get-Volume).DriveLetter; $w=$l+':\\sources\\install.wim'; "
+        L"if(-not (Test-Path $w)){ $w=$l+':\\sources\\install.esd' }; "
+        L"$p=Get-WindowsImage -ImagePath $w -ErrorAction Stop | Where-Object { $_.ImageName -match '^Windows \\d+ Pro$' } | Select-Object -First 1; "
+        L"if($p){ $i=$p.ImageIndex } "
+        L"}catch{} finally{ if($m){ Dismount-DiskImage -ImagePath $env:ASB_ISO | Out-Null } }; "
+        L"Write-Output $i";
+    wchar_t cmd[2048];
+    const wchar_t *ext = wcsrchr(iso_path, L'.');
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    char out[256];
+    DWORD got, total = 0;
+    int index = 1;
+
+    if (!ext || _wcsicmp(ext, L".iso") != 0) return 1;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 1;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    swprintf_s(cmd, _countof(cmd),
+               L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"%s\"", script);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    ZeroMemory(&pi, sizeof(pi));
+    SetEnvironmentVariableW(L"ASB_ISO", iso_path);
+    if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(wr);
+        wr = NULL;
+        while (total < sizeof(out) - 1 &&
+               ReadFile(rd, out + total, (DWORD)(sizeof(out) - 1 - total), &got, NULL) && got)
+            total += got;
+        WaitForSingleObject(pi.hProcess, 120000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    SetEnvironmentVariableW(L"ASB_ISO", NULL);
+    out[total] = '\0';
+    if (wr) CloseHandle(wr);
+    CloseHandle(rd);
+    index = atoi(out);
+    return index >= 1 && index <= 64 ? index : 1;
+}
+
 static DWORD WINAPI vhdx_create_thread(LPVOID param)
 {
     VhdxCreateArgs *args = (VhdxCreateArgs *)param;
@@ -1780,11 +1835,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         goto done;
     }
 
-    /* Build iso-patch command line */
-    swprintf_s(cmdline, 2048,
-        L"\"%s\\iso-patch.exe\" --to-vhdx \"%s\" 1 %lu --output \"%s\" --stage \"%s\"",
-        exe_dir, args->config.image_path, args->config.hdd_gb,
-        args->config.vhdx_path, manifest);
+    /* Build iso-patch command line: the Pro edition, not index 1 (Home). */
+    {
+        int image_index = windows_pro_image_index(args->config.image_path);
+        asb_log(L"Windows image: using index %d of the ISO%s.", image_index,
+                image_index == 1 ? L" (no plain Pro edition found, or not an ISO)" : L" (Pro)");
+        swprintf_s(cmdline, 2048,
+            L"\"%s\\iso-patch.exe\" --to-vhdx \"%s\" %d %lu --output \"%s\" --stage \"%s\"",
+            exe_dir, args->config.image_path, image_index, args->config.hdd_gb,
+            args->config.vhdx_path, manifest);
+    }
 
     /* Create pipe */
     sa.nLength = sizeof(sa);
