@@ -55,7 +55,21 @@ def main() -> None:
     assert 'L"appsandbox-backstage.exe", L"*AppSandboxVDD.dll"' in core
     assert disk.count("appsandbox-backstage.exe") >= 6
     assert "#define IDM_BACKSTAGE" in idd and 'vm_agent_send(ask->vm, "backstage"' in idd
-    print("[ok] backstage session contract")
+    # The switch uses a handle opened with switch rights; failures say why.
+    assert "g_desk = OpenDesktopW(BACKSTAGE_DESKTOP, 0, FALSE, GENERIC_ALL);" in shell
+    assert "GetExitCodeProcess(pi.hProcess, &code)" in agent and "backstage.log" in agent
+    assert "WM_IDD_BACKSTAGE_DONE" in idd
+
+    # Floating menu: a tab on the top edge opens a panel with every option,
+    # sent as the title-bar menu's own commands; it hides while captured.
+    assert "static void idd_fab_create(VmDisplayIdd *d)" in idd and "idd_fab_create(d);" in idd
+    assert "WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED" in idd
+    assert "PostMessageW(d->hwnd, WM_SYSCOMMAND, cmd, 0);" in idd
+    for cmd in ("IDM_CAPTURE_MOUSE", "IDM_GAME_MODE", "IDM_XMIT_HOTKEYS", "IDM_AUDIO_MUTE",
+                "IDM_BACKSTAGE", "IDM_SHOW_CONSOLE", "IDM_SHOW_LOG"):
+        assert "rows[n].cmd = %s;" % cmd in idd, cmd
+    assert "want = !d->captured && IsWindowVisible(d->hwnd) && !IsIconic(d->hwnd);" in idd
+    print("[ok] backstage session and floating menu contract")
 
 
 if __name__ == "__main__":

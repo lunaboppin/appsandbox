@@ -143,6 +143,7 @@ typedef struct InputPacket {
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_CURSOR_VIS       (WM_USER + 102)   /* wp = guest cursor visible */
+#define WM_IDD_BACKSTAGE_DONE   (WM_USER + 103)   /* wp = ok, lp = malloc'd note */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -300,6 +301,21 @@ struct VmDisplayIdd {
     HANDLE           audio_recv_thread;
     volatile BOOL    audio_muted;
 
+    /* Floating menu (Parsec-style): a small tab on the top edge of the
+       picture that opens a panel with the display's options. Both are owned,
+       non-activating popups, so clicking them never takes focus from the VM. */
+    HWND           fab_hwnd;
+    HWND           panel_hwnd;
+    double         fab_pos;          /* tab position across the top, 0..1 */
+    BOOL           fab_shown;
+    BOOL           fab_hot;
+    BOOL           fab_dragging;
+    BOOL           fab_moved;
+    int            fab_drag_x;       /* screen x where the drag started */
+    int            fab_drag_left;    /* tab's left edge then */
+    int            panel_hot;        /* hovered row, -1 for none */
+    BOOL           backstage_busy;
+
     /* Threads */
     HANDLE         recv_thread;
     HANDLE         window_thread;
@@ -339,12 +355,16 @@ static DWORD WINAPI idd_backstage_thread(LPVOID param)
 {
     IddBackstageAsk *ask = (IddBackstageAsk *)param;
     char reply[256] = "";
-    wchar_t message[400];
-    if (!vm_agent_send(ask->vm, "backstage", reply, sizeof(reply), 30000)) {
-        swprintf_s(message, _countof(message), L"Backstage could not be opened: %S",
-                   strncmp(reply, "error:", 6) == 0 ? reply + 6
-                   : reply[0] ? reply : "the VM's agent did not answer.");
-        MessageBoxW(ask->hwnd, message, L"Backstage", MB_ICONWARNING);
+    BOOL ok = vm_agent_send(ask->vm, "backstage", reply, sizeof(reply), 30000);
+    wchar_t *note = (wchar_t *)calloc(300, sizeof(wchar_t));
+    if (note) {
+        if (ok)
+            wcscpy_s(note, 300, strcmp(reply, "ok:left") == 0 ? L"left" : L"entered");
+        else
+            swprintf_s(note, 300, L"%S", strncmp(reply, "error:", 6) == 0 ? reply + 6
+                       : reply[0] ? reply : "the VM's agent did not answer.");
+        /* Finished on the window's thread, which owns the state. */
+        if (!PostMessageW(ask->hwnd, WM_IDD_BACKSTAGE_DONE, ok, (LPARAM)note)) free(note);
     }
     free(ask);
     return 0;
@@ -511,6 +531,385 @@ static void ensure_idd_class(HINSTANCE hInst)
     RegisterClassExW(&wc);
 
     g_idd_class_registered = TRUE;
+}
+
+/* ---- Floating menu (Parsec-style tab + panel) ---- */
+
+#define IDD_FAB_CLASS    L"AppSandboxIddFab"
+#define IDD_PANEL_CLASS  L"AppSandboxIddPanel"
+#define FAB_W            64
+#define FAB_H            20
+#define PANEL_W          300
+#define PANEL_HEADER     40
+#define PANEL_ROW        36
+#define PANEL_MAX_ROWS   8
+
+#define FAB_BG           RGB(0x1b, 0x22, 0x2c)
+#define FAB_BG_HOT       RGB(0x2a, 0x36, 0x47)
+#define FAB_BORDER       RGB(0x3b, 0x4a, 0x5e)
+#define FAB_TEXT         RGB(0xe6, 0xed, 0xf5)
+#define FAB_DIM          RGB(0x8d, 0xa2, 0xb8)
+#define FAB_ON           RGB(0x5c, 0xc8, 0x8a)
+
+typedef struct {
+    UINT cmd;
+    const wchar_t *label;
+    const wchar_t *state;
+    BOOL on;
+} IddMenuRow;
+
+static HFONT g_fab_font, g_fab_font_bold;
+
+static void idd_panel_close(VmDisplayIdd *d);
+
+/* What the panel offers: the same commands as the title-bar menu, which
+   the panel sends as WM_SYSCOMMAND so both share one handler. */
+static int idd_menu_rows(VmDisplayIdd *d, IddMenuRow *rows)
+{
+    int n = 0;
+    rows[n].cmd = IDM_CAPTURE_MOUSE; rows[n].label = L"Capture mouse now";
+    rows[n].state = L"Ctrl+Alt releases"; rows[n].on = FALSE; n++;
+    rows[n].cmd = IDM_GAME_MODE; rows[n].label = L"Game mode";
+    rows[n].state = d->game_mode ? L"On" : L"Off"; rows[n].on = d->game_mode; n++;
+    rows[n].cmd = IDM_XMIT_HOTKEYS; rows[n].label = L"Send hotkeys to the VM";
+    rows[n].state = d->transmit_hotkeys ? L"On" : L"Off"; rows[n].on = d->transmit_hotkeys; n++;
+    rows[n].cmd = IDM_AUDIO_MUTE; rows[n].label = L"Mute audio";
+    rows[n].state = d->audio_muted ? L"On" : L"Off"; rows[n].on = d->audio_muted; n++;
+    if (_wcsicmp(d->os_type, L"Windows") == 0) {
+        rows[n].cmd = IDM_BACKSTAGE; rows[n].label = L"Backstage session (SYSTEM)";
+        rows[n].state = d->backstage_busy ? L"Working..." : L"Open / leave";
+        rows[n].on = FALSE; n++;
+    }
+    if (d->switchable) {
+        rows[n].cmd = IDM_SHOW_CONSOLE; rows[n].label = L"Show Hyper-V screen";
+        rows[n].state = L"Boot console"; rows[n].on = FALSE; n++;
+    }
+    rows[n].cmd = IDM_SHOW_LOG; rows[n].label = L"Show log";
+    rows[n].state = L""; rows[n].on = FALSE; n++;
+    return n;
+}
+
+static void idd_fab_fonts(void)
+{
+    if (g_fab_font) return;
+    g_fab_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                             CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_fab_font_bold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                  CLEARTYPE_QUALITY, 0, L"Segoe UI");
+}
+
+/* The client area in screen coordinates. */
+static RECT idd_client_screen(VmDisplayIdd *d)
+{
+    RECT rc;
+    POINT origin = { 0, 0 };
+    GetClientRect(d->hwnd, &rc);
+    ClientToScreen(d->hwnd, &origin);
+    OffsetRect(&rc, origin.x, origin.y);
+    return rc;
+}
+
+/* Put the tab on the top edge at its saved position, or hide it while the
+   mouse is captured (game mode) or the window is minimised. */
+static void idd_fab_place(VmDisplayIdd *d)
+{
+    RECT rc;
+    int x, span;
+    BOOL want;
+    if (!d || !d->fab_hwnd) return;
+    want = !d->captured && IsWindowVisible(d->hwnd) && !IsIconic(d->hwnd);
+    if (!want) {
+        if (d->fab_shown) ShowWindow(d->fab_hwnd, SW_HIDE);
+        d->fab_shown = FALSE;
+        idd_panel_close(d);
+        return;
+    }
+    rc = idd_client_screen(d);
+    span = (rc.right - rc.left) - FAB_W;
+    if (span < 0) span = 0;
+    x = rc.left + (int)(d->fab_pos * span + 0.5);
+    SetWindowPos(d->fab_hwnd, NULL, x, rc.top, FAB_W, FAB_H,
+                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    d->fab_shown = TRUE;
+    if (d->panel_hwnd) {
+        RECT pr;
+        int px;
+        GetWindowRect(d->panel_hwnd, &pr);
+        px = x + FAB_W / 2 - PANEL_W / 2;
+        if (px + PANEL_W > rc.right) px = rc.right - PANEL_W;
+        if (px < rc.left) px = rc.left;
+        SetWindowPos(d->panel_hwnd, NULL, px, rc.top + FAB_H + 4, 0, 0,
+                     SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE);
+    }
+}
+
+static void idd_panel_close(VmDisplayIdd *d)
+{
+    HWND panel;
+    if (!d || !d->panel_hwnd) return;
+    panel = d->panel_hwnd;
+    d->panel_hwnd = NULL;     /* first, so losing capture doesn't come back here */
+    if (GetCapture() == panel) ReleaseCapture();
+    DestroyWindow(panel);
+    if (d->fab_hwnd) InvalidateRect(d->fab_hwnd, NULL, FALSE);
+}
+
+static void idd_panel_open(VmDisplayIdd *d)
+{
+    IddMenuRow rows[PANEL_MAX_ROWS];
+    int n = idd_menu_rows(d, rows);
+    int h = PANEL_HEADER + n * PANEL_ROW + 8;
+    HRGN rgn;
+    d->panel_hot = -1;
+    d->panel_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, IDD_PANEL_CLASS, L"",
+                                    WS_POPUP, 0, 0, PANEL_W, h, d->hwnd, NULL,
+                                    d->hInstance, d);
+    if (!d->panel_hwnd) return;
+    rgn = CreateRoundRectRgn(0, 0, PANEL_W + 1, h + 1, 12, 12);
+    SetWindowRgn(d->panel_hwnd, rgn, FALSE);
+    idd_fab_place(d);
+    ShowWindow(d->panel_hwnd, SW_SHOWNOACTIVATE);
+    SetCapture(d->panel_hwnd);    /* a click anywhere else closes it */
+    InvalidateRect(d->fab_hwnd, NULL, FALSE);
+}
+
+static LRESULT CALLBACK idd_fab_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          (LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+        break;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_MOUSEMOVE:
+        if (!d) break;
+        if (!d->fab_hot) {
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            tme.dwHoverTime = 0;
+            TrackMouseEvent(&tme);
+            d->fab_hot = TRUE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        if (d->fab_dragging) {
+            /* Drag along the top edge, like Parsec's tab. */
+            POINT pt;
+            RECT rc = idd_client_screen(d);
+            int span = (rc.right - rc.left) - FAB_W, left;
+            GetCursorPos(&pt);
+            if (abs(pt.x - d->fab_drag_x) > 3) d->fab_moved = TRUE;
+            if (d->fab_moved && span > 0) {
+                left = d->fab_drag_left + (pt.x - d->fab_drag_x) - rc.left;
+                if (left < 0) left = 0;
+                if (left > span) left = span;
+                d->fab_pos = (double)left / span;
+                idd_fab_place(d);
+            }
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (d) {
+            d->fab_hot = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+        if (d) {
+            POINT pt;
+            RECT wr;
+            GetCursorPos(&pt);
+            GetWindowRect(hwnd, &wr);
+            d->fab_dragging = TRUE;
+            d->fab_moved = FALSE;
+            d->fab_drag_x = pt.x;
+            d->fab_drag_left = wr.left;
+            SetCapture(hwnd);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (d && d->fab_dragging) {
+            d->fab_dragging = FALSE;
+            ReleaseCapture();
+            if (!d->fab_moved) idd_panel_open(d);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (d) d->fab_dragging = FALSE;
+        return 0;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(NULL, IDC_HAND));
+        return TRUE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        HBRUSH bg;
+        HPEN pen;
+        int i, cx;
+        GetClientRect(hwnd, &rc);
+        bg = CreateSolidBrush(d && (d->fab_hot || d->panel_hwnd) ? FAB_BG_HOT : FAB_BG);
+        pen = CreatePen(PS_SOLID, 1, FAB_BORDER);
+        SelectObject(dc, bg);
+        SelectObject(dc, pen);
+        RoundRect(dc, rc.left, rc.top - 8, rc.right, rc.bottom, 10, 10);
+        DeleteObject(bg);
+        DeleteObject(pen);
+        /* three dots */
+        bg = CreateSolidBrush(FAB_TEXT);
+        cx = rc.right / 2;
+        for (i = -1; i <= 1; i++) {
+            RECT dot = { cx + i * 8 - 2, rc.bottom / 2 - 2, cx + i * 8 + 2, rc.bottom / 2 + 2 };
+            FillRect(dc, &dot, bg);
+        }
+        DeleteObject(bg);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static int idd_panel_row_at(int y, int rows)
+{
+    int r;
+    if (y < PANEL_HEADER) return -1;
+    r = (y - PANEL_HEADER) / PANEL_ROW;
+    return r < rows ? r : -1;
+}
+
+static LRESULT CALLBACK idd_panel_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    IddMenuRow rows[PANEL_MAX_ROWS];
+    int n;
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          (LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+        break;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_MOUSEMOVE:
+        if (d) {
+            int hot;
+            n = idd_menu_rows(d, rows);
+            hot = idd_panel_row_at((short)HIWORD(lp), n);
+            if ((short)LOWORD(lp) < 0 || (short)LOWORD(lp) >= PANEL_W) hot = -1;
+            if (hot != d->panel_hot) {
+                d->panel_hot = hot;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+    {
+        RECT rc;
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        GetClientRect(hwnd, &rc);
+        if (d && !PtInRect(&rc, pt)) idd_panel_close(d);   /* clicked elsewhere */
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (d) {
+            int row;
+            UINT cmd;
+            n = idd_menu_rows(d, rows);
+            row = idd_panel_row_at((short)HIWORD(lp), n);
+            if ((short)LOWORD(lp) < 0 || (short)LOWORD(lp) >= PANEL_W || row < 0) return 0;
+            cmd = rows[row].cmd;
+            idd_panel_close(d);
+            SetForegroundWindow(d->hwnd);
+            PostMessageW(d->hwnd, WM_SYSCOMMAND, cmd, 0);
+        }
+        return 0;
+    case WM_RBUTTONDOWN:
+        if (d) idd_panel_close(d);
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (d && d->panel_hwnd == hwnd) idd_panel_close(d);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc, r;
+        HBRUSH brush;
+        HPEN pen;
+        int i;
+        GetClientRect(hwnd, &rc);
+        brush = CreateSolidBrush(FAB_BG);
+        pen = CreatePen(PS_SOLID, 1, FAB_BORDER);
+        SelectObject(dc, brush);
+        SelectObject(dc, pen);
+        RoundRect(dc, 0, 0, rc.right, rc.bottom, 12, 12);
+        DeleteObject(brush);
+        DeleteObject(pen);
+        if (!d) { EndPaint(hwnd, &ps); return 0; }
+        SetBkMode(dc, TRANSPARENT);
+        r = rc; r.left = 16; r.right -= 16; r.bottom = PANEL_HEADER;
+        SelectObject(dc, g_fab_font_bold);
+        SetTextColor(dc, FAB_TEXT);
+        DrawTextW(dc, d->vm_name, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        n = idd_menu_rows(d, rows);
+        for (i = 0; i < n; i++) {
+            RECT row = { 6, PANEL_HEADER + i * PANEL_ROW, rc.right - 6, PANEL_HEADER + (i + 1) * PANEL_ROW };
+            if (i == d->panel_hot) {
+                brush = CreateSolidBrush(FAB_BG_HOT);
+                FillRect(dc, &row, brush);
+                DeleteObject(brush);
+            }
+            r = row; r.left += 10; r.right -= 10;
+            SelectObject(dc, g_fab_font);
+            SetTextColor(dc, FAB_TEXT);
+            DrawTextW(dc, rows[i].label, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+            SetTextColor(dc, rows[i].on ? FAB_ON : FAB_DIM);
+            DrawTextW(dc, rows[i].state, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void idd_fab_create(VmDisplayIdd *d)
+{
+    static BOOL registered;
+    HRGN rgn;
+    if (!registered) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = d->hInstance;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.lpfnWndProc = idd_fab_proc;
+        wc.lpszClassName = IDD_FAB_CLASS;
+        RegisterClassExW(&wc);
+        wc.lpfnWndProc = idd_panel_proc;
+        wc.lpszClassName = IDD_PANEL_CLASS;
+        wc.style = CS_DROPSHADOW;
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+    idd_fab_fonts();
+    d->fab_pos = 0.5;
+    d->fab_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                                  IDD_FAB_CLASS, L"", WS_POPUP, 0, 0, FAB_W, FAB_H,
+                                  d->hwnd, NULL, d->hInstance, d);
+    if (!d->fab_hwnd) return;
+    SetLayeredWindowAttributes(d->fab_hwnd, 0, 235, LWA_ALPHA);
+    rgn = CreateRoundRectRgn(0, -10, FAB_W + 1, FAB_H + 1, 10, 10);
+    SetWindowRgn(d->fab_hwnd, rgn, FALSE);
+    idd_fab_place(d);
 }
 
 
@@ -2257,6 +2656,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         }
     }
 
+    /* Floating menu tab on the top edge (Parsec-style) */
+    idd_fab_create(d);
+
     /* Bring the display window to the foreground on open */
     ShowWindow(d->hwnd, SW_SHOW);
     BringWindowToTop(d->hwnd);
@@ -2420,15 +2822,22 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_BACKSTAGE) {
-            IddBackstageAsk *ask = (IddBackstageAsk *)calloc(1, sizeof(*ask));
+            IddBackstageAsk *ask;
             HANDLE thread = NULL;
+            if (d->backstage_busy) return 0;
+            ask = (IddBackstageAsk *)calloc(1, sizeof(*ask));
             if (ask && d->vm) {
                 ask->vm = d->vm;
                 ask->hwnd = hwnd;
                 thread = CreateThread(NULL, 0, idd_backstage_thread, ask, 0, NULL);
             }
-            if (thread) CloseHandle(thread);
-            else free(ask);
+            if (thread) {
+                CloseHandle(thread);
+                d->backstage_busy = TRUE;
+                idd_log(d, L"Backstage: asking the VM...");
+            } else {
+                free(ask);
+            }
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
@@ -2559,11 +2968,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
             idd_clip_cursor(d);
+            idd_fab_place(d);
         }
         return 0;
 
     case WM_MOVE:
-        if (d) idd_clip_cursor(d);
+        if (d) {
+            idd_clip_cursor(d);
+            idd_fab_place(d);
+        }
         break;
 
     /* Raw mouse deltas while captured: sent as relative moves, unthrottled,
@@ -2610,8 +3023,30 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == IDT_PRESENT && d) {
             if (d->frame_dirty)
                 d3d_render_frame(d);
+            /* the tab hides while the mouse is captured */
+            if (d->fab_hwnd && d->fab_shown != (!d->captured && !IsIconic(hwnd)))
+                idd_fab_place(d);
         }
         return 0;
+
+    case WM_IDD_BACKSTAGE_DONE:
+    {
+        wchar_t *note = (wchar_t *)lp;
+        if (d && note) {
+            d->backstage_busy = FALSE;
+            if (wp) {
+                idd_log(d, wcscmp(note, L"left") == 0 ? L"Backstage: left."
+                           : L"Backstage: open (SYSTEM desktop).");
+            } else {
+                wchar_t message[400];
+                idd_log(d, L"Backstage failed: %s", note);
+                swprintf_s(message, _countof(message), L"Backstage could not be opened: %s", note);
+                MessageBoxW(hwnd, message, L"Backstage", MB_ICONWARNING);
+            }
+        }
+        free(note);
+        return 0;
+    }
 
     case WM_IDD_FRAME_READY:
         if (d) d3d_render_frame(d);
@@ -2660,6 +3095,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
             if (!d->input_focused) {
+                idd_panel_close(d);
                 idd_end_capture(d);
                 idd_flush_held_keys(d);
             }
