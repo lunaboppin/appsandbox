@@ -9,11 +9,23 @@
 <!-- spellcheck="false" inherits to all descendants. -->
 <body spellcheck="false">
 
+<!-- Update notice. Filled in by renderUpdate(); nothing here is shown until an update exists. -->
+<div id="update-banner" class="update-banner" style="display:none">
+    <span id="update-banner-text"></span>
+    <span class="update-banner-actions">
+        <button type="button" id="update-banner-install" class="primary" onclick="installUpdate()" title="Download this version, verify it, then install it and reopen App Sandbox.">Install</button>
+        <button type="button" id="update-banner-notes" onclick="sendCmd('updateOpenRelease')" title="Open this release on GitHub.">Release Notes</button>
+        <button type="button" id="update-banner-cancel" onclick="sendCmd('updateCancel')" title="Cancel this update. You can install it later.">Cancel</button>
+        <button type="button" id="update-banner-dismiss" onclick="dismissUpdateBanner()" title="Hide this until the next start. Updates stays available from the Updates button.">Dismiss</button>
+    </span>
+</div>
+
 <!-- Virtual Machines -->
 <section id="vm-section">
     <div class="section-header">
         <h2>Sandboxes</h2>
         <div class="header-actions">
+            <button onclick="openUpdatesModal()" title="See this App Sandbox version and check for updates.">Updates</button>
             <button class="win-host-only" onclick="openSettingsModal()" title="Open the shared appliance and shared resource settings.">Shared Resources</button>
             <button class="win-host-only" onclick="openDomainModal()" title="Manage the users and groups of the AppSandbox domain (Windows Server Core appliance).">Domain</button>
             <button class="win-host-only" onclick="openLabModal()" title="Isolated, disposable VMs for running suspicious files, with recorded analysis reports.">Malware Lab</button>
@@ -437,6 +449,22 @@
             <div class="modal-buttons"><button type="button" onclick="clearResourceEditor()" title="Clear the shared resource editor and prepare a new resource.">Clear</button><button type="button" class="primary" onclick="saveResourceEditor()" title="Save this shared resource definition.">Save</button></div>
         </fieldset>
         <div class="modal-buttons"><button type="button" onclick="closeSettingsModal()" title="Close shared appliance settings.">Close</button></div>
+    </div>
+</div>
+
+<!-- Updates -->
+<div class="modal-overlay" id="updates-overlay">
+    <div class="modal">
+        <h3>Updates</h3>
+        <p>App Sandbox <span id="updates-current"></span></p>
+        <p id="updates-status"></p>
+        <label class="manage-check"><input type="checkbox" id="updates-auto" onchange="saveUpdatePrefs()"> Check for updates automatically</label><br>
+        <label class="manage-check" title="Pre-releases get new features first and may be less tested."><input type="checkbox" id="updates-pre" onchange="saveUpdatePrefs()"> Include pre-releases</label>
+        <div class="modal-buttons">
+            <button type="button" onclick="closeUpdatesModal()">Close</button>
+            <button type="button" id="updates-check" onclick="sendCmd('updateCheck')" title="Ask GitHub for the latest release now.">Check Now</button>
+            <button type="button" id="updates-install" class="primary" onclick="installUpdate()" title="Download this version, verify it, then install it and reopen App Sandbox.">Install</button>
+        </div>
     </div>
 </div>
 

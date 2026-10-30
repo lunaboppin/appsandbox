@@ -20,6 +20,13 @@ governs that file.
   GPL-2.0 and is *not* relicensed under MIT; it is included as a separate work
   (mere aggregation in the same repository).
 
+## Inno Setup (the installer's setup program)
+
+- **License:** the Inno Setup License (zlib-style), <https://jrsoftware.org/files/is/license.txt>.
+- **Copyright:** Copyright (C) 1997-2026 Jordan Russell. Portions Copyright (C) 2000-2026 Martijn Laan.
+- The App Sandbox setup program and uninstaller are built with Inno Setup
+  (<https://jrsoftware.org/isinfo.php>). It is a build tool and is not in this repository.
+
 ## tools/iso-patch/engine/xz/ — XZ Embedded decoder
 
 - **License:** BSD Zero Clause License (`SPDX: 0BSD`).

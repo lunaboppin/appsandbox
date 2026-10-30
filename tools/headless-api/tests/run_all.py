@@ -121,6 +121,10 @@ if RUN_STATIC:
     results["appliance-artifacts"] = [] if p.returncode == 0 else ["test_release_shared_resource_artifacts.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_display_boot_screen_contract.py")], cwd=HERE)
     results["display-boot-screen"] = [] if p.returncode == 0 else ["test_display_boot_screen_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_installer_contract.py")], cwd=HERE)
+    results["installer"] = [] if p.returncode == 0 else ["test_installer_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_updater_mock.py")], cwd=HERE)
+    results["updater-mock"] = [] if p.returncode == 0 else ["test_updater_mock.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_host_and_validation.py")], cwd=HERE)
     results["static"] = [] if p.returncode == 0 else ["test_host_and_validation.py exit %d" % p.returncode]
 

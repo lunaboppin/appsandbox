@@ -128,6 +128,7 @@ window.onHostMessage = function(msg) {
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
+        case 'updateState':    onUpdateState(msg); break;
     }
 };
 
@@ -2440,6 +2441,86 @@ function onPrereqResult(msg) {
 }
 
 /* ---- Modal ---- */
+
+/* ---- Updates ---- */
+
+var updateState = null;
+var updateDismissedVersion = '';
+
+function onUpdateState(msg) {
+    updateState = msg;
+    renderUpdate();
+}
+
+function updateIsBusy(s) {
+    return s.phase === 'downloading' || s.phase === 'waiting' || s.phase === 'installing';
+}
+
+function updateSummary(s) {
+    var name = 'Version ' + (s.version || '');
+    if (s.phase === 'downloading') return 'Downloading ' + name + ': ' + s.progress + '%';
+    if (s.phase === 'waiting') return name + ' is downloaded and verified. It installs once these have stopped: ' + (s.blockers || []).join(', ') + '.';
+    if (s.phase === 'installing') return 'Installing ' + name + '. App Sandbox will close and reopen.';
+    if (s.message && s.isError) return s.message;
+    if (s.available) {
+        var line = name + (s.prerelease ? ' (pre-release)' : '') + ' is available.';
+        return s.canInstall ? line : line + ' This copy was not set up by the installer, so it can\'t update itself. Get the installer from the release page.';
+    }
+    if (s.phase === 'checking') return 'Checking for updates...';
+    return s.message || '';
+}
+
+function renderUpdate() {
+    var s = updateState;
+    if (!s) return;
+    var busy = updateIsBusy(s);
+    var text = updateSummary(s);
+
+    var hidden = !busy && (!s.available || updateDismissedVersion === s.version);
+    document.getElementById('update-banner').style.display = hidden ? 'none' : 'flex';
+    document.getElementById('update-banner-text').textContent = text;
+    document.getElementById('update-banner-install').style.display = (!busy && s.available && s.canInstall) ? '' : 'none';
+    document.getElementById('update-banner-notes').style.display = (s.available && s.releaseUrl && s.phase !== 'installing') ? '' : 'none';
+    document.getElementById('update-banner-cancel').style.display = (s.phase === 'downloading' || s.phase === 'waiting') ? '' : 'none';
+    document.getElementById('update-banner-dismiss').style.display = busy ? 'none' : '';
+
+    document.getElementById('updates-current').textContent = s.currentVersion || '';
+    document.getElementById('updates-status').textContent = text;
+    document.getElementById('updates-status').className = (s.message && s.isError) ? 'update-error' : '';
+    document.getElementById('updates-auto').checked = !!s.autoCheck;
+    document.getElementById('updates-pre').checked = !!s.includePrereleases;
+    document.getElementById('updates-check').disabled = s.phase !== 'idle';
+    document.getElementById('updates-install').style.display = (!busy && s.available && s.canInstall) ? '' : 'none';
+}
+
+function dismissUpdateBanner() {
+    if (updateState) updateDismissedVersion = updateState.version || '';
+    renderUpdate();
+}
+
+function openUpdatesModal() { renderUpdate(); document.getElementById('updates-overlay').classList.add('active'); }
+function closeUpdatesModal() { document.getElementById('updates-overlay').classList.remove('active'); }
+
+function saveUpdatePrefs() {
+    sendCmd('updateSetPrefs', {
+        autoCheck: document.getElementById('updates-auto').checked,
+        includePrereleases: document.getElementById('updates-pre').checked
+    });
+}
+
+/* Installing closes the app and closing it stops every VM, so say which VMs are
+ * in the way before anything starts. Native code checks again before it closes. */
+function installUpdate() {
+    var s = updateState;
+    if (!s || !s.available) return;
+    var blockers = s.blockers || [];
+    var size = s.sizeMb ? ' (' + s.sizeMb + ' MB)' : '';
+    var message = blockers.length
+        ? 'These VMs are running or busy: ' + blockers.join(', ') + '. Installing closes App Sandbox, which would stop them, so they are left alone. Version ' + s.version + size + ' is downloaded and verified now, then installs by itself once you have shut them all down. App Sandbox then reopens.'
+        : 'App Sandbox downloads version ' + s.version + size + ', verifies it, closes, installs it and reopens. A running shared appliance stops with it.';
+    showModal('Install update', message, blockers.length ? 'Install After They Stop' : 'Install', { confirmClass: 'primary' })
+        .then(function(ok) { if (ok) sendCmd('updateInstall'); });
+}
 
 function showModal(title, message, confirmText, opts) {
     document.getElementById('modal-title').textContent = title;

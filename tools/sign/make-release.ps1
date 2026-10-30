@@ -19,6 +19,7 @@
     .\make-release.ps1 -NoBuild         # package the current bin\Release[-ARM64]
     .\make-release.ps1 -SkipDrivers     # sign app binaries + zip; leave drivers as-is
     .\make-release.ps1 -ForceDriverSign # re-submit drivers for attestation even if cached
+    .\make-release.ps1 -Installer       # also build the EV-signed installer (bin\Release\installer)
 
   -Platform selects the bin\ output dir (ARM64 -> bin\Release-ARM64), the driver
   attestation OS/signature codes (sign-drivers.ps1 -Platform rewrites the x64 config
@@ -34,7 +35,8 @@ param(
   [switch]$NoBuild,
   [switch]$BuildOnly,
   [switch]$SkipDrivers,
-  [switch]$ForceDriverSign
+  [switch]$ForceDriverSign,
+  [switch]$Installer
 )
 $ErrorActionPreference = 'Stop'
 
@@ -284,7 +286,7 @@ $signtool = Find-SignTool
 $msBinaries = @('WebView2Loader.dll', 'devcon.exe')
 $toSign = @(Get-ChildItem $bin -Recurse -Include *.exe, *.dll, *.sys | Where-Object {
     ($_.Name -notin $msBinaries) -and
-    ($_.FullName -notmatch '\\(drivers-signed|_attest|_package)\\') -and
+    ($_.FullName -notmatch '\\(drivers-signed|_attest|_package|_installer|installer)\\') -and
     (-not (Test-OurEvSigned $_.FullName $ev.Thumbprint))
 }) | ForEach-Object { $_.FullName }
 
@@ -356,65 +358,7 @@ if (-not $SkipDrivers) {
 $stageRoot = Join-Path $bin '_package'
 $stage     = Join-Path $stageRoot 'AppSandbox'
 if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-# Explicit allowlist (not "copy everything minus excludes"): the root holds ONLY the host app +
-# its direct deps; the guest binaries ship under resources\, the signed drivers under drivers\,
-# the web UI under web\.
-$rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll')
-foreach ($b in $rootBins) {
-    $src = Join-Path $bin $b
-    if (-not (Test-Path $src)) { throw "Missing required root binary $b under $bin." }
-    Copy-Item $src (Join-Path $stage $b) -Force
-}
-
-# The drivers\, resources\ and web\ subfolders are shipped whole, minus symbols/intermediates
-# and the test .cer (the drivers are MS-signed; devcon.exe is Microsoft's and stays).
-foreach ($sub in @('resources', 'drivers', 'web')) {
-    $srcSub = Join-Path $bin $sub
-    if (-not (Test-Path $srcSub)) { throw "Missing required folder $sub under $bin." }
-    robocopy $srcSub (Join-Path $stage $sub) /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log *.cer | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy $sub failed (exit $LASTEXITCODE)." }
-    $global:LASTEXITCODE = 0   # robocopy 0..7 = success
-}
-
-# Ship the headless-api SDK as a sibling folder at the zip root: the Python SDK +
-# examples + tests that script the daemon over the HTTP API. The folder is named
-# "headless-api" - the tools\ parent is intentionally NOT shipped. __pycache__ and
-# *.pyc are local build cruft and are excluded.
-$sdkSrc = Join-Path $repo 'tools\headless-api'
-$sdkDst = Join-Path $stage 'headless-api'
-New-Item -ItemType Directory -Force -Path $sdkDst | Out-Null
-foreach ($f in @('asb.py', 'README.md')) {
-    $fsrc = Join-Path $sdkSrc $f
-    if (-not (Test-Path $fsrc)) { throw "Missing headless-api file $f under $sdkSrc." }
-    Copy-Item $fsrc (Join-Path $sdkDst $f) -Force
-}
-foreach ($sub in @('examples', 'tests')) {
-    robocopy (Join-Path $sdkSrc $sub) (Join-Path $sdkDst $sub) /E /XD __pycache__ /XF *.pyc | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy headless-api\$sub failed (exit $LASTEXITCODE)." }
-    $global:LASTEXITCODE = 0
-}
-
-# Tripwire: the signed drivers come from the deposit (not the build) - fail loudly if any
-# expected artifact is missing rather than shipping a partial zip.
-$required = @(
-    'AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll',
-    'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
-    'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
-    'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
-    'drivers\devcon.exe', 'resources', 'web',
-    'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
-)
-$missing = @($required | Where-Object { -not (Test-Path (Join-Path $stage $_)) })
-if ($missing.Count) { throw "Refusing to package - missing expected artifacts: $($missing -join ', ')" }
-
-# Manifest: show exactly what is going into the zip.
-Write-Host "`n--- package contents ---"
-$files = Get-ChildItem $stage -Recurse -File
-$files | ForEach-Object { Write-Host ("  " + $_.FullName.Substring($stage.Length + 1)) }
-$mb = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 1)
-Write-Host ("--- {0} files, {1} MB ---`n" -f $files.Count, $mb)
+& (Join-Path $PSScriptRoot 'stage-package.ps1') -Bin $bin -Stage $stage
 
 $zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}.zip" -f $Version, $OS, $Platform.ToLower())
 if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -426,3 +370,10 @@ Remove-Item $stageRoot -Recurse -Force
 Write-Host ""
 Write-Host "==================== RELEASE READY ===================="
 Write-Host "Signed ZIP: $zip"
+
+# ------------------------------------------------------- 6. installer (on request)
+
+if ($Installer) {
+    & (Join-Path $repo 'tools\installer\build-installer.ps1') -Configuration $Configuration -Platform $Platform `
+        -SignThumbprint $ev.Thumbprint -TimestampUrl $tsUrl
+}

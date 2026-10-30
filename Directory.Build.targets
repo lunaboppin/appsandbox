@@ -38,7 +38,7 @@
        UNQUOTED and stringized in the source, mirroring the version.rc injection above. -->
   <ItemDefinitionGroup>
     <ClCompile>
-      <PreprocessorDefinitions>ASB_VERSION_SHORT=$(AsbVersionShort);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ASB_VERSION_SHORT=$(AsbVersionShort);ASB_VERSION_FULL=$(AsbVersion);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
 </Project>

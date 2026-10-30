@@ -1,11 +1,23 @@
-name: Build and sign Windows
+name: Signed release
+
+# Builds with the EV token on the self-hosted signing runner, so it only runs when
+# asked. Everyday builds and tests are in ci.yml. Test-signed releases are made by
+# hand: see "Releasing" in tools/installer/README.md.
 
 on:
-  push:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag for a DRAFT GitHub Release with the installer (for example v0.1.7.0). Empty builds only. Publishing the draft stays a manual step.
+        required: false
+        default: ''
 
 permissions:
   contents: read
+
+# A tag also builds the installer and attaches it to a draft release.
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
 
 concurrency:
   group: windows-signed-build-${{ github.ref }}
@@ -43,6 +55,15 @@ jobs:
 
           Write-Host 'WDK/UMDF, Inf2Cat, SignTool, and MakeCab are available.'
           Write-Host 'The release script will verify the EV YubiKey and certificate.'
+
+      - name: Check installer prerequisites
+        if: env.RELEASE_TAG != ''
+        shell: powershell
+        run: |
+          $iscc = @((Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+                    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+                    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $iscc) { throw 'The signing runner needs Inno Setup 6: winget install --id JRSoftware.InnoSetup -e' }
 
       - name: Create temporary Partner Center credentials
         shell: powershell
@@ -85,9 +106,9 @@ jobs:
           $env:PSModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:WINDIR\System32\WindowsPowerShell\v1.0\Modules"
 
           # No -BuildOnly, -SkipDrivers, or signing bypass is allowed here.
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\tools\sign\make-release.ps1' `
-            -Configuration Release `
-            -Platform x64
+          $releaseArgs = @('-Configuration', 'Release', '-Platform', 'x64')
+          if ($env:RELEASE_TAG) { $releaseArgs += '-Installer' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\tools\sign\make-release.ps1' @releaseArgs
 
           if ($LASTEXITCODE -ne 0) {
             throw "The signed release build failed with exit code $LASTEXITCODE."
@@ -142,6 +163,32 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Check the installer against the release tag
+        if: env.RELEASE_TAG != ''
+        shell: powershell
+        run: |
+          $setup = @(Get-ChildItem '.\bin\Release\installer' -Filter 'AppSandbox-*-win-x64-setup.exe' -File)
+          if ($setup.Count -ne 1) { throw 'Expected exactly one installer in bin\Release\installer.' }
+          $info = $setup[0].VersionInfo
+          $version = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart).$($info.FilePrivatePart)"
+          if ($env:RELEASE_TAG -notmatch "^v$([regex]::Escape($version))($|-)") {
+            throw "Tag $env:RELEASE_TAG does not match installer version $version (Directory.Build.props)."
+          }
+          if ((Get-AuthenticodeSignature -LiteralPath $setup[0].FullName).Status -ne 'Valid') {
+            throw 'The installer is not validly signed.'
+          }
+
+      - name: Upload installer
+        if: env.RELEASE_TAG != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppSandbox-installer
+          path: |
+            bin/Release/installer/AppSandbox-*-setup.exe
+            bin/Release/installer/AppSandbox-*-setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Remove temporary Partner Center credentials
         if: always()
         shell: powershell
@@ -152,3 +199,34 @@ jobs:
             Remove-Item -LiteralPath $credentialPath -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
           }
+
+  draft-release:
+    name: Draft GitHub Release
+    needs: build-and-sign
+    if: inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: AppSandbox-installer
+          path: installer
+
+      # Always a draft: nothing reaches users, or the app's update check, until
+      # someone reads it and presses Publish.
+      - name: Create or update the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $RELEASE_TAG is already published; refusing to change its assets."
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" installer/* --clobber
+          else
+            gh release create "$RELEASE_TAG" installer/* --draft --generate-notes --target "$GITHUB_SHA" --title "App Sandbox $RELEASE_TAG"
+          fi
