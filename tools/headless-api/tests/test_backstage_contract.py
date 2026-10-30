@@ -34,7 +34,9 @@ def main() -> None:
     app_proj = read("AppSandbox.vcxproj")
 
     # Guest shell: session 0, no desktop switching, streams and injects.
-    assert "SwitchDesktop" not in shell
+    # The only desktop switch is session 0 choosing its own input desktop
+    # (so the pointer can be placed and windows can take the foreground).
+    assert shell.count("SwitchDesktop(") == 1 and "if (g_session != 0) return;" in shell
     assert "#define ASB_CH_BACKSTAGE        8" in transport
     assert "asb_listen(ASB_CH_BACKSTAGE)" in shell
     assert "BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);" in shell
@@ -50,6 +52,12 @@ def main() -> None:
     assert "AttachThreadInput(GetCurrentThreadId(), tid, TRUE)" in shell and "SetKeyboardState(g_keys);" in shell
     assert "WM_NCHITTEST" in shell and "WM_LBUTTONDBLCLK" in shell and "SC_CLOSE" in shell
     assert "PostMessageW(w, up ? (sys ? WM_SYSKEYUP : WM_KEYUP) : (sys ? WM_SYSKEYDOWN : WM_KEYDOWN)" in shell
+    # Consoles ignore key messages: typing is written as console input.
+    assert "WriteConsoleInputW(g_conin, &r, 1, &n);" in shell and "AttachConsole(pid)" in shell
+    assert "GenerateConsoleCtrlEvent(" in shell and "DelegationConsole" in shell
+    # Exit Backstage closes the host window instead of starting a new session.
+    assert "end.magic = BS_END_MAGIC;" in shell and "if (hdr.magic == BS_END_MAGIC)" in view
+    assert "if (v->ended && !v->closing)" in view
     assert "SHGetKnownFolderPath(ids[i], KF_FLAG_CREATE" in shell   # SYSTEM Desktop exists
     assert "CLSID_ExplorerBrowser" in shell and "EnumDesktopWindows(g_desk" in shell
     for tool in ('L"cmd.exe"', 'L"powershell.exe"', 'L"taskmgr.exe"', 'L"regedit.exe"', 'L"services.msc"'):

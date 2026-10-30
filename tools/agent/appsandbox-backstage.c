@@ -150,6 +150,7 @@ static void choose_screen_mode(void)
 
 #define BS_FRAME_MAGIC  0x52465342u   /* "BSFR" little-endian */
 #define BS_INPUT_MAGIC  0x4E495342u   /* "BSIN" little-endian */
+#define BS_END_MAGIC    0x444E4542u   /* "BEND": the session is ending, don't restart it */
 #define BS_BAND         32            /* rows per band compared and sent */
 #define BS_FRAME_MS     50
 
@@ -243,14 +244,30 @@ static WPARAM mouse_keys(void)
 static void activate(HWND w)
 {
     HWND root = GetAncestor(w, GA_ROOT), fg = GetForegroundWindow();
+    GUITHREADINFO gti;
+    static BOOL logged;
     if (!root || (GetWindowLongPtrW(root, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
     g_active = root;
-    if (fg == root) return;
-    if (fg) share_input_with(fg);   /* sharing the foreground's input lets it move */
-    SetForegroundWindow(root);
+    if (fg != root) {
+        if (fg) share_input_with(fg);   /* sharing the foreground's input lets it move */
+        SetForegroundWindow(root);
+        share_input_with(root);
+        BringWindowToTop(root);
+        SetActiveWindow(root);
+        if (!logged) {
+            logged = TRUE;
+            bs_log(GetForegroundWindow() == root ? "Input: windows can take the foreground."
+                                                 : "Input: SetForegroundWindow was refused.");
+        }
+    }
+    /* Windows that don't take focus on a click (consoles) still need it
+       for keys; the focus moves only if it isn't already inside. */
     share_input_with(root);
-    BringWindowToTop(root);
-    SetActiveWindow(root);
+    ZeroMemory(&gti, sizeof(gti));
+    gti.cbSize = sizeof(gti);
+    if (!GetGUIThreadInfo(GetWindowThreadProcessId(root, NULL), &gti) ||
+        !gti.hwndFocus || (gti.hwndFocus != root && !IsChild(root, gti.hwndFocus)))
+        SetFocus(root);
 }
 
 static HWND capture_of(HWND w, BOOL *menu)
@@ -321,9 +338,15 @@ static void mouse_move(int x, int y)
     HWND w, cap;
     BOOL menu;
     LRESULT hit;
+    static BOOL logged;
     g_mouse.x = x;
     g_mouse.y = y;
-    SetCursorPos(x, y);
+    /* Programs that ask where the pointer is (GetMessagePos: tree views,
+       MMC) need it really there, not only in the messages. */
+    if (!SetCursorPos(x, y) && !logged) {
+        logged = TRUE;
+        bs_log("Input: the pointer could not be moved (%lu).", GetLastError());
+    }
     pt = g_mouse;
     if (g_drag.hwnd) {
         drag_to(pt);
@@ -368,7 +391,14 @@ static void mouse_button(int b, BOOL down)
     if (!w) return;
     hit = hit_test(w, pt);
     if (down) {
+        static int logged;
         DWORD now = GetTickCount();
+        if (logged < 40) {   /* enough to see where clicks land */
+            wchar_t cls[64] = L"";
+            GetClassNameW(w, cls, _countof(cls));
+            bs_log("Click %d,%d: %ls (hit %Id).", pt.x, pt.y, cls, (INT_PTR)hit);
+            logged++;
+        }
         dbl = g_last_down.hwnd == w && g_last_down.button == b &&
               now - g_last_down.time <= GetDoubleClickTime() &&
               abs(pt.x - g_last_down.pt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) / 2 &&
@@ -433,6 +463,76 @@ static HWND key_window(void)
     return top;
 }
 
+/* Console windows ignore window messages for keys, so typing goes in as
+   console input: the shell attaches to the console (one at a time) and
+   writes key records, the way conhost would from a real keyboard. */
+static DWORD  g_console_pid;
+static HANDLE g_conin;
+
+static void leave_console(void)
+{
+    if (g_conin) CloseHandle(g_conin);
+    g_conin = NULL;
+    if (g_console_pid) FreeConsole();
+    g_console_pid = 0;
+}
+
+static BOOL console_key(HWND w, int vk, int scan, BOOL ext, BOOL up)
+{
+    wchar_t cls[32], ch[4];
+    DWORD pid = 0, st = 0, n;
+    INPUT_RECORD r;
+    HWND root = GetAncestor(w, GA_ROOT);
+    if (!root || !GetClassNameW(root, cls, _countof(cls)) || wcscmp(cls, L"ConsoleWindowClass") != 0)
+        return FALSE;
+    GetWindowThreadProcessId(root, &pid);   /* a console window reports a program using it */
+    if (pid != g_console_pid) {
+        static DWORD failed_pid;
+        leave_console();
+        FreeConsole();   /* AttachConsole refuses while attached to any console */
+        if (!pid || !AttachConsole(pid)) {
+            if (pid != failed_pid)
+                bs_log("Input: could not attach to the console of process %lu (%lu).", pid, GetLastError());
+            failed_pid = pid;
+            return TRUE;
+        }
+        SetConsoleCtrlHandler(NULL, TRUE);   /* a Ctrl+C sent below must not end Backstage */
+        g_console_pid = pid;
+        g_conin = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, 0, NULL);
+        if (g_conin == INVALID_HANDLE_VALUE) {
+            g_conin = NULL;
+            leave_console();
+            return TRUE;
+        }
+    }
+    /* Ctrl+C and Ctrl+Break are signals, not keys. */
+    if (!up && (g_keys[VK_CONTROL] & 0x80) && (vk == 'C' || vk == VK_CANCEL)) {
+        GenerateConsoleCtrlEvent(vk == 'C' ? CTRL_C_EVENT : CTRL_BREAK_EVENT, 0);
+        return TRUE;
+    }
+    if (g_keys[VK_SHIFT] & 0x80)    st |= SHIFT_PRESSED;
+    if (g_keys[VK_LCONTROL] & 0x80) st |= LEFT_CTRL_PRESSED;
+    if (g_keys[VK_RCONTROL] & 0x80) st |= RIGHT_CTRL_PRESSED;
+    if (g_keys[VK_LMENU] & 0x80)    st |= LEFT_ALT_PRESSED;
+    if (g_keys[VK_RMENU] & 0x80)    st |= RIGHT_ALT_PRESSED;
+    if (g_keys[VK_CAPITAL] & 1)     st |= CAPSLOCK_ON;
+    if (g_keys[VK_NUMLOCK] & 1)     st |= NUMLOCK_ON;
+    if (ext)                        st |= ENHANCED_KEY;
+    ZeroMemory(&r, sizeof(r));
+    r.EventType = KEY_EVENT;
+    r.Event.KeyEvent.bKeyDown = !up;
+    r.Event.KeyEvent.wRepeatCount = 1;
+    r.Event.KeyEvent.wVirtualKeyCode = (WORD)vk;
+    r.Event.KeyEvent.wVirtualScanCode = (WORD)(scan & 0xFF);
+    r.Event.KeyEvent.dwControlKeyState = st;
+    /* 4: leave dead-key state alone */
+    if (ToUnicodeEx((UINT)vk, (UINT)scan, g_keys, ch, _countof(ch), 4, GetKeyboardLayout(0)) == 1)
+        r.Event.KeyEvent.uChar.UnicodeChar = ch[0];
+    WriteConsoleInputW(g_conin, &r, 1, &n);
+    return TRUE;
+}
+
 static void key_event(int vk, int scan, int flags)
 {
     BOOL up = (flags & 1) != 0, ext = (flags & 2) != 0, was, alt, sys;
@@ -447,6 +547,7 @@ static void key_event(int vk, int scan, int flags)
     else if (vk == VK_CONTROL) g_keys[ext ? VK_RCONTROL : VK_LCONTROL] = held;
     else if (vk == VK_MENU) g_keys[ext ? VK_RMENU : VK_LMENU] = held;
     if ((w = key_window()) == NULL) return;
+    if (console_key(w, vk, scan, ext, up)) return;
     alt = (g_keys[VK_MENU] & 0x80) != 0 || vk == VK_MENU;
     sys = vk == VK_F10 || (alt && !(g_keys[VK_CONTROL] & 0x80));
     lp = 1 | ((LPARAM)(scan & 0xFF) << 16) | (ext ? (LPARAM)1 << 24 : 0) |
@@ -551,6 +652,7 @@ static DWORD WINAPI viewer_input_thread(LPVOID param)
         if (in.magic == BS_INPUT_MAGIC) inject(&in);
     }
     share_input_with(NULL);
+    leave_console();
     ZeroMemory(g_keys, sizeof(g_keys));
     g_drag.hwnd = NULL;
     InterlockedExchange(&v->closed, 1);
@@ -625,6 +727,12 @@ static void serve_viewer(AsbConn *conn)
             memcpy(prev + off, cur + off, bytes);
         }
         Sleep(BS_FRAME_MS);
+    }
+    if (g_exiting && !v.closed) {   /* tell the host window to close rather than start a new session */
+        BsFrameHeader end;
+        ZeroMemory(&end, sizeof(end));
+        end.magic = BS_END_MAGIC;
+        send_all(conn, &end, sizeof(end));
     }
     /* The input thread ends when the host closes its side. */
     if (input) {
@@ -1203,9 +1311,36 @@ static void register_class(const wchar_t *name, WNDPROC proc, HBRUSH background)
     RegisterClassExW(&wc);
 }
 
+/* Consoles started here must use the classic console window: the terminal
+   Windows would hand them to can't run in session 0, and only the classic
+   window takes posted keys. Applies to SYSTEM's consoles in this VM. */
+static void use_console_host(void)
+{
+    static const wchar_t conhost[] = L"{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}";
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Console\\%%Startup", L"DelegationConsole",
+                    REG_SZ, conhost, sizeof(conhost));
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Console\\%%Startup", L"DelegationTerminal",
+                    REG_SZ, conhost, sizeof(conhost));
+}
+
+/* Session 0 has no input desktop until one is chosen; without it the
+   pointer can't be placed and windows can't take the foreground. Nobody
+   sees session 0, so choosing ours affects no one. */
+static void become_input_desktop(void)
+{
+    HDESK desk;
+    BOOL ok;
+    if (g_session != 0) return;
+    desk = OpenDesktopW(L"Default", 0, FALSE, DESKTOP_SWITCHDESKTOP);
+    ok = desk && SwitchDesktop(desk);
+    bs_log(ok ? "This is now session 0's input desktop."
+              : "Could not make this session 0's input desktop (%lu).", GetLastError());
+    if (desk) CloseDesktop(desk);
+}
+
 static int run_shell(void)
 {
-    HANDLE running, thread;
+    HANDLE running, thread, stream;
     MSG msg;
 
     running = OpenMutexW(SYNCHRONIZE, FALSE, BACKSTAGE_RUNNING_MUTEX);
@@ -1218,9 +1353,11 @@ static int run_shell(void)
     g_desk = GetThreadDesktop(GetCurrentThreadId());
     bs_log("Backstage started in session %lu.", g_session);
     choose_screen_mode();
+    become_input_desktop();
 
     OleInitialize(NULL);
     ensure_profile_folders();
+    use_console_host();
     g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                          CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_font_bold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
@@ -1243,13 +1380,16 @@ static int run_shell(void)
         thread = CreateThread(NULL, 0, exit_watch_thread, NULL, 0, NULL);
         if (thread) CloseHandle(thread);
     }
-    thread = CreateThread(NULL, 0, stream_thread, NULL, 0, NULL);
-    if (thread) CloseHandle(thread);
+    stream = CreateThread(NULL, 0, stream_thread, NULL, 0, NULL);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (files_pretranslate(&msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+    if (stream) {   /* lets it tell the host window the session ended */
+        WaitForSingleObject(stream, 8000);
+        CloseHandle(stream);
     }
     OleUninitialize();
     if (running) CloseHandle(running);

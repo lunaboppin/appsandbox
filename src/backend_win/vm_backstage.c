@@ -49,6 +49,7 @@ typedef struct {
 #define BS_CHANNEL      8
 #define BS_FRAME_MAGIC  0x52465342u   /* "BSFR" */
 #define BS_INPUT_MAGIC  0x4E495342u   /* "BSIN" */
+#define BS_END_MAGIC    0x444E4542u   /* "BEND": the session ended (Exit Backstage) */
 #define BS_IN_MOVE      1
 #define BS_IN_BUTTON    2
 #define BS_IN_WHEEL     3
@@ -70,6 +71,7 @@ typedef struct BsView {
     HWND              hwnd;
     volatile LONG     refs;
     volatile BOOL     closing;
+    volatile BOOL     ended;     /* the guest said the session is over */
     CRITICAL_SECTION  cs;          /* pixels, size, sock */
     SOCKET            sock;
     BYTE             *pixels;
@@ -161,6 +163,10 @@ static void bs_receive(BsView *v, SOCKET s)
     BOOL first = TRUE;
     while (!v->closing && bs_recv_all(s, &hdr, sizeof(hdr))) {
         size_t bytes;
+        if (hdr.magic == BS_END_MAGIC) {
+            v->ended = TRUE;
+            break;
+        }
         if (hdr.magic != BS_FRAME_MAGIC || !hdr.width || !hdr.height ||
             hdr.width > BS_MAX_SIDE || hdr.height > BS_MAX_SIDE ||
             hdr.y >= hdr.height || hdr.rows == 0 || hdr.rows > hdr.height - hdr.y)
@@ -240,6 +246,11 @@ static DWORD WINAPI bs_net_thread(LPVOID param)
         v->sock = INVALID_SOCKET;
         LeaveCriticalSection(&v->cs);
         closesocket(s);
+        if (v->ended && !v->closing) {   /* Exit Backstage: close rather than start it again */
+            HWND hwnd = v->hwnd;
+            if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            break;
+        }
         if (!v->closing) {
             view_status(v, L"Disconnected; reconnecting...");
             Sleep(1000);
