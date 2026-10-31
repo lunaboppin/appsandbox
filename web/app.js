@@ -107,6 +107,9 @@ window.onHostMessage = function(msg) {
         case 'fullState':     onFullState(msg); break;
         case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); renderLab(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
+        case 'sandboxRequest': onSandboxRequest(msg); break;
+        case 'sandboxFinishPrompt': openSandboxFinish(msg.vmIndex); break;
+        case 'sandboxError': showAlertModal('Run in Sandbox', msg.message); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
@@ -1310,6 +1313,9 @@ function buildRowCells(vm, i, statusTd) {
 
 function renderVmTable() {
     var tbody = document.getElementById('vm-tbody');
+
+    renderSandboxRuns();
+    if (sandboxFiles.length) renderSandboxPicker();
 
     if (vms.length === 0) {
         rowCache = {};
@@ -2730,6 +2736,222 @@ function installUpdate() {
         : 'App Sandbox downloads version ' + s.version + size + ', verifies it, closes, installs it and reopens. A running shared appliance stops with it.';
     showModal('Install update', message, blockers.length ? 'Install After They Stop' : 'Install', { confirmClass: 'primary' })
         .then(function(ok) { if (ok) sendCmd('updateInstall'); });
+}
+
+/* ---- Run in Sandbox ---- */
+
+var sandboxFiles = [];          /* files waiting on the picker */
+var sandboxPicked = null;       /* name of the VM selected in the picker */
+var sandboxFinishVm = null;     /* name of the VM the finish dialog is about */
+var sandboxStoppedAsked = {};   /* run id -> already asked since the VM stopped */
+
+/* Types that only mean something on Windows, to warn before they land on Linux. */
+var SANDBOX_WINDOWS_ONLY = /\.(exe|msi|bat|cmd|com|scr|ps1|msix|appx|reg|lnk|dll)$/i;
+
+function showAlertModal(title, text) {
+    showModal(title, text, 'OK', { confirmClass: 'primary' });
+    document.getElementById('modal-cancel-btn').style.display = 'none';
+    /* Don't leave the single button behind for the next caller. */
+    pendingConfirm.resolve = function() {
+        document.getElementById('modal-cancel-btn').style.display = '';
+    };
+}
+
+function onSandboxRequest(msg) {
+    if (!sandboxFiles.some(function(f) { return f.path === msg.path; }))
+        sandboxFiles.push(msg);
+    renderSandboxPicker();
+    document.getElementById('sandbox-overlay').classList.add('active');
+}
+
+function sandboxDefaultVm() {
+    var usable = vms.filter(function(v) { return !v.runUnsuitable; });
+    var pick = usable.filter(function(v) { return v.sandboxLast; })[0];
+    /* Next best is one with nothing to interrupt, Windows first since most of what
+       gets right-clicked on a Windows host is for Windows. */
+    if (!pick) pick = usable.filter(function(v) { return !v.running && v.osType.toLowerCase().indexOf('win') === 0; })[0];
+    if (!pick) pick = usable.filter(function(v) { return !v.running; })[0];
+    if (!pick) pick = usable.filter(function(v) { return v.runActive; })[0];
+    return pick || usable[0] || null;
+}
+
+function renderSandboxPicker() {
+    if (!sandboxFiles.length) return;
+    var list = document.getElementById('sandbox-vm-list');
+    var notes = document.getElementById('sandbox-notes');
+    var buttons = document.getElementById('sandbox-buttons');
+    var fileLine = sandboxFiles[0].name;
+    if (sandboxFiles[0].sizeMb >= 1) fileLine += ' (' + sandboxFiles[0].sizeMb + ' MB)';
+    if (sandboxFiles.length > 1) fileLine += ' and ' + (sandboxFiles.length - 1) + ' more';
+    document.getElementById('sandbox-file').textContent = fileLine;
+
+    var usable = vms.filter(function(v) { return !v.runUnsuitable; });
+    if (!usable.some(function(v) { return v.name === sandboxPicked; })) {
+        var def = sandboxDefaultVm();
+        sandboxPicked = def ? def.name : null;
+    }
+
+    list.innerHTML = '';
+    vms.forEach(function(vm) {
+        var label = document.createElement('label');
+        label.className = 'sandbox-vm' + (vm.runUnsuitable ? ' unsuitable' : '');
+        var radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'sandbox-vm';
+        radio.disabled = !!vm.runUnsuitable;
+        radio.checked = vm.name === sandboxPicked;
+        radio.onchange = function() { sandboxPicked = vm.name; renderSandboxPicker(); };
+        var text = document.createElement('span');
+        text.textContent = vm.name + ' ';
+        var small = document.createElement('small');
+        small.textContent = vm.runUnsuitable ? vm.runUnsuitable
+            : vm.runActive ? 'Already in a run: the file joins it.'
+            : vm.running ? 'Running' : 'Stopped';
+        text.appendChild(small);
+        label.appendChild(radio);
+        label.appendChild(text);
+        list.appendChild(label);
+    });
+
+    buttons.innerHTML = '';
+    notes.innerHTML = '';
+    function button(text, cls, handler) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        if (cls) b.className = cls;
+        b.onclick = handler;
+        buttons.appendChild(b);
+    }
+    function note(text, warn) {
+        var p = document.createElement('p');
+        p.textContent = text;
+        if (warn) p.className = 'warn';
+        notes.appendChild(p);
+    }
+    button('Cancel', '', closeSandboxPicker);
+
+    var vm = vms.filter(function(v) { return v.name === sandboxPicked; })[0];
+    if (!vm) {
+        note(vms.length ? 'None of your VMs can take a file right now, for the reasons above.'
+                        : 'You don\'t have a VM to run this in yet.');
+        button('Create a VM', 'primary', function() { closeSandboxPicker(); openCreateModal(); });
+        return;
+    }
+
+    if (vm.osType.toLowerCase().indexOf('win') !== 0 &&
+        sandboxFiles.some(function(f) { return SANDBOX_WINDOWS_ONLY.test(f.name); }))
+        note('This is a Windows file type, and ' + vm.name + ' runs Linux. It will be copied in but probably won\'t open.', true);
+    if (vm.networkMode !== 0)
+        note('The file can use this VM\'s network access while it runs.');
+    note('Rolling back covers this VM\'s own disk. Anything it writes to shared drives or sends over the network stays.');
+    if (vm.disposable)
+        note('This VM is disposable, so its next normal start replaces whatever you keep from this run.');
+
+    if (vm.runActive) {
+        button('Add to this run', 'primary', function() { startSandboxRun('checkpoint'); });
+    } else if (vm.running) {
+        note(vm.name + ' is running, and a checkpoint needs it off. Shutting it down closes its apps: save your work there first. ' +
+             'Opening without a checkpoint leaves it running, but nothing the file does can be rolled back.', true);
+        button('Open without checkpoint', 'danger', function() { startSandboxRun('no-checkpoint'); });
+        button('Shut down and checkpoint', 'primary', function() { startSandboxRun('shutdown-first'); });
+    } else {
+        button('Run', 'primary', function() { startSandboxRun('checkpoint'); });
+    }
+}
+
+function startSandboxRun(mode) {
+    var idx = vms.findIndex(function(v) { return v.name === sandboxPicked; });
+    if (idx < 0) return;
+    sandboxFiles.forEach(function(f) {
+        sendCmd('sandboxRun', { vmIndex: idx, path: f.path, mode: mode });
+    });
+    closeSandboxPicker();
+}
+
+function closeSandboxPicker() {
+    sandboxFiles = [];
+    sandboxPicked = null;
+    document.getElementById('sandbox-overlay').classList.remove('active');
+}
+
+function renderSandboxRuns() {
+    var host = document.getElementById('sandbox-runs');
+    if (!host) return;
+    host.innerHTML = '';
+    vms.forEach(function(vm, idx) {
+        /* Stopped with a run open: from a shutdown inside the guest, or from before the
+           app last closed. Ask once per stop, and leave the banner for later. */
+        if (vm.runActive && vm.running) delete sandboxStoppedAsked[vm.runId];
+        if (vm.runActive && !vm.running && !vm.runBusy && !sandboxStoppedAsked[vm.runId]) {
+            sandboxStoppedAsked[vm.runId] = true;
+            openSandboxFinish(idx);
+        }
+        if (!vm.runActive && !vm.runBusy && !vm.runMessage) return;
+
+        var box = document.createElement('div');
+        box.className = 'sandbox-run' + (vm.runPhase === 9 ? ' failed' : '');
+        var text = document.createElement('div');
+        text.className = 'sandbox-run-text';
+        text.textContent = vm.name + (vm.runFile ? ': ' + vm.runFile : '');
+        var small = document.createElement('small');
+        small.textContent = vm.runMessage ||
+            (vm.runActive ? 'This run is still open. Its changes are kept until you finish it.' : '');
+        text.appendChild(small);
+        if (vm.runGuestPath) {
+            var where = document.createElement('small');
+            where.textContent = 'In the VM: ' + vm.runGuestPath;
+            text.appendChild(where);
+        }
+        box.appendChild(text);
+        if (vm.runBusy && vm.runPhase === 5) {
+            var bar = document.createElement('progress');
+            bar.max = 100;
+            bar.value = vm.runPct;
+            box.appendChild(bar);
+        }
+        function action(label, handler, cls) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            if (cls) b.className = cls;
+            b.onclick = handler;
+            box.appendChild(b);
+        }
+        if (vm.running)
+            action('Open display', function() { sendCmd('connectIddVm', { vmIndex: idx }); });
+        if (vm.runActive && !vm.runBusy)
+            action('Finish...', function() { openSandboxFinish(idx); }, 'primary');
+        if (!vm.runActive && !vm.runBusy)
+            action('Dismiss', function() { sendCmd('sandboxDismiss', { vmIndex: idx }); });
+        host.appendChild(box);
+    });
+}
+
+function openSandboxFinish(idx) {
+    var vm = vms[idx];
+    if (!vm || !vm.runActive) return;
+    sandboxFinishVm = vm.name;
+    document.getElementById('sandbox-finish-title').textContent = 'Finish the run on ' + vm.name + '?';
+    document.getElementById('sandbox-finish-text').textContent =
+        (vm.runFile ? vm.runFile + ' was opened on a throwaway checkpoint. ' : '') +
+        'Discarding rolls ' + vm.name + ' back to before the run: everything changed since is deleted' +
+        (vm.running ? ' and the VM stops at once, without saving' : '') + '. ' +
+        'Keeping merges the changes into its disk' +
+        (vm.running ? ' after shutting it down cleanly' : '') + '. ' +
+        'Not yet leaves the run open.';
+    document.getElementById('sandbox-finish-overlay').classList.add('active');
+}
+
+function closeSandboxFinish() {
+    sandboxFinishVm = null;
+    document.getElementById('sandbox-finish-overlay').classList.remove('active');
+}
+
+function finishSandbox(keep) {
+    var idx = vms.findIndex(function(v) { return v.name === sandboxFinishVm; });
+    closeSandboxFinish();
+    if (idx >= 0) sendCmd('sandboxFinish', { vmIndex: idx, keep: keep });
 }
 
 function showModal(title, message, confirmText, opts) {

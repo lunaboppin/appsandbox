@@ -181,6 +181,8 @@ gpuMode, networkMode, displayOpen, displayView`.
 | `shutdown(name)` | graceful ACPI power-off |
 | `stop(name)` | force power-off (pull the plug) |
 | `delete_vm(name)` | remove the VM and its disk (refused 409 while building) |
+| `run_in_sandbox(name, path, mode="checkpoint")` | copy a host file into the VM and open it, on a throwaway checkpoint. Watch `status(name)["sandboxRun"]`. A running VM answers 409 `vm_running` and is left alone unless `mode` is `"shutdown-first"` or `"no-checkpoint"` (which can't be rolled back) |
+| `finish_run(name, action)` | end a run: `"discard"` force-stops the VM and rolls it back, `"keep"` shuts it down and merges the changes. Nothing rolls back without this call |
 | `delete_template(name)` | remove a template |
 | `shutdown_daemon(force=False)` | stop the daemon (refused 409 if VMs are active unless `force=True`) |
 

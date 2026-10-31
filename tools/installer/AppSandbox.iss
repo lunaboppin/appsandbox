@@ -101,6 +101,16 @@ Source: "..\..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autoprograms}\App Sandbox"; Filename: "{app}\AppSandbox.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\App Sandbox"; Filename: "{app}\AppSandbox.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
+[Registry]
+; Explorer's right-click entry, for every file type. On Windows 11 it sits under "Show more
+; options": the short menu only takes packaged extensions. The launcher runs unelevated, so
+; the entry raises no UAC prompt while the app is open. HKA follows the install mode, and an
+; upgrade rewrites the same key with the current folder.
+Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox"; ValueType: string; ValueName: ""; ValueData: "Run in Sandbox"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\AppSandbox.exe,0"
+Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Document"
+Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox\command"; ValueType: string; ValueName: ""; ValueData: """{app}\appsandbox-run.exe"" ""%1"""
+
 [Run]
 ; An update reopens the app from DeinitializeSetup instead, so that it comes back
 ; even if the update failed.

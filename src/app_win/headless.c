@@ -30,6 +30,7 @@
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
+#include "sandbox_run.h"
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_stream.h"
@@ -283,6 +284,22 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->install_status);
     pos += sprintf_s(out + pos, cap - pos, ",\"storageRoot\":");
     pos = append_wstr(out, cap, pos, v->storage_root);
+    /* null when nothing is going on, so a client can test it plainly. */
+    if (v->sandbox_run_id[0] || v->sandbox_message[0] || v->sandbox_worker) {
+        static const char *const phases[] = { "idle", "shutting-down", "checkpoint", "starting",
+            "waiting-guest", "copying", "opening", "ready", "finishing", "failed" };
+        int phase = v->sandbox_phase >= 0 && v->sandbox_phase < 10 ? v->sandbox_phase : 0;
+        pos += sprintf_s(out + pos, cap - pos, ",\"sandboxRun\":{\"active\":%s,\"busy\":%s,\"phase\":\"%s\",\"percent\":%d,\"file\":",
+            v->sandbox_run_id[0] ? "true" : "false", v->sandbox_worker ? "true" : "false", phases[phase], v->sandbox_pct);
+        pos  = append_wstr(out, cap, pos, v->sandbox_run_file);
+        pos += sprintf_s(out + pos, cap - pos, ",\"message\":");
+        pos  = append_wstr(out, cap, pos, v->sandbox_message);
+        pos += sprintf_s(out + pos, cap - pos, ",\"guestPath\":");
+        pos  = append_wstr(out, cap, pos, v->sandbox_guest_path);
+        pos += sprintf_s(out + pos, cap - pos, "}");
+    } else {
+        pos += sprintf_s(out + pos, cap - pos, ",\"sandboxRun\":null");
+    }
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
@@ -642,7 +659,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"streaming\":true,\"browserAccess\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"streaming\":true,\"browserAccess\":true,\"runInSandbox\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -1015,6 +1032,47 @@ static int handle_request(PHTTP_REQUEST req)
                              "shared-storage appliance is unavailable; retry or set allowMissingSharedResources=true");
                 else send_hr(req->RequestId, "start", nu, start_hr);
             }
+            return 0;
+        }
+        if (verb == HttpVerbPOST && wcscmp(sub, L"run-in-sandbox") == 0) {
+            /* {"path":"C:\\x.exe","mode":"checkpoint"|"shutdown-first"|"no-checkpoint"}. The
+               caller watches sandboxRun on the VM; 409 vm_running touches nothing. */
+            static wchar_t rb_body[8192], rb_path[4096];
+            wchar_t mode[24] = L"checkpoint", error[256] = L"";
+            char message[512];
+            AsbRunMode m;
+            HRESULT hr;
+            rb_path[0] = 0;
+            body_to_wide(req, rb_body, _countof(rb_body));
+            json_get_string(rb_body, L"path", rb_path, _countof(rb_path));
+            json_get_string(rb_body, L"mode", mode, _countof(mode));
+            if (wcscmp(mode, L"checkpoint") == 0) m = ASB_RUN_MODE_CHECKPOINT;
+            else if (wcscmp(mode, L"shutdown-first") == 0) m = ASB_RUN_MODE_SHUTDOWN_FIRST;
+            else if (wcscmp(mode, L"no-checkpoint") == 0) m = ASB_RUN_MODE_NO_CHECKPOINT;
+            else { send_err(req->RequestId, 400, "Bad Request", "bad_mode", "mode must be checkpoint, shutdown-first or no-checkpoint"); return 0; }
+            hr = asb_run_file(vm, rb_path, m, error, _countof(error));
+            if (SUCCEEDED(hr)) { send_hr(req->RequestId, "run-in-sandbox", nu, hr); return 0; }
+            WideCharToMultiByte(CP_UTF8, 0, error[0] ? error : L"could not run this file", -1, message, sizeof(message), NULL, NULL);
+            if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) send_err(req->RequestId, 409, "Conflict", "vm_running", message);
+            else if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) send_err(req->RequestId, 409, "Conflict", "vm_unsuitable", message);
+            else send_err(req->RequestId, 400, "Bad Request", "bad_file", message);
+            return 0;
+        }
+        if (verb == HttpVerbPOST && wcscmp(sub, L"run-in-sandbox/finish") == 0) {
+            /* {"action":"keep"|"discard"}, required: never guess at throwing work away. */
+            wchar_t fin_body[256], action[16] = L"", error[256] = L"";
+            char message[512];
+            HRESULT hr;
+            body_to_wide(req, fin_body, _countof(fin_body));
+            json_get_string(fin_body, L"action", action, _countof(action));
+            if (wcscmp(action, L"keep") != 0 && wcscmp(action, L"discard") != 0) {
+                send_err(req->RequestId, 400, "Bad Request", "bad_action", "action must be keep or discard");
+                return 0;
+            }
+            hr = asb_run_finish(vm, wcscmp(action, L"keep") == 0, error, _countof(error));
+            if (SUCCEEDED(hr)) { send_hr(req->RequestId, "run-in-sandbox/finish", nu, hr); return 0; }
+            WideCharToMultiByte(CP_UTF8, 0, error[0] ? error : L"could not finish the run", -1, message, sizeof(message), NULL, NULL);
+            send_err(req->RequestId, 409, "Conflict", hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) ? "no_run" : "run_busy", message);
             return 0;
         }
         if (verb == HttpVerbPOST && wcscmp(sub, L"shutdown") == 0)

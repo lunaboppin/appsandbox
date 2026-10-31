@@ -104,6 +104,13 @@ class Client:
     def shutdown(self, name): return self._req("POST", "/vms/%s/shutdown" % name)   # graceful
     def stop(self, name):     return self._req("POST", "/vms/%s/stop" % name)       # force
     def delete_vm(self, name):return self._req("POST", "/vms/%s/delete" % name)
+    def run_in_sandbox(self, name, path, mode="checkpoint"):
+        """Copy a host file into the VM and open it. Watch status(name)["sandboxRun"].
+        mode: "checkpoint" (409 vm_running if the VM is on), "shutdown-first" or "no-checkpoint"."""
+        return self._req("POST", "/vms/%s/run-in-sandbox" % name, {"path": path, "mode": mode})
+    def finish_run(self, name, action):
+        """End a run: action is "discard" (roll back) or "keep" (merge the changes)."""
+        return self._req("POST", "/vms/%s/run-in-sandbox/finish" % name, {"action": action})
 
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,

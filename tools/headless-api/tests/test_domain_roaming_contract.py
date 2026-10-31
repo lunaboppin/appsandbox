@@ -66,8 +66,9 @@ def main() -> None:
     # Disposable VMs
     start = core[core.index("ASB_API HRESULT asb_vm_start_ex("):]
     start = start[:start.index("/* Switch to snapshot/base branch before booting */")]
-    assert "if (inst->disposable_snap[0] && snap_idx == -1) {" in start
-    assert start.index("snapshot_new_branch(tree, inst, node)") < start.index("snapshot_delete_branch(tree, inst, node, i)")
+    assert "if (inst->disposable_snap[0] && snap_idx == -1" in start and "asb_disposable_new_session(vm)" in start
+    session = core[core.index("HRESULT asb_disposable_new_session("):]
+    assert session.index("snapshot_new_branch(tree, inst, node)") < session.index("snapshot_delete_branch(tree, inst, node, i)")
     assert 'asb_snap_take(vm, L"Disposable clean state")' in core
     assert 'fwprintf(f, L"DisposableSnap=%s\\nDisposableBranch=%s\\n",' in core
     assert 'wcscmp(action, L"setVmDisposable") == 0' in ui

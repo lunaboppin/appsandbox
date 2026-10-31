@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include "p9copy.h"
 #include "lab_recorder.h"
+#include "file_drop.h"
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -4613,6 +4614,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start audio capture monitor (SYSTEM, :0004) */
     start_audio_monitor();
 
+    /* Run in Sandbox: files the host copies in (:0010) */
+    file_drop_start(p9copy_log, g_stop_event);
+
     set_service_status(SERVICE_RUNNING, 0);
     /* Stamp the build into the guest log. Without it there is no way to tell,
        from the log alone, whether the VM is running the agent you just built
@@ -4782,6 +4786,8 @@ int main(int argc, char *argv[])
             return remove_service();
         if (strcmp(argv[1], "--refresh-drive") == 0 && argc == 3)
             return refresh_drive_shell(argv[2]);
+        if (strcmp(argv[1], "--open-file") == 0)
+            return file_drop_open_main();
         printf("Usage: appsandbox-agent.exe [--install | --remove | --refresh-drive X]\n");
         return 1;
     }
