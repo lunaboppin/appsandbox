@@ -101,6 +101,8 @@ if RUN_STATIC:
     results["idd_game_mode"] = [] if p.returncode == 0 else ["test_idd_game_mode_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_idd_nv12_contract.py")], cwd=HERE)
     results["idd_nv12"] = [] if p.returncode == 0 else ["test_idd_nv12_contract.py exit %d" % p.returncode]
+    p = subprocess.run([sys.executable, os.path.join(HERE, "test_idd_any_size_contract.py")], cwd=HERE)
+    results["idd_any_size"] = [] if p.returncode == 0 else ["test_idd_any_size_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_clean_taskbar_contract.py")], cwd=HERE)
     results["clean_taskbar"] = [] if p.returncode == 0 else ["test_clean_taskbar_contract.py exit %d" % p.returncode]
     p = subprocess.run([sys.executable, os.path.join(HERE, "test_secure_boot_setting_contract.py")], cwd=HERE)

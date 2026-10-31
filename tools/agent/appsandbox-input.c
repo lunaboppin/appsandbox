@@ -108,18 +108,23 @@ static void follow_input_desktop(void)
    another display attached (the Hyper-V basic adapter, say) that monitor may
    not be the primary one or sit at the desktop origin, so positions are
    placed inside its own rectangle of the virtual desktop. Looked up again
-   every second so layout changes are followed. */
+   every second so layout changes are followed, and at once when the desktop
+   changes size, so a resized display never clamps to its old rectangle. */
 static RECT  g_vdd_rect;
 static BOOL  g_vdd_found;
 static DWORD g_vdd_checked_tick;
+static LONG  g_vdd_checked_w, g_vdd_checked_h;
 
-static void find_vdd_monitor(void)
+static void find_vdd_monitor(LONG virtual_w, LONG virtual_h)
 {
     DISPLAY_DEVICEW dd;
     DEVMODEW dm;
     DWORD i, now = GetTickCount();
-    if (g_vdd_checked_tick && now - g_vdd_checked_tick < 1000) return;
+    if (g_vdd_checked_tick && now - g_vdd_checked_tick < 1000 &&
+        virtual_w == g_vdd_checked_w && virtual_h == g_vdd_checked_h) return;
     g_vdd_checked_tick = now;
+    g_vdd_checked_w = virtual_w;
+    g_vdd_checked_h = virtual_h;
     g_vdd_found = FALSE;
     for (i = 0; ; i++) {
         ZeroMemory(&dd, sizeof(dd));
@@ -155,7 +160,7 @@ static void inject_input(const InputPacket *pkt)
         LONG vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         LONG vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         LONG x = (LONG)pkt->param1, y = (LONG)pkt->param2;
-        find_vdd_monitor();
+        find_vdd_monitor(vw, vh);
         if (g_vdd_found) {
             x += g_vdd_rect.left;
             y += g_vdd_rect.top;
@@ -302,6 +307,11 @@ static void handle_conn(AsbConn *c)
 int main(void)
 {
     AsbListener *l;
+
+    /* Host mouse positions are real pixels. A larger display can come up scaled
+       (Windows picks the scale from size), and without this the metrics above
+       would be in scaled units while the monitor rectangle stays in pixels. */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     input_log("Starting (PID=%lu, session=%lu).",
               GetCurrentProcessId(),

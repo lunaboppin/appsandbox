@@ -6,11 +6,11 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
+    AppSandbox Virtual Display Driver - Single monitor of any size with
     direct HvSocket frame transport to the host (no agent middleman).
 
-    Single fixed-resolution monitor with framebuffer readback sent directly
-    over Hyper-V sockets.
+    The monitor offers one mode, the size the host's display window asks for,
+    with framebuffer readback sent directly over Hyper-V sockets.
 
 Environment:
 
@@ -38,12 +38,19 @@ Environment:
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
-#define VDD_WIDTH            1920
-#define VDD_HEIGHT           1080
+#define VDD_DEFAULT_WIDTH    1920       /* until the host asks for a size */
+#define VDD_DEFAULT_HEIGHT   1080
 #define VDD_BPP              4          /* BGRA 8-bit */
-#define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
-#define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
+
+/* Limits on a requested size; the host clamps to the same ones (IDD_* in
+   vm_display_idd.c). Below 640x480 Windows doesn't offer a mode. The upper
+   limit is what a frame may cost, not what IddCx can do: per-frame buffers
+   here and on the host (133 MB of BGRA) and the link's throughput. */
+#define VDD_MIN_WIDTH        640
+#define VDD_MIN_HEIGHT       480
+#define VDD_MAX_SIDE         8192
+#define VDD_MAX_PIXELS       (7680u * 4320u)
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -51,10 +58,13 @@ Environment:
  * ============================================================================ */
 #define VDD_FRAME_MAGIC     0x52465341  /* "ASFR" little-endian */
 /* Same header, full frame as NV12 (Y plane then interleaved UV, full-range
-   BT.601, stride = width). Sent for frames where most of the screen changed:
-   2.7x fewer bytes than BGRA, which keeps games near 60 fps over the link. */
+   BT.601). Sent for frames where most of the screen changed: 2.7x fewer bytes
+   than BGRA, which keeps games near 60 fps over the link. NV12 needs even
+   planes, so an odd size is padded up by repeating its last column or row:
+   stride = width rounded up to even, and the host crops the padding off. */
 #define VDD_FRAME_NV12_MAGIC 0x3231564E  /* "NV12" little-endian */
-#define VDD_NV12_BYTES      (VDD_WIDTH * VDD_HEIGHT * 3 / 2)
+#define VDD_ALIGN2(n)       (((n) + 1) & ~1u)
+#define VDD_NV12_BYTES(w, h) (VDD_ALIGN2(w) * VDD_ALIGN2(h) * 3 / 2)
 /* Dirty area (percent of the frame) from which a frame goes as NV12. */
 #define VDD_NV12_AREA_PCT   40
 
@@ -87,32 +97,17 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
     UINT32  cursor_type;        /* 1=MASKED_COLOR, 2=ALPHA */
     UINT32  shape_data_size;    /* bytes of shape data following header (0 if !shape_updated) */
 } VDD_WIRE_CURSOR_HEADER;
+
+/* Wire protocol: ASRZ mode request, the one message the host sends this way on
+ * the frame connection. Must match RESIZE_MAGIC in vm_display_idd.c */
+#define VDD_RESIZE_MAGIC    0x5A525341  /* "ASRZ" little-endian */
+
+typedef struct _VDD_WIRE_RESIZE {
+    UINT32  magic;              /* VDD_RESIZE_MAGIC */
+    UINT32  width;
+    UINT32  height;
+} VDD_WIRE_RESIZE;
 #pragma pack(pop)
-
-/* ============================================================================
- *  Supported resolutions and refresh rates (single mode for this driver)
- * ============================================================================ */
-struct ResolutionEntry {
-    UINT width;
-    UINT height;
-};
-
-static const ResolutionEntry g_SupportedResolutions[] = {
-    { 1920, 1080 },
-};
-
-static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
-
-struct RefreshRateEntry {
-    UINT numerator;
-    UINT denominator;
-};
-
-static const RefreshRateEntry g_SupportedRefreshRates[] = {
-    { 60, 1 },
-};
-
-static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
 
 /* ============================================================================
  *  EDID - 128-byte block
@@ -120,6 +115,10 @@ static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
  *  Manufacturer: "ASB" (AppSandBox)
  *  Descriptor:   1920x1080 @ 60 Hz, 8-bit
  *  Checksum byte 127 is a placeholder - patched at runtime.
+ *
+ *  It identifies the monitor and never changes, so Windows keeps treating it
+ *  as the same monitor (scale, window positions) at every size. The modes come
+ *  from VddParseMonitorDescription2, not from this descriptor.
  * ============================================================================ */
 static const BYTE VDD_EDID[] = {
     /* Header (bytes 0-7) */
@@ -186,7 +185,10 @@ static const BYTE VDD_EDID[] = {
 /* ============================================================================
  *  Swap chain processor state (heap-allocated per AssignSwapChain)
  * ============================================================================ */
+typedef struct _VDD_DEVICE_CONTEXT VDD_DEVICE_CONTEXT;
+
 typedef struct _VDD_SWAP_PROC {
+    VDD_DEVICE_CONTEXT* pCtx;
     IDDCX_SWAPCHAIN     hSwapChain;
     HANDLE              hAvailableEvent;    /* from pInArgs->hNextSurfaceAvailable */
     HANDLE              hTerminateEvent;
@@ -200,6 +202,8 @@ typedef struct _VDD_SWAP_PROC {
 
     /* Staging texture for CPU readback (owned, per-swap-chain) */
     ID3D11Texture2D*    pStagingTex;
+    UINT                width;              /* size of pStagingTex and of the frames sent */
+    UINT                height;
 
     /* Host connection via asb_transport — AF_HYPERV HvSocket on a Windows host, ivshmem stream
        slot on a macOS host. One emit path, two backends. */
@@ -209,6 +213,8 @@ typedef struct _VDD_SWAP_PROC {
     volatile BOOL       bStopNetwork;
     UINT64              frameSeq;
     PBYTE               pSendBuf;           /* one packed frame: header, rects, size, pixels */
+    VDD_WIRE_RESIZE     resizeMsg;          /* mode request being read from the host */
+    UINT                resizeMsgLen;
 
     /* Sender thread: sends one packed frame while the swap chain thread reads
        back and packs the next, so the two stages overlap instead of adding up.
@@ -236,7 +242,13 @@ typedef struct _VDD_SWAP_PROC {
 /* ============================================================================
  *  Device context (heap-allocated, stored via IndirectDeviceContextWrapper)
  * ============================================================================ */
-typedef struct _VDD_DEVICE_CONTEXT {
+typedef enum _VDD_MODE_STATE {
+    VDD_MODE_IDLE,                          /* the monitor has the size in force */
+    VDD_MODE_DEPARTED,                      /* departed, waiting for its swap chain to go */
+    VDD_MODE_WAIT_ASSIGN,                   /* arrived at the new size, waiting for a swap chain */
+} VDD_MODE_STATE;
+
+struct _VDD_DEVICE_CONTEXT {
     WDFDEVICE           wdfDevice;
     IDDCX_ADAPTER       hAdapter;
     IDDCX_MONITOR       hMonitor;
@@ -249,16 +261,33 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
 
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
-    UINT                modeCount;
+    /* Mode changes. Windows offers the intersection of the monitor's modes and
+       the target modes, and the monitor's modes are read when it arrives, so a
+       size it didn't arrive with can't be added by IddCxMonitorUpdateModes2.
+       The monitor departs and arrives again offering only the requested size,
+       which also leaves Windows nothing else to choose, at the sign-in screen
+       as much as on a desktop. All of it runs on hModeTimer, a WDF timer like
+       hRecoveryTimer, so only one step ever runs at a time. */
+    WDFTIMER            hModeTimer;
+    VDD_MODE_STATE      modeState;
+    ULONGLONG           modeDeadline;       /* GetTickCount64 when the current wait gives up */
+    volatile LONG64     wantedMode;         /* requested size: width << 32 | height */
+    UINT                goodWidth;          /* last size a swap chain arrived at */
+    UINT                goodHeight;
+    GUID                containerId;        /* the same across arrivals */
+    BOOL                hasContainerId;
+    /* The frame connection outlives a mode change: the old swap chain's teardown
+       parks it here for the next one, so the host sees frames of the new size
+       on the connection it already has. */
+    volatile BOOL       bReplugging;
+    AsbConn * volatile  hCarriedConn;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.
        Uses a WDF timer so the callback runs on a proper WDF thread
        (IddCx APIs crash when called from raw CreateThread threads). */
     WDFTIMER            hRecoveryTimer;
-} VDD_DEVICE_CONTEXT;
+};
 
 /* ============================================================================
  *  WDF Context Wrappers
