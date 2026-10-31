@@ -15,6 +15,11 @@
  * the secondary one. Prints "unchanged", "no appsandbox display",
  * "applied: N other display(s) off" or "error ...".
  *
+ * --stream-prep: run by Sunshine before a stream. Asks the display driver for
+ * the size in SUNSHINE_CLIENT_WIDTH/HEIGHT and waits for it to appear, so capture
+ * starts at the client's size. Always exits 0, because a failure here would stop
+ * the stream, and the picture is only scaled if the size doesn't change.
+ *
  * Must be launched in the interactive session (WinSta0\Default) so that
  * EnumDisplayDevices / EnumDisplaySettings see all displays.
  */
@@ -25,6 +30,7 @@
 #include <string.h>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 static BOOL is_appsandbox_display(const wchar_t *gdi_name)
 {
@@ -96,6 +102,49 @@ static int only_appsandbox(void)
     return rc == ERROR_SUCCESS ? 0 : 1;
 }
 
+static int stream_prep(void)
+{
+    char sw[16], sh[16];
+    DWORD w, h, value, tick;
+    BOOL asked = FALSE;
+    HKEY key;
+    DEVMODEW dm;
+    if (!GetEnvironmentVariableA("SUNSHINE_CLIENT_WIDTH", sw, sizeof(sw)) ||
+        !GetEnvironmentVariableA("SUNSHINE_CLIENT_HEIGHT", sh, sizeof(sh)))
+        return 0;
+    w = (DWORD)atoi(sw);
+    h = (DWORD)atoi(sh);
+    if (w < 640 || h < 480 || w > 8192 || h > 8192) return 0;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\AppSandbox\\Display", 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+        return 0;
+    value = (w << 16) | h;
+    /* Writing the same data again doesn't notify, and the driver has to hear every request. */
+    RegDeleteValueW(key, L"StreamMode");
+    RegSetValueExW(key, L"StreamMode", 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+    RegCloseKey(key);
+    tick = GetTickCount();
+    while (GetTickCount() - tick < 10000) {
+        memset(&dm, 0, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmPelsWidth == w && dm.dmPelsHeight == h) {
+            Sleep(500);   /* the monitor just arrived: let the desktop settle */
+            break;
+        }
+        /* Windows can keep the desktop size it saved for this monitor and scale it. */
+        if (!asked && GetTickCount() - tick > 2500) {
+            asked = TRUE;
+            dm.dmPelsWidth = w;
+            dm.dmPelsHeight = h;
+            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            ChangeDisplaySettingsExW(NULL, &dm, NULL, CDS_UPDATEREGISTRY, NULL);
+        }
+        Sleep(200);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     DISPLAY_DEVICEW dd;
@@ -107,6 +156,8 @@ int main(int argc, char **argv)
 
     if (argc > 1 && strcmp(argv[1], "--only-appsandbox") == 0)
         return only_appsandbox();
+    if (argc > 1 && strcmp(argv[1], "--stream-prep") == 0)
+        return stream_prep();
 
     buf[0] = '\0';
 

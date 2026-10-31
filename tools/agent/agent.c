@@ -2468,6 +2468,259 @@ static void run_domain_script(const char *script, DWORD timeout_ms,
     free(out);
 }
 
+/* ---- Streaming (Sunshine) ----
+
+   Sunshine is GPL-3, so App Sandbox doesn't ship it: when the host turns the option
+   on, the official release is downloaded into the VM and checked against the hash
+   pinned here before it runs. Everything runs as SYSTEM.
+
+   stream_setup:<port>:<auto|software>:<allowed client>:<name> queues a background
+   setup and says "ok"; stream_status reports progress and which encoders Sunshine
+   found. The host sends setup at every agent start, so a port change or a new GPU
+   driver takes effect and an install cut short by a reboot finishes. The web UI
+   stays on localhost with a random password that only these scripts use. */
+#define STREAM_SUNSHINE_VER  "2026.914.233613"
+#define STREAM_SUNSHINE_URL  "https://github.com/LizardByte/Sunshine/releases/download/v2026.914.233613/Sunshine-Windows-AMD64-installer.msi"
+#define STREAM_SUNSHINE_SHA  "1D7FED8BEECD5889DC7FF14CF9F42D6D38F37C3066C13C6C2A5F4E91847E0CCF"
+#define STREAM_VIGEM_URL     "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe"
+#define STREAM_VIGEM_SHA     "89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A"
+#define STREAM_SETUP         L"C:\\ProgramData\\AppSandbox\\stream-setup.ps1"
+
+static const char stream_common_ps[] =
+    "$ErrorActionPreference='Stop'\r\n"
+    "$ProgressPreference='SilentlyContinue'\r\n"
+    "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12\r\n"
+    "$dir='C:\\ProgramData\\AppSandbox\\stream'\r\n"
+    "$root=Join-Path $env:ProgramFiles 'Sunshine'\r\n"
+    "$exe=Join-Path $root 'sunshine.exe'\r\n"
+    "$cfg=Join-Path $root 'config\\sunshine.conf'\r\n"
+    "$creds=Join-Path $dir 'webui.txt'\r\n"
+    "$statusFile=Join-Path $dir 'status.txt'\r\n"
+    "function WebUi($path,$body){\r\n"
+    /* Compiled: a script block has no runspace on the thread that does the handshake. */
+    " if(-not ('AsbTrust' -as [type])){ Add-Type 'public static class AsbTrust{public static void On(){System.Net.ServicePointManager.ServerCertificateValidationCallback=delegate{return true;};}}' }\r\n"
+    " [AsbTrust]::On()\r\n"
+    " $p=(Get-Content $creds -Raw).Trim()\r\n"
+    " $auth=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('asb:'+$p))\r\n"
+    " $port=[int]((Select-String -Path $cfg -Pattern '^port = (\\d+)').Matches[0].Groups[1].Value)+1\r\n"
+    " $a=@{Uri=\"https://localhost:$port$path\";Headers=@{Authorization=\"Basic $auth\"};UseBasicParsing=$true;TimeoutSec=20}\r\n"
+    " if($null -ne $body){ $a.Method='Post'; $a.ContentType='application/json'; $a.Body=($body|ConvertTo-Json -Compress) }\r\n"
+    " Invoke-RestMethod @a\r\n"
+    "}\r\n";
+
+static const char stream_setup_ps[] =
+    "New-Item -ItemType Directory -Force $dir | Out-Null\r\n"
+    "& icacls $dir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\\Administrators:(OI)(CI)F' | Out-Null\r\n"
+    "function Status($phase,$detail){ Set-Content -Path $statusFile -Value ($phase+'|'+$detail) -Encoding ascii }\r\n"
+    "function Fetch($url,$sha,$file){\r\n"
+    " $f=Join-Path $dir $file\r\n"
+    " if(-not ((Test-Path $f) -and (Get-FileHash $f -Algorithm SHA256).Hash -eq $sha)){\r\n"
+    "  Invoke-WebRequest -Uri $url -OutFile $f -UseBasicParsing\r\n"
+    "  $h=(Get-FileHash $f -Algorithm SHA256).Hash\r\n"
+    "  if($h -ne $sha){ Remove-Item $f -Force; throw \"$file failed its hash check (got $h)\" }\r\n"
+    " }\r\n"
+    " return $f\r\n"
+    "}\r\n"
+    "try {\r\n"
+    " $installed=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Sunshine' }).DisplayVersion\r\n"
+    " if($installed -ne $version -or -not (Test-Path $exe)){\r\n"
+    "  Status 'downloading' \"Sunshine $version\"\r\n"
+    "  $msi=Fetch $sunshineUrl $sunshineSha 'sunshine.msi'\r\n"
+    "  Status 'installing' \"Sunshine $version\"\r\n"
+    "  $p=Start-Process msiexec.exe -ArgumentList '/i',('\"'+$msi+'\"'),'/qn','/norestart' -Wait -PassThru\r\n"
+    "  if($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010){ throw \"the Sunshine installer failed with code $($p.ExitCode)\" }\r\n"
+    " }\r\n"
+    " if(-not (Get-Service ViGEmBus -ErrorAction SilentlyContinue)){\r\n"
+    "  Status 'installing' 'the gamepad driver'\r\n"
+    "  try {\r\n"
+    "   $v=Fetch $vigemUrl $vigemSha 'vigembus.exe'\r\n"
+    "   Start-Process $v -ArgumentList '/qn','/norestart' -Wait | Out-Null\r\n"
+    "  } catch { Add-Content (Join-Path $dir 'setup.log') (\"gamepad driver: \"+$_.Exception.Message) }\r\n"
+    " }\r\n"
+    " Status 'configuring' ''\r\n"
+    " Stop-Service SunshineService -Force -ErrorAction SilentlyContinue\r\n"
+    " if($encoder -ne 'software'){\r\n"
+    "  # A GPU-PV guest has the host's driver files in HostDriverStore; the encoder\r\n"
+    "  # library normally sits in System32, so put it where Sunshine looks.\r\n"
+    "  $lib=Get-ChildItem 'C:\\Windows\\System32\\HostDriverStore\\FileRepository\\nv*\\nvEncodeAPI64.dll' -ErrorAction SilentlyContinue | Select-Object -First 1\r\n"
+    "  if($lib){ Copy-Item $lib.FullName 'C:\\Windows\\System32\\nvEncodeAPI64.dll' -Force -ErrorAction SilentlyContinue }\r\n"
+    " }\r\n"
+    " if(-not (Test-Path $creds)){\r\n"
+    "  $b=New-Object byte[] 24; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)\r\n"
+    "  $pw=[Convert]::ToBase64String($b).Replace('+','a').Replace('/','b').Replace('=','')\r\n"
+    "  Push-Location $root; & $exe --creds asb $pw | Out-Null; Pop-Location\r\n"
+    "  Set-Content -Path $creds -Value $pw -Encoding ascii\r\n"
+    " }\r\n"
+    " $lines=@(\r\n"
+    "  \"sunshine_name = $name\",\r\n"
+    "  \"port = $port\",\r\n"
+    "  'origin_web_ui_allowed = pc',\r\n"
+    "  'upnp = disabled',\r\n"
+    "  'capture = ddx',\r\n"
+    "  'lan_encryption_mode = 1',\r\n"
+    "  'wan_encryption_mode = 1',\r\n"
+    "  'dd_configuration_option = disabled'\r\n"
+    " )\r\n"
+    " if($encoder -eq 'software'){ $lines+='encoder = software' }\r\n"
+    " Set-Content -Path $cfg -Value $lines -Encoding ascii\r\n"
+    " # Sunshine can't run a prep command with nobody signed in, and a failed one stops\r\n"
+    " # the stream. So plain Desktop has none and works at the sign-in screen, scaled.\r\n"
+    " $apps=Join-Path $root 'config\\apps.json'\r\n"
+    " $fitName='Desktop (resize to this device)'\r\n"
+    " $list=Get-Content $apps -Raw | ConvertFrom-Json\r\n"
+    " $fit=@{name=$fitName;'image-path'='desktop.png';'prep-cmd'=@(@{do='C:\\Windows\\AppSandbox\\appsandbox-displays.exe --stream-prep';undo='';elevated=$true})}\r\n"
+    " $list.apps=@($list.apps | Where-Object { $_.name -ne $fitName })+$fit\r\n"
+    " Set-Content -Path $apps -Value ($list | ConvertTo-Json -Depth 6) -Encoding ascii\r\n"
+    " # The installer lets Sunshine through for everyone. Only the host's relay, or\r\n"
+    " # the local network on a bridged VM, should reach it.\r\n"
+    " Get-NetFirewallRule -DisplayName 'Sunshine*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
+    " Get-NetFirewallRule -Group 'AppSandboxStream' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
+    " New-NetFirewallRule -DisplayName 'App Sandbox streaming' -Group 'AppSandboxStream' -Direction Inbound -Action Allow -Program $exe -RemoteAddress $allowed | Out-Null\r\n"
+    " Set-Service SunshineService -StartupType Automatic\r\n"
+    " Start-Service SunshineService\r\n"
+    " Status 'ready' ''\r\n"
+    " Write-Output 'result:ok'\r\n"
+    "} catch {\r\n"
+    " Status 'failed' ($_.Exception.Message -replace '[\\r\\n|]',' ')\r\n"
+    " Write-Output ('result:'+$_.Exception.Message)\r\n"
+    " exit 1\r\n"
+    "}\r\n";
+
+static const char stream_status_ps[] =
+    "$phase='none'; $detail=''\r\n"
+    "if(Test-Path $statusFile){ $parts=(Get-Content $statusFile -Raw).Trim().Split('|'); $phase=$parts[0]; if($parts.Count -gt 1){ $detail=$parts[1] } }\r\n"
+    "$svc=Get-Service SunshineService -ErrorAction SilentlyContinue\r\n"
+    "$encoders=@{}\r\n"
+    "$log=Join-Path $root 'config\\sunshine.log'\r\n"
+    "if(Test-Path $log){\r\n"
+    " Select-String -Path $log -Pattern 'Found (H\\.264|HEVC|AV1) encoder: (\\S+)' | ForEach-Object { $encoders[$_.Matches[0].Groups[1].Value]=$_.Matches[0].Groups[2].Value }\r\n"
+    "}\r\n"
+    "$address=(Get-NetIPConfiguration -ErrorAction SilentlyContinue | Where-Object { $_.IPv4DefaultGateway } | Select-Object -First 1).IPv4Address.IPAddress\r\n"
+    "$o=@{phase=$phase;detail=$detail;running=[bool]($svc -and $svc.Status -eq 'Running');gamepad=[bool](Get-Service ViGEmBus -ErrorAction SilentlyContinue);encoders=$encoders;address=$address}\r\n"
+    "Write-Output ('json:'+($o|ConvertTo-Json -Compress))\r\n";
+
+static const char stream_pin_ps[] =
+    "try {\r\n"
+    " $waiting=@((WebUi '/api/pin' $null).pairings)\r\n"
+    " if($waiting.Count -eq 0){ Write-Output 'result:No device is waiting to pair. Start pairing in Moonlight first, then enter the PIN it shows.'; exit 1 }\r\n"
+    " if($waiting.Count -gt 1){ Write-Output 'result:More than one device is waiting to pair. Cancel the others, then try again.'; exit 1 }\r\n"
+    " $r=WebUi '/api/pin' @{pairing_id=$waiting[0].id;pin=$pin;name=$client}\r\n"
+    " if($r.status -eq $true -or $r.status -eq 'true'){ Write-Output 'result:ok' } else { Write-Output 'result:Pairing failed. Check the PIN and try again from Moonlight.'; exit 1 }\r\n"
+    "} catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+
+static const char stream_unpair_ps[] =
+    "try { $r=WebUi '/api/clients/unpair-all' @{}; Write-Output 'result:ok' } catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+
+static const char stream_off_ps[] =
+    "Stop-Service SunshineService -Force -ErrorAction SilentlyContinue\r\n"
+    "Set-Service SunshineService -StartupType Disabled -ErrorAction SilentlyContinue\r\n"
+    "Get-NetFirewallRule -Group 'AppSandboxStream' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
+    "if(Test-Path $statusFile){ Remove-Item $statusFile -Force }\r\n"
+    "Write-Output 'result:ok'\r\n";
+
+/* Letters, digits and the few other characters a field needs: nothing a
+   PowerShell string or config line could read as syntax. */
+static BOOL stream_token_ok(const char *s, const char *extra)
+{
+    if (!*s) return FALSE;
+    for (; *s; s++)
+        if (!isalnum((unsigned char)*s) && !strchr(extra, *s)) return FALSE;
+    return TRUE;
+}
+
+static char g_stream_vars[1024];
+static volatile LONG g_stream_running;
+
+static DWORD WINAPI stream_setup_thread(LPVOID param)
+{
+    size_t cap = sizeof(g_stream_vars) + sizeof(stream_common_ps) + sizeof(stream_setup_ps);
+    char *script = (char *)malloc(cap);
+    char out[1024];
+    (void)param;
+    if (script) {
+        sprintf_s(script, cap, "%s%s%s", g_stream_vars, stream_common_ps, stream_setup_ps);
+        if (!write_agent_script(STREAM_SETUP, script)) {
+            int ec = run_agent_powershell_out(STREAM_SETUP, 45 * 60 * 1000, out, sizeof(out));
+            agent_log("Streaming: setup finished (%d): %.300s", ec, out);
+            if (ec != 0) agent_log_to_host("Streaming: Sunshine setup failed: %.300s", out);
+        }
+        free(script);
+    }
+    InterlockedExchange(&g_stream_running, 0);
+    return 0;
+}
+
+static void stream_setup(const char *args, char *reply, size_t reply_size)
+{
+    char copy[300], *ctx = NULL, *port, *encoder, *allowed, *name;
+    HANDLE t;
+    if (strcpy_s(copy, sizeof(copy), args)) copy[0] = '\0';
+    port = strtok_s(copy, ":", &ctx);
+    encoder = strtok_s(NULL, ":", &ctx);
+    allowed = strtok_s(NULL, ":", &ctx);
+    name = strtok_s(NULL, ":", &ctx);
+    if (!port || !encoder || !allowed || !name ||
+        !stream_token_ok(port, "") || !stream_token_ok(encoder, "") ||
+        !stream_token_ok(allowed, ".") || !stream_token_ok(name, "-")) {
+        strcpy_s(reply, reply_size, "error:invalid arguments");
+        return;
+    }
+    if (InterlockedExchange(&g_stream_running, 1)) {
+        strcpy_s(reply, reply_size, "ok");
+        return;
+    }
+    sprintf_s(g_stream_vars, sizeof(g_stream_vars),
+              "$port=%s\r\n$encoder='%s'\r\n$allowed='%s'\r\n$name='%s'\r\n$version='%s'\r\n"
+              "$sunshineUrl='%s'\r\n$sunshineSha='%s'\r\n$vigemUrl='%s'\r\n$vigemSha='%s'\r\n",
+              port, encoder, allowed, name, STREAM_SUNSHINE_VER,
+              STREAM_SUNSHINE_URL, STREAM_SUNSHINE_SHA, STREAM_VIGEM_URL, STREAM_VIGEM_SHA);
+    t = CreateThread(NULL, 0, stream_setup_thread, NULL, 0, NULL);
+    if (!t) {
+        InterlockedExchange(&g_stream_running, 0);
+        strcpy_s(reply, reply_size, "error:could not start setup");
+        return;
+    }
+    CloseHandle(t);
+    strcpy_s(reply, reply_size, "ok");
+}
+
+static void stream_run(const char *vars, const char *body, DWORD timeout_ms, char *reply, size_t reply_size)
+{
+    size_t cap = strlen(vars) + sizeof(stream_common_ps) + strlen(body) + 1;
+    char *script = (char *)malloc(cap);
+    if (!script) { strcpy_s(reply, reply_size, "error:out of memory"); return; }
+    sprintf_s(script, cap, "%s%s%s", vars, stream_common_ps, body);
+    run_domain_script(script, timeout_ms, reply, reply_size);
+    free(script);
+}
+
+static void stream_command(const char *cmd, char *reply, size_t reply_size)
+{
+    if (strncmp(cmd, "stream_setup:", 13) == 0) {
+        stream_setup(cmd + 13, reply, reply_size);
+    } else if (strcmp(cmd, "stream_status") == 0) {
+        stream_run("", stream_status_ps, 30000, reply, reply_size);
+    } else if (strncmp(cmd, "stream_pin:", 11) == 0) {
+        char copy[128] = "", vars[200], *ctx = NULL, *pin, *client;
+        strncpy_s(copy, sizeof(copy), cmd + 11, _TRUNCATE);
+        pin = strtok_s(copy, ":", &ctx);
+        client = strtok_s(NULL, ":", &ctx);
+        if (!pin || !client || strlen(pin) != 4 || !stream_token_ok(pin, "") ||
+            !stream_token_ok(client, "- ")) {
+            strcpy_s(reply, reply_size, "error:invalid arguments");
+            return;
+        }
+        sprintf_s(vars, sizeof(vars), "$pin='%s'\r\n$client='%s'\r\n", pin, client);
+        stream_run(vars, stream_pin_ps, 30000, reply, reply_size);
+    } else if (strcmp(cmd, "stream_unpair") == 0) {
+        stream_run("", stream_unpair_ps, 30000, reply, reply_size);
+    } else if (strcmp(cmd, "stream_off") == 0) {
+        stream_run("", stream_off_ps, 60000, reply, reply_size);
+    } else {
+        strcpy_s(reply, reply_size, "error:unknown");
+    }
+}
+
 static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
 {
     char *f[8];
@@ -3904,6 +4157,11 @@ static void handle_client(AsbConn *client)
             } else {
                 REPLY("error:queue_failed");
             }
+        }
+        else if (strncmp(cmd, "stream_", 7) == 0) {
+            char reply[1024];
+            stream_command(cmd, reply, sizeof(reply));
+            REPLY(reply);
         }
         else if (strncmp(cmd, "grow_root:", 10) == 0) {
             REPLY(grow_root_partition() ? "ok" : "error:guest_grow_failed");

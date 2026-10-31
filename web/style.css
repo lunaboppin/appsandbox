@@ -552,6 +552,10 @@ td.editing select {
 .manage-row.compact input[type="number"] { width: 90px; }
 .manage-row button.danger { color: var(--danger); }
 .manage-check { display: flex; align-items: center; gap: 6px; color: var(--text) !important; }
+.manage-remote-sub { margin-left: 22px; }
+.manage-remote-rule { border: 0; border-top: 1px solid var(--border, rgba(128,128,128,.3)); margin: 10px 0; }
+#manage-remote-section small:empty { display: none; }
+.manage-remote-error { color: var(--danger) !important; }
 .modal.wide .form-grid {
     margin-bottom: 16px;
 }

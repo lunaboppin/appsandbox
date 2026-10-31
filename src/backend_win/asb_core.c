@@ -18,6 +18,8 @@
 #include "vmms_cert.h"
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
+#include "vm_stream.h"
+#include "vm_web.h"
 #include "prereq.h"
 #include "ui.h"
 #include "shared_resources.h"
@@ -563,6 +565,14 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"SshPort=%lu\n", g_vms[i].ssh_port);
         if (g_vms[i].ssh_deploy_key)
             fwprintf(f, L"SshDeployKey=1\n");
+        if (g_vms[i].stream_enabled)
+            fwprintf(f, L"StreamEnabled=1\n");
+        if (g_vms[i].stream_exposure)
+            fwprintf(f, L"StreamExposure=%d\n", g_vms[i].stream_exposure);
+        if (g_vms[i].stream_port)
+            fwprintf(f, L"StreamPort=%lu\n", g_vms[i].stream_port);
+        if (g_vms[i].stream_software)
+            fwprintf(f, L"StreamSoftware=1\n");
         if (g_vms[i].ssh_pubkey[0])
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
@@ -708,6 +718,14 @@ static void load_vm_list(void)
             vm->ssh_port = (DWORD)_wtoi(line + 8);
         else if (wcsncmp(line, L"SshDeployKey=", 13) == 0)
             vm->ssh_deploy_key = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"StreamEnabled=", 14) == 0)
+            vm->stream_enabled = (_wtoi(line + 14) != 0);
+        else if (wcsncmp(line, L"StreamExposure=", 15) == 0)
+            vm->stream_exposure = _wtoi(line + 15);
+        else if (wcsncmp(line, L"StreamPort=", 11) == 0)
+            vm->stream_port = (DWORD)_wtoi(line + 11);
+        else if (wcsncmp(line, L"StreamSoftware=", 15) == 0)
+            vm->stream_software = (_wtoi(line + 15) != 0);
         else if (wcsncmp(line, L"SshPubKey=", 10) == 0)
             /* Truncating copy: wcscpy_s ABORTS the process on overflow, and this
                line comes from an editable config file. Generated ed25519 lines
@@ -1410,6 +1428,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             instance->ssh_key_deployed = FALSE;
             hcs_stop_monitor(instance);
             vm_ssh_proxy_stop(instance);
+            vm_stream_relay_stop(instance);
             vm_agent_stop(instance);
             idd_probe_stop(instance);
             asb_log(L"VM \"%s\" exited (event=0x%08X).", instance->name, event);
@@ -3757,9 +3776,11 @@ ASB_API void asb_cleanup(void)
     int i;
     if (!g_initialized) return;
 
+    vm_web_shutdown();
     for (i = 0; i < g_vm_count; i++) {
         hcs_stop_monitor(&g_vms[i]);
         vm_ssh_proxy_stop(&g_vms[i]);
+        vm_stream_relay_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
         idd_probe_stop(&g_vms[i]);
         if (g_vms[i].running) hcs_terminate_vm(&g_vms[i]);
@@ -3788,9 +3809,11 @@ ASB_API void asb_detach(void)
        handle - HcsCloseComputeSystem terminates the VM when it's the last
        handle.  Instead, let the OS close it during process teardown after
        the callback is already gone. */
+    vm_web_shutdown();
     for (i = 0; i < g_vm_count; i++) {
         hcs_stop_monitor(&g_vms[i]);
         vm_ssh_proxy_stop(&g_vms[i]);
+        vm_stream_relay_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
         idd_probe_stop(&g_vms[i]);
         hcs_unregister_vm_callback(&g_vms[i]);
@@ -4636,6 +4659,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     inst->ssh_key_deployed = FALSE;   /* disk may change while stopped (revert) -- re-deploy next boot */
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
+    vm_stream_relay_stop(inst);
     vm_agent_stop(inst);
     idd_probe_stop(inst);
 
@@ -4676,6 +4700,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
 
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
+    vm_stream_relay_stop(inst);
     vm_agent_stop(inst);
     idd_probe_stop(inst);
 

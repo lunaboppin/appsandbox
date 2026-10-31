@@ -179,6 +179,28 @@ class Client:
                          {"enabled": bool(enabled)})
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
+    def stream_status(self, name):
+        """Moonlight streaming: {enabled, exposure, port, reach, addresses, guest, ...}.
+        'guest' is what the VM reports: phase, running, encoders, gamepad, address."""
+        return self._req("GET", "/vms/%s/stream" % name)[1]
+    def stream_set(self, name, enabled, exposure="this_pc", software_encoder=True):
+        """Turn Sunshine in the guest on or off. exposure "this_pc" or "network" decides
+        who can reach it. software_encoder=False lets Sunshine try the GPU: see the README."""
+        return self._req("POST", "/vms/%s/stream" % name, {"enabled": bool(enabled), "exposure": exposure,
+                                                           "softwareEncoder": bool(software_encoder)})
+    def stream_pair(self, name, pin, client="Moonlight"):
+        """Finish pairing with the 4-digit PIN Moonlight shows."""
+        return self._req("POST", "/vms/%s/stream/pair" % name, {"pin": pin, "name": client})
+    def stream_unpair(self, name):
+        return self._req("POST", "/vms/%s/stream/unpair" % name, {})
+    def web_status(self, name):
+        """Browser access: {enabled, lan, url, key, connected, reach, ...}. url holds the
+        VM's access key: anyone with it can control the VM."""
+        return self._req("GET", "/vms/%s/web" % name)[1]
+    def web_set(self, name, enabled, lan=False):
+        """Turn browser access on (a new key each time) or off. lan=True also lets other
+        devices connect, over HTTPS. It's always off again when the daemon exits."""
+        return self._req("POST", "/vms/%s/web" % name, {"enabled": bool(enabled), "lan": bool(lan)})
     def open_display(self, name, view=None):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
