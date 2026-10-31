@@ -14,6 +14,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Tidy new installs:** new Windows VMs start with a clean taskbar (just Edge and File Explorer, no search box, widgets or Copilot).
 - **Checkpoints and branches:** freeze a VM's state and fork independent working copies from it.
 - **Disposable VMs:** every start begins from a clean checkpoint and throws away the last session's changes.
+- **Run in Sandbox:** right-click any file in Explorer (under **Show more options** on Windows 11) to copy it into a VM and open it there on a throwaway checkpoint. When you're done, discard rolls the VM back and keep merges the changes. Your original file is only ever read, and shared drives and anything sent over the network aren't rolled back.
 - **Templates** for creating Windows VMs from a prepared state instead of reinstalling.
 - **Per-VM management:** installer media, storage relocation, grow-only disk resizing, Secure Boot and display preferences. The whole VM tree can be placed on any fixed NTFS/ReFS volume.
 - **Backstage session:** like ScreenConnect's Backstage, open a SYSTEM shell in a Windows VM's hidden session 0, in a window of its own, from the display window's menu. The signed-in user, or the sign-in screen, never sees it. It has a taskbar with Command Prompt, PowerShell, Task Manager, Registry Editor and more, plus an Explorer file browser, and everything opened from it runs there too.

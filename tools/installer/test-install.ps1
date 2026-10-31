@@ -108,6 +108,7 @@ try {
     Check 'upgrade keeps the runtime cache' (Test-Path (Join-Path $dir 'd3dlayers\cached.dll'))
     Check 'upgrade clears files a new version dropped' (-not (Test-Path (Join-Path $dir 'resources\dropped-by-new-version.exe')))
     Check 'upgrade still has the guest helpers' (Test-Path (Join-Path $dir 'resources\appsandbox-backstage.exe'))
+    Check 'upgrade keeps the Run in Sandbox entry' ((Get-RunEntryCommand) -eq "`"$dir\appsandbox-run.exe`" `"%1`"") (Get-RunEntryCommand)
 
     # ------------------------------------------------- app running = hands off ---
     # Holding the app's own mutex looks exactly like a running app to Setup. Only an
@@ -163,6 +164,7 @@ try {
     }
     Check 'a file of the user''s in the folder is left alone' (Test-Path (Join-Path $dir 'user-file.txt'))
     Check 'Apps & features entry removed' (-not (Test-Path $uninstallKey))
+    Check 'Run in Sandbox entry removed' (-not (Test-Path -LiteralPath $runEntry))
     Check 'shortcuts removed' (-not (Test-Path (Join-Path $programs 'App Sandbox.lnk')) -and -not (Test-Path (Join-Path $desktop 'App Sandbox.lnk')))
     Check 'a silent uninstall leaves VM data alone' ((Test-Path $dataDir) -eq $dataBefore)
 } finally {

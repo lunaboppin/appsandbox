@@ -46,8 +46,8 @@ typedef struct {
 /* Agent up, this long, and still nothing on the file channel: an old guest. */
 #define GUEST_OLD_AGENT_MS  (6 * 60 * 1000)
 #define SAVED_WAIT_MS       (5 * 60 * 1000)
-/* The guest waits up to 90 s for someone to sign in, then up to 20 s for the handler. */
-#define OPEN_WAIT_MS        (2 * 60 * 1000 + 30 * 1000)
+/* The guest waits up to 5 minutes for someone to sign in, then up to 20 s for the handler. */
+#define OPEN_WAIT_MS        (6 * 60 * 1000)
 #define COPY_ATTEMPTS       3
 #define HOST_SPARE_BYTES    (1024ull * 1024 * 1024)
 
@@ -534,7 +534,7 @@ static DropResult send_file(UINT64 id, VmInstance *v, SOCKET s, const wchar_t *p
         wcscpy_s(v->sandbox_guest_path, _countof(v->sandbox_guest_path), guest_path);
         run_unlock();
 
-        set_status(id, ASB_RUN_PHASE_OPENING, 100, L"Opening %s in the VM...", name);
+        set_status(id, ASB_RUN_PHASE_OPENING, 100, L"Opening %s in the VM. If the VM is asking you to sign in, do that and it will open.", name);
         /* The copy is safe from here on, so a failure below isn't a reason to send it again. */
         if (!drop_send_all(s, "open\n", 5) || !drop_recv_line(s, line, sizeof(line), OPEN_WAIT_MS))
             swprintf_s(why, why_chars, L"Copied to %s, but the VM didn't say whether it opened.", guest_path);
@@ -543,7 +543,7 @@ static DropResult send_file(UINT64 id, VmInstance *v, SOCKET s, const wchar_t *p
         else if (strcmp(line, "nohandler") == 0)
             swprintf_s(why, why_chars, L"Copied to %s. Nothing in this VM opens this type of file.", guest_path);
         else if (strcmp(line, "nosession") == 0)
-            swprintf_s(why, why_chars, L"Copied to %s. Nobody is signed in to the VM, so open it from there after signing in.", guest_path);
+            swprintf_s(why, why_chars, L"Copied to %s. Nobody signed in to the VM in time, so open it from there.", guest_path);
         else
             swprintf_s(why, why_chars, L"Copied to %s, but it could not be opened.", guest_path);
         result = DROP_OK;
@@ -871,19 +871,27 @@ HRESULT asb_run_file(AsbVm vm, const wchar_t *path, AsbRunMode mode,
     error[0] = L'\0';
     if (!v) return E_INVALIDARG;
     reason = asb_run_unsuitable_reason(vm);
-    if (reason) { swprintf_s(error, error_chars, L"%s", reason); return E_ACCESSDENIED; }
+    if (reason) { swprintf_s(error, error_chars, L"%s", reason); return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED); }
     /* Absolute only: the app's working folder means nothing to whoever asked. */
     if (!path || !((iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') ||
                    (path[0] == L'\\' && path[1] == L'\\'))) {
         swprintf_s(error, error_chars, L"Give the file's full path.");
         return E_INVALIDARG;
     }
+    {
+        /* A folder can't be opened as a file at all, so it has to be asked about first. */
+        wchar_t *lp = long_path(path);
+        DWORD attrs = lp ? GetFileAttributesW(lp) : INVALID_FILE_ATTRIBUTES;
+        free(lp);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            swprintf_s(error, error_chars, L"Only files can be run, not folders.");
+            return E_INVALIDARG;
+        }
+    }
     probe = open_source(path, NULL);
     if (probe == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        swprintf_s(error, error_chars, err == ERROR_INVALID_PARAMETER
-                   ? L"Only files can be run, not folders."
-                   : L"Could not read this file (error %lu).", err);
+        swprintf_s(error, error_chars, L"Could not read this file (error %lu).", err);
         return HRESULT_FROM_WIN32(err);
     }
     CloseHandle(probe);

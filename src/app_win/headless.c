@@ -1052,7 +1052,7 @@ static int handle_request(PHTTP_REQUEST req)
             if (SUCCEEDED(hr)) { send_hr(req->RequestId, "run-in-sandbox", nu, hr); return 0; }
             WideCharToMultiByte(CP_UTF8, 0, error[0] ? error : L"could not run this file", -1, message, sizeof(message), NULL, NULL);
             if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) send_err(req->RequestId, 409, "Conflict", "vm_running", message);
-            else if (hr == E_ACCESSDENIED) send_err(req->RequestId, 409, "Conflict", "vm_unsuitable", message);
+            else if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) send_err(req->RequestId, 409, "Conflict", "vm_unsuitable", message);
             else send_err(req->RequestId, 400, "Bad Request", "bad_file", message);
             return 0;
         }

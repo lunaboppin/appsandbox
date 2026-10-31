@@ -25,7 +25,7 @@
 #define DROP_LINE_MAX     4096
 #define DROP_NAME_CHARS   180       /* keeps the whole path well under MAX_PATH */
 #define DROP_SPARE_BYTES  (64ull * 1024 * 1024)
-#define DROP_SESSION_WAIT_MS 90000  /* a VM that was just started may still be signing in */
+#define DROP_SESSION_WAIT_MS 300000 /* long enough for someone to sign in at the display */
 #define DROP_OPEN_WAIT_MS    20000
 
 static FileDropLog g_log;
@@ -269,6 +269,7 @@ void file_drop_start(FileDropLog log, HANDLE stop_event)
 
 int file_drop_open_main(void)
 {
+    BOOL unknown_type = FALSE;
     int argc = 0, rc = FILE_DROP_OPEN_FAILED;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     SHELLEXECUTEINFOW sei;
@@ -285,9 +286,20 @@ int file_drop_open_main(void)
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
     sei.lpFile = argv[2];
     sei.nShow = SW_SHOWNORMAL;
-    if (ShellExecuteExW(&sei)) {
+    /* Windows 11 shows its app picker for an unknown type and calls that a success,
+       so ask first. Only a type nothing has registered counts: plenty of real handlers
+       have no plain open command. */
+    {
+        const wchar_t *dot = wcsrchr(argv[2], L'.'), *slash = wcsrchr(argv[2], L'\\');
+        HKEY key = NULL;
+        if (!dot || (slash && dot < slash) ||
+            RegOpenKeyExW(HKEY_CLASSES_ROOT, dot, 0, KEY_READ, &key) != ERROR_SUCCESS)
+            unknown_type = TRUE;
+        if (key) RegCloseKey(key);
+    }
+    if (!unknown_type && ShellExecuteExW(&sei)) {
         rc = FILE_DROP_OPEN_OK;
-    } else if (GetLastError() == ERROR_NO_ASSOCIATION || (INT_PTR)sei.hInstApp == SE_ERR_NOASSOC) {
+    } else if (unknown_type || GetLastError() == ERROR_NO_ASSOCIATION || (INT_PTR)sei.hInstApp == SE_ERR_NOASSOC) {
         sei.fMask = SEE_MASK_NOASYNC;
         sei.lpVerb = L"openas";
         ShellExecuteExW(&sei);

@@ -1933,7 +1933,7 @@ static void on_term(int sig)
 #define DROP_PORT           16
 #define DROP_NAME_BYTES     200     /* well under NAME_MAX, whatever the encoding */
 #define DROP_SPARE_BYTES    (64ull * 1024 * 1024)
-#define DROP_SESSION_WAIT_S 90      /* a VM that was just started may still be signing in */
+#define DROP_SESSION_WAIT_S 300     /* long enough for someone to sign in at the display */
 #define DROP_OPEN_WAIT_S    15
 
 static int drop_recv_line(int fd, char *buf, size_t cap)
