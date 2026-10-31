@@ -130,7 +130,7 @@ building → stopped → installing → booting → online → stopping → stop
 `wait()`/`status()` (poll-based and miss-proof) or `events()` (push, for UIs).
 
 > **Create VMs sequentially, not all at once.** A create runs a VHDX build that
-> prefetches the guest agent + build dependencies (over the network for Linux) and
+> prefetches the build dependencies (over the network for Linux) and
 > stages them. Firing multiple creates simultaneously can make those concurrent
 > prefetch/staging steps race, and a build may fail (`iso-patch.exe exited with code
 > 1`) and get removed. It's generally advised to let one create clear its build phase
@@ -289,8 +289,9 @@ c.close_display("dev")              # or the user just closes it with the [X]
   (what a frame may cost in buffers and link throughput); past either the picture
   is scaled to fit. If the guest can't take a size (a driver from before this, or
   a size Windows won't use) it stays where it was, scaled to the window, and the
-  driver returns to the last size that worked by itself. Linux guests keep their
-  size and scale to the window.
+  driver returns to the last size that worked by itself. Ubuntu guests follow the
+  window the same way, through `asb_drm`; one built before this keeps its size and
+  scales.
 - The Hyper-V console only shows what the guest draws on the synthetic video
   adapter: once the Windows agent disables that adapter in favour of the IDD
   monitor, the console stays dark, so use the IDD view for a running desktop.
@@ -320,6 +321,7 @@ rather than forwarding bad input to the core.
 | `adminPass` | required on Linux (≤255 bytes); optional on Windows |
 | `testMode` | skip interactive setup where supported |
 | `sshEnabled` | provision SSH + forward a loopback port |
+| `preinstallApps` | comma-separated apps to install after the first start: winget IDs on Windows, apt or snap names on Ubuntu |
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
 

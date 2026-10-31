@@ -71,7 +71,7 @@ $required = @(
     'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe',
     'resources\appsandbox-clipboard.exe', 'resources\appsandbox-clipboard-reader.exe',
     'resources\appsandbox-displays.exe', 'resources\appsandbox-input.exe',
-    'resources\linux\appsandbox-agent.c', 'resources\win-mesa-gl\opengl32.dll',
+    'resources\linux\appsandbox-agent.c', 'resources\linux\guest-src\tools\linux\agent\appsandbox-agent.c', 'resources\win-mesa-gl\opengl32.dll',
     'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
 )
 $missing = @($required | Where-Object { -not (Test-Path (Join-Path $Stage $_)) })

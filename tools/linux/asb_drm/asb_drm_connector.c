@@ -11,6 +11,8 @@
  * detailed-timing descriptor; checksum byte is patched at the end.
  */
 
+#include <linux/math64.h>
+
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_edid.h>
@@ -155,6 +157,30 @@ void asb_build_edid(struct asb_device *asb)
  * Connector helper callbacks
  * -------------------------------------------------------------------------- */
 
+/* CVT rounds widths to 8 pixels, and a window can be any size. Nothing scans
+ * this mode out, so simple timings with the exact size do. */
+static struct drm_display_mode *asb_exact_mode(struct drm_device *dev,
+                                               unsigned int w, unsigned int h,
+                                               unsigned int hz)
+{
+	struct drm_display_mode *m = drm_mode_create(dev);
+
+	if (!m)
+		return NULL;
+	m->hdisplay    = w;
+	m->hsync_start = w + 48;
+	m->hsync_end   = w + 80;
+	m->htotal      = w + 160;
+	m->vdisplay    = h;
+	m->vsync_start = h + 3;
+	m->vsync_end   = h + 8;
+	m->vtotal      = h + 30;
+	m->clock       = div_u64((u64)m->htotal * m->vtotal * hz, 1000);
+	m->flags       = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC;
+	drm_mode_set_name(m);
+	return m;
+}
+
 static int asb_connector_get_modes(struct drm_connector *connector)
 {
 	struct asb_device *asb = to_asb(connector->dev);
@@ -165,14 +191,15 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	                                   (const struct edid *)asb->edid);
 
 	/* Preferred mode first — what the EDID DTD also points at. */
-	m = drm_cvt_mode(connector->dev,
-	                 asb->width, asb->height, asb->refresh,
-	                 false, false, false);
+	m = asb_exact_mode(connector->dev, asb->width, asb->height, asb->refresh);
 	if (m) {
 		m->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
 		drm_mode_probed_add(connector, m);
 		count++;
 	}
+
+	if (asb->single_mode)
+		return count;
 
 	/* Common fallbacks. Mutter typically ignores these unless the user
 	 * explicitly switches resolution, but they're cheap to publish. */
@@ -217,6 +244,26 @@ static const struct drm_connector_funcs asb_connector_funcs = {
 	.atomic_destroy_state   = drm_atomic_helper_connector_destroy_state,
 };
 
+int asb_connector_set_size(struct asb_device *asb,
+                           unsigned int width, unsigned int height)
+{
+	struct drm_device *drm = &asb->drm;
+
+	if (width < 64 || height < 64 ||
+	    width > ASB_MAX_WIDTH || height > ASB_MAX_HEIGHT)
+		return -EINVAL;
+
+	mutex_lock(&drm->mode_config.mutex);
+	asb->width  = width;
+	asb->height = height;
+	asb->single_mode = true;
+	asb_build_edid(asb);
+	mutex_unlock(&drm->mode_config.mutex);
+
+	drm_kms_helper_hotplug_event(drm);
+	return 0;
+}
+
 /* --------------------------------------------------------------------------
  * Init
  * -------------------------------------------------------------------------- */
@@ -235,7 +282,8 @@ int asb_connector_init(struct asb_device *asb)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
 
-	/* "Connected" forever — we're virtual, no hot-plug events. */
+	/* "Connected" forever — we're virtual. The only hot-plug event is the
+	 * one asb_connector_set_size() sends when the size changes. */
 	asb->connector.status = connector_status_connected;
 	asb->connector.interlace_allowed = false;
 	asb->connector.doublescan_allowed = false;

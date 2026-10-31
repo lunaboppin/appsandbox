@@ -270,6 +270,11 @@ ASB_API BOOL asb_get_suppress_tray_warn(void);
 ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int capacity);
 
 /* ---- Global shared resources (Windows guests) ---- */
+/* Linux guest source this build ships (resources\linux\guest-src): a stamp to
+   compare with a VM's, and a tar of it to send to one that differs. */
+BOOL asb_linux_guest_stamp(char *out, size_t chars);
+HRESULT asb_linux_guest_tar(wchar_t *out_path, size_t chars);
+
 ASB_API int asb_shared_resource_count(void);
 ASB_API BOOL asb_shared_resource_get(int index, AsbSharedResourceInfo *out);
 ASB_API HRESULT asb_shared_resource_create(const AsbSharedResourceInfo *info,

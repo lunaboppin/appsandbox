@@ -3000,16 +3000,17 @@ int wmain(int argc, wchar_t *argv[])
     }
 
     if (_wcsicmp(argv[1], L"--prefetch-repo") == 0) {
-        const wchar_t *branch = NULL, *out_dir = NULL;
+        const wchar_t *branch = NULL, *local_root = NULL, *out_dir = NULL;
         for (int i = 2; i < argc; i++) {
             if (_wcsicmp(argv[i], L"--branch") == 0 && i + 1 < argc) branch = argv[++i];
+            else if (_wcsicmp(argv[i], L"--local-root") == 0 && i + 1 < argc) local_root = argv[++i];
             else if (_wcsicmp(argv[i], L"--out-dir") == 0 && i + 1 < argc) out_dir = argv[++i];
         }
         if (!branch || !out_dir) {
             log_err(L"--prefetch-repo requires --branch and --out-dir");
             return 1;
         }
-        return do_prefetch_repo(branch, out_dir);
+        return do_prefetch_repo(branch, local_root, out_dir);
     }
 
     if (_wcsicmp(argv[1], L"--prefetch-wsl-deps") == 0) {

@@ -1,13 +1,14 @@
 /* prefetch_repo.h - host-side fetch of the appsandbox repo's
- * tools/linux/ subtree from GitHub, straight into the per-VM staging
- * extras dir. No host cache.
+ * tools/linux/ subtree, from the copy this build ships or else from GitHub,
+ * straight into the per-VM staging extras dir. No host cache.
  */
 #ifndef PREFETCH_REPO_H
 #define PREFETCH_REPO_H
 
 #include <windows.h>
 
-/* Download github.com/jamesstringer90/appsandbox @ <branch> and place
+/* Use <local_root> (a tree holding tools/linux/...) if given and present,
+ * otherwise download github.com/lunaboppin/appsandbox @ <branch>, and place
  * the tools/linux/ subtree directly into <out_dir> in the final layout
  * the manifest writer expects:
  *
@@ -27,6 +28,6 @@
  *     wsl-mesa.tar.zst     (from tools/linux/wsl-mesa/prebuilt/...)
  *
  * Returns 0 on success; non-zero on any failure. */
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir);
+int do_prefetch_repo(const wchar_t *branch, const wchar_t *local_root, const wchar_t *out_dir);
 
 #endif

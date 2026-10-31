@@ -828,6 +828,7 @@ static int handle_request(PHTTP_REQUEST req)
             AsbVmConfig cfg; int iv; BOOL bv;
             wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0}, storage[MAX_PATH]={0}, exclusions[1024]={0};
+            wchar_t apps[1024]={0};
             char nu[256]={0};
             body_to_wide(req, body, 8192);
             ZeroMemory(&cfg, sizeof(cfg));
@@ -840,12 +841,14 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_string(body, L"netAdapter", adapter, 256);
             json_get_string(body, L"storageParent", storage, MAX_PATH);
             json_get_string(body, L"sharedResourceExclusions", exclusions, _countof(exclusions));
+            json_get_string(body, L"preinstallApps", apps, _countof(apps));
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
             cfg.storage_parent = storage;
             cfg.shared_resource_exclusions = exclusions;
+            cfg.preinstall_apps = apps;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
             if (json_get_int(body, L"hddGb", &iv)) cfg.hdd_gb = (DWORD)iv;
             if (json_get_int(body, L"cpuCores", &iv)) cfg.cpu_cores = (DWORD)iv;

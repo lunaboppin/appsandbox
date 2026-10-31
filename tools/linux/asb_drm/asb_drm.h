@@ -59,10 +59,16 @@ struct asb_device {
 	struct drm_plane        primary_plane;
 	struct drm_plane        cursor_plane;
 
-	/* Active mode at probe time; module params seed this. */
+	/* Preferred mode: module params seed it, the host's window size replaces
+	 * it through the preferred_mode sysfs attribute. Guarded by
+	 * mode_config.mutex once the device is registered. */
 	unsigned int            width;
 	unsigned int            height;
 	unsigned int            refresh;
+
+	/* Set by the first size request: publish only the requested mode, so the
+	 * compositor has to take it instead of keeping one from the fallback list. */
+	bool                    single_mode;
 
 	/* Synthesized 128-byte EDID. Built once at probe, served via
 	 * drm_connector_attach_edid_property() → drm_connector_update_edid_property(). */
@@ -95,6 +101,10 @@ int  asb_mode_init(struct asb_device *asb);
 void asb_mode_fini(struct asb_device *asb);
 
 int  asb_connector_init(struct asb_device *asb);
+
+/* Make width x height the preferred mode and tell userspace to re-probe. */
+int  asb_connector_set_size(struct asb_device *asb,
+                            unsigned int width, unsigned int height);
 
 int  asb_planes_init(struct asb_device *asb);
 

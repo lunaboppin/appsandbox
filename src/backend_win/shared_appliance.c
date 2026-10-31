@@ -1906,7 +1906,7 @@ HRESULT shared_appliance_prepare_client(const VmConfig *config,
     HRESULT hr;
     if (!endpoint_guid || !runtime) return E_INVALIDARG;
     endpoint_guid[0] = L'\0';
-    if (!config || _wcsicmp(config->os_type, L"Windows") != 0) return S_FALSE;
+    if (!config) return S_FALSE;
     /* Managed VMs need the link for the domain controller even without shares. */
     if (config->shared_resource_count <= 0 &&
         !(config->domain_member && g_appliance.status.domain_enabled)) return S_FALSE;

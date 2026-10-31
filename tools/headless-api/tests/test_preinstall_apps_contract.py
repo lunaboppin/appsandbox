@@ -24,13 +24,13 @@ def main() -> None:
     link = read("src/backend_win/vm_agent.c")
     agent = read("tools/agent/agent.c")
 
-    # UI: checklist (Windows only) and validated extra IDs.
+    # UI: checklist and validated extra IDs (test_linux_parity_contract covers Ubuntu).
     assert 'id="create-app-list"' in html and 'id="create-app-extra"' in html
     for app in ("Anthropic.Claude", "Valve.Steam", "Notepad++.Notepad++",
                 "Microsoft.VisualStudioCode", "voidtools.Everything"):
         assert "id: '%s'" % app in js, app
     assert "var WINGET_ID_RE = /^[A-Za-z0-9.+_-]{1,100}$/;" in js
-    assert "preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : ''" in js
+    assert "preinstallApps: gatherPreinstallApps()," in js
     assert "if (cfg.preinstallApps === null) return;" in js
     assert 'json_get_string(json, L"preinstallApps", apps_buf, _countof(apps_buf));' in ui
 

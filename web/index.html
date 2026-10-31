@@ -123,14 +123,14 @@
                 <span class="host-info" id="host-hdd"></span>
             </div>
 
-            <label for="storage-parent" class="win-only">Storage Parent:</label>
-            <div class="image-row win-only">
+            <label for="storage-parent">Storage Parent:</label>
+            <div class="image-row">
                 <input type="text" id="storage-parent" placeholder="Default: %ProgramData%\\AppSandbox" spellcheck="false">
                 <button type="button" onclick="sendCmd('browseCreateStorage')">Browse...</button>
             </div>
 
-            <label class="win-only">Shared Drives:</label>
-            <div id="create-shared-resource-list" class="resource-check-list win-only"></div>
+            <label>Shared Drives:</label>
+            <div id="create-shared-resource-list" class="resource-check-list"></div>
 
             <label for="ram-size">RAM Size:</label>
             <div class="form-row">
@@ -198,11 +198,11 @@
                 <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>
 
-            <label class="win-only app-label">Apps:</label>
-            <div class="win-only app-picker">
+            <label class="app-label">Apps:</label>
+            <div class="app-picker">
                 <div id="create-app-list" class="app-check-grid"></div>
                 <input type="text" id="create-app-extra" placeholder="More winget IDs, comma-separated (e.g. Spotify.Spotify)" spellcheck="false">
-                <small>Installed with winget after your first sign-in. Needs internet access in the VM. Not used for templates.</small>
+                <small id="create-app-hint">Installed with winget after your first sign-in. Needs internet access in the VM. Not used for templates.</small>
             </div>
         </div>
         <div class="modal-buttons">
@@ -279,6 +279,10 @@
             <small>Turning this on checkpoints the VM as it is now (shut it down first). Every start then begins from that checkpoint and throws away the last session's changes. On managed VMs, domain users keep their Desktop, Documents, Downloads and Pictures (on H:), and shared drives keep their files. To change the clean copy: turn this off, make the change, shut down, turn it on again.</small>
         </fieldset>
 
+        <fieldset id="manage-linux-note-section" style="display:none">
+            <legend>Not available on Ubuntu</legend>
+            <small>Secure Boot: the App Sandbox display and GPU drivers are built on the VM and are not signed for it. Domain: joining uses the Windows domain tools. Backstage: it runs in the Windows hidden session 0. Malware Lab: its recorder is a Windows program. Templates: they rely on Windows Sysprep. Shared drives appear under /mnt/appsandbox and in the Files sidebar.</small>
+        </fieldset>
         <fieldset id="manage-secure-boot-section">
             <legend>Secure Boot</legend>
             <label class="manage-check"><input type="checkbox" id="manage-secure-boot" onchange="saveManageSecureBoot()"> Start this VM with Secure Boot</label>

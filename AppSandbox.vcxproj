@@ -104,6 +104,9 @@
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
 copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
+if exist "$(OutDir)resources\linux\guest-src" rmdir /S /Q "$(OutDir)resources\linux\guest-src"
+robocopy "$(SolutionDir)tools\linux" "$(OutDir)resources\linux\guest-src\tools\linux" /E /XD build dist .git /XF *.o *.ko *.cmd *.mod *.mod.c *.order *.symvers &gt;nul &amp; if errorlevel 8 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\normalize-eol.ps1" -Path "$(OutDir)resources\linux\guest-src"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
@@ -133,6 +136,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
 copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
+if exist "$(OutDir)resources\linux\guest-src" rmdir /S /Q "$(OutDir)resources\linux\guest-src"
+robocopy "$(SolutionDir)tools\linux" "$(OutDir)resources\linux\guest-src\tools\linux" /E /XD build dist .git /XF *.o *.ko *.cmd *.mod *.mod.c *.order *.symvers &gt;nul &amp; if errorlevel 8 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\normalize-eol.ps1" -Path "$(OutDir)resources\linux\guest-src"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"
@@ -166,6 +172,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
 copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
+if exist "$(OutDir)resources\linux\guest-src" rmdir /S /Q "$(OutDir)resources\linux\guest-src"
+robocopy "$(SolutionDir)tools\linux" "$(OutDir)resources\linux\guest-src\tools\linux" /E /XD build dist .git /XF *.o *.ko *.cmd *.mod *.mod.c *.order *.symvers &gt;nul &amp; if errorlevel 8 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\normalize-eol.ps1" -Path "$(OutDir)resources\linux\guest-src"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
@@ -199,6 +208,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 if not exist "$(OutDir)resources\linux" mkdir "$(OutDir)resources\linux"
 copy /Y "$(SolutionDir)tools\linux\agent\appsandbox-agent.c" "$(OutDir)resources\linux\appsandbox-agent.c"
+if exist "$(OutDir)resources\linux\guest-src" rmdir /S /Q "$(OutDir)resources\linux\guest-src"
+robocopy "$(SolutionDir)tools\linux" "$(OutDir)resources\linux\guest-src\tools\linux" /E /XD build dist .git /XF *.o *.ko *.cmd *.mod *.mod.c *.order *.symvers &gt;nul &amp; if errorlevel 8 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\normalize-eol.ps1" -Path "$(OutDir)resources\linux\guest-src"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"

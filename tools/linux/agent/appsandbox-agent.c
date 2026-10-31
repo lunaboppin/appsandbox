@@ -501,7 +501,7 @@ static void *heartbeat_thread(void *arg)
  * Reply: "ok" on success, "error:..." on failure. */
 static void handle_set_ip(int fd, const char *tag, const char *args)
 {
-    char ip[64], prefix[8], gw[64], dns[160];
+    char ip[64], prefix[8], gw[64], dns[160], match[64];
     char *field;
     const char *slash  = strchr(args, '/');
     const char *colon2 = slash ? strchr(slash, ':') : NULL;
@@ -522,15 +522,30 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
     memcpy(ip,     args,        ip_len);  ip[ip_len]   = '\0';
     memcpy(prefix, slash + 1,   pfx_len); prefix[pfx_len] = '\0';
     snprintf(gw, sizeof(gw), "%s", colon2 + 1);
-    /* set_ip:IP/PREFIX:GATEWAY[:MAC[:DNS,DNS]]. netplan matches the NIC by
-       name here, so the MAC is skipped; DNS defaults to the gateway. */
+    /* set_ip:IP/PREFIX:GATEWAY[:MAC[:DNS,DNS]]. netplan matches the NIC by its
+       MAC, since a VM with shared drives has a second e* adapter that must not
+       get this address, and by name if the host could not read it. DNS defaults
+       to the gateway. */
     snprintf(dns, sizeof(dns), "%s, 8.8.8.8", gw);
+    snprintf(match, sizeof(match), "name: \"e*\"");
     field = strchr(gw, ':');
     if (field) {
         char *dns_field;
+        char mac[18] = "";
         *field++ = '\0';
         snprintf(dns, sizeof(dns), "%s, 8.8.8.8", gw);
         dns_field = strchr(field, ':');
+        if (dns_field && (size_t)(dns_field - field) == 17) memcpy(mac, field, 17);
+        else if (!dns_field && strlen(field) == 17) memcpy(mac, field, 17);
+        if (mac[0]) {
+            int valid = 1;
+            for (char *p = mac; *p; p++) {
+                if (*p == '-') *p = ':';
+                else *p = (char)tolower((unsigned char)*p);
+                if (!isxdigit((unsigned char)*p) && *p != ':') valid = 0;
+            }
+            if (valid) snprintf(match, sizeof(match), "macaddress: \"%s\"", mac);
+        }
         if (dns_field && dns_field[1]) {
             const char *p;
             for (p = dns_field + 1; *p; p++)
@@ -571,7 +586,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "  renderer: $RENDERER\n"
         "  ethernets:\n"
         "    appsbnic:\n"
-        "      match: { name: \"e*\" }\n"
+        "      match: { %s }\n"
         "      dhcp4: false\n"
         "      dhcp6: false\n"
         "      addresses: [\"%s/%s\"]\n"
@@ -612,7 +627,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "  sleep 0.5; "
         "done; "
         "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
-        ip, prefix, gw, dns, ip);
+        match, ip, prefix, gw, dns, ip);
     if (n < 0 || n >= (int)sizeof(cmd)) {
         send_reply(fd, tag, "error:cmd_too_long");
         return;
@@ -1117,14 +1132,314 @@ static int configure_shared_nic(const char *arguments)
        adapter and refuse egress off the share subnet, so the appliance cannot
        reach the internet through it. Best effort: the address is what the
        shares need, and HCN ACLs on the host enforce the same boundary. */
+    /* On a desktop guest NetworkManager would run DHCP on this adapter and take
+       the address away again, so it is told to leave this MAC alone first. */
     snprintf(command, sizeof(command),
         "iface=$(ip -o link | awk -v mac='%s' 'tolower($0) ~ tolower(mac){gsub(\":\",\"\",$2);print $2;exit}'); "
+        "if systemctl is-active --quiet NetworkManager; then "
+        "printf '[keyfile]\\nunmanaged-devices=mac:%s\\n' > /etc/NetworkManager/conf.d/90-appsandbox-share.conf; "
+        "nmcli general reload conf 2>/dev/null; nmcli device set $iface managed no 2>/dev/null; fi; "
         "[ -n \"$iface\" ] && ip link set $iface up && ip addr replace %s/24 dev $iface && "
         "{ ip route del default dev $iface 2>/dev/null; "
         "iptables -C OUTPUT -o $iface ! -d %s -j DROP 2>/dev/null || "
         "iptables -A OUTPUT -o $iface ! -d %s -j DROP 2>/dev/null; true; }",
-        copy, separator, subnet, subnet);
+        copy, copy, separator, subnet, subnet);
     return run_sync(command);
+}
+
+/* ---- Shared drives ----
+   Same command the Windows agent gets: shared_smb_map:L:HOST:SHARE:USER:PASSWORD.
+   Linux has no drive letters, so each drive mounts at /mnt/appsandbox/<L> and gets
+   a Files sidebar bookmark. The password goes in a root-only file, never on a
+   command line. Retries because the appliance's SMB may still be starting. */
+
+#define SHARED_MOUNT_ROOT "/mnt/appsandbox"
+
+static void add_files_bookmark(const char *letter, const char *share)
+{
+    char home[256], dir[320], path[360], line[256], want[128];
+    uid_t uid; gid_t gid;
+    FILE *f;
+    if (!find_primary_user(home, sizeof(home), &uid, &gid)) return;
+    snprintf(dir, sizeof(dir), "%s/.config/gtk-3.0", home);
+    snprintf(path, sizeof(path), "%s/bookmarks", dir);
+    snprintf(want, sizeof(want), "file://" SHARED_MOUNT_ROOT "/%s ", letter);
+    f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, want, strlen(want)) == 0) { fclose(f); return; }
+        }
+        fclose(f);
+    }
+    mkpath_p(dir);
+    f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "%s%s: %s\n", want, letter, share);
+    fclose(f);
+    {
+        char home_cfg[300];
+        snprintf(home_cfg, sizeof(home_cfg), "%s/.config", home);
+        if (chown(home_cfg, uid, gid) != 0 || chown(dir, uid, gid) != 0 ||
+            chown(path, uid, gid) != 0)
+            agent_log("shared drive: bookmark chown: %s", strerror(errno));
+    }
+}
+
+static int shared_valid_host(const char *host)
+{
+    const char *p;
+    if (!*host) return 0;
+    for (p = host; *p; p++)
+        if (!isdigit((unsigned char)*p) && *p != '.') return 0;
+    return 1;
+}
+
+static int shared_valid_letter(const char *letter)
+{
+    return letter && letter[0] >= 'A' && letter[0] <= 'Z' && !letter[1];
+}
+
+static int shared_map(char *args)
+{
+    char *save = NULL, command[768], home[256], cred[] = "/run/appsandbox-cifs-XXXXXX";
+    char *letter = strtok_r(args, ":", &save);
+    char *host = strtok_r(NULL, ":", &save);
+    char *share = strtok_r(NULL, ":", &save);
+    char *user = strtok_r(NULL, ":", &save);
+    char *password = strtok_r(NULL, "", &save);
+    char *domain = NULL;
+    uid_t uid = 0; gid_t gid = 0;
+    FILE *file;
+    int fd, rc;
+
+    /* The appliance's account is USER or DOMAIN\\USER. */
+    if (user) {
+        char *sep = strchr(user, '\\');
+        if (sep) { *sep = '\0'; domain = user; user = sep + 1; }
+    }
+    if (domain && !shared_valid_host(domain) && !appliance_token_valid(domain))
+        return EINVAL;
+    if (!shared_valid_letter(letter) || !host || !shared_valid_host(host) ||
+        !share || !appliance_token_valid(share) ||
+        !user || !appliance_token_valid(user) || !password || !*password)
+        return EINVAL;
+    find_primary_user(home, sizeof(home), &uid, &gid);
+
+    fd = mkstemp(cred);
+    if (fd < 0) return errno;
+    fchmod(fd, 0600);
+    file = fdopen(fd, "w");
+    if (!file) { close(fd); unlink(cred); return errno; }
+    fprintf(file, "username=%s\npassword=%s\n", user, password);
+    if (domain) fprintf(file, "domain=%s\n", domain);
+    fclose(file);
+    memset(password, 0, strlen(password));
+
+    snprintf(command, sizeof(command),
+        "m=" SHARED_MOUNT_ROOT "/%s; mkdir -p \"$m\"; "
+        "mountpoint -q \"$m\" && umount -l \"$m\"; "
+        "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do "
+        "mount -t cifs //%s/%s \"$m\" -o credentials=%s,uid=%u,gid=%u,"
+        "file_mode=0775,dir_mode=0775,nosuid,nodev && exit 0; sleep 5; done; exit 32",
+        letter, host, share, cred, (unsigned)uid, (unsigned)gid);
+    rc = run_sync(command);
+    unlink(cred);
+    if (rc == 0) add_files_bookmark(letter, share);
+    return rc;
+}
+
+static int shared_unmap(const char *letter)
+{
+    char command[256];
+    if (!shared_valid_letter(letter)) return EINVAL;
+    snprintf(command, sizeof(command),
+        "m=" SHARED_MOUNT_ROOT "/%s; ! mountpoint -q \"$m\" || umount -l \"$m\"", letter);
+    return run_sync(command);
+}
+
+/* ---- Apps chosen at creation ----
+   install_apps:a,b,c, the command the Windows agent takes with winget IDs. Here
+   each name is an apt package, or else a snap. Kept in a file across reboots, and
+   a name that keeps failing is dropped after a few starts like the Windows agent. */
+
+#define APPS_FILE      "/var/lib/appsandbox/apps-pending"
+#define APPS_ATTEMPTS  "/var/lib/appsandbox/apps-attempts"
+#define APPS_MAX_ATTEMPTS 3
+
+static volatile int g_apps_running = 0;
+
+static void host_log(const char *fmt, ...)
+{
+    char line[1024];
+    size_t used;
+    va_list ap;
+    int fd = g_client_fd;
+    used = (size_t)snprintf(line, sizeof(line), "log:");
+    va_start(ap, fmt);
+    vsnprintf(line + used, sizeof(line) - used, fmt, ap);
+    va_end(ap);
+    agent_log("%s", line + used);
+    if (fd >= 0) send_line(fd, line);
+}
+
+static int apps_valid_name(const char *name)
+{
+    const unsigned char *p = (const unsigned char *)name;
+    if (!*p || strlen(name) > 100 || *p == '-') return 0;
+    for (; *p; p++)
+        if (!isalnum(*p) && *p != '.' && *p != '+' && *p != '_' && *p != '-') return 0;
+    return 1;
+}
+
+static void *apps_thread(void *arg)
+{
+    char names[1024] = "", failed[1024] = "", ok[1024] = "";
+    char *save = NULL, *name;
+    FILE *f;
+    int attempts = 0, i;
+    (void)arg;
+
+    f = fopen(APPS_FILE, "r");
+    if (f) {
+        if (!fgets(names, sizeof(names), f)) names[0] = '\0';
+        fclose(f);
+    }
+    names[strcspn(names, "\r\n")] = '\0';
+    if (!names[0]) goto done;
+    f = fopen(APPS_ATTEMPTS, "r");
+    if (f) { if (fscanf(f, "%d", &attempts) != 1) attempts = 0; fclose(f); }
+    f = fopen(APPS_ATTEMPTS, "w");
+    if (f) { fprintf(f, "%d\n", attempts + 1); fclose(f); }
+
+    /* Wait for the network the host configures after connecting. */
+    for (i = 0; i < 60; i++) {
+        if (run_sync("getent hosts archive.ubuntu.com >/dev/null 2>&1") == 0) break;
+        sleep(5);
+    }
+    host_log("Installing the apps chosen for this VM: %s", names);
+    run_sync("DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1");
+    for (name = strtok_r(names, ",", &save); name; name = strtok_r(NULL, ",", &save)) {
+        char cmd[512], *list = failed;
+        if (apps_valid_name(name)) {
+            snprintf(cmd, sizeof(cmd),
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y %s >/dev/null 2>&1 || "
+                "snap install %s >/dev/null 2>&1 || snap install %s --classic >/dev/null 2>&1",
+                name, name, name);
+            if (run_sync(cmd) == 0) list = ok;
+        }
+        size_t used = strlen(list);
+        snprintf(list + used, sizeof(ok) - used, "%s%s", used ? "," : "", name);
+    }
+    if (ok[0]) host_log("Installed apps: %s", ok);
+    if (failed[0] && attempts + 1 < APPS_MAX_ATTEMPTS) {
+        f = fopen(APPS_FILE, "w");
+        if (f) { fprintf(f, "%s\n", failed); fclose(f); }
+        host_log("Could not install: %s (retried at the next start)", failed);
+    } else {
+        if (failed[0]) host_log("Giving up on installing: %s", failed);
+        unlink(APPS_FILE);
+        unlink(APPS_ATTEMPTS);
+    }
+done:
+    g_apps_running = 0;
+    return NULL;
+}
+
+static void start_app_install(void)
+{
+    pthread_t t;
+    struct stat st;
+    if (stat(APPS_FILE, &st) != 0 || g_apps_running) return;
+    g_apps_running = 1;
+    if (pthread_create(&t, NULL, apps_thread, NULL) == 0) pthread_detach(t);
+    else g_apps_running = 0;
+}
+
+static int queue_apps(const char *names)
+{
+    FILE *f;
+    mkpath_p("/var/lib/appsandbox");
+    f = fopen(APPS_FILE, "w");
+    if (!f) return 0;
+    fprintf(f, "%s\n", names);
+    fclose(f);
+    unlink(APPS_ATTEMPTS);
+    return 1;
+}
+
+/* ---- Guest refresh ----
+   The Linux counterpart of the Windows helper refresh: the host compares the
+   stamp of the guest source it ships with the one this VM was built from, and
+   sends a tar of the source if they differ. The update script builds and installs
+   it, which restarts this agent; a changed display driver waits for the reboot. */
+
+#define GUEST_STAMP_FILE  "/etc/appsandbox-guest-stamp"
+#define GUEST_UPDATE_DIR  "/var/lib/appsandbox/update"
+#define GUEST_UPDATE_MAX  (32u * 1024u * 1024u)
+
+static int stamp_valid(const char *stamp)
+{
+    const unsigned char *p = (const unsigned char *)stamp;
+    if (!*p || strlen(stamp) > 128) return 0;
+    for (; *p; p++) if (!isxdigit(*p)) return 0;
+    return 1;
+}
+
+static void handle_guest_stamp(int fd, const char *tag)
+{
+    char stamp[160] = "none", reply[192];
+    FILE *f = fopen(GUEST_STAMP_FILE, "r");
+    if (f) {
+        if (!fgets(stamp, sizeof(stamp), f)) snprintf(stamp, sizeof(stamp), "none");
+        stamp[strcspn(stamp, "\r\n")] = '\0';
+        fclose(f);
+    }
+    snprintf(reply, sizeof(reply), "stamp:%s", stamp);
+    send_reply(fd, tag, reply);
+}
+
+/* guest_update:STAMP:BYTES, then BYTES of .tar.gz on this socket. */
+static void handle_guest_update(int fd, const char *tag, const char *args)
+{
+    char stamp[160], path[] = GUEST_UPDATE_DIR ".tar.gz", cmd[512], buf[65536];
+    const char *colon = strchr(args, ':');
+    unsigned long left = 0;
+    size_t len;
+    FILE *f;
+
+    if (!colon) { send_reply(fd, tag, "error:bad_format"); return; }
+    len = (size_t)(colon - args);
+    left = strtoul(colon + 1, NULL, 10);
+    if (len >= sizeof(stamp) || !left || left > GUEST_UPDATE_MAX) {
+        send_reply(fd, tag, "error:bad_format");
+        return;
+    }
+    memcpy(stamp, args, len);
+    stamp[len] = '\0';
+    mkpath_p("/var/lib/appsandbox");
+    f = fopen(path, "wb");
+    /* The bytes are on the wire whatever happens, so always read them all. */
+    while (left) {
+        ssize_t n = read(fd, buf, left < sizeof(buf) ? left : sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { if (f) fclose(f); return; }
+        if (f && fwrite(buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); f = NULL; }
+        left -= (unsigned long)n;
+    }
+    if (!f || fclose(f) != 0 || !stamp_valid(stamp)) {
+        send_reply(fd, tag, "error:write");
+        return;
+    }
+    snprintf(cmd, sizeof(cmd),
+        "rm -rf " GUEST_UPDATE_DIR " && mkdir -p " GUEST_UPDATE_DIR " && "
+        "tar -xzf %s -C " GUEST_UPDATE_DIR, path);
+    if (run_sync(cmd) != 0) { send_reply(fd, tag, "error:extract"); return; }
+    send_reply(fd, tag, "ok");
+    snprintf(cmd, sizeof(cmd),
+        "systemd-run --no-block --collect --unit=appsandbox-guest-update "
+        "/bin/bash " GUEST_UPDATE_DIR "/tools/linux/agent/appsandbox-guest-update.sh %s",
+        stamp);
+    if (run_sync(cmd) != 0) host_log("Could not start the guest refresh.");
 }
 
 static int appliance_prepare_storage(void)
@@ -1423,6 +1738,8 @@ static void handle_client(int fd)
 
         if (strncmp(cmd, "appliance_account:", 18) == 0)
             agent_log("cmd: appliance_account:<redacted>");
+        else if (strncmp(cmd, "shared_smb_map:", 15) == 0)
+            agent_log("cmd: shared_smb_map:<redacted>");
         else if (strncmp(cmd, "vpn_set:", 8) == 0)
             agent_log("cmd: vpn_set:<redacted>");
         else
@@ -1473,6 +1790,26 @@ static void handle_client(int fd)
         }
         else if (strncmp(cmd, "shared_net:", 11) == 0) {
             send_reply(fd, tag, configure_shared_nic(cmd + 11) == 0 ? "ok" : "net_failed");
+        }
+        else if (strncmp(cmd, "shared_smb_map:", 15) == 0) {
+            char failure[64];
+            int rc = shared_map((char *)cmd + 15);
+            snprintf(failure, sizeof(failure), "map_failed:%d", rc);
+            send_reply(fd, tag, rc == 0 ? "ok" : failure);
+        }
+        else if (strncmp(cmd, "shared_smb_unmap:", 17) == 0) {
+            send_reply(fd, tag, shared_unmap(cmd + 17) == 0 ? "ok" : "unmap_failed");
+        }
+        else if (strncmp(cmd, "install_apps:", 13) == 0) {
+            int queued = queue_apps(cmd + 13);
+            send_reply(fd, tag, queued ? "ok" : "error:queue");
+            if (queued) start_app_install();
+        }
+        else if (strcmp(cmd, "guest_stamp") == 0) {
+            handle_guest_stamp(fd, tag);
+        }
+        else if (strncmp(cmd, "guest_update:", 13) == 0) {
+            handle_guest_update(fd, tag, cmd + 13);
         }
         else if (strcmp(cmd, "shutdown") == 0) {
             send_reply(fd, tag, "ok");
@@ -1603,6 +1940,9 @@ int main(int argc, char **argv)
      * clients. It'll spawn the helper as soon as the user session is
      * ready, independent of host-driven idd_connect. */
     start_clipboard_monitor();
+
+    /* Apps left over from an earlier start (see apps_thread). */
+    start_app_install();
 
     while (!g_stop) {
         int c = accept(ls, NULL, NULL);
