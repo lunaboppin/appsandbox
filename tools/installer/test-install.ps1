@@ -7,7 +7,7 @@
 
   The per-machine installer needs an elevated prompt. -PerUser takes the installer
   from build-installer.ps1 -TestPerUser and needs none, but can't cover the HKLM
-  uninstall entry or the update run that reopens the app.
+  uninstall entry, the update run that reopens the app or the short menu's package.
 #>
 [CmdletBinding()]
 param(
@@ -47,6 +47,16 @@ $dataDir = Join-Path $env:ProgramData 'AppSandbox'
 # -LiteralPath: the * here is a real key name, not a wildcard.
 $runEntry = "$root\Software\Classes\*\shell\AppSandbox.RunInSandbox"
 function Get-RunEntryCommand { (Get-Item -LiteralPath "$runEntry\command" -ErrorAction SilentlyContinue).GetValue('') }
+function Get-MenuPackage { Get-AppxPackage -Name 'AppSandbox.ShellMenu' }
+# A signed installer must carry the short menu's package. The per-user one is never signed.
+$signed = (Get-AuthenticodeSignature -LiteralPath $Setup).SignerCertificate -ne $null
+function Check-MenuPackage([string]$when) {
+    $package = Get-MenuPackage
+    Check "short menu package registered ($when)" ($null -ne $package) (Get-Content (Join-Path $env:TEMP 'AppSandbox-shell-menu.log') -Tail 3 -ErrorAction SilentlyContinue)
+    if ($package) {
+        Check "short menu package has the installer's version ($when)" ($package.Version -eq $version) $package.Version
+    }
+}
 $dataBefore = Test-Path $dataDir
 
 $held = $null
@@ -60,7 +70,7 @@ try {
         throw "Setup exited $code, so nothing was installed. Exit 1 before any log usually means this Windows is below MinVersion."
     }
 
-    foreach ($f in @('AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'iso-patch.exe', 'WebView2Loader.dll', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
+    foreach ($f in @('AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'appsandbox-shell.dll', 'shell-menu.ps1', 'iso-patch.exe', 'WebView2Loader.dll', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
                      'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe',
                      'resources\appsandbox-clipboard.exe', 'resources\appsandbox-clipboard-reader.exe',
                      'resources\appsandbox-displays.exe', 'resources\appsandbox-input.exe',
@@ -73,6 +83,7 @@ try {
     Check 'installed app is the installer''s version' ((Get-PeVersion (Join-Path $dir 'AppSandbox.exe')) -eq $version)
     Check 'uninstaller present' (Test-Path (Join-Path $dir 'unins000.exe'))
     Check 'Run in Sandbox entry runs the installed launcher' ((Get-RunEntryCommand) -eq "`"$dir\appsandbox-run.exe`" `"%1`"") (Get-RunEntryCommand)
+    if ($signed) { Check-MenuPackage 'install' }
 
     $entry = Get-ItemProperty $uninstallKey -ErrorAction SilentlyContinue
     Check 'Apps & features entry written' ($null -ne $entry)
@@ -109,6 +120,7 @@ try {
     Check 'upgrade clears files a new version dropped' (-not (Test-Path (Join-Path $dir 'resources\dropped-by-new-version.exe')))
     Check 'upgrade still has the guest helpers' (Test-Path (Join-Path $dir 'resources\appsandbox-backstage.exe'))
     Check 'upgrade keeps the Run in Sandbox entry' ((Get-RunEntryCommand) -eq "`"$dir\appsandbox-run.exe`" `"%1`"") (Get-RunEntryCommand)
+    if ($signed) { Check-MenuPackage 'upgrade' }
 
     # ------------------------------------------------- app running = hands off ---
     # Holding the app's own mutex looks exactly like a running app to Setup. Only an
@@ -165,6 +177,11 @@ try {
     Check 'a file of the user''s in the folder is left alone' (Test-Path (Join-Path $dir 'user-file.txt'))
     Check 'Apps & features entry removed' (-not (Test-Path $uninstallKey))
     Check 'Run in Sandbox entry removed' (-not (Test-Path -LiteralPath $runEntry))
+    if ($signed) {
+        Check 'short menu package removed' ($null -eq (Get-MenuPackage))
+        $signer = (Get-AuthenticodeSignature -LiteralPath $Setup).SignerCertificate
+        Check 'short menu certificate no longer trusted' (-not (Test-Path "Cert:\LocalMachine\TrustedPeople\$($signer.Thumbprint)"))
+    }
     Check 'shortcuts removed' (-not (Test-Path (Join-Path $programs 'App Sandbox.lnk')) -and -not (Test-Path (Join-Path $desktop 'App Sandbox.lnk')))
     Check 'a silent uninstall leaves VM data alone' ((Test-Path $dataDir) -eq $dataBefore)
 } finally {

@@ -134,6 +134,7 @@ jobs:
             'bin\Release\AppSandbox.exe',
             'bin\Release\appsandbox_core.dll',
             'bin\Release\appsandbox-run.exe',
+            'bin\Release\appsandbox-shell.dll',
             'bin\Release\iso-patch.exe',
             'bin\Release\drivers\AppSandboxVDD.dll',
             'bin\Release\drivers\AppSandboxVAD.sys',

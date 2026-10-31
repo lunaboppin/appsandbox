@@ -95,6 +95,7 @@ Type: filesandordirs; Name: "{app}\headless-api"
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "shell-menu.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; The working folder matters: the app writes appsandbox.log to its current directory.
@@ -102,10 +103,11 @@ Name: "{autoprograms}\App Sandbox"; Filename: "{app}\AppSandbox.exe"; WorkingDir
 Name: "{autodesktop}\App Sandbox"; Filename: "{app}\AppSandbox.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-; Explorer's right-click entry, for every file type. On Windows 11 it sits under "Show more
-; options": the short menu only takes packaged extensions. The launcher runs unelevated, so
-; the entry raises no UAC prompt while the app is open. HKA follows the install mode, and an
-; upgrade rewrites the same key with the current folder.
+; Explorer's right-click entry, for every file type, under "Show more options" on Windows 11.
+; The short menu only takes packaged extensions: see shell-menu.ps1, run from [Code] below. Windows
+; shows the two as one entry. The launcher runs unelevated, so the entry raises no UAC prompt
+; while the app is open. HKA follows the install mode, and an upgrade rewrites the same key with
+; the current folder.
 Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox"; ValueType: string; ValueName: ""; ValueData: "Run in Sandbox"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\AppSandbox.exe,0"
 Root: HKA; Subkey: "Software\Classes\*\shell\AppSandbox.RunInSandbox"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Document"
@@ -207,6 +209,44 @@ begin
   end;
 end;
 
+// See shell-menu.ps1. Never fails Setup: the classic entry stays either way.
+function ShellMenuParams(Action: String): String;
+begin
+  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+            ExpandConstant('{app}\shell-menu.ps1') + '" -Action ' + Action;
+end;
+
+function PowerShellPath: String;
+begin
+  Result := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+end;
+
+procedure RemoveShellMenu;
+var
+  ResultCode: Integer;
+begin
+  if FileExists(ExpandConstant('{app}\shell-menu.ps1')) then begin
+    Exec(PowerShellPath, ShellMenuParams('remove'), '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Log('Removing the short menu entry: exit ' + IntToStr(ResultCode));
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  // Before any file is replaced, because the package's process holds appsandbox-shell.dll.
+  if CurStep = ssInstall then
+    RemoveShellMenu
+  else if (CurStep = ssPostInstall) and FileExists(ExpandConstant('{app}\AppSandbox-shell.msix')) then begin
+    Exec(PowerShellPath, ShellMenuParams('trust'), '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Log('Trusting the short menu package: exit ' + IntToStr(ResultCode));
+    // A package belongs to one user, and Setup may be elevated as a different one.
+    ExecAsOriginalUser(PowerShellPath, ShellMenuParams('register'), '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Log('Adding the short menu entry: exit ' + IntToStr(ResultCode));
+  end;
+end;
+
 // The VMMS certificate the app created so VMs can use integration services
 // (src\backend_win\vmms_cert.c), recognised by its subject. Hyper-V's own certificate isn't touched.
 procedure RemoveVmmsCertificate;
@@ -223,6 +263,7 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: String;
 begin
+  if CurUninstallStep = usUninstall then RemoveShellMenu;
   if CurUninstallStep <> usPostUninstall then exit;
   DataDir := ExpandConstant('{commonappdata}\AppSandbox');
   // VMs are the user's data, so they stay unless the user says otherwise, and a

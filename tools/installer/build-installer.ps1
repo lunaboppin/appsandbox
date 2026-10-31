@@ -55,6 +55,13 @@ function Find-SignTool {
     return $c.FullName
 }
 
+function Find-MakeAppx {
+    $c = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
+         Sort-Object FullName -Descending | Select-Object -First 1
+    if (-not $c) { throw 'makeappx.exe not found under Windows Kits\10\bin\*\x64.' }
+    return $c.FullName
+}
+
 function Get-PeVersion([string]$path) {
     # The numeric parts: Inno pads its version strings with spaces.
     $v = (Get-Item -LiteralPath $path).VersionInfo
@@ -83,6 +90,34 @@ $stageArgs = @{ Bin = $bin; Stage = $stage }
 if ($TestCerts) { $stageArgs.IncludeTestCerts = $true }
 & (Join-Path $repo 'tools\sign\stage-package.ps1') @stageArgs
 
+if ($SignThumbprint -and -not $TimestampUrl) {
+    $cfg = Get-Content (Join-Path $repo 'tools\sign\submission-config.json') -Raw | ConvertFrom-Json
+    $TimestampUrl = $cfg.timestampUrl
+}
+
+# ---------------------------------------------------- the short menu's package ---
+
+# Windows only installs a signed package, so an unsigned installer has just the classic entry.
+if ($SignThumbprint) {
+    $cert = Get-Item "Cert:\CurrentUser\My\$SignThumbprint"
+    $packageDir = Join-Path $work 'shell-package'
+    New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+    $source = Join-Path $PSScriptRoot 'shell-package'
+    Copy-Item (Join-Path $source 'logo.png') $packageDir
+    $manifest = (Get-Content (Join-Path $source 'AppxManifest.xml') -Raw).Replace('@VERSION@', $version).Replace('@PUBLISHER@', [Security.SecurityElement]::Escape($cert.Subject))
+    Set-Content -LiteralPath (Join-Path $packageDir 'AppxManifest.xml') -Value $manifest -Encoding UTF8
+    $msix = Join-Path $stage 'AppSandbox-shell.msix'
+    # /nv: the executable and DLL the manifest names are the installed ones, not in the package.
+    & (Find-MakeAppx) pack /o /nv /d $packageDir /p $msix | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "makeappx failed (exit $LASTEXITCODE)." }
+    & (Find-SignTool) sign /sha1 $SignThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $msix | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Signing the shell package failed (exit $LASTEXITCODE)." }
+    # Other PCs don't trust a self-signed certificate, so Setup has to add it.
+    if ($cert.Subject -eq $cert.Issuer) {
+        [IO.File]::WriteAllBytes((Join-Path $stage 'AppSandbox-shell.cer'), $cert.Export('Cert'))
+    }
+}
+
 # ---------------------------------------------------------------- compile ---
 
 $outDir = if ($TestPerUser) { Join-Path $work 'output' } else { Join-Path $bin 'installer' }
@@ -92,10 +127,6 @@ $isccArgs = @("/DAppVersion=$version", "/DStageDir=$stage", "/DOutputDir=$outDir
 if ($TestPerUser) { $isccArgs += '/DTestPerUser' }
 if ($SignThumbprint) {
     $signtool = Find-SignTool
-    if (-not $TimestampUrl) {
-        $cfg = Get-Content (Join-Path $repo 'tools\sign\submission-config.json') -Raw | ConvertFrom-Json
-        $TimestampUrl = $cfg.timestampUrl
-    }
     # ISCC signs Setup and the uninstaller inside it through this named tool; $f is the
     # file and $q a quote. The uninstaller can only be signed during the build.
     $isccArgs += '/DSignTool'

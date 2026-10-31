@@ -22,7 +22,7 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 # Explicit allowlist (not "copy everything minus excludes"): the root holds ONLY the host app +
 # its direct deps; the guest binaries ship under resources\, the signed drivers under drivers\,
 # the web UI under web\.
-$rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'iso-patch.exe', 'WebView2Loader.dll')
+$rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'appsandbox-shell.dll', 'iso-patch.exe', 'WebView2Loader.dll')
 foreach ($b in $rootBins) {
     $src = Join-Path $Bin $b
     if (-not (Test-Path $src)) { throw "Missing required root binary $b under $Bin." }
@@ -63,7 +63,7 @@ foreach ($sub in @('examples', 'tests')) {
 # expected artifact is missing rather than shipping a partial package. The guest helpers are
 # named one by one: a VM started from a package missing one fails in ways that are slow to trace.
 $required = @(
-    'AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'iso-patch.exe', 'WebView2Loader.dll',
+    'AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'appsandbox-shell.dll', 'iso-patch.exe', 'WebView2Loader.dll',
     'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
     'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
