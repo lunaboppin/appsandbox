@@ -20,7 +20,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Nested virtualization,** so Docker, WSL and Claude Cowork run inside the VM.
 
 ### Display, input and sound
-- **Virtual display (IddCx) at 1080p60**, with frames sent as compact NV12 when most of the screen changes (games, video) and losslessly otherwise.
+- **Virtual display (IddCx) at 60 Hz that follows the window:** resize the display window on a Windows VM and the guest takes exactly that size. Frames are sent as compact NV12 when most of the screen changes (games, video) and losslessly otherwise.
 - **Game mode:** the mouse is captured when a game hides the cursor, raw relative mouse input is passed through, and Ctrl+Alt releases it. Keyboard hotkeys can be passed to the guest too.
 - **2-channel audio** from the VM, using App Sandbox's own audio driver or, when Secure Boot blocks it, VB-CABLE, installed automatically.
 - **Copy and paste** between host and guest.

@@ -107,7 +107,20 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+
+/* The guest display takes the size of the window's client area, exactly. These
+   are the only limits, and the driver applies the same ones (VDD_* in vdd.h).
+   Below 640x480 Windows offers no mode, so a smaller window shows the picture
+   scaled down. The upper limit is what a frame may cost: buffers per frame here
+   and in the guest, and the link's throughput. A bigger window scales up. */
+#define IDD_MIN_WIDTH       640
+#define IDD_MIN_HEIGHT      480
+#define IDD_MAX_SIDE        8192
+#define IDD_MAX_PIXELS      (7680u * 4320u)
+#define MAX_FRAME_DATA_SIZE (IDD_MAX_PIXELS * 4)
+
+/* Host -> driver on the frame connection: please use this size (VDD_WIRE_RESIZE). */
+#define RESIZE_MAGIC        0x5A525341  /* "ASRZ" little-endian */
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -144,12 +157,21 @@ typedef struct InputPacket {
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_CURSOR_VIS       (WM_USER + 102)   /* wp = guest cursor visible */
+#define WM_IDD_RESIZE_CHECK     (WM_USER + 103)   /* the frame size or connection changed */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
 #define IDT_INPUT       2002
 #define MOUSE_MOVE_MIN_INTERVAL_MS 8
+/* A mode change makes the guest's monitor depart and arrive, so it waits for the
+   window to settle: the end of a drag, or a pause after maximize and the like. */
+#define IDT_RESIZE      2003
+#define RESIZE_SETTLE_MS 300
+#define RESIZE_POLL_MS   250
+/* How long a requested size has to appear. Longer than the driver takes to
+   go back to the last size that worked (VDD_ASSIGN_WAIT_MS and friends). */
+#define RESIZE_WAIT_MS   15000
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -235,6 +257,8 @@ struct VmDisplayIdd {
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT                     tex_width;     /* size of frame_tex */
+    UINT                     tex_height;
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -249,6 +273,20 @@ struct VmDisplayIdd {
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
+
+    /* Guest display following the window (window thread, except as noted) */
+    volatile SOCKET frame_socket;    /* frame connection; closed under frame_cs */
+    volatile BOOL  frame_seen;       /* a frame arrived on this connection (recv thread) */
+    BOOL           can_resize;       /* a Windows guest whose driver answers requests */
+    BOOL           resize_worked;    /* the driver reached a requested size */
+    BOOL           resize_even_only; /* an odd size didn't appear, an even one might */
+    BOOL           resize_gave_up;   /* until the window's size changes again */
+    BOOL           in_sizemove;      /* the user is dragging the frame */
+    UINT           want_width;       /* the window's client area, within the limits */
+    UINT           want_height;
+    UINT           asked_width;      /* the size last requested and not yet seen */
+    UINT           asked_height;
+    DWORD          asked_tick;
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
@@ -1277,20 +1315,24 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
 }
 
 /* NV12 (Y plane, then interleaved UV; full-range BT.601) -> BGRA. The
-   inverse of VddPackNv12 in the guest driver. width and height are even. */
+   inverse of VddPackNv12 in the guest driver. The planes have even sizes, so
+   an odd width or height carries one column or row of padding, dropped here. */
+#define IDD_ALIGN2(n) (((n) + 1) & ~1u)
+
 static void idd_nv12_to_bgra(const BYTE *src, UINT w, UINT h, BYTE *dst, UINT dst_stride)
 {
-    const BYTE *uv_plane = src + (size_t)w * h;
+    const UINT aw = IDD_ALIGN2(w), ah = IDD_ALIGN2(h);
+    const BYTE *uv_plane = src + (size_t)aw * ah;
     UINT x, y;
     for (y = 0; y < h; y++) {
-        const BYTE *yrow = src + (size_t)y * w;
-        const BYTE *uv = uv_plane + (size_t)(y / 2) * w;
+        const BYTE *yrow = src + (size_t)y * aw;
+        const BYTE *uv = uv_plane + (size_t)(y / 2) * aw;
         BYTE *out = dst + (size_t)y * dst_stride;
         for (x = 0; x < w; x += 2) {
             int u = uv[x] - 128, v = uv[x + 1] - 128;
             int dr = 359 * v, dg = -88 * u - 183 * v, db = 454 * u;
             int k;
-            for (k = 0; k < 2; k++) {
+            for (k = 0; k < 2 && x + k < w; k++) {
                 int l = yrow[x + k] << 8;
                 int r = (l + dr + 128) >> 8, g = (l + dg + 128) >> 8, b = (l + db + 128) >> 8;
                 out[0] = (BYTE)(b < 0 ? 0 : b > 255 ? 255 : b);
@@ -1686,12 +1728,59 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+/* The dynamic, CPU-writable texture frames are uploaded to, sized to the frame. */
+static BOOL d3d_create_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    HRESULT hr;
+
+    if (d->frame_srv) { d->frame_srv->lpVtbl->Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL; }
+    d->tex_width = d->tex_height = 0;
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = width;
+    td.Height             = height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D(%ux%u) failed (0x%08X)", width, height, hr);
+        return FALSE;
+    }
+
+    /* Shader resource view for the frame texture */
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
+        d->frame_tex->lpVtbl->Release(d->frame_tex);
+        d->frame_tex = NULL;
+        return FALSE;
+    }
+
+    d->tex_width  = width;
+    d->tex_height = height;
+    return TRUE;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
@@ -1739,37 +1828,8 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
-    ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
-    td.MipLevels          = 1;
-    td.ArraySize          = 1;
-    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
-    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
-
-    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateTexture2D failed (0x%08X)", hr);
+    if (!d3d_create_frame_texture(d, DEFAULT_WIDTH, DEFAULT_HEIGHT))
         return FALSE;
-    }
-
-    /* Shader resource view for the frame texture */
-    ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Texture2D.MipLevels       = 1;
-    srv_desc.Texture2D.MostDetailedMip = 0;
-
-    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
-            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
-        return FALSE;
-    }
 
     /* Compile and create vertex shader */
     if (!d3d_compile_shader(g_vs_hlsl, "main", "vs_4_0", &vs_blob))
@@ -1854,7 +1914,7 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
 
 static void d3d_render_frame(VmDisplayIdd *d)
 {
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_MAPPED_SUBRESOURCE mapped = { 0 };
     D3D11_VIEWPORT vp;
     RECT rc;
     HRESULT hr;
@@ -1867,9 +1927,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
-        hr = d->ctx->lpVtbl->Map(d->ctx,
+        if (d->frame_width != d->tex_width || d->frame_height != d->tex_height)
+            d3d_create_frame_texture(d, d->frame_width, d->frame_height);
+        hr = d->frame_tex ? d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
-                D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                D3D11_MAP_WRITE_DISCARD, 0, &mapped) : E_FAIL;
         if (SUCCEEDED(hr)) {
             UINT row;
             UINT copy_stride = d->frame_width * 4;
@@ -1878,7 +1940,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -2151,6 +2213,100 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
 }
 
 /* ==================================================================
+ * Guest display following the window
+ * ================================================================== */
+
+/* The window's client area changed. Nothing is asked of the guest until it
+   settles, and the picture is scaled to fit until the new size arrives. */
+static void idd_resize_note_client(VmDisplayIdd *d, HWND hwnd, UINT width, UINT height)
+{
+    if (width < IDD_MIN_WIDTH)   width = IDD_MIN_WIDTH;
+    if (height < IDD_MIN_HEIGHT) height = IDD_MIN_HEIGHT;
+    if (width > IDD_MAX_SIDE)    width = IDD_MAX_SIDE;
+    if (height > IDD_MAX_SIDE)   height = IDD_MAX_SIDE;
+    if ((UINT64)width * height > IDD_MAX_PIXELS) height = IDD_MAX_PIXELS / width;
+    if (width == d->want_width && height == d->want_height) return;
+    d->want_width = width;
+    d->want_height = height;
+    d->resize_gave_up = FALSE;
+    d->asked_width = d->asked_height = 0;
+    SetTimer(hwnd, IDT_RESIZE, RESIZE_SETTLE_MS, NULL);
+}
+
+static BOOL idd_resize_send(VmDisplayIdd *d, UINT width, UINT height)
+{
+    UINT32 msg[3];
+    BOOL sent = FALSE;
+    msg[0] = RESIZE_MAGIC;
+    msg[1] = width;
+    msg[2] = height;
+    EnterCriticalSection(&d->frame_cs);
+    if (d->frame_socket != INVALID_SOCKET)
+        sent = send(d->frame_socket, (const char *)msg, sizeof(msg), 0) == (int)sizeof(msg);
+    LeaveCriticalSection(&d->frame_cs);
+    return sent;
+}
+
+/* Bring the guest to the window's size, one request at a time. The frames are
+   the answer: when they have the new size, it worked. A guest that never gets
+   there (a driver from before this, or a size Windows won't use) keeps what it
+   has, with the picture scaled to the window as before, and is not asked again
+   until the window's size changes. */
+static void idd_resize_step(VmDisplayIdd *d)
+{
+    UINT target_w = d->want_width, target_h = d->want_height;
+
+    if (!d->can_resize || d->in_sizemove || d->resize_gave_up || !target_w) return;
+    if (d->resize_even_only) {
+        target_w = IDD_ALIGN2(target_w);
+        target_h = IDD_ALIGN2(target_h);
+    }
+
+    if (d->frame_seen && d->frame_width == target_w && d->frame_height == target_h) {
+        if (d->asked_width) {
+            idd_log(d, L"Guest display is now %ux%u.", target_w, target_h);
+            d->resize_worked = TRUE;
+        }
+        d->asked_width = d->asked_height = 0;
+        return;
+    }
+
+    /* After a guest reboot this comes round again when frames return. */
+    if (!d->frame_seen || d->frame_socket == INVALID_SOCKET) {
+        SetTimer(d->hwnd, IDT_RESIZE, RESIZE_POLL_MS, NULL);
+        return;
+    }
+
+    if (d->asked_width == target_w && d->asked_height == target_h) {
+        if ((DWORD)(GetTickCount() - d->asked_tick) < RESIZE_WAIT_MS) {
+            SetTimer(d->hwnd, IDT_RESIZE, RESIZE_POLL_MS, NULL);
+            return;
+        }
+        if ((target_w | target_h) & 1) {
+            idd_log(d, L"Guest display didn't change to %ux%u; trying the nearest even size.",
+                    target_w, target_h);
+            d->resize_even_only = TRUE;
+            target_w = IDD_ALIGN2(target_w);
+            target_h = IDD_ALIGN2(target_h);
+        } else {
+            idd_log(d, L"Guest display didn't change to %ux%u; staying at %ux%u, scaled to the window.",
+                    target_w, target_h, d->frame_width, d->frame_height);
+            d->resize_gave_up = TRUE;
+            if (!d->resize_worked) d->can_resize = FALSE;   /* e.g. an older guest driver */
+            return;
+        }
+    }
+
+    idd_log(d, L"Asking for guest display size %ux%u.", target_w, target_h);
+    if (idd_resize_send(d, target_w, target_h)) {
+        d->asked_width = target_w;
+        d->asked_height = target_h;
+        d->asked_tick = GetTickCount();
+    }
+    SetTimer(d->hwnd, IDT_RESIZE, RESIZE_POLL_MS, NULL);
+}
+
+/* ==================================================================
  * Recv thread - connects to VM, receives frames, updates frame_buf
  * ================================================================== */
 
@@ -2165,6 +2321,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    UINT32 recv_cap = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;   /* grows with the frames */
     /* Frame pipeline timing, logged every 2 s: how long each frame takes to
        arrive once it starts (transfer) against how often frames start (the
        guest's rate). Slow transfer points at the link, slow starts at the
@@ -2181,7 +2338,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     QueryPerformanceCounter(&perf_window);
 
     /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_cap);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -2266,6 +2423,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        EnterCriticalSection(&d->frame_cs);
+        d->frame_socket = s;
+        d->frame_seen = FALSE;
+        LeaveCriticalSection(&d->frame_cs);
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
         while (!d->stop) {
@@ -2275,6 +2436,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             UINT32 i;
             UINT32 magic;
             BOOL nv12;
+            BOOL size_changed = FALSE;
 
             /* Peek at magic to determine message type */
             if (!recv_exact(s, &magic, sizeof(magic)))
@@ -2347,9 +2509,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Sanity checks */
             if (hdr.width == 0 || hdr.height == 0 ||
-                hdr.width > 7680 || hdr.height > 4320 ||
+                hdr.width > IDD_MAX_SIDE || hdr.height > IDD_MAX_SIDE ||
+                (UINT64)hdr.width * hdr.height > IDD_MAX_PIXELS ||
                 hdr.stride < hdr.width * (nv12 ? 1 : 4) ||
-                (nv12 && ((hdr.width | hdr.height) & 1 || hdr.dirty_rect_count != 0))) {
+                (nv12 && (hdr.stride != IDD_ALIGN2(hdr.width) || hdr.dirty_rect_count != 0))) {
                 idd_log(d, L"Invalid frame dimensions %ux%u stride %u.",
                        hdr.width, hdr.height, hdr.stride);
                 break;
@@ -2372,9 +2535,20 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 break;
 
             if (data_size > MAX_FRAME_DATA_SIZE ||
-                (nv12 && data_size != hdr.width * hdr.height / 2 * 3)) {
+                (nv12 && data_size != IDD_ALIGN2(hdr.width) * IDD_ALIGN2(hdr.height) / 2 * 3)) {
                 idd_log(d, L"Frame data size %u bytes is wrong, reconnecting.", data_size);
                 break;
+            }
+
+            if (data_size > recv_cap) {
+                BYTE *bigger = (BYTE *)HeapAlloc(GetProcessHeap(), 0, data_size);
+                if (!bigger) {
+                    idd_log(d, L"No memory for a %u byte frame, reconnecting.", data_size);
+                    break;
+                }
+                HeapFree(GetProcessHeap(), 0, recv_buf);
+                recv_buf = bigger;
+                recv_cap = data_size;
             }
 
             /* Read pixel data */
@@ -2421,6 +2595,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->frame_width  = hdr.width;
                     d->frame_height = hdr.height;
                     d->frame_stride = new_stride;
+                    size_changed = TRUE;
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
                     idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
@@ -2491,11 +2666,18 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             d->frame_dirty = TRUE;
             d->recv_count++;
+            if (!d->frame_seen) {
+                d->frame_seen = TRUE;
+                size_changed = TRUE;
+            }
             LeaveCriticalSection(&d->frame_cs);
 
             /* Signal the window thread to repaint */
-            if (d->hwnd && IsWindow(d->hwnd))
+            if (d->hwnd && IsWindow(d->hwnd)) {
                 PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+                if (size_changed)
+                    PostMessageW(d->hwnd, WM_IDD_RESIZE_CHECK, 0, 0);
+            }
 
             idd_lab_screenshot(d, &lab_shot_tick, &lab_shot_hash);
 
@@ -2529,6 +2711,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         /* Frame channel lost — close it but keep input alive */
+        EnterCriticalSection(&d->frame_cs);
+        d->frame_socket = INVALID_SOCKET;
+        d->frame_seen = FALSE;
+        LeaveCriticalSection(&d->frame_cs);
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
 
@@ -2891,6 +3077,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
         KillTimer(hwnd, IDT_INPUT);
+        KillTimer(hwnd, IDT_RESIZE);
         if (d && d->captured) ClipCursor(NULL);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
@@ -2908,8 +3095,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
+        /* Max: native frame size, for a guest whose display can't follow the window */
+        if (d && !d->can_resize && d->frame_width > 0 && d->frame_height > 0) {
             wr.left = 0; wr.top = 0;
             wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2928,7 +3115,25 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d3d_resize_swap_chain(d);
             idd_clip_cursor(d);
             idd_fab_place(d);
+            if (wp != SIZE_MINIMIZED && rc.right > 0 && rc.bottom > 0)
+                idd_resize_note_client(d, hwnd, (UINT)rc.right, (UINT)rc.bottom);
         }
+        return 0;
+
+    /* The guest changes size once at the end of a drag, not along the way. */
+    case WM_ENTERSIZEMOVE:
+        if (d) d->in_sizemove = TRUE;
+        break;
+
+    case WM_EXITSIZEMOVE:
+        if (d) {
+            d->in_sizemove = FALSE;
+            idd_resize_step(d);
+        }
+        break;
+
+    case WM_IDD_RESIZE_CHECK:
+        if (d) idd_resize_step(d);
         return 0;
 
     case WM_MOVE:
@@ -2977,6 +3182,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             flush_pending_mouse(d);
             if (d->pending_mouse)
                 SetTimer(hwnd, IDT_INPUT, MOUSE_MOVE_MIN_INTERVAL_MS, NULL);
+            return 0;
+        }
+        if (wp == IDT_RESIZE && d) {
+            KillTimer(hwnd, IDT_RESIZE);
+            idd_resize_step(d);
             return 0;
         }
         if (wp == IDT_PRESENT && d) {
@@ -3209,6 +3419,9 @@ static VmDisplayIdd *idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_h
     d->stop         = FALSE;
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
+    d->frame_socket       = INVALID_SOCKET;
+    /* The Linux guest's display (asb_drm) keeps its own size. */
+    d->can_resize         = _wcsicmp(vm->os_type, L"Windows") == 0;
     d->clipboard          = NULL;
 
     /* Load the per-VM display setting, creating display_settings.json with

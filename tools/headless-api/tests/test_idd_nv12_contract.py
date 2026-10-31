@@ -27,7 +27,7 @@ def main() -> None:
     # Guest: NV12 only once a lossless frame went, for full or mostly-dirty frames.
     assert "static void VddPackNv12(" in vdd
     assert "if (bSentFullFrame) {" in vdd
-    assert "area * 100 >= (UINT64)VDD_WIDTH * VDD_HEIGHT * VDD_NV12_AREA_PCT" in vdd
+    assert "area * 100 >= (UINT64)proc->width * proc->height * VDD_NV12_AREA_PCT" in vdd
     assert "int len = VddPackFrame(proc, &mapped, NULL, 0, FALSE);" in vdd, "idle resend is lossless"
 
     # Same coefficients on both ends.
@@ -38,7 +38,7 @@ def main() -> None:
 
     # Host: validated before decoding into the BGRA frame buffer.
     assert "if (magic != FRAME_MAGIC && magic != FRAME_NV12_MAGIC) {" in idd
-    assert "(nv12 && data_size != hdr.width * hdr.height / 2 * 3)" in idd
+    assert "(nv12 && data_size != IDD_ALIGN2(hdr.width) * IDD_ALIGN2(hdr.height) / 2 * 3)" in idd
     assert "idd_nv12_to_bgra(recv_buf, hdr.width, hdr.height," in idd
 
     # Sending overlaps the next frame's readback and packing.

@@ -278,6 +278,19 @@ c.close_display("dev")              # or the user just closes it with the [X]
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an
   invisible window. Multiple VMs' displays can be open at once.
+- **On a Windows guest the IDD display follows the window.** When the window
+  settles at a new size (the end of a drag, or just after maximize or snap) the
+  guest display takes exactly that client size, odd sizes and portrait included,
+  and goes back to 1920x1080 only until the window asks again after a guest
+  reboot. The driver changes size by making its monitor depart and arrive with
+  that one mode, because Windows reads a monitor's modes when it arrives, so the
+  screen blanks for a moment. Limits: 640x480 at the small end (Windows offers no
+  smaller mode) and 8192 per side and 7680x4320 worth of pixels at the large end
+  (what a frame may cost in buffers and link throughput); past either the picture
+  is scaled to fit. If the guest can't take a size (a driver from before this, or
+  a size Windows won't use) it stays where it was, scaled to the window, and the
+  driver returns to the last size that worked by itself. Linux guests keep their
+  size and scale to the window.
 - The Hyper-V console only shows what the guest draws on the synthetic video
   adapter: once the Windows agent disables that adapter in favour of the IDD
   monitor, the console stays dark, so use the IDD view for a running desktop.
