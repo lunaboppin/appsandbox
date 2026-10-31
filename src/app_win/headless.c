@@ -1090,7 +1090,7 @@ static int handle_request(PHTTP_REQUEST req)
                 if (view == VDA_VIEW_IDD && !ready) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_ready",
                              "the VM's virtual display driver is not up yet; open with view "
-                             "\"auto\" to watch the boot on the Hyper-V console meanwhile");
+                             "auto to watch the boot on the Hyper-V console meanwhile");
                     return 0;
                 }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
