@@ -277,7 +277,7 @@ struct VmDisplayIdd {
     /* Guest display following the window (window thread, except as noted) */
     volatile SOCKET frame_socket;    /* frame connection; closed under frame_cs */
     volatile BOOL  frame_seen;       /* a frame arrived on this connection (recv thread) */
-    BOOL           can_resize;       /* a Windows guest whose driver answers requests */
+    BOOL           can_resize;       /* a guest display that answers size requests */
     BOOL           resize_worked;    /* the driver reached a requested size */
     BOOL           resize_even_only; /* an odd size didn't appear, an even one might */
     BOOL           resize_gave_up;   /* until the window's size changes again */
@@ -3420,8 +3420,8 @@ static VmDisplayIdd *idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_h
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
     d->frame_socket       = INVALID_SOCKET;
-    /* The Linux guest's display (asb_drm) keeps its own size. */
-    d->can_resize         = _wcsicmp(vm->os_type, L"Windows") == 0;
+    /* A guest that doesn't answer (an older driver) turns this off by itself. */
+    d->can_resize         = TRUE;
     d->clipboard          = NULL;
 
     /* Load the per-VM display setting, creating display_settings.json with

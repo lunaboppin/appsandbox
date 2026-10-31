@@ -54,6 +54,6 @@ and uses real disk and bandwidth.
 - **Guest agent provenance differs per OS.** The Windows guest agent
   is built locally and staged into the guest at create time, so its key-deploy
   checks pass with a local build. The **Linux** agent is compiled inside the
-  guest from the pushed GitHub branch, so its key-deploy checks stay red until
-  the `headless-api` branch is pushed.
+  guest from the source the build copied to `resources\linux\guest-src`, so a
+  local build tests local guest changes too.
 - Default guest credentials are `user` / `test123`.

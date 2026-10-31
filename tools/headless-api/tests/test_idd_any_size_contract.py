@@ -91,10 +91,10 @@ def main() -> None:
     assert "case WM_EXITSIZEMOVE:" in idd
     assert "if (d && !d->can_resize && d->frame_width > 0 && d->frame_height > 0) {" in idd
 
-    # Host: stops asking when the size doesn't appear; only Windows guests are asked.
+    # Host: stops asking when the size doesn't appear, whatever the guest.
     assert "d->resize_even_only = TRUE;" in step
     assert "d->resize_gave_up = TRUE;" in step
-    assert '_wcsicmp(vm->os_type, L"Windows") == 0' in idd
+    assert "d->can_resize         = TRUE;" in idd
 
     # Mouse: mapped through the frame's size, in real pixels in the guest, and
     # the guest's monitor rectangle is re-read as soon as the desktop changes size.

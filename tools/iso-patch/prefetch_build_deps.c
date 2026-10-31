@@ -1,7 +1,8 @@
 /* prefetch_build_deps.c - see header for design.
  *
  * Pipeline:
- *   1. WinHTTP-download Packages.xz for <codename>/main/binary-<arch>
+ *   1. WinHTTP-download Packages.xz for <codename>, <codename>-security and
+ *      <codename>-updates /main/binary-<arch>
  *   2. Decompress it in-process with the vendored xz-embedded decoder
  *      (xz_decompress_file_to_file below; Packages.gz is raw-gzipped
  *      text that tar.exe rejects, so we target the .xz instead).
@@ -719,6 +720,53 @@ int do_prefetch_build_deps(const wchar_t *codename,
         return -1;
     }
 
+    /* ---- 2b. Append the update pockets ----
+       A point-release ISO (26.04.1) installs packages from -updates, and a -dev
+       package needs its library at exactly the same version, so the release pocket
+       alone can't be installed next to them. lookup_pkg returns the stanza parsed
+       last, which makes updates win over security over release. */
+    {
+        static const wchar_t *pockets[] = { L"security", L"updates" };
+        for (int i = 0; i < 2; i++) {
+            wchar_t pocket_xz[MAX_PATH], pocket[MAX_PATH];
+            swprintf_s(pocket_xz, MAX_PATH, L"%s\\Packages-%s.xz", staging, pockets[i]);
+            swprintf_s(pocket,    MAX_PATH, L"%s\\Packages-%s",    staging, pockets[i]);
+            swprintf_s(url, 1024, L"%s/dists/%s-%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
+                       mirror, codename, pockets[i]);
+            log_msg(L"prefetch: GET %s", url);
+            if (http_download(url, pocket_xz) != 0 ||
+                xz_decompress_file_to_file(pocket_xz, pocket) != 0) {
+                log_msg(L"prefetch: WARN no %s pocket; using the release pocket without it",
+                        pockets[i]);
+            } else {
+                HANDLE in = CreateFileW(pocket, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                HANDLE out = CreateFileW(pkgs, FILE_APPEND_DATA, 0, NULL,
+                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (in == INVALID_HANDLE_VALUE || out == INVALID_HANDLE_VALUE) {
+                    log_err(L"prefetch: merge Packages failed");
+                    if (in != INVALID_HANDLE_VALUE) CloseHandle(in);
+                    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+                    return -1;
+                }
+                static char chunk[1 << 16];
+                DWORD got = 0, wrote = 0;
+                WriteFile(out, "\n", 1, &wrote, NULL);
+                while (ReadFile(in, chunk, sizeof(chunk), &got, NULL) && got > 0) {
+                    if (!WriteFile(out, chunk, got, &wrote, NULL) || wrote != got) {
+                        log_err(L"prefetch: merge Packages failed");
+                        CloseHandle(in); CloseHandle(out);
+                        return -1;
+                    }
+                }
+                CloseHandle(in);
+                CloseHandle(out);
+            }
+            DeleteFileW(pocket_xz);
+            DeleteFileW(pocket);
+        }
+    }
+
     /* ---- 3. Slurp Packages into memory + parse ---- */
     pkg_table_t T = { 0 };
     {
@@ -742,7 +790,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
     /* ---- 4. Mark seeds in_closure ---- */
     const char *seeds[] = {
         "libasound2-dev", "libxcb1-dev", "libxcb-xfixes0-dev",
-        "libdrm-dev", "pkg-config",
+        "libdrm-dev", "pkg-config", "cifs-utils",
         "openssh-server"  /* for ssh_enabled VMs; firstboot installs conditionally */
     };
     int closure_count = 0;

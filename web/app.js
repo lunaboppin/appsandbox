@@ -93,6 +93,7 @@ function applyOsTypeUI() {
     revalidateUsername();
     revalidatePassword();
     applyAccountModeUI();
+    renderCreateApps();
     updateCreateButtons();
 }
 
@@ -462,12 +463,35 @@ var PREINSTALL_APPS = [
     { id: 'OBSProject.OBSStudio',        name: 'OBS Studio' },
     { id: 'EpicGames.EpicGamesLauncher', name: 'Epic Games' }
 ];
+/* Linux: an apt package name, or a snap if apt has none. */
+var PREINSTALL_APPS_LINUX = [
+    { id: 'code',       name: 'VS Code' },
+    { id: 'steam',      name: 'Steam' },
+    { id: 'chromium',   name: 'Chromium' },
+    { id: 'discord',    name: 'Discord' },
+    { id: 'vlc',        name: 'VLC' },
+    { id: 'git',        name: 'Git' },
+    { id: 'python3',    name: 'Python 3' },
+    { id: 'obs-studio', name: 'OBS Studio' },
+    { id: 'p7zip-full', name: '7-Zip' },
+    { id: 'gimp',       name: 'GIMP' }
+];
 var WINGET_ID_RE = /^[A-Za-z0-9.+_-]{1,100}$/;
 
 function renderCreateApps() {
     var list = document.getElementById('create-app-list');
-    if (!list || list.childElementCount) return;
-    PREINSTALL_APPS.forEach(function(app) {
+    if (!list) return;
+    var isLinux = document.getElementById('os-type').value === 'Linux';
+    if (list.dataset.os === (isLinux ? 'Linux' : 'Windows')) return;
+    list.dataset.os = isLinux ? 'Linux' : 'Windows';
+    list.textContent = '';
+    document.getElementById('create-app-extra').placeholder = isLinux
+        ? 'More apt or snap names, comma-separated (e.g. spotify)'
+        : 'More winget IDs, comma-separated (e.g. Spotify.Spotify)';
+    document.getElementById('create-app-hint').textContent = isLinux
+        ? 'Installed with apt, or snap if apt has none, once the VM has internet access. Not used for templates.'
+        : 'Installed with winget after your first sign-in. Needs internet access in the VM. Not used for templates.';
+    (isLinux ? PREINSTALL_APPS_LINUX : PREINSTALL_APPS).forEach(function(app) {
         var label = document.createElement('label');
         var cb = document.createElement('input');
         cb.type = 'checkbox';
@@ -489,7 +513,7 @@ function gatherPreinstallApps() {
     for (var i = 0; i < extra.length; i++) {
         if (!extra[i]) continue;
         if (!WINGET_ID_RE.test(extra[i])) {
-            sendCmd('log', { message: '"' + extra[i] + '" is not a winget package ID (letters, digits and . + _ - only).' });
+            sendCmd('log', { message: '"' + extra[i] + '" is not a package name (letters, digits and . + _ - only).' });
             return null;
         }
         if (ids.indexOf(extra[i]) < 0) ids.push(extra[i]);
@@ -933,7 +957,7 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked,
-        preinstallApps: osType === 'Windows' ? gatherPreinstallApps() : '',
+        preinstallApps: gatherPreinstallApps(),
         accountMode: osType === 'Windows' ? document.getElementById('account-mode').value : 'local'
     };
 }
@@ -1707,6 +1731,7 @@ function refreshManageVm(forceFields) {
     if (forceFields || document.activeElement !== sizeInput) sizeInput.value = vm.hddGb + 1;
     document.getElementById('manage-auto-display').checked = !!vm.autoOpenDisplay;
     document.getElementById('manage-secure-boot-section').style.display = vm.osType === 'Windows' ? '' : 'none';
+    document.getElementById('manage-linux-note-section').style.display = vm.osType === 'Linux' ? '' : 'none';
     document.getElementById('manage-secure-boot').checked = vm.secureBoot !== false;
     document.getElementById('manage-domain-section').style.display =
         vm.osType === 'Windows' && !vm.isTemplate ? '' : 'none';

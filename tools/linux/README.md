@@ -110,6 +110,19 @@ Windows / 7-Zip / WinRAR equivalents all handle `.tar.gz` fine.
    `/usr/local/bin/`, the kernel modules into `/lib/modules/<kver>/updates/`,
    wires up systemd units, and enables them.
 
+## How a VM gets these
+
+The app build copies this tree to `resources\linux\guest-src` next to
+`AppSandbox.exe`, with line endings converted to LF (`tools/normalize-eol.ps1`).
+Creating an Ubuntu VM stages that copy, and the VM's first boot compiles the
+daemons and builds the modules with DKMS, so a local build tests local guest
+changes without pushing anything.
+
+Each start compares a stamp of `agent/` and `asb_drm/` with the VM's
+`/etc/appsandbox-guest-stamp`. If they differ the host sends the tree and
+`agent/appsandbox-guest-update.sh` installs it in the guest. The daemons restart
+straight away; a changed `asb_drm` loads at the next boot.
+
 ## Kernel module version skew
 
 Kernel modules built here only load against an **identical** kernel version

@@ -1111,6 +1111,75 @@ static void guest_payload_stamp(wchar_t *out, size_t chars)
     }
 }
 
+static BOOL linux_guest_src_dir(wchar_t *out, size_t chars)
+{
+    wchar_t module[MAX_PATH], *slash;
+    GetModuleFileNameW(g_dll_module, module, MAX_PATH);
+    slash = wcsrchr(module, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(out, chars, L"%s\\resources\\linux\\guest-src", module);
+    return GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* The parts of the guest source a running VM can refresh. dxgkrnl and the
+   firstboot scripts only matter while a VM is being built. */
+static const wchar_t *const LINUX_GUEST_DIRS[] = { L"tools\\linux\\agent", L"tools\\linux\\asb_drm" };
+
+BOOL asb_linux_guest_stamp(char *out, size_t chars)
+{
+    wchar_t root[MAX_PATH], spec[MAX_PATH], path[MAX_PATH];
+    BYTE digest[32], combined[16] = { 0 };
+    int d, i, files = 0;
+    out[0] = '\0';
+    if (!linux_guest_src_dir(root, MAX_PATH) || chars < 33) return FALSE;
+    for (d = 0; d < (int)_countof(LINUX_GUEST_DIRS); d++) {
+        WIN32_FIND_DATAW fd;
+        HANDLE find;
+        swprintf_s(spec, MAX_PATH, L"%s\\%s\\*", root, LINUX_GUEST_DIRS[d]);
+        find = FindFirstFileW(spec, &fd);
+        if (find == INVALID_HANDLE_VALUE) return FALSE;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            swprintf_s(path, MAX_PATH, L"%s\\%s\\%s", root, LINUX_GUEST_DIRS[d], fd.cFileName);
+            if (FAILED(sha256_file(path, digest))) continue;
+            for (i = 0; i < 16; i++) combined[i] ^= digest[i];   /* order-independent */
+            files++;
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    if (!files) return FALSE;
+    for (i = 0; i < 16; i++) sprintf_s(out + i * 2, chars - i * 2, "%02x", combined[i]);
+    return TRUE;
+}
+
+HRESULT asb_linux_guest_tar(wchar_t *out_path, size_t chars)
+{
+    wchar_t root[MAX_PATH], temp[MAX_PATH], sysdir[MAX_PATH], cmd[MAX_PATH * 3];
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    DWORD code = 1;
+
+    if (!linux_guest_src_dir(root, MAX_PATH)) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    GetTempPathW(MAX_PATH, temp);
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    if (!GetTempFileNameW(temp, L"asb", 0, out_path)) return HRESULT_FROM_WIN32(GetLastError());
+    (void)chars;
+    swprintf_s(cmd, _countof(cmd),
+               L"\"%s\\tar.exe\" -czf \"%s\" -C \"%s\" tools/linux/agent tools/linux/asb_drm",
+               sysdir, out_path, root);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        DeleteFileW(out_path);
+        return hr;
+    }
+    WaitForSingleObject(pi.hProcess, 60000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (code != 0) { DeleteFileW(out_path); return E_FAIL; }
+    return S_OK;
+}
+
 static void guest_payload_stamp_path(const wchar_t *vhdx_path, wchar_t *out, size_t chars)
 {
     wchar_t *slash;
@@ -2571,6 +2640,16 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         asb_log(L"ssh_enabled: staged /etc/appsandbox-ssh-enabled marker");
     }
 
+    /* Which guest source this VM is built from, so a later app version can
+     * tell it needs a refresh (see linux_guest_refresh in vm_agent.c). */
+    {
+        char stamp[64];
+        if (asb_linux_guest_stamp(stamp, sizeof(stamp)))
+            n += stage_marker_file(f, staging, L"guest-stamp.marker",
+                                   stamp, strlen(stamp),
+                                   L"/etc/appsandbox-guest-stamp");
+    }
+
     /* Host-derived locale / keyboard / timezone. firstboot STEP 3 + 4
      * read these; absent markers fall back to en_US.UTF-8 / us / Etc/UTC. */
     if (host_locale && host_locale[0])
@@ -3014,16 +3093,19 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
         CreateDirectoryW(extras, NULL);
 
-        /* Prefetch 1: repo source from GitHub. Writes agent-src/,
-           asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
+        /* Prefetch 1: guest source. Writes agent-src/, asb_drm-src/,
+           dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
            50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
-           wsl-mesa.tar.zst directly into <staging>/extras/. */
-        asb_log(L"Prefetch 1/3: cloning repo source from GitHub...");
-        /* Branch must match the branch this binary was built from, so the Linux
-           guest builds its agent/driver source from the SAME revision. */
+           wsl-mesa.tar.zst directly into <staging>/extras/. Uses the copy
+           shipped with this build, so the guest runs the same revision as the
+           host; GitHub's main is only the fallback for a build without one. */
+        asb_log(L"Prefetch 1/3: staging guest source...");
+        GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
+        slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
-            extras);
+            L"--prefetch-repo --branch \"main\" "
+            L"--local-root \"%s\\resources\\linux\\guest-src\" --out-dir \"%s\"",
+            exe_dir, extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
 
@@ -3166,6 +3248,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
 
     /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
     {
+        wchar_t share_endpoint_guid[64] = { 0 };
         VmInstance *temp_inst = (VmInstance *)HeapAlloc(
             GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
         if (!temp_inst) {
@@ -3174,8 +3257,13 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
             goto done;
         }
 
-        hr = (args->endpoint_guid[0] != L'\0')
-            ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, temp_inst)
+        prepare_shared_transport(&args->config, temp_inst,
+                                 share_endpoint_guid, _countof(share_endpoint_guid));
+
+        hr = (args->endpoint_guid[0] != L'\0' || share_endpoint_guid[0] != L'\0')
+            ? hcs_create_vm_with_endpoints(&args->config,
+                  args->endpoint_guid[0] ? args->endpoint_guid : NULL,
+                  share_endpoint_guid[0] ? share_endpoint_guid : NULL, temp_inst)
             : hcs_create_vm(&args->config, temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
@@ -3235,6 +3323,12 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    inst->share_network_id = heap_inst->share_network_id;
+                    inst->share_endpoint_id = heap_inst->share_endpoint_id;
+                    strcpy_s(inst->share_ip, sizeof(inst->share_ip), heap_inst->share_ip);
+                    strcpy_s(inst->share_host_ip, sizeof(inst->share_host_ip), heap_inst->share_host_ip);
+                    strcpy_s(inst->share_mac, sizeof(inst->share_mac), heap_inst->share_mac);
+                    inst->share_network_cleaned = heap_inst->share_network_cleaned;
                     memcpy(inst->shared_resources, heap_inst->shared_resources,
                            sizeof(inst->shared_resources));
                     inst->shared_resource_count = heap_inst->shared_resource_count;
@@ -3626,8 +3720,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
 
     /* Apps to install after the first sign-in (Windows VMs, not templates,
        which are sysprepped). Kept until the agent has queued them. */
-    if (config->preinstall_apps && !is_template_create &&
-        _wcsicmp(cfg.os_type, L"Windows") == 0)
+    if (config->preinstall_apps && !is_template_create)
         preinstall_apps_normalize(config->preinstall_apps, inst->preinstall_apps,
                                   _countof(inst->preinstall_apps));
 

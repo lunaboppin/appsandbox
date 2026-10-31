@@ -109,7 +109,8 @@ class Client:
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
         hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, storageParent,
         adminUser,
-        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
+        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate, preinstallApps
+        (comma-separated winget IDs on Windows, apt or snap names on Ubuntu). sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is

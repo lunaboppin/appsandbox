@@ -125,6 +125,32 @@ static int asb_mode_config_setup(struct asb_device *asb)
  * platform_driver — probe / remove
  * -------------------------------------------------------------------------- */
 
+/* /sys/devices/platform/asb_drm.0/preferred_mode: "<width>x<height>". Written by
+ * appsandbox-display when the host asks for a size, read by appsandbox-input to
+ * scale pointer coordinates. */
+static ssize_t preferred_mode_show(struct device *dev,
+                                   struct device_attribute *attr, char *buf)
+{
+	struct asb_device *asb = to_asb(dev_get_drvdata(dev));
+
+	return sysfs_emit(buf, "%ux%u\n", asb->width, asb->height);
+}
+
+static ssize_t preferred_mode_store(struct device *dev,
+                                    struct device_attribute *attr,
+                                    const char *buf, size_t count)
+{
+	struct asb_device *asb = to_asb(dev_get_drvdata(dev));
+	unsigned int w, h;
+	int ret;
+
+	if (sscanf(buf, "%ux%u", &w, &h) != 2)
+		return -EINVAL;
+	ret = asb_connector_set_size(asb, w, h);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(preferred_mode);
+
 static int asb_probe(struct platform_device *pdev)
 {
 	struct asb_device *asb;
@@ -192,6 +218,10 @@ static int asb_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = device_create_file(&pdev->dev, &dev_attr_preferred_mode);
+	if (ret)
+		dev_warn(&pdev->dev, "preferred_mode attribute failed (%d)\n", ret);
+
 	dev_info(&pdev->dev, "AppSandbox virtual display ready: %ux%u@%uHz\n",
 	         asb->width, asb->height, asb->refresh);
 	return 0;
@@ -202,6 +232,7 @@ static void asb_remove(struct platform_device *pdev)
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct asb_device *asb = to_asb(drm);
 
+	device_remove_file(&pdev->dev, &dev_attr_preferred_mode);
 	drm_dev_unplug(drm);
 	asb_mode_fini(asb);
 	drm_atomic_helper_shutdown(drm);

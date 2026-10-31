@@ -67,8 +67,29 @@ struct input_packet {
 #pragma pack(pop)
 
 static volatile sig_atomic_t g_stop = 0;
-static int g_frame_w = 1920;  /* updated by hint command if we add one later */
+/* Size of the frames the host's coordinates are in: asb_drm's current mode. */
+#define ASB_MODE_ATTR "/sys/devices/platform/asb_drm.0/preferred_mode"
+static int g_frame_w = 1920;
 static int g_frame_h = 1080;
+
+/* Called per pointer move (at most ~125/s) but only reads once a second. */
+static void refresh_frame_size(void)
+{
+    static time_t last;
+    time_t now = time(NULL);
+    int w = 0, h = 0;
+    FILE *f;
+
+    if (now == last) return;
+    last = now;
+    f = fopen(ASB_MODE_ATTR, "r");
+    if (!f) return;
+    if (fscanf(f, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+        g_frame_w = w;
+        g_frame_h = h;
+    }
+    fclose(f);
+}
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -237,6 +258,7 @@ static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y)
     /* Host gives us pixel coordinates in the current frame. Map to
      * 0..ABS_RANGE so the compositor scales correctly regardless of
      * the actual screen size. */
+    refresh_frame_size();
     int32_t ax = (int32_t)((uint64_t)x * ABS_RANGE / (g_frame_w ? g_frame_w : 1));
     int32_t ay = (int32_t)((uint64_t)y * ABS_RANGE / (g_frame_h ? g_frame_h : 1));
     if (ax < 0) ax = 0; if (ax > ABS_RANGE) ax = ABS_RANGE;

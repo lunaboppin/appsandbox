@@ -43,6 +43,9 @@
 #define TARGET_FPS      60
 #define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
 
+#define RESIZE_MAGIC    0x5A525341u   /* 'ASRZ' little-endian */
+#define ASB_MODE_ATTR   "/sys/devices/platform/asb_drm.0/preferred_mode"
+
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
 
@@ -193,7 +196,8 @@ static int drm_acquire_fb(struct capture_ctx *c)
             goto out;
         }
 
-        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, p->fb_id);
+        uint32_t fb_id = p->fb_id;
+        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, fb_id);
         drmModeFreePlane(p);
         if (!fb2) continue;
 
@@ -223,7 +227,7 @@ static int drm_acquire_fb(struct capture_ctx *c)
         }
 
         drm_release_fb(c);
-        c->fb_id_last = p->fb_id;
+        c->fb_id_last = fb_id;
         c->width  = width;
         c->height = height;
         c->stride = pitch;
@@ -504,6 +508,41 @@ static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq)
     return 0;
 }
 
+/* The host asks for the window's size on the frame connection (the same ASRZ
+ * the Windows driver takes). asb_drm publishes it as the only mode, and the
+ * frames that follow at the new size are the answer. Never blocks. */
+struct resize_reader {
+    uint32_t msg[3];
+    size_t   got;
+};
+
+static void resize_poll(int client_fd, struct resize_reader *r)
+{
+    for (;;) {
+        ssize_t n = recv(client_fd, (char *)r->msg + r->got,
+                         sizeof(r->msg) - r->got, MSG_DONTWAIT);
+        if (n <= 0) return;   /* nothing waiting; a closed peer fails the next send */
+        r->got += (size_t)n;
+        if (r->got < sizeof(r->msg)) continue;
+        r->got = 0;
+        if (r->msg[0] != RESIZE_MAGIC) {
+            agent_log("ignoring unknown message from host (0x%08x)", r->msg[0]);
+            continue;
+        }
+        FILE *f = fopen(ASB_MODE_ATTR, "w");
+        if (!f) {
+            agent_log("resize %ux%u: %s: %s", r->msg[1], r->msg[2],
+                      ASB_MODE_ATTR, strerror(errno));
+            continue;
+        }
+        fprintf(f, "%ux%u\n", r->msg[1], r->msg[2]);
+        if (fclose(f) != 0)
+            agent_log("resize %ux%u refused: %s", r->msg[1], r->msg[2], strerror(errno));
+        else
+            agent_log("host asked for %ux%u", r->msg[1], r->msg[2]);
+    }
+}
+
 static void capture_loop(int client_fd)
 {
     struct capture_ctx ctx = { .fd = -1, .dma_fd = -1 };
@@ -651,8 +690,12 @@ have_card:
     clock_gettime(CLOCK_MONOTONIC, &next);
     uint64_t seq = 0;
     int last_status = 0;
+    struct resize_reader resize = {0};
+    uint32_t last_w = 0, last_h = 0;
 
     while (!g_stop) {
+        resize_poll(client_fd, &resize);
+
         int rc = drm_acquire_fb(&ctx);
         if (rc < 0) {
             if (last_status != -1) {
@@ -660,9 +703,11 @@ have_card:
                 last_status = -1;
             }
         } else {
-            if (last_status != 1) {
+            if (last_status != 1 || ctx.width != last_w || ctx.height != last_h) {
                 agent_log("capturing %ux%u stride=%u", ctx.width, ctx.height, ctx.stride);
                 last_status = 1;
+                last_w = ctx.width;
+                last_h = ctx.height;
             }
             if (send_frame(client_fd, &ctx, ++seq) < 0) {
                 agent_log("client disconnected");

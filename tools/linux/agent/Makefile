@@ -53,7 +53,7 @@ install: $(BINS)
 	install -m 0755 $(BINS) $(DESTDIR)$(BINDIR)/
 	install -d $(DESTDIR)$(SYSTEMDDIR)
 	for u in $(SYSTEM_UNITS); do \
-	    install -m 0644 $$u $(DESTDIR)$(SYSTEMDDIR)/; \
+	    [ ! -f $$u ] || install -m 0644 $$u $(DESTDIR)$(SYSTEMDDIR)/; \
 	done
 	@if [ -n "$(USER_UNITS)" ]; then \
 	    install -d $(DESTDIR)$(USERUNITDIR); \

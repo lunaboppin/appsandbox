@@ -2,7 +2,7 @@
  *
  * Pipeline:
  *   1. WinHTTP-download
- *      https://codeload.github.com/jamesstringer90/appsandbox/tar.gz/refs/heads/<branch>
+ *      https://codeload.github.com/lunaboppin/appsandbox/tar.gz/refs/heads/<branch>
  *      → <tmp>/repo.tar.gz
  *   2. Shell out to tar.exe (libarchive handles .tar.gz natively):
  *      `tar -xzf repo.tar.gz -C <tmp>` → <tmp>/appsandbox-<branch>/...
@@ -189,12 +189,19 @@ static int u_cp_tree(const wchar_t *src_dir, const wchar_t *dst_dir)
  * Main flow
  * ==================================================================== */
 
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
+int do_prefetch_repo(const wchar_t *branch, const wchar_t *local_root, const wchar_t *out_dir)
 {
-    log_msg(L"prefetch-repo: branch=%s out=%s", branch, out_dir);
+    log_msg(L"prefetch-repo: branch=%s local=%s out=%s", branch,
+            local_root ? local_root : L"(none)", out_dir);
+
+    wchar_t extracted_root[MAX_PATH] = L"";
+    wchar_t tmp[MAX_PATH] = L"";
+    if (local_root && GetFileAttributesW(local_root) != INVALID_FILE_ATTRIBUTES) {
+        wcsncpy_s(extracted_root, MAX_PATH, local_root, _TRUNCATE);
+        goto have_root;
+    }
 
     /* Temp dir for download + extract. Wiped on completion. */
-    wchar_t tmp[MAX_PATH];
     DWORD n = GetTempPathW(MAX_PATH, tmp);
     if (n == 0) return -1;
     swprintf_s(tmp + wcslen(tmp), MAX_PATH - wcslen(tmp),
@@ -212,7 +219,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
     {
         wchar_t path[1024];
         swprintf_s(path, 1024,
-            L"/jamesstringer90/appsandbox/tar.gz/refs/heads/%s", branch);
+            L"/lunaboppin/appsandbox/tar.gz/refs/heads/%s", branch);
         log_msg(L"prefetch-repo: GET https://codeload.github.com%s", path);
         if (http_download_secure(L"codeload.github.com", 443, path, tgz) != 0) {
             log_err(L"prefetch-repo: download failed");
@@ -235,7 +242,6 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
 
     /* GitHub names the top-level dir "appsandbox-<branch>". Find it
      * (just glob, in case '/' in branch name became '-'). */
-    wchar_t extracted_root[MAX_PATH] = L"";
     {
         wchar_t spec[MAX_PATH];
         swprintf_s(spec, MAX_PATH, L"%s\\appsandbox-*", tmp);
@@ -257,6 +263,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
     }
     log_msg(L"prefetch-repo: extracted to %s", extracted_root);
 
+have_root:
     /* ---- 3. Copy each piece into the final layout under <out_dir>. ----
      *
      * The layout matches what generate_vhdx_manifest_ubuntu walks and
@@ -264,7 +271,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
      */
     u_mkdir_p(out_dir);
 
-    /* agent-src/: 5 .c files + Makefile */
+    /* agent-src/: 5 .c files, Makefile, refresh script */
     {
         wchar_t agent_src[MAX_PATH], dst[MAX_PATH];
         swprintf_s(agent_src, MAX_PATH,
@@ -272,7 +279,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         const wchar_t *files[] = {
             L"appsandbox-agent.c", L"appsandbox-audio.c",
             L"appsandbox-clipboard.c", L"appsandbox-display.c",
-            L"appsandbox-input.c", L"Makefile"
+            L"appsandbox-input.c", L"Makefile", L"appsandbox-guest-update.sh"
         };
         wchar_t out_agent[MAX_PATH];
         swprintf_s(out_agent, MAX_PATH, L"%s\\agent-src", out_dir);
@@ -375,7 +382,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
     }
 
     /* Clean up temp. */
-    {
+    if (tmp[0]) {
         wchar_t cmd[1024];
         swprintf_s(cmd, 1024, L"cmd.exe /c rd /s /q \"%s\" 2>nul", tmp);
         u_run_cmd(cmd);

@@ -1,0 +1,5 @@
+# Guest-side Linux files run inside the VM and are bundled from the working tree
+# into resources\linux\guest-src, so a Windows checkout must keep them LF.
+tools/linux/** text=auto eol=lf
+tools/linux/**/*.zst binary
+tools/linux/**/*.so* binary

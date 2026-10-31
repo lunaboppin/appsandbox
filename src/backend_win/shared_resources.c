@@ -294,7 +294,7 @@ int shared_resources_build_attachments(const wchar_t *os_type, const wchar_t *ex
                                        HcsSharedResource *out, int capacity)
 {
     int i, n = 0;
-    if (!os_type || _wcsicmp(os_type, L"Windows") != 0) return 0;
+    if (!os_type) return 0;
     EnterCriticalSection(&g_resource_cs);
     for (i = 0; i < g_resource_count && n < capacity; i++) {
         AsbSharedResourceInfo *r = &g_resources[i];

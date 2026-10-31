@@ -366,6 +366,75 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     return 0;
 }
 
+static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
+                           const char *cmd, char *rsp, int rsp_size,
+                           DWORD timeout_ms);
+
+/* Linux guests build their helpers from source, so the refresh Windows VMs get
+   offline at start happens here: compare stamps, and if the VM's source differs
+   send the current tree. The guest builds and installs it in the background, then
+   restarts its agent, and this connection starts over on the new one. A VM with an
+   agent from before this existed answers unknown and is left as it is.
+   Returns FALSE when the connection is gone. */
+static BOOL linux_guest_refresh(SOCKET s, VmInstance *vm, AgentConn *conn, char *buf, int buf_size)
+{
+    char want[64], cmd[128];
+    wchar_t tar_path[MAX_PATH];
+    HANDLE file;
+    LARGE_INTEGER size;
+    BOOL sent = TRUE;
+    int n;
+
+    if (!asb_linux_guest_stamp(want, sizeof(want))) return TRUE;
+    n = send_tagged_cmd(s, vm, &conn->cmd_seq, "guest_stamp", buf, buf_size, 15000);
+    if (n <= 0) return FALSE;
+    if (strncmp(buf, "stamp:", 6) != 0) {
+        ui_log(L"\"%s\": this VM's helpers are too old to refresh themselves (%S).", vm->name, buf);
+        return TRUE;
+    }
+    if (strcmp(buf + 6, want) == 0) return TRUE;
+
+    if (FAILED(asb_linux_guest_tar(tar_path, MAX_PATH))) {
+        ui_log(L"\"%s\": could not package the guest helpers for a refresh.", vm->name);
+        return TRUE;
+    }
+    file = CreateFileW(tar_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &size)) {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        DeleteFileW(tar_path);
+        return TRUE;
+    }
+    conn->cmd_seq++;
+    sprintf_s(cmd, sizeof(cmd), "%u:guest_update:%s:%lld", conn->cmd_seq, want, size.QuadPart);
+    if (send_line(s, cmd) <= 0) sent = FALSE;
+    while (sent) {
+        char chunk[16384];
+        DWORD got = 0, off = 0;
+        if (!ReadFile(file, chunk, sizeof(chunk), &got, NULL) || got == 0) break;
+        while (off < got) {
+            int w = send(s, chunk + off, (int)(got - off), 0);
+            if (w <= 0) { sent = FALSE; break; }
+            off += (DWORD)w;
+        }
+    }
+    CloseHandle(file);
+    DeleteFileW(tar_path);
+    if (!sent) return FALSE;
+    /* The agent answers once it has all the bytes. */
+    {
+        char prefix[32];
+        sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
+        for (;;) {
+            n = recv_line_wait(s, buf, buf_size, 30000);
+            if (n <= 0) return FALSE;
+            if (strncmp(buf, prefix, strlen(prefix)) == 0) break;
+            if (process_async_message(vm, s, buf) != 0) return FALSE;
+        }
+        ui_log(L"\"%s\": refreshing the guest helpers (%S).", vm->name, buf + strlen(prefix));
+    }
+    return TRUE;
+}
+
 /* Send a tagged command and wait for the tagged response.
    Processes any interleaved async messages while waiting.
    Returns: response length on success, 0 on close, -1 on error. */
@@ -519,6 +588,10 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 ui_log(L"Guest disk expansion failed for \"%s\" (%S); expand it manually.", vm->name, buf);
             notify_agent_status(vm);
         }
+
+        if (_wcsicmp(vm->os_type, L"Linux") == 0 && !vm->is_appliance &&
+            !linux_guest_refresh(s, vm, conn, buf, sizeof(buf)))
+            goto disconnected;
 
         /* Apps chosen at creation: hand them to the agent, which installs
            them after sign-in and retries failures itself. Kept here until

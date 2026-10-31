@@ -10,7 +10,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 
 ### Virtual machines
 - **Windows 11 and Ubuntu 26.04 LTS** guests, installed with zero touch from your own ISO. Windows VMs get the **Pro** edition from the ISO.
-- **Apps on first boot:** pick apps when creating a Windows VM (Claude, Steam, VS Code, Notepad++, Everything, 7-Zip and more, or any winget ID) and they install after the first sign-in.
+- **Apps on first boot:** pick apps when creating a VM. On Windows that's Claude, Steam, VS Code, Notepad++, Everything, 7-Zip and more, or any winget ID, installed after the first sign-in. On Ubuntu it's any apt or snap name, installed once the VM has internet access.
 - **Tidy new installs:** new Windows VMs start with a clean taskbar (just Edge and File Explorer, no search box, widgets or Copilot).
 - **Checkpoints and branches:** freeze a VM's state and fork independent working copies from it.
 - **Disposable VMs:** every start begins from a clean checkpoint and throws away the last session's changes.
@@ -20,7 +20,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Nested virtualization,** so Docker, WSL and Claude Cowork run inside the VM.
 
 ### Display, input and sound
-- **Virtual display (IddCx) at 60 Hz that follows the window:** resize the display window on a Windows VM and the guest takes exactly that size. Frames are sent as compact NV12 when most of the screen changes (games, video) and losslessly otherwise.
+- **Virtual display (IddCx) at 60 Hz that follows the window:** resize the display window and the guest takes exactly that size. Frames are sent as compact NV12 when most of the screen changes (games, video) and losslessly otherwise.
 - **Game mode:** the mouse is captured when a game hides the cursor, raw relative mouse input is passed through, and Ctrl+Alt releases it. Keyboard hotkeys can be passed to the guest too.
 - **2-channel audio** from the VM, using App Sandbox's own audio driver or, when Secure Boot blocks it, VB-CABLE, installed automatically.
 - **Copy and paste** between host and guest.
@@ -30,7 +30,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Hardware video decode and encode.**
 
 ### Shared drives and storage
-- **Shared drives** live on a small hidden **shared appliance** VM (Ubuntu with Samba, or Windows Server Core) and appear in every Windows VM as drive letters, read/write or read-only, with per-VM opt-outs.
+- **Shared drives** live on a small hidden **shared appliance** VM (Ubuntu with Samba, or Windows Server Core) and appear in every VM, as drive letters on Windows and under `/mnt/appsandbox/<letter>` and in the Files sidebar on Ubuntu, read/write or read-only, with per-VM opt-outs.
 - **Mount Host** maps a shared drive in File Explorer on your PC too.
 
 ### Networking
