@@ -102,6 +102,9 @@ typedef struct {
     BOOL        is_template;     /* TRUE = template VM (sysprep after install) */
     BOOL        is_appliance;    /* TRUE = hidden shared-storage appliance */
     BOOL        install_complete; /* TRUE after guest agent first comes online */
+    wchar_t     install_error[512]; /* why setup can't finish; empty = no failure (Linux) */
+    wchar_t     install_status[128]; /* current first-boot step reported by the guest (Linux) */
+    volatile LONG install_watch_generation; /* retires the previous boot's watchdog */
     BOOL        auto_open_display; /* TRUE = open IDD display whenever it becomes ready */
     BOOL        secure_boot_off;  /* TRUE = start without Secure Boot so test-signed kernel drivers load */
     BOOL        domain_member;    /* TRUE = managed: domain users sign in, joins at every boot */

@@ -121,6 +121,7 @@ building → stopped → installing → booting → online → stopping → stop
 | `building` | the VHDX is being created/staged (the build worker holds the disk) |
 | `stopped` | powered off |
 | `installing` | powered on, guest OS still installing (`installComplete` = false) |
+| `failed` | powered on, first-boot setup on a Linux guest can't finish; the reason is in `installError` |
 | `booting` | installed and powered on, guest agent not yet connected |
 | `online` | guest agent connected — fully up |
 | `stopping` | graceful shutdown requested, not yet powered off |
@@ -128,6 +129,17 @@ building → stopped → installing → booting → online → stopping → stop
 `create()` is **async and auto-starts** the VM, so a fresh create walks
 `building → installing → booting → online` on its own. Watch it with
 `wait()`/`status()` (poll-based and miss-proof) or `events()` (push, for UIs).
+`wait()` raises `RuntimeError` with the reason if the VM reaches `failed`.
+
+**Linux first-boot failures.** The guest reports its setup over COM1, and the
+current step shows in `installStatus`. If the guest agent can't be built, the VM
+goes to `failed` as soon as setup ends. If the guest goes quiet, it goes there
+when a deadline passes: 15 minutes with no sign of setup starting, 10 minutes of
+silence during setup, or 15 minutes after setup with no agent. The longest wait is
+about an hour. The console output is in `firstboot-console.log` in the VM's
+folder, and `installError` stays set after the VM is stopped. Starting the VM again
+clears it until the guest reports again, and the agent connecting clears it for
+good. To retry a failed setup, delete the VM and create it again.
 
 > **Create VMs sequentially, not all at once.** A create runs a VHDX build that
 > prefetches the build dependencies (over the network for Linux) and
@@ -156,7 +168,8 @@ methods return `(http_status, body)` so you can branch on the status code.
 | `snapshots_full(name)` | the above **plus** `current: {snapIndex, branchIndex}` |
 
 A **status object** has: `name, osType, state, running, agentOnline,
-installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
+installComplete, installError, installStatus, building, progress, sshState,
+sshPort, ramMb, hddGb, cpuCores,
 gpuMode, networkMode, displayOpen, displayView`.
 
 ### Lifecycle  *(return `(status, body)`)*

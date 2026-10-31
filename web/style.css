@@ -416,6 +416,8 @@ th.icon-col, td.icon-col {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .status-stopped { color: var(--text-dim); }
+.status-failed { color: var(--danger); font-weight: 600; }
+.status-detail { font-weight: 400; font-size: 12px; white-space: normal; max-width: 320px; }
 
 /* Inline editing */
 td.editing { overflow: hidden; box-sizing: border-box; }

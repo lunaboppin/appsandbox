@@ -1072,12 +1072,11 @@ static BOOL serial_line_is_interesting(const char *line)
            strstr(line, "E: ") || strstr(line, "W: ");
 }
 
-static void serial_emit_line(FILE *file, char *line, const wchar_t *label)
+/* Drop ANSI escapes and control characters (systemd colours its status). */
+void serial_clean_line(const char *line, char *clean, size_t clean_size)
 {
-    char clean[1024];
     size_t r, w = 0;
-    /* Drop ANSI escapes and control characters (systemd colours its status). */
-    for (r = 0; line[r] && w + 1 < sizeof(clean); ++r) {
+    for (r = 0; line[r] && w + 1 < clean_size; ++r) {
         unsigned char c = (unsigned char)line[r];
         if (c == 0x1B) {
             if (line[r + 1] == '[') {
@@ -1091,7 +1090,13 @@ static void serial_emit_line(FILE *file, char *line, const wchar_t *label)
         clean[w++] = (char)c;
     }
     clean[w] = '\0';
-    if (!w) return;
+}
+
+static void serial_emit_line(FILE *file, char *line, const wchar_t *label)
+{
+    char clean[1024];
+    serial_clean_line(line, clean, sizeof(clean));
+    if (!clean[0]) return;
     if (file) { fputs(clean, file); fputc('\n', file); fflush(file); }
     if (serial_line_is_interesting(clean))
         ui_log(L"[%s console] %S", label, clean);

@@ -250,6 +250,8 @@ class Client:
                 raise RuntimeError("%s vanished (404)" % name)
             if s["state"] in target_states:
                 return s
+            if s["state"] == "failed":
+                raise RuntimeError("%s setup failed: %s" % (name, s.get("installError")))
             if time.time() > deadline:
                 raise TimeoutError(
                     "%s did not reach %s within %ss (last state=%s)"

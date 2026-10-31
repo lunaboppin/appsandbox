@@ -563,6 +563,12 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Mark install complete on first agent connection */
         if (!vm->install_complete && !vm->is_template) {
             vm->install_complete = TRUE;
+            vm->install_status[0] = L'\0';
+            /* A watchdog timeout on a very slow host; the agent is the last word. */
+            if (vm->install_error[0]) {
+                vm->install_error[0] = L'\0';
+                asb_save();
+            }
             vm_save_state_json(vm->vhdx_path, TRUE);
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
