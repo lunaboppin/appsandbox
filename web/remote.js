@@ -26,7 +26,10 @@ let frameH = 0;
 let drawn = 0;
 let audioCtx = null;
 let audioNode = null;
+let audioGain = null;
 let audioFormat = '';
+let muted = false;
+try { muted = localStorage.getItem('asb-muted') === '1'; } catch (e) { /* storage blocked */ }
 let lastClip = null;
 let cursorCss = 'default';
 let cursorVisible = true;
@@ -305,8 +308,26 @@ async function setupAudio(rate, channels) {
     outputChannelCount: [2],
     processorOptions: { channels },
   });
-  audioNode.connect(audioCtx.destination);
+  audioGain = audioCtx.createGain();
+  audioGain.gain.value = muted ? 0 : 1;
+  audioNode.connect(audioGain);
+  audioGain.connect(audioCtx.destination);
 }
+
+function showMuted() {
+  const b = $('btn-mute');
+  b.textContent = muted ? 'Unmute' : 'Mute';
+  b.setAttribute('aria-pressed', String(muted));
+  if (audioGain) audioGain.gain.value = muted ? 0 : 1;
+}
+
+$('btn-mute').addEventListener('click', () => {
+  muted = !muted;
+  try { localStorage.setItem('asb-muted', muted ? '1' : '0'); } catch (e) { /* just this visit, then */ }
+  showMuted();
+  canvas.focus();
+});
+showMuted();
 
 function onAudio(view, data) {
   const rate = view.getUint32(1, true);

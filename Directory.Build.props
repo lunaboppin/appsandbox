@@ -1,4 +1,4 @@
-<Project>
+﻿<Project>
   <!--
     SINGLE SOURCE OF TRUTH for the App Sandbox version.
 
@@ -17,7 +17,7 @@
     <AsbVersionMajor>0</AsbVersionMajor>
     <AsbVersionMinor>1</AsbVersionMinor>
     <AsbVersionPatch>7</AsbVersionPatch>
-    <AsbVersionRevision>4</AsbVersionRevision>
+    <AsbVersionRevision>5</AsbVersionRevision>
 
     <!-- Derived forms - do not edit. -->
     <AsbVersion>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch).$(AsbVersionRevision)</AsbVersion>
@@ -38,7 +38,7 @@
 
   <!--
     Same class of problem as the InfVerif skip above, for ARM64 driver builds.
-    ARM64 drivers must be Universal, so the WDK runs ApiValidator on them — but it
+    ARM64 drivers must be Universal, so the WDK runs ApiValidator on them â€” but it
     defaults to the x86 ApiExtractor (aitstatic.exe), which cannot read an ARM64 PE
     and fails with exit code 193 (ERROR_BAD_EXE_FORMAT) when cross-building ARM64 on
     a non-ARM64 host (e.g. the x64 dev/CI box). Disable it ONLY for that cross-build

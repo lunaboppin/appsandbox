@@ -2497,7 +2497,9 @@ static const char stream_common_ps[] =
     "$creds=Join-Path $dir 'webui.txt'\r\n"
     "$statusFile=Join-Path $dir 'status.txt'\r\n"
     "function WebUi($path,$body){\r\n"
-    " [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}\r\n"
+    /* Compiled: a script block has no runspace on the thread that does the handshake. */
+    " if(-not ('AsbTrust' -as [type])){ Add-Type 'public static class AsbTrust{public static void On(){System.Net.ServicePointManager.ServerCertificateValidationCallback=delegate{return true;};}}' }\r\n"
+    " [AsbTrust]::On()\r\n"
     " $p=(Get-Content $creds -Raw).Trim()\r\n"
     " $auth=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('asb:'+$p))\r\n"
     " $port=[int]((Select-String -Path $cfg -Pattern '^port = (\\d+)').Matches[0].Groups[1].Value)+1\r\n"
@@ -2557,11 +2559,18 @@ static const char stream_setup_ps[] =
     "  'capture = ddx',\r\n"
     "  'lan_encryption_mode = 1',\r\n"
     "  'wan_encryption_mode = 1',\r\n"
-    "  'dd_configuration_option = disabled',\r\n"
-    "  'global_prep_cmd = [{\"do\":\"C:\\\\Windows\\\\AppSandbox\\\\appsandbox-displays.exe --stream-prep\",\"undo\":\"\",\"elevated\":true}]'\r\n"
+    "  'dd_configuration_option = disabled'\r\n"
     " )\r\n"
     " if($encoder -eq 'software'){ $lines+='encoder = software' }\r\n"
     " Set-Content -Path $cfg -Value $lines -Encoding ascii\r\n"
+    " # Sunshine can't run a prep command with nobody signed in, and a failed one stops\r\n"
+    " # the stream. So plain Desktop has none and works at the sign-in screen, scaled.\r\n"
+    " $apps=Join-Path $root 'config\\apps.json'\r\n"
+    " $fitName='Desktop (resize to this device)'\r\n"
+    " $list=Get-Content $apps -Raw | ConvertFrom-Json\r\n"
+    " $fit=@{name=$fitName;'image-path'='desktop.png';'prep-cmd'=@(@{do='C:\\Windows\\AppSandbox\\appsandbox-displays.exe --stream-prep';undo='';elevated=$true})}\r\n"
+    " $list.apps=@($list.apps | Where-Object { $_.name -ne $fitName })+$fit\r\n"
+    " Set-Content -Path $apps -Value ($list | ConvertTo-Json -Depth 6) -Encoding ascii\r\n"
     " # The installer lets Sunshine through for everyone. Only the host's relay, or\r\n"
     " # the local network on a bridged VM, should reach it.\r\n"
     " Get-NetFirewallRule -DisplayName 'Sunshine*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
@@ -2591,7 +2600,13 @@ static const char stream_status_ps[] =
     "Write-Output ('json:'+($o|ConvertTo-Json -Compress))\r\n";
 
 static const char stream_pin_ps[] =
-    "try { $r=WebUi '/api/pin' @{pin=$pin;name=$client}; if($r.status -eq $true -or $r.status -eq 'true'){ Write-Output 'result:ok' } else { Write-Output 'result:Sunshine did not accept that PIN. Start pairing in Moonlight first, then enter the PIN it shows.'; exit 1 } } catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+    "try {\r\n"
+    " $waiting=@((WebUi '/api/pin' $null).pairings)\r\n"
+    " if($waiting.Count -eq 0){ Write-Output 'result:No device is waiting to pair. Start pairing in Moonlight first, then enter the PIN it shows.'; exit 1 }\r\n"
+    " if($waiting.Count -gt 1){ Write-Output 'result:More than one device is waiting to pair. Cancel the others, then try again.'; exit 1 }\r\n"
+    " $r=WebUi '/api/pin' @{pairing_id=$waiting[0].id;pin=$pin;name=$client}\r\n"
+    " if($r.status -eq $true -or $r.status -eq 'true'){ Write-Output 'result:ok' } else { Write-Output 'result:Pairing failed. Check the PIN and try again from Moonlight.'; exit 1 }\r\n"
+    "} catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
 
 static const char stream_unpair_ps[] =
     "try { $r=WebUi '/api/clients/unpair-all' @{}; Write-Output 'result:ok' } catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";

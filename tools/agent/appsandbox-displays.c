@@ -106,6 +106,7 @@ static int stream_prep(void)
 {
     char sw[16], sh[16];
     DWORD w, h, value, tick;
+    BOOL asked = FALSE;
     HKEY key;
     DEVMODEW dm;
     if (!GetEnvironmentVariableA("SUNSHINE_CLIENT_WIDTH", sw, sizeof(sw)) ||
@@ -118,6 +119,8 @@ static int stream_prep(void)
                         KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
         return 0;
     value = (w << 16) | h;
+    /* Writing the same data again doesn't notify, and the driver has to hear every request. */
+    RegDeleteValueW(key, L"StreamMode");
     RegSetValueExW(key, L"StreamMode", 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
     RegCloseKey(key);
     tick = GetTickCount();
@@ -128,6 +131,14 @@ static int stream_prep(void)
             dm.dmPelsWidth == w && dm.dmPelsHeight == h) {
             Sleep(500);   /* the monitor just arrived: let the desktop settle */
             break;
+        }
+        /* Windows can keep the desktop size it saved for this monitor and scale it. */
+        if (!asked && GetTickCount() - tick > 2500) {
+            asked = TRUE;
+            dm.dmPelsWidth = w;
+            dm.dmPelsHeight = h;
+            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            ChangeDisplaySettingsExW(NULL, &dm, NULL, CDS_UPDATEREGISTRY, NULL);
         }
         Sleep(200);
     }

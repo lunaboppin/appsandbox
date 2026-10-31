@@ -80,7 +80,16 @@ def main() -> None:
 
     # The page takes the key from the fragment and wipes it.
     assert "location.hash.match" in page and "history.replaceState" in page
-    assert "localStorage" not in page and "sessionStorage" not in page
+    assert "sessionStorage" not in page
+    assert set(re.findall(r"localStorage\.\w+\(([^,)]+)", page)) == {"'asb-muted'"}   # never the key
+
+    # A session's memory outlives every thread that reads guest channels.
+    assert web.count("t_stop = &ws->stop;") == 4
+    assert "if (stuck) {" in web
+    # This Sunshine release wants the waiting device's id with the PIN.
+    assert "pairing_id=$waiting[0].id" in agent
+    # The driver hears every stream's size, even a repeat of the last.
+    assert 'RegDeleteValueW(key, L"StreamMode")' in read("tools/agent/appsandbox-displays.c")
 
     # The display window yields the one-client channels.
     assert display.count("web_session_active") >= 3

@@ -1380,7 +1380,7 @@ static DWORD WINAPI VddModeWatchThread(LPVOID param)
     HANDLE changed = CreateEventW(NULL, FALSE, FALSE, NULL);
     HANDLE waits[2] = { ctx->hModeWatchStop, changed };
     HKEY key = NULL;
-    DWORD last = 0;
+    BOOL stale = TRUE;   /* what's there when the driver starts is an old stream's */
     if (!changed) return 0;
     for (;;) {
         /* The key appears with the first request; until then, look again now and then. */
@@ -1390,13 +1390,15 @@ static DWORD WINAPI VddModeWatchThread(LPVOID param)
         if (key) {
             DWORD value = 0, size = sizeof(value), type = 0;
             RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, changed, TRUE);
-            if (RegQueryValueExW(key, VDD_MODE_VALUE, NULL, &type, (LPBYTE)&value, &size) == ERROR_SUCCESS &&
-                type == REG_DWORD && value && value != last) {
-                last = value;
+            /* Each request counts, even of the same size: the host may have moved the
+               display since the last stream. */
+            if (!stale && RegQueryValueExW(key, VDD_MODE_VALUE, NULL, &type, (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+                type == REG_DWORD && value) {
                 VddLog("Mode: a stream in the guest asks for %ux%u", value >> 16, value & 0xFFFF);
                 VddRequestMode(ctx, value >> 16, value & 0xFFFF);
             }
         }
+        stale = FALSE;
         if (WaitForMultipleObjects(2, waits, FALSE, key ? INFINITE : 5000) == WAIT_OBJECT_0) break;
     }
     if (key) RegCloseKey(key);

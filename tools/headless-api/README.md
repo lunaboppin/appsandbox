@@ -341,6 +341,11 @@ is reached through a relay in the app, which lives and dies with it and listens 
 networks. A bridged VM is on the network directly. Windows guests only for now; `unsupported`
 gives the reason on others. Gamepads use ViGEmBus, which its author no longer maintains.
 
+Moonlight lists two desktops. `Desktop` works at the sign-in screen and scales to the client.
+`Desktop (resize to this device)` sets the guest's display to the client's size first, which
+Sunshine can only do with someone signed in. While the display window or a browser is open on
+the VM, that viewer's size takes over.
+
 `softwareEncoder` defaults to on. Setting it off lets Sunshine probe the GPU's encoder through
 GPU-PV, where [Sunshine #2141](https://github.com/LizardByte/Sunshine/issues/2141) has reports of
 the *host* crashing with NVENC on some cards and drivers.

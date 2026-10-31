@@ -593,11 +593,25 @@ static SOCKET hv_connect(const GUID *runtime_id, const wchar_t *os_type, unsigne
     return s;
 }
 
+/* The session's stop flag, on threads that read guest channels. shutdown() from another
+   thread doesn't wake a recv on a Hyper-V socket, so those threads look before reading. */
+static __declspec(thread) volatile LONG *t_stop;
+
 static BOOL recv_all(SOCKET s, void *buf, int len)
 {
     char *p = (char *)buf;
     while (len > 0) {
-        int n = recv(s, p, len, 0);
+        int n;
+        if (t_stop) {
+            fd_set rd;
+            struct timeval tv = { 0, 250000 };
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            n = select(0, &rd, NULL, NULL, &tv);
+            if (n < 0 || *t_stop) return FALSE;
+            if (n == 0) continue;
+        }
+        n = recv(s, p, len, 0);
         if (n <= 0) return FALSE;
         p += n;
         len -= n;
@@ -935,6 +949,7 @@ static DWORD WINAPI frame_thread(LPVOID param)
     BYTE *buf = (BYTE *)malloc(cap);
     BOOL helpers_woken = FALSE;
 
+    t_stop = &ws->stop;
     while (!ws->stop && buf) {
         SOCKET s;
         VmInstance *v = vm_by_id(ws->vm_id);
@@ -1121,9 +1136,12 @@ static DWORD WINAPI audio_thread(LPVOID param)
     DWORD cap = 65536;
     BYTE *buf = (BYTE *)malloc(cap);
     short *pcm = (short *)malloc(cap);
+    DWORD retry_ms = 1000;
 
+    t_stop = &ws->stop;
     while (!ws->stop && buf && pcm) {
         AudioHeader h;
+        DWORD waited;
         SOCKET s = hv_connect(&ws->runtime_id, ws->os_type, 4, 1000);
         if (s == INVALID_SOCKET) { Sleep(1000); continue; }
         EnterCriticalSection(&ws->sock_cs);
@@ -1133,6 +1151,7 @@ static DWORD WINAPI audio_thread(LPVOID param)
             (h.bits == 16 || h.bits == 32)) {
             BYTE head[5];
             UINT32 rate = h.rate;
+            retry_ms = 1000;
             memcpy(head, &rate, 4);
             head[4] = (BYTE)(h.channels > 2 ? 2 : h.channels);
             while (!ws->stop) {
@@ -1171,12 +1190,14 @@ static DWORD WINAPI audio_thread(LPVOID param)
                 }
                 if (frames) ws_send(ws, MSG_AUDIO, head, sizeof(head), pcm, frames * out_ch * 2);
             }
+        } else if (retry_ms < 10000) {
+            retry_ms *= 2;   /* no audio device in the guest: each try writes to its log */
         }
         EnterCriticalSection(&ws->sock_cs);
         ws->audio_sock = INVALID_SOCKET;
         LeaveCriticalSection(&ws->sock_cs);
         closesocket(s);
-        if (!ws->stop) Sleep(1000);
+        for (waited = 0; waited < retry_ms && !ws->stop; waited += 200) Sleep(200);
     }
     free(buf);
     free(pcm);
@@ -1250,6 +1271,7 @@ static void clip_from_browser(WebSession *ws, const char *utf8, DWORD len)
 static DWORD WINAPI clip_writer_thread(LPVOID param)
 {
     WebSession *ws = (WebSession *)param;
+    t_stop = &ws->stop;
     while (!ws->stop) {
         UINT32 ready = 0;
         ClipHeader h;
@@ -1322,6 +1344,7 @@ static DWORD WINAPI clip_writer_thread(LPVOID param)
 static DWORD WINAPI clip_reader_thread(LPVOID param)
 {
     WebSession *ws = (WebSession *)param;
+    t_stop = &ws->stop;
     while (!ws->stop) {
         UINT32 ready = 0;
         ClipHeader h;
@@ -1412,9 +1435,12 @@ static void input_send(WebSession *ws, const InputPacket *p)
     if (s == INVALID_SOCKET) {
         UINT32 ready = 0;
         LeaveCriticalSection(&ws->sock_cs);
+        DWORD wait_ms = 2000, none = 0;
         s = hv_connect(&ws->runtime_id, ws->os_type, 3, 500);
         if (s == INVALID_SOCKET) return;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&wait_ms, sizeof(wait_ms));
         if (!recv_all(s, &ready, 4) || ready != INPUT_READY_MAGIC) { closesocket(s); return; }
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&none, sizeof(none));
         EnterCriticalSection(&ws->sock_cs);
         ws->input_sock = s;
     }
@@ -1562,6 +1588,7 @@ static void session_run(WebConn *conn, UINT64 vm_id)
     WebSession *ws = (WebSession *)calloc(1, sizeof(*ws));
     VmInstance *v;
     WebVm *entry;
+    BOOL stuck = FALSE;
     int i;
 
     if (!ws) return;
@@ -1634,7 +1661,7 @@ static void session_run(WebConn *conn, UINT64 vm_id)
     for (i = 0; i < ws->thread_count; i++) {
         if (ws->threads[i]) {
             /* A thread parked in a connect gives up within its timeout. */
-            WaitForSingleObject(ws->threads[i], 10000);
+            if (WaitForSingleObject(ws->threads[i], 10000) != WAIT_OBJECT_0) stuck = TRUE;
             CloseHandle(ws->threads[i]);
         }
     }
@@ -1646,6 +1673,12 @@ static void session_run(WebConn *conn, UINT64 vm_id)
     v = vm_by_id(vm_id);
     if (v) InterlockedDecrement(&v->web_session_active);
     ReleaseSRWLockExclusive(&g_lock);
+
+    if (stuck) {
+        /* Still running on this memory: losing it beats freeing it under a thread. */
+        ui_log(L"Browser access: a session thread didn't stop in time.");
+        return;
+    }
 
 cleanup:
     {

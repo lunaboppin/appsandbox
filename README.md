@@ -17,6 +17,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Templates** for creating Windows VMs from a prepared state instead of reinstalling.
 - **Per-VM management:** installer media, storage relocation, grow-only disk resizing, Secure Boot and display preferences. The whole VM tree can be placed on any fixed NTFS/ReFS volume.
 - **Backstage session:** like ScreenConnect's Backstage, open a SYSTEM shell in a Windows VM's hidden session 0, in a window of its own, from the display window's menu. The signed-in user, or the sign-in screen, never sees it. It has a taskbar with Command Prompt, PowerShell, Task Manager, Registry Editor and more, plus an Explorer file browser, and everything opened from it runs there too.
+- **Remote access, off until you turn it on per VM:** use a VM from a web browser (video, sound, keyboard, mouse, clipboard), on this PC or over HTTPS on your network, with a key shown in Manage. Or stream it to Moonlight: the guest downloads the official Sunshine and you enter the PIN in the app. In Moonlight, **Desktop** works at the sign-in screen and scales to your device; **Desktop (resize to this device)** matches your device's size and needs someone signed in. Windows VMs only for Moonlight.
 - **Nested virtualization,** so Docker, WSL and Claude Cowork run inside the VM.
 
 ### Display, input and sound
