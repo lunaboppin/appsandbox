@@ -81,6 +81,22 @@ def main() -> None:
     assert "appsandbox-run.exe" in read("tools/sign/stage-package.ps1")
     assert "appsandbox-run.vcxproj" in read("AppSandbox.sln")
 
+
+def test_short_menu_entry_is_packaged_and_stays_out_of_the_package():
+    source = read("tools/shell-launcher/appsandbox-shell.c")
+    manifest = read("tools/installer/shell-package/AppxManifest.xml")
+    iss = read("tools/installer/AppSandbox.iss")
+    clsid = re.search(r'Clsid="([0-9A-F-]+)"', manifest).group(1).split("-")
+    assert f"0x{clsid[0].lower()}, 0x{clsid[1].lower()}, 0x{clsid[2].lower()}" in source
+    assert "appsandbox-shell.vcxproj" in read("AppSandbox.sln")
+    assert "appsandbox-shell.dll" in read("tools/sign/stage-package.ps1")
+    # A child of the surrogate would keep the package's identity, so removing the package could
+    # take the app and its VMs with it: Explorer has to be what starts the launcher.
+    assert "IShellDispatch2_ShellExecute" in source
+    assert "CreateProcess" not in source
+    # Removed before files are replaced, and for the signed-in user rather than an elevated admin.
+    assert "ExecAsOriginalUser" in iss and "ssInstall" in iss and "usUninstall" in iss
+
     # The launcher and the window it talks to agree, and the window can hear it.
     assert "0x41534252" in launcher and "0x41534252" in ui
     assert "ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA" in ui

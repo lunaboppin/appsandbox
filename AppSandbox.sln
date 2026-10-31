@@ -66,6 +66,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AppSandboxPackage", "tools\
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "appsandbox-run", "tools\shell-launcher\appsandbox-run.vcxproj", "{7C2D94E1-3B6A-4F08-9E15-A4D7B02C6F83}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "appsandbox-shell", "tools\shell-launcher\appsandbox-shell.vcxproj", "{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "updater-test", "tools\updater-test\updater-test.vcxproj", "{4E6A1B2C-7D3F-4A95-B8C1-2F9D0E7A6C31}"
 EndProject
 Global
@@ -84,6 +86,14 @@ Global
 		{7C2D94E1-3B6A-4F08-9E15-A4D7B02C6F83}.Release|ARM64.Build.0 = Release|ARM64
 		{7C2D94E1-3B6A-4F08-9E15-A4D7B02C6F83}.Release|x64.ActiveCfg = Release|x64
 		{7C2D94E1-3B6A-4F08-9E15-A4D7B02C6F83}.Release|x64.Build.0 = Release|x64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Debug|ARM64.Build.0 = Debug|ARM64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Debug|x64.ActiveCfg = Debug|x64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Debug|x64.Build.0 = Debug|x64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Release|ARM64.ActiveCfg = Release|ARM64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Release|ARM64.Build.0 = Release|ARM64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Release|x64.ActiveCfg = Release|x64
+		{B4E81F36-6A27-4D91-8C03-2F95D7A1E460}.Release|x64.Build.0 = Release|x64
 		{4E6A1B2C-7D3F-4A95-B8C1-2F9D0E7A6C31}.Debug|ARM64.ActiveCfg = Debug|ARM64
 		{4E6A1B2C-7D3F-4A95-B8C1-2F9D0E7A6C31}.Debug|ARM64.Build.0 = Debug|ARM64
 		{4E6A1B2C-7D3F-4A95-B8C1-2F9D0E7A6C31}.Debug|x64.ActiveCfg = Debug|x64

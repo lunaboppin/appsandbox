@@ -14,7 +14,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Tidy new installs:** new Windows VMs start with a clean taskbar (just Edge and File Explorer, no search box, widgets or Copilot).
 - **Checkpoints and branches:** freeze a VM's state and fork independent working copies from it.
 - **Disposable VMs:** every start begins from a clean checkpoint and throws away the last session's changes.
-- **Run in Sandbox:** right-click any file in Explorer (under **Show more options** on Windows 11) to copy it into a VM and open it there on a throwaway checkpoint. When you're done, discard rolls the VM back and keep merges the changes. Your original file is only ever read, and shared drives and anything sent over the network aren't rolled back.
+- **Run in Sandbox:** right-click any file in Explorer to copy it into a VM and open it there on a throwaway checkpoint. When you're done, discard rolls the VM back and keep merges the changes. Your original file is only ever read, and shared drives and anything sent over the network aren't rolled back.
 - **Templates** for creating Windows VMs from a prepared state instead of reinstalling.
 - **Per-VM management:** installer media, storage relocation, grow-only disk resizing, Secure Boot and display preferences. The whole VM tree can be placed on any fixed NTFS/ReFS volume.
 - **Backstage session:** like ScreenConnect's Backstage, open a SYSTEM shell in a Windows VM's hidden session 0, in a window of its own, from the display window's menu. The signed-in user, or the sign-in screen, never sees it. It has a taskbar with Command Prompt, PowerShell, Task Manager, Registry Editor and more, plus an Explorer file browser, and everything opened from it runs there too.
@@ -66,7 +66,7 @@ The **Malware Lab** button builds an isolated, disposable Windows VM for running
 
 ## Installing and updating
 
-Download `AppSandbox-<version>-win-x64-setup.exe` from [Releases](https://github.com/lunaboppin/appsandbox/releases) and run it. It installs to Program Files, adds a Start Menu shortcut (and a desktop one if you tick it) and an entry in Apps & features. No driver or service is installed on your PC: the drivers it carries are copied into your VMs when they're provisioned.
+Download `AppSandbox-<version>-win-x64-setup.exe` from [Releases](https://github.com/lunaboppin/appsandbox/releases) and run it. It installs to Program Files, adds a Start Menu shortcut (and a desktop one if you tick it) and an entry in Apps & features. No driver or service is installed on your PC: the drivers it carries are copied into your VMs when they're provisioned. To put Run in Sandbox on Windows 11's right-click menu, it registers a small package for the user who ran Setup. Other users on the PC find the entry under **Show more options**. If the release's certificate is self-signed, Setup also adds it to the PC's Trusted People store, which Windows requires for the package. Uninstalling removes both.
 
 **Updates:** App Sandbox checks GitHub once a day, and when a newer release exists it shows a notice at the top of the window. The **Updates** button shows your version, checks on demand, and has the settings for automatic checks and for including pre-releases (off by default).
 
