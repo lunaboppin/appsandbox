@@ -68,7 +68,9 @@ Download `AppSandbox-<version>-win-x64-setup.exe` from [Releases](https://github
 
 **Updates:** App Sandbox checks GitHub once a day, and when a newer release exists it shows a notice at the top of the window. The **Updates** button shows your version, checks on demand, and has the settings for automatic checks and for including pre-releases (off by default).
 
-**Your VMs are safe from updates.** Installing closes App Sandbox, and closing it stops every VM, so an update never starts while a VM is running or being built. You're told which VMs are in the way; the update downloads and then waits, and installs by itself once they've all been shut down. App Sandbox then reopens.
+**Closing the window** leaves App Sandbox running in the notification area, along with your VMs. Click the tray icon or launch the app again to bring the window back; right-click the icon and choose **Exit** to really quit, which stops every VM.
+
+**Your VMs are safe from updates.** Installing exits App Sandbox, and exiting stops every VM, so an update never starts while a VM is running or being built. You're told which VMs are in the way; the update downloads and then waits, and installs by itself once they've all been shut down. App Sandbox then reopens.
 
 **What's checked:** a download must match the SHA-256 GitHub reports for it and carry an intact signature from a certificate pinned in App Sandbox, and its file version must be the one the release advertises. Anything else is deleted and not run.
 
