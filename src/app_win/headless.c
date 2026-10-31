@@ -244,7 +244,7 @@ static const char *derive_state(VmInstance *v)
     if (v->building_vhdx)      return "building";
     if (!v->running)           return "stopped";
     if (v->shutdown_requested) return "stopping";
-    if (!v->install_complete)  return "installing";
+    if (!v->install_complete)  return v->install_error[0] ? "failed" : "installing";
     if (!v->agent_online)      return "booting";
     return "online";
 }
@@ -275,6 +275,10 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->shared_resource_transport);
     pos += sprintf_s(out + pos, cap - pos, ",\"sharedResourceError\":");
     pos = append_wstr(out, cap, pos, v->shared_resource_error);
+    pos += sprintf_s(out + pos, cap - pos, ",\"installError\":");
+    pos = append_wstr(out, cap, pos, v->install_error);
+    pos += sprintf_s(out + pos, cap - pos, ",\"installStatus\":");
+    pos = append_wstr(out, cap, pos, v->install_status);
     pos += sprintf_s(out + pos, cap - pos, ",\"storageRoot\":");
     pos = append_wstr(out, cap, pos, v->storage_root);
     pos += sprintf_s(out + pos, cap - pos, "}");

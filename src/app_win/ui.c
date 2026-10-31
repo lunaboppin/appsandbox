@@ -258,6 +258,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"vhdxStaging", v->vhdx_staging);
     jb_int(jb, L"vhdxProgress", v->vhdx_progress);
     jb_bool(jb, L"installComplete", v->install_complete);
+    jb_string(jb, L"installError", v->install_error);
+    jb_string(jb, L"installStatus", v->install_status);
     jb_bool(jb, L"sshEnabled", v->ssh_enabled);
     jb_int(jb, L"sshPort", (int)v->ssh_port);
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);

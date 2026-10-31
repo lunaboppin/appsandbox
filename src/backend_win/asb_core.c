@@ -331,6 +331,8 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
     return 0;
 }
 
+static void install_watch_start(VmInstance *vm, BOOL fresh_boot);
+
 static void idd_probe_start(VmInstance *vm)
 {
     /* The probe exists only to AUTO-OPEN the display in the GUI: it posts
@@ -565,6 +567,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
+        else if (g_vms[i].install_error[0])
+            fwprintf(f, L"InstallError=%s\n", g_vms[i].install_error);
         if (g_vms[i].auto_open_display)
             fwprintf(f, L"AutoOpenDisplay=1\n");
         if (g_vms[i].secure_boot_off)
@@ -711,6 +715,8 @@ static void load_vm_list(void)
             wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
+        else if (wcsncmp(line, L"InstallError=", 13) == 0)
+            wcsncpy_s(vm->install_error, _countof(vm->install_error), line + 13, _TRUNCATE);
         else if (wcsncmp(line, L"AutoOpenDisplay=", 16) == 0)
             vm->auto_open_display = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"SecureBootOff=", 14) == 0)
@@ -750,6 +756,8 @@ static void load_vm_list(void)
             g_vms[i].running = FALSE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
+            if (g_vms[i].install_complete)
+                g_vms[i].install_error[0] = L'\0';
             wcscpy_s(root, MAX_PATH, g_vms[i].vhdx_path);
             for(scan=root;*scan;scan++)
                 if(_wcsnicmp(scan,L"\\snapshots",10)==0&&
@@ -1778,6 +1786,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         vm_agent_start(vm);
         idd_probe_start(vm);
         hcs_start_monitor(vm);
+        install_watch_start(vm, TRUE);
     }
 
     InterlockedExchange(&vm->management_busy, 0);
@@ -3030,6 +3039,254 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
     return result;
 }
 
+/* ---- Linux first-boot watchdog ----
+ *
+ * A Linux VM is "installing" until its agent first connects, and the agent is
+ * built on the VM by firstboot.sh (see plant_firstboot_service in ubuntu_vhdx.c).
+ * When that build fails nothing ever connects, so without this the VM would say
+ * "installing" for good. The script reports over COM1, the one channel that needs
+ * nothing from the guest but a kernel:
+ *
+ *   ASB-FIRSTBOOT:START | HEARTBEAT (every 30 s) | STEP <text> | FAIL <reason> | DONE
+ *
+ * FAIL is the normal way to learn of a failure, seconds after it happens. The
+ * deadlines catch the guest that can't say so. They only start once the VM is on,
+ * so slow downloads don't count: everything is fetched during "building", and
+ * firstboot.sh installs from the VM's own disk. A timeout is a judgment, not a
+ * fact, so it's withdrawn if the guest reports again; and the agent connecting
+ * always clears the error (vm_agent.c), so a slow host only ever sees it early.
+ *
+ * Worst case to an error: 15 min to start + 30 min (the unit's TimeoutStartSec)
+ * + 15 min for the agent. A normal install takes 3.5 to 5 minutes in all. */
+#define INSTALL_WATCH_NO_REPORT_MS (15 * 60 * 1000ULL)
+#define INSTALL_WATCH_SILENCE_MS   (10 * 60 * 1000ULL)
+#define INSTALL_WATCH_AGENT_MS     (15 * 60 * 1000ULL)
+#define INSTALL_REPORT_PREFIX      "ASB-FIRSTBOOT:"
+
+typedef struct {
+    UINT64    vm_id;
+    LONG      generation;
+    wchar_t   pipe[MAX_PATH];
+    wchar_t   log_path[MAX_PATH];
+    enum { WATCH_WAIT_START, WATCH_SETUP, WATCH_WAIT_AGENT } phase;
+    ULONGLONG last_report;
+} InstallWatch;
+
+/* Reports come from the guest and end up in vms.cfg, JSON and the UI. */
+static void install_report_text(const char *in, wchar_t *out, size_t cap)
+{
+    size_t i;
+    for (i = 0; in[i] && i + 1 < cap; i++)
+        out[i] = (in[i] >= 0x20 && in[i] < 0x7F) ? (wchar_t)in[i] : L'?';
+    out[i] = L'\0';
+}
+
+/* Update the VM's error and/or status text; NULL leaves one as it is. */
+static void install_watch_publish(UINT64 vm_id, const wchar_t *error, const wchar_t *status)
+{
+    VmInstance *vm;
+    BOOL error_changed = FALSE, status_changed = FALSE;
+
+    EnterCriticalSection(&g_cs);
+    vm = asb_find_vm_by_id(vm_id);
+    if (vm && !vm->install_complete) {
+        if (error && wcscmp(vm->install_error, error) != 0) {
+            wcsncpy_s(vm->install_error, _countof(vm->install_error), error, _TRUNCATE);
+            error_changed = TRUE;
+        }
+        if (status && wcscmp(vm->install_status, status) != 0) {
+            wcsncpy_s(vm->install_status, _countof(vm->install_status), status, _TRUNCATE);
+            status_changed = TRUE;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (error_changed) {
+        if (error[0])
+            asb_log(L"VM \"%s\" setup failed: %s", vm->name, error);
+        else
+            asb_log(L"VM \"%s\" setup is running again.", vm->name);
+        save_vm_list();
+    }
+    if ((error_changed || status_changed) && g_state_cb)
+        g_state_cb(vm_handle(vm), vm->running, g_state_ud);
+}
+
+static void install_watch_line(InstallWatch *w, const char *raw)
+{
+    char clean[1024];
+    const char *report;
+    wchar_t text[512];
+    FILE *log;
+
+    serial_clean_line(raw, clean, sizeof(clean));
+    if (!clean[0]) return;
+
+    /* Opened per line so it can't keep the VM's folder from being deleted. */
+    log = _wfsopen(w->log_path, L"ab", _SH_DENYNO);
+    if (log) { fputs(clean, log); fputc('\n', log); fclose(log); }
+
+    if (strncmp(clean, INSTALL_REPORT_PREFIX, strlen(INSTALL_REPORT_PREFIX)) != 0) return;
+    report = clean + strlen(INSTALL_REPORT_PREFIX);
+    w->last_report = GetTickCount64();
+
+    if (strncmp(report, "FAIL ", 5) == 0) {
+        install_report_text(report + 5, text, _countof(text));
+        install_watch_publish(w->vm_id, text[0] ? text : L"First-boot setup failed.", NULL);
+    } else if (strcmp(report, "DONE") == 0) {
+        w->phase = WATCH_WAIT_AGENT;
+        install_watch_publish(w->vm_id, L"", L"Starting the guest agent");
+    } else if (strncmp(report, "STEP ", 5) == 0) {
+        w->phase = WATCH_SETUP;
+        install_report_text(report + 5, text, 128);
+        install_watch_publish(w->vm_id, L"", text);
+    } else {
+        w->phase = WATCH_SETUP;
+        install_watch_publish(w->vm_id, L"", NULL);
+    }
+}
+
+static void install_watch_check_deadline(InstallWatch *w, const wchar_t *step)
+{
+    ULONGLONG quiet = GetTickCount64() - w->last_report;
+    wchar_t error[512];
+
+    if (w->phase == WATCH_WAIT_START && quiet >= INSTALL_WATCH_NO_REPORT_MS)
+        wcscpy_s(error, _countof(error),
+                 L"The guest didn't start first-boot setup within 15 minutes. It may not have booted.");
+    else if (w->phase == WATCH_SETUP && quiet >= INSTALL_WATCH_SILENCE_MS)
+        swprintf_s(error, _countof(error),
+                   L"First-boot setup stopped responding for 10 minutes (last step: %s).",
+                   step[0] ? step : L"unknown");
+    else if (w->phase == WATCH_WAIT_AGENT && quiet >= INSTALL_WATCH_AGENT_MS)
+        wcscpy_s(error, _countof(error),
+                 L"First-boot setup finished, but the guest agent didn't connect within 15 minutes.");
+    else
+        return;
+    install_watch_publish(w->vm_id, error, NULL);
+}
+
+static DWORD WINAPI install_watch_thread(LPVOID param)
+{
+    InstallWatch *w = (InstallWatch *)param;
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    OVERLAPPED ov;
+    BOOL pending = FALSE;
+    char buffer[4096], line[1024];
+    size_t used = 0;
+
+    ZeroMemory(&ov, sizeof(ov));
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) { free(w); return 0; }
+
+    for (;;) {
+        VmInstance *vm;
+        BOOL keep_going, deadlines_apply = FALSE;
+        wchar_t step[128] = L"";
+        DWORD got, i;
+
+        /* Resolve by stable id each pass: g_vms[] can be compacted under us. */
+        EnterCriticalSection(&g_cs);
+        vm = asb_find_vm_by_id(w->vm_id);
+        keep_going = vm && vm->install_watch_generation == w->generation &&
+                     vm->running && !vm->install_complete;
+        if (keep_going) {
+            deadlines_apply = !vm->install_error[0] && !vm->shutdown_requested;
+            wcscpy_s(step, _countof(step), vm->install_status);
+        }
+        LeaveCriticalSection(&g_cs);
+        if (!keep_going) break;
+        if (deadlines_apply) install_watch_check_deadline(w, step);
+
+        /* The VM worker owns the server end and may drop it on a guest reboot. */
+        if (pipe == INVALID_HANDLE_VALUE) {
+            pipe = CreateFileW(w->pipe, GENERIC_READ, 0, NULL, OPEN_EXISTING,
+                               FILE_FLAG_OVERLAPPED, NULL);
+            if (pipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
+            used = 0;
+        }
+        if (!pending) {
+            if (!ReadFile(pipe, buffer, sizeof(buffer), NULL, &ov) &&
+                GetLastError() != ERROR_IO_PENDING) {
+                CloseHandle(pipe);
+                pipe = INVALID_HANDLE_VALUE;
+                Sleep(1000);
+                continue;
+            }
+            pending = TRUE;
+        }
+        if (WaitForSingleObject(ov.hEvent, 1000) != WAIT_OBJECT_0) continue;
+        pending = FALSE;
+        if (!GetOverlappedResult(pipe, &ov, &got, FALSE)) {
+            CloseHandle(pipe);
+            pipe = INVALID_HANDLE_VALUE;
+            Sleep(1000);
+            continue;
+        }
+        for (i = 0; i < got; i++) {
+            if (buffer[i] == '\n' || used + 1 >= sizeof(line)) {
+                line[used] = '\0';
+                install_watch_line(w, line);
+                used = 0;
+                if (buffer[i] == '\n') continue;
+            }
+            line[used++] = buffer[i];
+        }
+    }
+
+    if (pipe != INVALID_HANDLE_VALUE) {
+        if (pending) {
+            DWORD got;
+            CancelIoEx(pipe, &ov);
+            GetOverlappedResult(pipe, &ov, &got, TRUE);
+        }
+        CloseHandle(pipe);
+    }
+    CloseHandle(ov.hEvent);
+    free(w);
+    return 0;
+}
+
+/* Call once the VM is on. fresh_boot is FALSE when reattaching to a running VM
+   after the app restarted, where an earlier error still stands. */
+static void install_watch_start(VmInstance *vm, BOOL fresh_boot)
+{
+    InstallWatch *w;
+    HANDLE thread;
+
+    if (_wcsicmp(vm->os_type, L"Linux") != 0 || vm->is_appliance ||
+        vm->is_template || vm->install_complete)
+        return;
+
+    if (fresh_boot) {
+        BOOL had_error = vm->install_error[0] != L'\0';
+        vm->install_error[0] = L'\0';
+        vm->install_status[0] = L'\0';
+        if (had_error) save_vm_list();
+    }
+
+    w = (InstallWatch *)calloc(1, sizeof(*w));
+    if (!w) return;
+    w->vm_id = vm->unique_id;
+    w->generation = InterlockedIncrement(&vm->install_watch_generation);
+    w->phase = WATCH_WAIT_START;
+    w->last_report = GetTickCount64();
+    swprintf_s(w->pipe, _countof(w->pipe), L"\\\\.\\pipe\\%s.com1", vm->name);
+    if (vm->storage_root[0]) {
+        swprintf_s(w->log_path, _countof(w->log_path), L"%s\\firstboot-console.log", vm->storage_root);
+    } else {
+        wchar_t *slash;
+        wcscpy_s(w->log_path, _countof(w->log_path), vm->vhdx_path);
+        slash = wcsrchr(w->log_path, L'\\');
+        if (slash) wcscpy_s(slash + 1, _countof(w->log_path) - (slash + 1 - w->log_path),
+                            L"firstboot-console.log");
+    }
+
+    thread = CreateThread(NULL, 0, install_watch_thread, w, 0, NULL);
+    if (thread) CloseHandle(thread);
+    else free(w);
+}
+
 /* ---- Background Linux create thread (direct ISO -> VHDX) ----
  *
  * Spawns iso-patch.exe --ubuntu-to-vhdx, which builds a fully-installed
@@ -3346,6 +3603,7 @@ done:
                 hcs_start_monitor(inst);
                 vm_agent_start(inst);
                 idd_probe_start(inst);
+                install_watch_start(inst, TRUE);
                 asb_log(L"VM \"%s\" created and started.", inst->name);
                 save_vm_list();
             } else if (args->vhdx_created) {
@@ -4321,6 +4579,7 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
+        install_watch_start(inst, TRUE);
         InterlockedExchange(&inst->management_busy, 0);
         if (g_state_cb) g_state_cb(vm, TRUE, g_state_ud);
     }
@@ -5467,6 +5726,7 @@ ASB_API void asb_reconnect_running(void)
             hcs_start_monitor(&g_vms[i]);
             vm_agent_start(&g_vms[i]);
             idd_probe_start(&g_vms[i]);
+            install_watch_start(&g_vms[i], FALSE);
         } else if (hcs_is_running_by_enum(g_vms[i].name)) {
             /* HCS open failed (stale handle from dead process) but enumeration
                confirms the VM is running.  Mark it so queries return the right

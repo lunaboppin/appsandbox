@@ -1160,6 +1160,7 @@ function updateStatusCell(td, vm) {
     var needsSpinner = false;
     var label = '';
     var className = '';
+    var detail = '';
 
     if (vm.buildingVhdx) {
         needsSpinner = true;
@@ -1168,6 +1169,11 @@ function updateStatusCell(td, vm) {
     } else if (vm.running && vm.shuttingDown) {
         className = 'status-shutting-down';
         label = 'Shutting Down';
+    } else if (vm.installError && !vm.installComplete) {
+        /* Stays after the VM is stopped: starting it again won't help by itself. */
+        className = 'status-failed';
+        label = 'Setup failed';
+        detail = vm.installError;
     } else if (vm.running && vm.isTemplate) {
         needsSpinner = true;
         label = 'Building Template ';
@@ -1216,7 +1222,14 @@ function updateStatusCell(td, vm) {
         /* No spinner needed — wipe and set plain text. Any existing spinner is
            removed along with the old text. */
         td.textContent = label;
+        if (detail) {
+            var detailEl = document.createElement('div');
+            detailEl.className = 'status-detail';
+            detailEl.textContent = detail;
+            td.appendChild(detailEl);
+        }
     }
+    td.title = detail;
 }
 
 /* Build the list of <td> cells for a row. The status cell is passed in and

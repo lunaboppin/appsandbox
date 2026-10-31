@@ -132,6 +132,7 @@ BOOL shared_appliance_domain_join_command(const char *dc_ip, char *command, size
 /* Shared with the VPN gateway, the other Ubuntu appliance VM. */
 HRESULT appliance_download_ubuntu_image(wchar_t *image_path, size_t image_chars);
 HRESULT appliance_run_hidden_process(wchar_t *command, DWORD timeout_ms);
+void serial_clean_line(const char *line, char *clean, size_t clean_size);
 void appliance_start_serial_capture(const wchar_t *vm_name, const wchar_t *label,
                                     const wchar_t *log_path);
 
