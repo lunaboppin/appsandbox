@@ -32,14 +32,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
        vms.cfg (no file locking) and the machine-global HCN networks that asb_init
        wipes (hcn_cleanup_stale_networks). Global\ name = machine-wide (any folder),
        fixed string = path-independent. OS auto-releases on crash.
-       The handle is intentionally held (leaked) for the process lifetime. */
+       The handle is intentionally held (leaked) for the process lifetime.
+       A second launch brings a running app's window back, even from the tray. */
     {
         HANDLE inst_mutex = CreateMutexW(NULL, FALSE, L"Global\\AppSandboxCoreHost");
         if (inst_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-            MessageBoxW(NULL,
-                L"AppSandbox is already running (either the app window or the "
-                L"headless service). Only one can run at a time.",
-                L"App Sandbox", MB_ICONINFORMATION | MB_OK);
+            if (!ui_show_running_instance()) {
+                MessageBoxW(NULL,
+                    L"AppSandbox is already running (either the app window or the "
+                    L"headless service). Only one can run at a time.",
+                    L"App Sandbox", MB_ICONINFORMATION | MB_OK);
+            }
             OleUninitialize();
             return 0;
         }

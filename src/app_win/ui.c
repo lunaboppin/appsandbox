@@ -42,6 +42,8 @@ static HWND g_hwnd_main = NULL;
 static HINSTANCE g_hInstance = NULL;
 static int g_selected_vm = -1;
 
+#define MAIN_WINDOW_CLASS L"AppSandbox_Main"
+
 /* Minimum window size */
 static int g_min_width = 0;
 static int g_min_height = 0;
@@ -72,6 +74,7 @@ static VmDisplay *g_appliance_display = NULL;
 #define WM_HOST_RESOURCE_DONE (WM_APP + 20)
 #define WM_DOMAIN_DONE        (WM_APP + 21)
 #define WM_DOMAIN_PROGRESS    (WM_APP + 22)
+#define WM_SHOW_MAIN_WINDOW   (WM_APP + 24)
 
 #define MANAGE_OP_MOVE_STORAGE 1
 #define MANAGE_OP_RESIZE_DISK  2
@@ -84,6 +87,10 @@ static VmDisplay *g_appliance_display = NULL;
 #define TRAY_CMD_STOP_BASE     300
 
 static NOTIFYICONDATAW g_nid;
+static UINT g_wm_taskbar_created = 0;
+
+/* Windows is ending the session: a WM_CLOSE now means it, not close-to-tray. */
+static BOOL g_session_ending = FALSE;
 
 /* UI thread ID for thread-safe log dispatch */
 static DWORD g_ui_thread_id;
@@ -767,7 +774,7 @@ static void do_connect_appliance_console(void)
 
 /* ---- System tray ---- */
 
-static void tray_add(HWND hwnd)
+static BOOL tray_add(HWND hwnd)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
@@ -777,10 +784,47 @@ static void tray_add(HWND hwnd)
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX));
     wcscpy_s(g_nid.szTip, 128, L"App Sandbox");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    /* TaskbarCreated can also arrive with our icon still there (a DPI change). */
+    return Shell_NotifyIconW(NIM_ADD, &g_nid) || Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 static void tray_remove(void) { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
+
+/* Says once, ever, where the window went. Nothing is saved before asb_init has
+   loaded the settings, since saving then would overwrite them with empty ones. */
+static void tray_explain_once(void)
+{
+    if (!g_prereq_ok || asb_get_suppress_tray_warn()) return;
+    asb_set_suppress_tray_warn(TRUE);
+    asb_save();
+
+    g_nid.uFlags |= NIF_INFO;
+    g_nid.dwInfoFlags = NIIF_INFO;
+    wcscpy_s(g_nid.szInfoTitle, _countof(g_nid.szInfoTitle), L"App Sandbox is still running");
+    wcscpy_s(g_nid.szInfo, _countof(g_nid.szInfo),
+             L"Your VMs keep running in the background. Click the tray icon to reopen it, "
+             L"or right-click it to exit.");
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags &= ~NIF_INFO;
+}
+
+static void main_window_to_tray(HWND hwnd)
+{
+    /* With no icon to come back through (Explorer is down), stay on the taskbar. */
+    if (!tray_add(hwnd)) {
+        ShowWindow(hwnd, SW_MINIMIZE);
+        return;
+    }
+    ShowWindow(hwnd, SW_HIDE);
+    tray_explain_once();
+}
+
+static void main_window_show(HWND hwnd)
+{
+    /* SW_RESTORE would also take a maximized window out of being maximized. */
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
 
 #ifndef DWMWA_BORDER_COLOR
 #define DWMWA_BORDER_COLOR 34
@@ -959,8 +1003,8 @@ static void tray_show_menu(HWND hwnd)
 
     g_tray_item_count = 0;
 
-    tray_append(menu, TRAY_CMD_SHOW, L"Show App Sandbox", FALSE, FALSE, FALSE);
-    tray_append(menu, 0,             NULL,                TRUE,  FALSE, FALSE);
+    tray_append(menu, TRAY_CMD_SHOW, L"Open", FALSE, FALSE, FALSE);
+    tray_append(menu, 0,             NULL,    TRUE,  FALSE, FALSE);
 
     for (i = 0; i < count; i++) {
         VmInstance *v = asb_vm_instance(asb_vm_get(i));
@@ -982,10 +1026,11 @@ static void tray_show_menu(HWND hwnd)
     cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
     if (hook) UnhookWindowsHookEx(hook);
     DestroyMenu(menu);
+    /* Lets the menu dismiss properly next time when the window is hidden. */
+    PostMessageW(hwnd, WM_NULL, 0, 0);
 
     if (cmd == TRAY_CMD_SHOW) {
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+        main_window_show(hwnd);
     } else if (cmd == TRAY_CMD_EXIT) {
         DestroyWindow(hwnd);
     } else if (cmd >= TRAY_CMD_STOP_BASE) {
@@ -1966,6 +2011,18 @@ static void CALLBACK ui_vm_removed_callback(int index, void *user_data)
 
 /* ---- Window creation ---- */
 
+BOOL ui_show_running_instance(void)
+{
+    HWND hwnd = FindWindowW(MAIN_WINDOW_CLASS, NULL);
+    DWORD pid = 0;
+
+    if (!hwnd) return FALSE;
+    /* This new process may take the foreground; the running one may not, unless told. */
+    GetWindowThreadProcessId(hwnd, &pid);
+    AllowSetForegroundWindow(pid);
+    return PostMessageW(hwnd, WM_SHOW_MAIN_WINDOW, 0, 0);
+}
+
 HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 {
     WNDCLASSEXW wc;
@@ -1991,14 +2048,14 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     wc.hInstance     = hInstance;
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
-    wc.lpszClassName = L"AppSandbox_Main";
+    wc.lpszClassName = MAIN_WINDOW_CLASS;
     wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX));
 
     if (!RegisterClassExW(&wc))
         return NULL;
 
     hwnd = CreateWindowExW(
-        0, L"AppSandbox_Main", L"App Sandbox",
+        0, MAIN_WINDOW_CLASS, L"App Sandbox",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1575, 900,
         NULL, NULL, hInstance, NULL);
@@ -2019,6 +2076,12 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* Explorer restarted, and took the tray icon with it. */
+    if (g_wm_taskbar_created && msg == g_wm_taskbar_created) {
+        tray_add(hwnd);
+        return 0;
+    }
+
     switch (msg) {
 
     case WM_CREATE:
@@ -2030,6 +2093,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
                         L"App Sandbox", MB_ICONERROR);
         }
+        /* Explorer isn't elevated, so without the filter this never reaches us. */
+        g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+        if (g_wm_taskbar_created)
+            ChangeWindowMessageFilterEx(hwnd, g_wm_taskbar_created, MSGFLT_ALLOW, NULL);
         tray_add(hwnd);
         return 0;
 
@@ -2320,61 +2387,33 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_TRAYICON:
-        if (lp == WM_LBUTTONDBLCLK) {
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
-        } else if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) {
+        if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK || lp == NIN_BALLOONUSERCLICK) {
+            main_window_show(hwnd);
+        } else if (lp == WM_RBUTTONUP) {
             tray_show_menu(hwnd);
         }
         return 0;
 
-    case WM_CLOSE:
-    {
-        int i, count = asb_vm_count();
-        BOOL has_running = FALSE;
-        for (i = 0; i < count; i++) {
-            if (asb_vm_is_running(asb_vm_get(i))) { has_running = TRUE; break; }
-        }
-        if (has_running) {
-            if (!asb_get_suppress_tray_warn()) {
-                int btn = 0;
-                BOOL checked = FALSE;
-                TASKDIALOGCONFIG tdc;
-                TASKDIALOG_BUTTON buttons[2];
-
-                buttons[0].nButtonID = IDOK;
-                buttons[0].pszButtonText = L"Minimize to Tray";
-                buttons[1].nButtonID = IDCANCEL;
-                buttons[1].pszButtonText = L"Cancel";
-
-                ZeroMemory(&tdc, sizeof(tdc));
-                tdc.cbSize = sizeof(tdc);
-                tdc.hwndParent = hwnd;
-                tdc.pszWindowTitle = L"App Sandbox";
-                tdc.pszMainIcon = TD_INFORMATION_ICON;
-                tdc.pszMainInstruction = L"VMs are still running";
-                tdc.pszContent = L"App Sandbox will minimize to the system tray.\n"
-                                 L"Your VMs will continue running in the background.\n\n"
-                                 L"Click the tray icon to manage VMs or exit.";
-                tdc.pszVerificationText = L"Don't show this again";
-                tdc.cButtons = 2;
-                tdc.pButtons = buttons;
-                tdc.nDefaultButton = IDOK;
-
-                if (FAILED(TaskDialogIndirect(&tdc, &btn, NULL, &checked)) || btn != IDOK)
-                    return 0;
-
-                if (checked) {
-                    asb_set_suppress_tray_warn(TRUE);
-                    asb_save();
-                }
-            }
-            ShowWindow(hwnd, SW_HIDE);
-            return 0;
-        }
-        DestroyWindow(hwnd);
+    case WM_SHOW_MAIN_WINDOW:
+        main_window_show(hwnd);
         return 0;
-    }
+
+    /* Closing only hides the window: the process and its VMs carry on. Quitting is
+       the tray menu's Exit or the updater, and both call DestroyWindow directly. */
+    case WM_CLOSE:
+        if (g_session_ending) DestroyWindow(hwnd);
+        else main_window_to_tray(hwnd);
+        return 0;
+
+    /* Never in the way of a shutdown or logoff. As before, the app does no cleanup
+       of its own for it, so it can't hold one up: Windows ends the process. */
+    case WM_QUERYENDSESSION:
+        g_session_ending = TRUE;
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (!wp) g_session_ending = FALSE;
+        return 0;
 
     case WM_DESTROY:
     {

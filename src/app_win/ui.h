@@ -16,6 +16,11 @@
    Returns the window handle, or NULL on failure. */
 HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow);
 
+/* Bring back the window of an app instance that is already running, even one
+   closed to the tray. Returns FALSE if there is none (the headless daemon has
+   no such window). */
+BOOL ui_show_running_instance(void);
+
 /* Write a line to appsandbox.log and forward it to the registered
    AsbLogCallback (if any). Thread-safe: can be called from any thread.
    Implemented in asb_core.c (DLL). */
