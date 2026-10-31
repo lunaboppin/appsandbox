@@ -33,6 +33,8 @@
 #include "sandbox_run.h"
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
+#include "vm_stream.h"
+#include "vm_web.h"
 #include "vm_display_auto.h"   /* display window (Hyper-V console while booting, then IDD) */
 
 #pragma comment(lib, "httpapi.lib")
@@ -657,7 +659,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"runInSandbox\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"streaming\":true,\"browserAccess\":true,\"runInSandbox\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -1105,6 +1107,63 @@ static int handle_request(PHTTP_REQUEST req)
                 "\"keyDeployed\":%s}",
                 (unsigned long)v->ssh_port, user, ssh_rep, v->ssh_enabled ? "true" : "false",
                 v->ssh_key_deployed ? "true" : "false");
+            send_json(req->RequestId, 200, "OK", buf);
+            return 0;
+        }
+
+        /* Moonlight streaming (Sunshine in the guest).
+             GET  /v1/vms/{n}/stream
+             POST /v1/vms/{n}/stream        {enabled, exposure:"this_pc"|"network", softwareEncoder}
+             POST /v1/vms/{n}/stream/pair   {pin, name?}
+             POST /v1/vms/{n}/stream/unpair
+           Browser access.
+             GET  /v1/vms/{n}/web           includes the access key
+             POST /v1/vms/{n}/web           {enabled, lan}                        */
+        if (wcscmp(sub, L"stream") == 0 || wcsncmp(sub, L"stream/", 7) == 0 || wcscmp(sub, L"web") == 0) {
+            VmInstance *v = asb_vm_instance(vm);
+            wchar_t body[1024] = L"", err[512] = L"";
+            HRESULT hr = S_OK;
+            if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
+            if (verb == HttpVerbPOST) body_to_wide(req, body, _countof(body));
+            if (wcscmp(sub, L"stream") == 0 && verb == HttpVerbPOST) {
+                BOOL enabled = FALSE, software = TRUE;
+                wchar_t exposure[16] = L"this_pc";
+                json_get_bool(body, L"enabled", &enabled);
+                json_get_bool(body, L"softwareEncoder", &software);
+                json_get_string(body, L"exposure", exposure, _countof(exposure));
+                hr = vm_stream_configure(v, enabled,
+                                         wcscmp(exposure, L"network") == 0 ? ASB_STREAM_NETWORK : ASB_STREAM_THIS_PC,
+                                         software, err, _countof(err));
+            } else if (wcscmp(sub, L"stream/pair") == 0 && verb == HttpVerbPOST) {
+                wchar_t pin[8] = L"", name[48] = L"";
+                char pin_u[8] = "", name_u[100] = "", message[400] = "";
+                json_get_string(body, L"pin", pin, _countof(pin));
+                json_get_string(body, L"name", name, _countof(name));
+                WideCharToMultiByte(CP_UTF8, 0, pin, -1, pin_u, sizeof(pin_u), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, name, -1, name_u, sizeof(name_u), NULL, NULL);
+                hr = vm_stream_pair(v, pin_u, name_u, message, sizeof(message));
+                if (FAILED(hr)) { send_err(req->RequestId, 409, "Conflict", "pair_failed", message[0] ? message : "Pairing failed: is the VM on, and did Moonlight show this PIN?"); return 0; }
+            } else if (wcscmp(sub, L"stream/unpair") == 0 && verb == HttpVerbPOST) {
+                char message[400] = "";
+                hr = vm_stream_unpair_all(v, message, sizeof(message));
+                if (FAILED(hr)) { send_err(req->RequestId, 409, "Conflict", "unpair_failed", message[0] ? message : "The VM has to be on, with streaming turned on."); return 0; }
+            } else if (wcscmp(sub, L"web") == 0 && verb == HttpVerbPOST) {
+                BOOL enabled = FALSE, lan = FALSE;
+                json_get_bool(body, L"enabled", &enabled);
+                json_get_bool(body, L"lan", &lan);
+                hr = vm_web_set(v, enabled, lan, err, _countof(err));
+            } else if (verb != HttpVerbGET || (wcscmp(sub, L"stream") != 0 && wcscmp(sub, L"web") != 0)) {
+                send_err(req->RequestId, 404, "Not Found", "not_found", "no such route");
+                return 0;
+            }
+            if (FAILED(hr)) {
+                char m[600] = "the request could not be done";
+                if (err[0]) WideCharToMultiByte(CP_UTF8, 0, err, -1, m, sizeof(m), NULL, NULL);
+                send_err(req->RequestId, 409, "Conflict", "remote_refused", m);
+                return 0;
+            }
+            if (wcscmp(sub, L"web") == 0) vm_web_status_json(v, buf, sizeof(buf));
+            else vm_stream_status_json(v, buf, sizeof(buf));
             send_json(req->RequestId, 200, "OK", buf);
             return 0;
         }

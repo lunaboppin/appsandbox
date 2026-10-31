@@ -268,6 +268,45 @@
             <label class="manage-check"><input type="checkbox" id="manage-auto-display" onchange="saveManageDisplay()"> Auto-open the IDD virtual monitor when this VM boots</label>
         </fieldset>
 
+        <fieldset id="manage-remote-section">
+            <legend>Remote</legend>
+            <label class="manage-check"><input type="checkbox" id="manage-web-enabled" onchange="saveRemoteWeb()"> Use this VM from a web browser</label>
+            <label class="manage-check manage-remote-sub"><input type="checkbox" id="manage-web-lan" onchange="saveRemoteWeb()"> Allow other devices on your network too</label>
+            <small id="manage-web-reach"></small>
+            <div id="manage-web-details" style="display:none">
+                <div class="manage-row">
+                    <input id="manage-web-url" type="text" readonly aria-label="Browser link" title="This link includes the VM's access key. Anyone with it can control the VM.">
+                    <button class="primary" onclick="openRemoteWeb()">Open</button>
+                    <button onclick="copyRemoteWeb()">Copy</button>
+                </div>
+                <small id="manage-web-lan-info"></small>
+            </div>
+            <hr class="manage-remote-rule">
+            <label class="manage-check"><input type="checkbox" id="manage-stream-enabled" onchange="saveRemoteStream()"> Stream to Moonlight, with Sunshine set up in the VM</label>
+            <div id="manage-stream-options" style="display:none">
+                <div class="manage-row">
+                    <label for="manage-stream-exposure">Who can connect</label>
+                    <select id="manage-stream-exposure" onchange="saveRemoteStream()">
+                        <option value="this_pc">Only this PC</option>
+                        <option value="network">Devices on my network</option>
+                    </select>
+                </div>
+                <label class="manage-check"><input type="checkbox" id="manage-stream-gpu" onchange="saveRemoteStream()"> Encode with the VM's GPU (riskier)</label>
+                <small>Off encodes on the CPU. On lets Sunshine try the GPU, which is smoother and uses less CPU, but there are reports of NVIDIA encoding in a GPU-PV VM crashing the host PC on some cards and drivers. Save your work on the host first.</small>
+            </div>
+            <small id="manage-stream-reach"></small>
+            <small id="manage-stream-state"></small>
+            <div id="manage-stream-pair" style="display:none">
+                <div class="manage-row">
+                    <input id="manage-stream-pin" type="text" inputmode="numeric" maxlength="4" placeholder="PIN" aria-label="PIN Moonlight shows" style="width:6em">
+                    <button class="primary" onclick="pairRemoteStream()">Pair</button>
+                    <button onclick="unpairRemoteStream()">Unpair all</button>
+                </div>
+                <small>In Moonlight, add the address above and pick this PC. Moonlight shows a 4-digit PIN: enter it here within a minute or so.</small>
+            </div>
+            <small id="manage-remote-message" class="manage-remote-error"></small>
+        </fieldset>
+
         <fieldset id="manage-domain-section">
             <legend>Domain</legend>
             <label class="manage-check"><input type="checkbox" id="manage-domain-member" onchange="saveManageDomainMember()"> Join the AppSandbox domain (managed)</label>

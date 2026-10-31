@@ -124,6 +124,7 @@ window.onHostMessage = function(msg) {
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
         case 'manageResult':  onManageResult(msg); break;
+        case 'remoteStatus':  onRemoteStatus(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -1690,10 +1691,15 @@ function openManageVm(idx) {
     managePending = false;
     document.getElementById('manage-vm-overlay').classList.add('active');
     refreshManageVm(true);
+    remoteState = null;
+    requestRemoteStatus();
+    clearInterval(remoteTimer);
+    remoteTimer = setInterval(requestRemoteStatus, 5000);
 }
 
 function closeManageVm() {
     if (managePending) return;
+    clearInterval(remoteTimer);
     document.getElementById('manage-vm-overlay').classList.remove('active');
     manageVmIndex = -1;
 }
@@ -2058,6 +2064,172 @@ function saveManageDisposable() {
     showModal('Make this VM disposable',
         'Checkpoint this VM as it is now and start every session from that clean copy? Anything saved inside the VM since its last start is thrown away at the next start, except on H: and shared drives.',
         'Make Disposable', { confirmClass: 'primary' }).then(function(ok) { if (ok) send(true); });
+}
+
+/* ---- Remote: browser access and Moonlight ---- */
+
+var remoteTimer = 0;
+var remoteBusy = false;
+var remoteState = null;
+
+function requestRemoteStatus() {
+    if (manageVmIndex < 0 || remoteBusy) return;
+    remoteBusy = true;
+    sendCmd('remoteGet', { vmIndex: manageVmIndex });
+}
+
+function remoteCommand(action, data) {
+    if (manageVmIndex < 0) return;
+    data.vmIndex = manageVmIndex;
+    remoteBusy = true;
+    document.getElementById('manage-remote-message').textContent = '';
+    sendCmd(action, data);
+}
+
+function streamGuestText(s) {
+    var g = s.guest;
+    if (!s.enabled) return '';
+    if (!g) return 'Sets up the next time the VM is running with its agent connected.';
+    var text = '';
+    switch (g.phase) {
+        case 'downloading': text = 'Downloading Sunshine in the VM from its official release...'; break;
+        case 'installing': text = 'Installing Sunshine in the VM...'; break;
+        case 'failed': text = 'Setup failed: ' + (g.detail || 'see the VM log.'); break;
+        case 'ready': text = g.running ? 'Sunshine is running.' : 'Sunshine is installed but not running.'; break;
+        default: text = g.detail || 'Getting Sunshine ready...';
+    }
+    var encoders = Object.keys(g.encoders || {}).map(function(k) { return g.encoders[k]; });
+    if (encoders.length) text += ' Encoders found: ' + encoders.join(', ') + '.';
+    if (g.phase === 'ready') text += g.gamepad ? ' Gamepads work.' : ' No gamepad driver yet, so gamepads won\'t work.';
+    return text;
+}
+
+function onRemoteStatus(msg) {
+    remoteBusy = false;
+    if (msg.vmIndex !== manageVmIndex) return;
+    remoteState = msg;
+    if (msg.message) document.getElementById('manage-remote-message').textContent = msg.message;
+    var w = msg.web, s = msg.stream;
+    if (!w || !s) return;
+
+    // Browser access
+    var webBox = document.getElementById('manage-web-enabled');
+    var lanBox = document.getElementById('manage-web-lan');
+    webBox.checked = !!w.enabled;
+    webBox.disabled = !!w.unsupported;
+    lanBox.checked = !!w.lan;
+    lanBox.disabled = !w.enabled;
+    document.getElementById('manage-web-reach').textContent = w.unsupported || w.reach || '';
+    document.getElementById('manage-web-details').style.display = w.enabled ? '' : 'none';
+    var urlBox = document.getElementById('manage-web-url');
+    if (urlBox.value !== (w.url || '')) urlBox.value = w.url || '';
+    var lanInfo = '';
+    if (w.enabled && w.lan) {
+        var links = (w.lanAddresses || []).map(function(a) {
+            return 'https://' + a + ':' + w.lanPort + w.lanPath;
+        });
+        lanInfo = 'From another device: ' + (links.join(' or ') || 'this PC has no network address right now') +
+            '. Access key: ' + w.key + '. Certificate fingerprint (SHA-256), to compare with what the browser shows: ' + w.fingerprint + '.';
+    }
+    if (w.connected) lanInfo = 'A browser is connected, so the display window is paused. ' + lanInfo;
+    document.getElementById('manage-web-lan-info').textContent = lanInfo;
+
+    // Moonlight
+    var streamBox = document.getElementById('manage-stream-enabled');
+    var options = document.getElementById('manage-stream-options');
+    var exposure = document.getElementById('manage-stream-exposure');
+    streamBox.checked = !!s.enabled;
+    streamBox.disabled = !!s.unsupported;
+    options.style.display = s.enabled ? '' : 'none';
+    exposure.value = s.exposure === 'network' ? 'network' : 'this_pc';
+    exposure.disabled = !!s.bridged;
+    document.getElementById('manage-stream-gpu').checked = s.encoder !== 'software';
+    var reach = s.unsupported || s.reach || '';
+    if (s.enabled && !s.bridged) {
+        var hosts = s.exposure === 'network' ? (s.addresses || []) : ['127.0.0.1'];
+        reach += ' Address: ' + hosts.map(function(a) {
+            return s.port === 47989 ? a : a + ':' + s.port;
+        }).join(' or ') + '.';
+    } else if (s.enabled && s.guest && s.guest.address) {
+        reach += ' Address: ' + s.guest.address + (s.port === 47989 ? '' : ':' + s.port) + '.';
+    }
+    if (s.relayError) reach += ' ' + s.relayError;
+    document.getElementById('manage-stream-reach').textContent = reach;
+    document.getElementById('manage-stream-state').textContent = streamGuestText(s);
+    document.getElementById('manage-stream-pair').style.display =
+        s.enabled && s.guest && s.guest.phase === 'ready' && s.guest.running ? '' : 'none';
+}
+
+function saveRemoteWeb() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-web-enabled');
+    var lan = document.getElementById('manage-web-lan');
+    var wasLan = !!(remoteState && remoteState.web && remoteState.web.lan);
+    function send() {
+        remoteCommand('remoteSetWeb', { enabled: box.checked, flag: box.checked && lan.checked });
+    }
+    if (box.checked && lan.checked && !wasLan) {
+        lan.checked = false;
+        showModal('Allow other devices', 'Anyone on your private or domain networks who has this VM\'s access key can then control it: screen, keyboard, mouse and clipboard. Traffic is encrypted with a self-signed certificate, so browsers warn about it; check its fingerprint. A firewall rule opens one port on those networks until you turn this off or close App Sandbox.', 'Allow', {confirmClass:'danger'}).then(function(ok) {
+            if (ok) { lan.checked = true; send(); }
+        });
+        return;
+    }
+    send();
+}
+
+function saveRemoteStream() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-stream-enabled');
+    var exposure = document.getElementById('manage-stream-exposure');
+    var gpu = document.getElementById('manage-stream-gpu');
+    var was = remoteState && remoteState.stream ? remoteState.stream : {};
+    function send() {
+        remoteCommand('remoteSetStream', { enabled: box.checked, exposure: exposure.value, flag: !gpu.checked });
+    }
+    if (box.checked && !was.enabled) {
+        box.checked = false;
+        showModal('Stream with Moonlight', 'This downloads Sunshine, a separate GPL-3 program, from its official release into the VM, checks the download against a known hash, and installs it with a service that runs at startup. Only this PC can connect until you choose otherwise. Turning this off removes Sunshine again.', 'Set up', {confirmClass:'primary'}).then(function(ok) {
+            if (ok) { box.checked = true; gpu.checked = false; send(); }
+        });
+        return;
+    }
+    if (box.checked && exposure.value === 'network' && was.exposure !== 'network') {
+        exposure.value = 'this_pc';
+        showModal('Allow other devices', 'Any device that can reach this PC on a private or domain network can then try to pair, and Windows may count VPNs like Tailscale as private. Pairing needs a PIN you enter here. A paired device controls the VM, including at the sign-in screen, until you unpair it.', 'Allow', {confirmClass:'danger'}).then(function(ok) {
+            if (ok) { exposure.value = 'network'; send(); }
+        });
+        return;
+    }
+    send();
+}
+
+function openRemoteWeb() {
+    var url = document.getElementById('manage-web-url').value;
+    if (url) sendCmd('remoteOpenWeb', { url: url });
+}
+
+function copyRemoteWeb() {
+    var box = document.getElementById('manage-web-url');
+    box.select();
+    document.execCommand('copy');
+}
+
+function pairRemoteStream() {
+    var box = document.getElementById('manage-stream-pin');
+    var pin = box.value.trim();
+    if (!/^[0-9]{4}$/.test(pin)) {
+        document.getElementById('manage-remote-message').textContent = 'The PIN is the 4 digits Moonlight shows.';
+        return;
+    }
+    box.value = '';
+    remoteCommand('remotePair', { pin: pin, client: 'Moonlight' });
+}
+
+function unpairRemoteStream() {
+    showModal('Unpair all', 'Forget every Moonlight device paired with this VM? They would have to pair again with a new PIN.', 'Unpair', {}).then(function(ok) {
+        if (ok) remoteCommand('remoteUnpair', {});
+    });
 }
 
 function saveManageDomainMember() {

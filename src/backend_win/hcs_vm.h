@@ -160,6 +160,11 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    BOOL        stream_enabled;          /* TRUE = Sunshine set up in the guest, for Moonlight clients */
+    int         stream_exposure;         /* ASB_STREAM_THIS_PC or ASB_STREAM_NETWORK */
+    DWORD       stream_port;             /* Sunshine base port (47989 + 100 * n) */
+    BOOL        stream_software;         /* TRUE = never use the guest GPU to encode */
+    volatile LONG web_session_active;    /* browser sessions using the guest channels; the display window lets go while > 0 */
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
     wchar_t     preinstall_apps[1024]; /* winget IDs not yet handed to the guest agent */
     HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];

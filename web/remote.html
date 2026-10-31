@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>App Sandbox</title>
+<link rel="stylesheet" href="/remote.css">
+</head>
+<body>
+<canvas id="screen" tabindex="0" aria-label="VM screen"></canvas>
+<div id="bar">
+  <span id="bar-name"></span>
+  <span id="bar-status"></span>
+  <button id="btn-mute" type="button" aria-pressed="false">Mute</button>
+  <button id="btn-capture" type="button" title="Lock the mouse to the VM, for games. Press Esc to let go.">Lock mouse</button>
+  <button id="btn-fullscreen" type="button" title="Full screen also sends shortcuts like Alt+Tab to the VM, where the browser allows it.">Full screen</button>
+</div>
+<div id="overlay">
+  <div id="panel">
+    <h1 id="panel-title">Connecting</h1>
+    <p id="panel-text"></p>
+    <form id="login" hidden>
+      <label for="key">Access key</label>
+      <input id="key" type="password" autocomplete="off" spellcheck="false">
+      <button type="submit">Connect</button>
+    </form>
+    <button id="btn-retry" type="button" hidden>Connect here</button>
+  </div>
+</div>
+<script src="/remote.js"></script>
+</body>
+</html>
