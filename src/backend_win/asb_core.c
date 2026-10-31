@@ -24,6 +24,7 @@
 #include "shared_appliance.h"
 #include "vpn_configs.h"
 #include "vpn_gateway.h"
+#include "sandbox_run.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -496,6 +497,13 @@ ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int cap)
     return pubkey_out[0] != 0;
 }
 
+/* What every disk-changing operation answers while a Run in Sandbox is open. */
+static HRESULT sandbox_run_blocks(VmInstance *inst)
+{
+    asb_log(L"\"%s\" has an open Run in Sandbox. Finish it first.", inst->name);
+    return HRESULT_FROM_WIN32(ERROR_BUSY);
+}
+
 /* ---- Persistence: save VM list ---- */
 
 static BOOL save_vm_list(void)
@@ -516,7 +524,7 @@ static BOOL save_vm_list(void)
     }
 
     if (g_last_iso_path[0] != L'\0' || g_last_storage_parent[0] != L'\0' ||
-        g_suppress_tray_warn ||
+        g_suppress_tray_warn || asb_get_last_sandbox_vm()[0] ||
         g_settings_passthrough[0] != L'\0') {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
@@ -525,6 +533,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"LastStorageParent=%s\n", g_last_storage_parent);
         if (g_suppress_tray_warn)
             fwprintf(f, L"SuppressTrayWarn=1\n");
+        if (asb_get_last_sandbox_vm()[0])
+            fwprintf(f, L"LastSandboxVm=%s\n", asb_get_last_sandbox_vm());
         if (g_settings_passthrough[0] != L'\0')
             fwprintf(f, L"%s", g_settings_passthrough);
         fwprintf(f, L"\n");
@@ -578,6 +588,13 @@ static BOOL save_vm_list(void)
         if (g_vms[i].disposable_snap[0])
             fwprintf(f, L"DisposableSnap=%s\nDisposableBranch=%s\n",
                      g_vms[i].disposable_snap, g_vms[i].disposable_branch);
+        if (g_vms[i].sandbox_run_id[0]) {
+            wchar_t encoded[800];
+            asb_run_encode_name(g_vms[i].sandbox_run_file, encoded, _countof(encoded));
+            fwprintf(f, L"SandboxRunId=%s\nSandboxRunParent=%s\nSandboxRunOverlay=%s\nSandboxRunFile=%s\n",
+                     g_vms[i].sandbox_run_id, g_vms[i].sandbox_run_parent,
+                     g_vms[i].sandbox_run_overlay, encoded);
+        }
         if (g_vms[i].lab_mode)
             fwprintf(f, L"LabMode=1\n");
         if (g_vms[i].lab_report[0])
@@ -657,6 +674,8 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_storage_parent, MAX_PATH, line + 18);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"LastSandboxVm=", 14) == 0)
+                asb_run_load_last_vm(line + 14);
             else
                 preserve_config_line(g_settings_passthrough,
                                      _countof(g_settings_passthrough), line);
@@ -727,6 +746,14 @@ static void load_vm_list(void)
             wcsncpy_s(vm->disposable_snap, _countof(vm->disposable_snap), line + 15, _TRUNCATE);
         else if (wcsncmp(line, L"DisposableBranch=", 17) == 0)
             wcsncpy_s(vm->disposable_branch, _countof(vm->disposable_branch), line + 17, _TRUNCATE);
+        else if (wcsncmp(line, L"SandboxRunId=", 13) == 0)
+            wcsncpy_s(vm->sandbox_run_id, _countof(vm->sandbox_run_id), line + 13, _TRUNCATE);
+        else if (wcsncmp(line, L"SandboxRunParent=", 17) == 0)
+            wcsncpy_s(vm->sandbox_run_parent, MAX_PATH, line + 17, _TRUNCATE);
+        else if (wcsncmp(line, L"SandboxRunOverlay=", 18) == 0)
+            wcsncpy_s(vm->sandbox_run_overlay, MAX_PATH, line + 18, _TRUNCATE);
+        else if (wcsncmp(line, L"SandboxRunFile=", 15) == 0)
+            asb_run_decode_name(line + 15, vm->sandbox_run_file, _countof(vm->sandbox_run_file));
         else if (wcsncmp(line, L"LabMode=", 8) == 0)
             vm->lab_mode = (_wtoi(line + 8) != 0);
         else if (wcsncmp(line, L"LabReport=", 10) == 0)
@@ -769,6 +796,14 @@ static void load_vm_list(void)
                 wcscpy_s(g_vms[i].storage_root, MAX_PATH, root);
             }
             snapshot_init(&g_snap_trees[i], snap_dir);
+            asb_run_sweep_orphans(&g_vms[i], snap_dir);
+            if (g_vms[i].sandbox_run_id[0]) {
+                /* Whatever happened since (a closed app, a host reboot), the decision
+                   is still the user's. Nothing rolls back here. */
+                g_vms[i].sandbox_phase = ASB_RUN_PHASE_READY;
+                asb_log(L"Run in Sandbox: \"%s\" still has an open run for %s.",
+                        g_vms[i].name, g_vms[i].sandbox_run_file);
+            }
         }
     }
 }
@@ -4398,6 +4433,47 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     return hr;
 }
 
+/* Point a disposable VM at a new branch of its clean checkpoint and delete the
+   branch the last session ran on, with everything it changed. */
+HRESULT asb_disposable_new_session(AsbVm vm)
+{
+    int idx = vm_index_of(vm), node = -1, i, b;
+    VmInstance *inst;
+    SnapshotTree *tree;
+    wchar_t previous[64];
+    HRESULT dhr;
+
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    tree = &g_snap_trees[idx];
+    for (i = 0; i < tree->count; i++)
+        if (tree->nodes[i].valid && _wcsicmp(tree->nodes[i].guid, inst->disposable_snap) == 0)
+            node = i;
+    if (node < 0) {
+        asb_log(L"\"%s\": the clean checkpoint for disposable starts is gone; starting normally.",
+                inst->name);
+        return S_FALSE;
+    }
+    wcscpy_s(previous, _countof(previous), inst->disposable_branch);
+    dhr = snapshot_new_branch(tree, inst, node);
+    if (FAILED(dhr)) {
+        asb_log(L"Error: could not create a clean copy for \"%s\" (0x%08X).", inst->name, dhr);
+        return dhr;
+    }
+    b = tree->nodes[node].branch_count - 1;
+    wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
+             tree->nodes[node].branches[b].guid);
+    for (i = 0; previous[0] && i < tree->nodes[node].branch_count; i++)
+        if (_wcsicmp(tree->nodes[node].branches[i].guid, previous) == 0) {
+            snapshot_delete_branch(tree, inst, node, i);
+            break;
+        }
+    asb_log(L"\"%s\" is disposable: starting from a clean copy of \"%s\".",
+            inst->name, tree->nodes[node].name);
+    save_vm_list();
+    return S_OK;
+}
+
 /* ---- VM Start ---- */
 
 ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
@@ -4412,6 +4488,12 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
     inst = &g_vms[idx];
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
+    /* A run's checkpoint sits on the disk it was taken from: booting another
+       checkpoint or branch now would strand it. */
+    if (inst->sandbox_run_id[0] && snap_idx != -1) {
+        asb_log(L"\"%s\" has an open Run in Sandbox. Finish it before switching checkpoints.", inst->name);
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
     if (InterlockedCompareExchange(&inst->management_busy, 1, 0) != 0) {
         asb_log(L"VM \"%s\" is busy with another lifecycle operation.", inst->name);
         return HRESULT_FROM_WIN32(ERROR_BUSY);
@@ -4420,7 +4502,7 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
     /* Lab VM: the first start after setup saves the clean copy every later
        start begins from (installs made before this shutdown are kept). */
     if (inst->lab_mode && inst->install_complete && !inst->disposable_snap[0] &&
-        snap_idx == -1 && !inst->running) {
+        snap_idx == -1 && !inst->running && !inst->sandbox_run_id[0]) {
         SnapshotTree *tree = &g_snap_trees[idx];
         if (SUCCEEDED(snapshot_take(tree, inst, L"Lab clean state")) && tree->count > 0) {
             SnapNode *node = &tree->nodes[tree->count - 1];
@@ -4447,37 +4529,12 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
     /* Disposable: every normal start (or a start from the clean checkpoint
        itself) boots a new branch of the clean checkpoint, and the branch the
        last session ran on is deleted with everything it changed. */
-    if (inst->disposable_snap[0] && snap_idx == -1) {
-        SnapshotTree *tree = &g_snap_trees[idx];
-        int node = -1, i, b;
-        for (i = 0; i < tree->count; i++)
-            if (tree->nodes[i].valid && _wcsicmp(tree->nodes[i].guid, inst->disposable_snap) == 0)
-                node = i;
-        if (node < 0) {
-            asb_log(L"\"%s\": the clean checkpoint for disposable starts is gone; starting normally.",
-                    inst->name);
-        } else {
-            wchar_t previous[64];
-            HRESULT dhr;
-            wcscpy_s(previous, _countof(previous), inst->disposable_branch);
-            dhr = snapshot_new_branch(tree, inst, node);
-            if (FAILED(dhr)) {
-                asb_log(L"Error: could not create a clean copy for \"%s\" (0x%08X).", inst->name, dhr);
-                InterlockedExchange(&inst->management_busy, 0);
-                if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
-                return dhr;
-            }
-            b = tree->nodes[node].branch_count - 1;
-            wcscpy_s(inst->disposable_branch, _countof(inst->disposable_branch),
-                     tree->nodes[node].branches[b].guid);
-            for (i = 0; previous[0] && i < tree->nodes[node].branch_count; i++)
-                if (_wcsicmp(tree->nodes[node].branches[i].guid, previous) == 0) {
-                    snapshot_delete_branch(tree, inst, node, i);
-                    break;
-                }
-            asb_log(L"\"%s\" is disposable: starting from a clean copy of \"%s\".",
-                    inst->name, tree->nodes[node].name);
-            save_vm_list();
+    if (inst->disposable_snap[0] && snap_idx == -1 && !inst->sandbox_run_id[0]) {
+        HRESULT dhr = asb_disposable_new_session(vm);
+        if (FAILED(dhr)) {
+            InterlockedExchange(&inst->management_busy, 0);
+            if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+            return dhr;
         }
     }
 
@@ -4586,6 +4643,14 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
 
     return S_OK;
 }
+
+void asb_notify_vm_state(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    if (inst && g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+}
+
+BOOL asb_save_checked(void) { return save_vm_list(); }
 
 /* ---- VM Shutdown (graceful) ---- */
 
@@ -5211,6 +5276,7 @@ ASB_API HRESULT asb_vm_set_disposable(AsbVm vm, BOOL enabled)
     if (idx < 0) return E_INVALIDARG;
     inst = &g_vms[idx];
     tree = &g_snap_trees[idx];
+    if (inst->sandbox_run_id[0]) return sandbox_run_blocks(inst);
     if (!enabled) {
         inst->disposable_snap[0] = L'\0';
         inst->disposable_branch[0] = L'\0';
@@ -5265,6 +5331,7 @@ static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t ch
 static HRESULT management_begin(VmInstance *inst, BOOL require_closed_handle)
 {
     if (!inst) return E_INVALIDARG;
+    if (inst->sandbox_run_id[0]) return sandbox_run_blocks(inst);
     if (inst->running || inst->building_vhdx ||
         (require_closed_handle && inst->handle))
         return E_ACCESSDENIED;
@@ -5452,6 +5519,7 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     int idx = vm_index_of(vm);
     wchar_t snap_name[128];
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].sandbox_run_id[0]) return sandbox_run_blocks(&g_vms[idx]);
     if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm)) {
         asb_log(L"VM must be stopped and idle to create a checkpoint."); return E_ACCESSDENIED;
     }
@@ -5478,6 +5546,7 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].sandbox_run_id[0]) return sandbox_run_blocks(&g_vms[idx]);
     if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
         return E_ACCESSDENIED;
     if (snap_idx < 0) { asb_log(L"Select a checkpoint to delete."); return E_INVALIDARG; }
@@ -5502,6 +5571,7 @@ ASB_API HRESULT asb_snap_new_branch(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].sandbox_run_id[0]) return sandbox_run_blocks(&g_vms[idx]);
     if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
         return E_ACCESSDENIED;
 
@@ -5518,6 +5588,7 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].sandbox_run_id[0]) return sandbox_run_blocks(&g_vms[idx]);
     if (g_vms[idx].running || g_vms[idx].building_vhdx || asb_vm_management_busy(vm))
         return E_ACCESSDENIED;
 

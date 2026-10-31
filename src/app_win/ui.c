@@ -15,6 +15,7 @@
 #include "vm_display_idd.h"
 #include "vm_display_auto.h"
 #include "vm_agent.h"
+#include "sandbox_run.h"
 #include "webview2_bridge.h"
 #include "update_ui.h"
 #include "prereq.h"
@@ -56,6 +57,8 @@ static VmDisplayAuto *g_vm_displays[ASB_MAX_VMS];
 static VmDisplay *g_appliance_display = NULL;
 
 /* Custom window messages */
+/* From appsandbox-run.exe: a file to run, as a NUL-terminated absolute path. */
+#define ASB_COPYDATA_RUN_FILE  0x41534252
 #define WM_VM_STATE_CHANGED    (WM_APP + 1)
 #define WM_VM_AGENT_STATUS     (WM_APP + 2)
 #define WM_VM_AGENT_SHUTDOWN   (WM_APP + 3)
@@ -232,6 +235,12 @@ static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
     jb_string(jb, key, buf);
 }
 
+/* Paths Explorer sent before the page could show them. */
+#define SANDBOX_PENDING_MAX 32
+static wchar_t *g_sandbox_pending[SANDBOX_PENDING_MAX];
+static int g_sandbox_pending_count;
+static BOOL g_sandbox_ui_ready;
+
 static void build_vm_json(JsonBuilder *jb, int i)
 {
     VmInstance *v = asb_vm_instance(asb_vm_get(i));
@@ -271,6 +280,21 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"secureBoot", !v->secure_boot_off);
     jb_bool(jb, L"domainMember", v->domain_member);
     jb_bool(jb, L"disposable", v->disposable_snap[0] != L'\0');
+    {
+        AsbRunStatus run;
+        const wchar_t *unsuitable = asb_run_unsuitable_reason(asb_vm_get(i));
+        asb_run_get_status(asb_vm_get(i), &run);
+        jb_bool(jb, L"runActive", run.active);
+        jb_bool(jb, L"runBusy", run.busy);
+        jb_int(jb, L"runPhase", run.phase);
+        jb_int(jb, L"runPct", run.pct);
+        jb_string(jb, L"runId", run.id);
+        jb_string(jb, L"runFile", run.file);
+        jb_string(jb, L"runMessage", run.message);
+        jb_string(jb, L"runGuestPath", run.guest_path);
+        jb_string(jb, L"runUnsuitable", unsuitable ? unsuitable : L"");
+        jb_bool(jb, L"sandboxLast", _wcsicmp(asb_get_last_sandbox_vm(), v->name) == 0);
+    }
     jb_bool(jb, L"labMode", v->lab_mode);
     jb_bool(jb, L"labRunning", v->lab_running != 0);
     jb_int(jb, L"labShots", (int)v->lab_shots);
@@ -819,6 +843,43 @@ static void main_window_to_tray(HWND hwnd)
     }
     ShowWindow(hwnd, SW_HIDE);
     tray_explain_once();
+}
+
+/* Ask the page to offer this file. The picker is where anything gets decided. */
+static void post_sandbox_request(const wchar_t *path)
+{
+    static wchar_t buf[8192];
+    JsonBuilder jb;
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    const wchar_t *slash = wcsrchr(path, L'\\');
+    ULONGLONG size = 0;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &info))
+        size = ((ULONGLONG)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+    jb_init(&jb, buf, _countof(buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"sandboxRequest");
+    jb_string(&jb, L"path", path);
+    jb_string(&jb, L"name", slash ? slash + 1 : path);
+    jb_int(&jb, L"sizeMb", (int)(size / (1024 * 1024)));
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
+static void flush_sandbox_pending(void)
+{
+    int i;
+    for (i = 0; i < g_sandbox_pending_count; i++) {
+        post_sandbox_request(g_sandbox_pending[i]);
+        free(g_sandbox_pending[i]);
+    }
+    g_sandbox_pending_count = 0;
+}
+
+static void post_sandbox_finish_prompt(int idx)
+{
+    wchar_t json[96];
+    swprintf_s(json, _countof(json), L"{\"type\":\"sandboxFinishPrompt\",\"vmIndex\":%d}", idx);
+    webview2_post(json);
 }
 
 static void main_window_show(HWND hwnd)
@@ -1394,6 +1455,8 @@ static void on_webview2_message(const wchar_t *json)
         g_prereq_ok = TRUE;
         asb_init();
         send_full_state();
+        g_sandbox_ui_ready = TRUE;
+        flush_sandbox_pending();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1501,6 +1564,51 @@ static void on_webview2_message(const wchar_t *json)
             asb_vm_stop(asb_vm_get(idx));
             send_vm_list();
         }
+    } else if (wcscmp(action, L"sandboxRun") == 0) {
+        static wchar_t path[4096];
+        wchar_t mode[24] = L"", error[256] = L"";
+        int idx = -1;
+        path[0] = L'\0';
+        json_get_string(json, L"path", path, _countof(path));
+        json_get_string(json, L"mode", mode, _countof(mode));
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            HRESULT hr = asb_run_file(asb_vm_get(idx), path,
+                wcscmp(mode, L"shutdown-first") == 0 ? ASB_RUN_MODE_SHUTDOWN_FIRST
+                : wcscmp(mode, L"no-checkpoint") == 0 ? ASB_RUN_MODE_NO_CHECKPOINT
+                                                      : ASB_RUN_MODE_CHECKPOINT,
+                error, _countof(error));
+            if (FAILED(hr)) {
+                wchar_t out[512];
+                JsonBuilder jb;
+                jb_init(&jb, out, _countof(out));
+                jb_object_begin(&jb);
+                jb_string(&jb, L"type", L"sandboxError");
+                jb_string(&jb, L"message", error[0] ? error : L"Could not run this file.");
+                jb_object_end(&jb);
+                webview2_post(out);
+            }
+        }
+    } else if (wcscmp(action, L"sandboxFinish") == 0) {
+        wchar_t error[256] = L"";
+        int idx = -1;
+        BOOL keep = FALSE;
+        /* Discard is destructive, so it has to be asked for by name. */
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count() &&
+            json_get_bool(json, L"keep", &keep) &&
+            FAILED(asb_run_finish(asb_vm_get(idx), keep, error, _countof(error)))) {
+            wchar_t out[512];
+            JsonBuilder jb;
+            jb_init(&jb, out, _countof(out));
+            jb_object_begin(&jb);
+            jb_string(&jb, L"type", L"sandboxError");
+            jb_string(&jb, L"message", error[0] ? error : L"Could not finish the run.");
+            jb_object_end(&jb);
+            webview2_post(out);
+        }
+    } else if (wcscmp(action, L"sandboxDismiss") == 0) {
+        int idx = -1;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count())
+            asb_run_clear_status(asb_vm_get(idx));
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         /* optional "view": "auto" (default) | "console" | "idd" */
         int idx;
@@ -2095,6 +2203,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
                         L"App Sandbox", MB_ICONERROR);
         }
+        /* appsandbox-run.exe isn't elevated either. */
+        ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);
         /* Explorer isn't elevated, so without the filter this never reaches us. */
         g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
         if (g_wm_taskbar_created)
@@ -2128,6 +2238,37 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_COPYDATA:
+    {
+        /* From another process at a lower integrity level: check it all. It only ever
+           opens the picker, so a bogus path gets no further than a dialog. */
+        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
+        const wchar_t *path;
+        size_t chars;
+        if (!cds || cds->dwData != ASB_COPYDATA_RUN_FILE || !cds->lpData ||
+            cds->cbData < 4 * sizeof(wchar_t) || cds->cbData % sizeof(wchar_t) ||
+            cds->cbData > 4096 * sizeof(wchar_t))
+            return 0;
+        path = (const wchar_t *)cds->lpData;
+        chars = cds->cbData / sizeof(wchar_t);
+        if (path[chars - 1] != L'\0' || wcslen(path) != chars - 1) return 0;
+        if (!((iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') ||
+              (path[0] == L'\\' && path[1] == L'\\')))
+            return 0;
+        if (g_sandbox_ui_ready) {
+            post_sandbox_request(path);
+        } else {
+            wchar_t *copy;
+            /* Refused means the launcher tries again in a moment. */
+            if (g_sandbox_pending_count >= SANDBOX_PENDING_MAX) return 0;
+            copy = _wcsdup(path);
+            if (!copy) return 0;
+            g_sandbox_pending[g_sandbox_pending_count++] = copy;
+        }
+        main_window_show(hwnd);
+        return 1;
+    }
+
     case WM_VM_STATE_CHANGED:
     {
         /* Library already handled cleanup - just refresh UI and manage displays */
@@ -2138,6 +2279,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (idx >= 0 && !running) {
             safe_destroy_display(idx);
         }
+        if (idx >= 0 && asb_run_take_display_request(vm))
+            do_connect_vm(idx, VDA_VIEW_AUTO);
 
         send_vm_list();
         update_ui_on_vm_state();
@@ -2275,6 +2418,11 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
                 /* wp 0 = Hyper-V console, 1 = IDD: either way the window is gone */
                 safe_destroy_display(i);
+                /* Closing the window is how most people say they are done. */
+                if (asb_run_active(asb_vm_get(i))) {
+                    main_window_show(hwnd);
+                    post_sandbox_finish_prompt(i);
+                }
                 break;
             }
         }

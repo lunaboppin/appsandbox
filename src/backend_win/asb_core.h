@@ -147,6 +147,12 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
                                 const wchar_t *branch_name,
                                 BOOL allow_missing_shared_resources);
 
+/* Internal: fire the state callback / save and report whether it reached the disk /
+   start a disposable VM's next session (see sandbox_run.c). */
+void asb_notify_vm_state(AsbVm vm);
+BOOL asb_save_checked(void);
+HRESULT asb_disposable_new_session(AsbVm vm);
+
 /* Graceful shutdown (sends ACPI shutdown signal). */
 ASB_API HRESULT asb_vm_shutdown(AsbVm vm);
 

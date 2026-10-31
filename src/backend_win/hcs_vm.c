@@ -1225,6 +1225,15 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                 (port > 1) ? L"," : L"", guid_str);
             wcscat_s(service_table, 2048, entry);
         }
+        /* Run in Sandbox's file copy channel. */
+        hcs_service_guid_str(config->os_type, ASB_FILE_DROP_CHANNEL, guid_str, 64);
+        swprintf_s(entry, 256,
+            L",\"%s\":{"
+                L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                L"\"AllowWildcardBinds\":true"
+            L"}", guid_str);
+        wcscat_s(service_table, 2048, entry);
     }
 
     /* Nested virtualization — default ON, gated on host capability exactly like

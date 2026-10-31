@@ -44,6 +44,9 @@ $log = Join-Path $work 'setup.log'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $version = Get-PeVersion $Setup
 $dataDir = Join-Path $env:ProgramData 'AppSandbox'
+# -LiteralPath: the * here is a real key name, not a wildcard.
+$runEntry = "$root\Software\Classes\*\shell\AppSandbox.RunInSandbox"
+function Get-RunEntryCommand { (Get-Item -LiteralPath "$runEntry\command" -ErrorAction SilentlyContinue).GetValue('') }
 $dataBefore = Test-Path $dataDir
 
 $held = $null
@@ -57,7 +60,7 @@ try {
         throw "Setup exited $code, so nothing was installed. Exit 1 before any log usually means this Windows is below MinVersion."
     }
 
-    foreach ($f in @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
+    foreach ($f in @('AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'iso-patch.exe', 'WebView2Loader.dll', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
                      'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe',
                      'resources\appsandbox-clipboard.exe', 'resources\appsandbox-clipboard-reader.exe',
                      'resources\appsandbox-displays.exe', 'resources\appsandbox-input.exe',
@@ -69,6 +72,7 @@ try {
     Check 'symbols and test tools are not installed' (-not (Get-ChildItem $dir -Recurse -Include '*.pdb', 'updater-test.exe'))
     Check 'installed app is the installer''s version' ((Get-PeVersion (Join-Path $dir 'AppSandbox.exe')) -eq $version)
     Check 'uninstaller present' (Test-Path (Join-Path $dir 'unins000.exe'))
+    Check 'Run in Sandbox entry runs the installed launcher' ((Get-RunEntryCommand) -eq "`"$dir\appsandbox-run.exe`" `"%1`"") (Get-RunEntryCommand)
 
     $entry = Get-ItemProperty $uninstallKey -ErrorAction SilentlyContinue
     Check 'Apps & features entry written' ($null -ne $entry)

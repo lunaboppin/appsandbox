@@ -169,6 +169,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\backend_win\asb_core.c" />
+    <ClCompile Include="src\backend_win\sandbox_run.c" />
     <ClCompile Include="src\backend_win\shared_resources.c" />
     <ClCompile Include="src\backend_win\shared_appliance.c" />
     <ClCompile Include="src\backend_win\vpn_configs.c" />
