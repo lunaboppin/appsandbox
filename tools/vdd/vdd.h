@@ -271,6 +271,10 @@ struct _VDD_DEVICE_CONTEXT {
     WDFTIMER            hModeTimer;
     VDD_MODE_STATE      modeState;
     ULONGLONG           modeDeadline;       /* GetTickCount64 when the current wait gives up */
+    /* Streaming inside the guest (Sunshine) has no host window to ask for a size,
+       so it asks through a registry value only SYSTEM and administrators can write. */
+    HANDLE              hModeWatchThread;
+    HANDLE              hModeWatchStop;
     volatile LONG64     wantedMode;         /* requested size: width << 32 | height */
     UINT                goodWidth;          /* last size a swap chain arrived at */
     UINT                goodHeight;

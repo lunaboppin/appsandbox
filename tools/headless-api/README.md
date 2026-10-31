@@ -312,6 +312,51 @@ c.close_display("dev")              # or the user just closes it with the [X]
 
 ---
 
+### Remote: Moonlight and browser
+
+Both are off until turned on, per VM. A browser session or a Moonlight stream controls
+the VM, so the responses say in `reach` exactly who can get in.
+
+```python
+c.web_set("dev", True)                 # new key; c.web_status("dev")["url"] opens it
+c.web_set("dev", True, lan=True)       # adds HTTPS for other devices
+c.stream_set("dev", True)              # Sunshine in the guest, this PC only, CPU encoding
+c.stream_status("dev")["guest"]        # {'phase': 'ready', 'running': True, ...}
+c.stream_pair("dev", "1234")           # the PIN Moonlight shows
+```
+
+| Call | Route |
+|---|---|
+| `stream_status(name)` | `GET /vms/{n}/stream` |
+| `stream_set(name, enabled, exposure, software_encoder)` | `POST /vms/{n}/stream` `{enabled, exposure, softwareEncoder}` |
+| `stream_pair(name, pin, client)` | `POST /vms/{n}/stream/pair` `{pin, name}` |
+| `stream_unpair(name)` | `POST /vms/{n}/stream/unpair` |
+| `web_status(name)` | `GET /vms/{n}/web` |
+| `web_set(name, enabled, lan)` | `POST /vms/{n}/web` `{enabled, lan}` |
+
+**Moonlight.** The guest downloads the official Sunshine MSI at setup and checks it
+against a pinned SHA-256; Sunshine (GPL-3) is never shipped with App Sandbox. A NAT VM
+is reached through a relay in the app, which lives and dies with it and listens on
+127.0.0.1 unless you choose `network`, which adds a firewall rule for private and domain
+networks. A bridged VM is on the network directly. Windows guests only for now; `unsupported`
+gives the reason on others. Gamepads use ViGEmBus, which its author no longer maintains.
+
+`softwareEncoder` defaults to on. Setting it off lets Sunshine probe the GPU's encoder through
+GPU-PV, where [Sunshine #2141](https://github.com/LizardByte/Sunshine/issues/2141) has reports of
+the *host* crashing with NVENC on some cards and drivers.
+
+**Browser.** The VM's display channel is encoded on the host to H.264 (the host GPU's encoder if
+it has one) and decoded by WebCodecs, on one WebSocket with sound, input and text clipboard.
+It isn't WebRTC: that adds a jitter buffer and native dependencies, and this path works from the
+sign-in screen with nothing installed in the guest. Being TCP, a lossy link stalls rather than
+degrades; the encoder skips frames when the link falls behind. The display window pauses while
+a browser is connected, and only one browser can hold a VM: the newest wins. No gamepad.
+
+What protects it: a new 256-bit access key per turn-on (never saved), exchanged for an
+HttpOnly, SameSite=Strict cookie tied to one VM; failed logins limited per address; Host
+and Origin checked on every request; 127.0.0.1 by default, HTTPS with a self-signed certificate
+and a fingerprint to compare on the network. Malware lab VMs are refused for both features.
+
 ## Create config & validation
 
 The daemon validates create/edit input **exactly like the GUI** (it mirrors the

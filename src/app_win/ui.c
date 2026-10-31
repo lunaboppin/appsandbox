@@ -15,6 +15,8 @@
 #include "vm_display_idd.h"
 #include "vm_display_auto.h"
 #include "vm_agent.h"
+#include "vm_stream.h"
+#include "vm_web.h"
 #include "webview2_bridge.h"
 #include "update_ui.h"
 #include "prereq.h"
@@ -1154,6 +1156,7 @@ typedef struct {
 } LabWork;
 
 #define WM_LAB_DONE (WM_APP + 23)
+#define WM_REMOTE_DONE (WM_APP + 25)
 
 static DWORD WINAPI lab_work_thread(LPVOID param)
 {
@@ -1186,6 +1189,76 @@ static void finish_lab_work(LabWork *w)
     if (SUCCEEDED(w->result) && w->report[0])
         ShellExecuteW(g_hwnd_main, L"open", w->report, NULL, NULL, SW_SHOWNORMAL);
     send_vm_list();
+}
+
+/* Remote access: asking the guest can take seconds, so a worker does it and the
+   result comes back as a remoteStatus message. */
+typedef struct {
+    wchar_t action[24];
+    int     vm_index;
+    BOOL    enabled, flag;
+    wchar_t exposure[16];
+    char    pin[8], client[64];
+    wchar_t message[512];
+    char    stream[16384], web[8192];
+} RemoteWork;
+
+static DWORD WINAPI remote_work_thread(LPVOID param)
+{
+    RemoteWork *w = (RemoteWork *)param;
+    VmInstance *v = asb_vm_instance(asb_vm_get(w->vm_index));
+    HRESULT hr = S_OK;
+    char message[400] = "";
+    if (v) {
+        if (wcscmp(w->action, L"remoteSetStream") == 0)
+            hr = vm_stream_configure(v, w->enabled,
+                                     wcscmp(w->exposure, L"network") == 0 ? ASB_STREAM_NETWORK : ASB_STREAM_THIS_PC,
+                                     w->flag, w->message, _countof(w->message));
+        else if (wcscmp(w->action, L"remotePair") == 0)
+            hr = vm_stream_pair(v, w->pin, w->client, message, sizeof(message));
+        else if (wcscmp(w->action, L"remoteUnpair") == 0)
+            hr = vm_stream_unpair_all(v, message, sizeof(message));
+        else if (wcscmp(w->action, L"remoteSetWeb") == 0)
+            hr = vm_web_set(v, w->enabled, w->flag, w->message, _countof(w->message));
+        if (FAILED(hr) && !w->message[0]) {
+            if (message[0]) MultiByteToWideChar(CP_UTF8, 0, message, -1, w->message, _countof(w->message));
+            else wcscpy_s(w->message, _countof(w->message), L"That didn't work. Is the VM on, with its agent running?");
+        }
+        vm_stream_status_json(v, w->stream, sizeof(w->stream));
+        vm_web_status_json(v, w->web, sizeof(w->web));
+    }
+    if (!PostMessageW(g_hwnd_main, WM_REMOTE_DONE, 0, (LPARAM)w)) free(w);
+    return 0;
+}
+
+static void finish_remote_work(RemoteWork *w)
+{
+    static wchar_t out[32768];
+    JsonBuilder jb;
+    size_t len;
+    int n;
+    jb_init(&jb, out, _countof(out));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"remoteStatus");
+    jb_string(&jb, L"action", w->action);
+    jb_int(&jb, L"vmIndex", w->vm_index);
+    jb_string(&jb, L"message", w->message);
+    jb_object_end(&jb);
+    len = wcslen(out);
+    if (len && out[len - 1] == L'}' && w->stream[0] && w->web[0]) {
+        len--;
+        wcscpy_s(out + len, _countof(out) - len, L",\"stream\":");
+        len = wcslen(out);
+        n = MultiByteToWideChar(CP_UTF8, 0, w->stream, -1, out + len, (int)(_countof(out) - len));
+        if (n > 0) len += n - 1;
+        wcscat_s(out, _countof(out), L",\"web\":");
+        len = wcslen(out);
+        n = MultiByteToWideChar(CP_UTF8, 0, w->web, -1, out + len, (int)(_countof(out) - len));
+        if (n > 0) len += n - 1;
+        wcscat_s(out, _countof(out), L"}");
+    }
+    webview2_post(out);
+    free(w);
 }
 
 /* Domain management talks to the appliance, which may have to start first
@@ -1854,6 +1927,29 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
             hr = asb_vm_set_secure_boot(asb_vm_get(vi), enabled);
         send_manage_result(0, hr); send_vm_list();
+    } else if (wcsncmp(action, L"remote", 6) == 0 && wcscmp(action, L"remoteOpenWeb") != 0) {
+        RemoteWork *work = (RemoteWork *)calloc(1, sizeof(*work));
+        HANDLE thread = NULL;
+        if (work && json_get_int(json, L"vmIndex", &work->vm_index)) {
+            wchar_t pin[8] = L"", client[32] = L"";
+            wcsncpy_s(work->action, _countof(work->action), action, _TRUNCATE);
+            json_get_bool(json, L"enabled", &work->enabled);
+            json_get_bool(json, L"flag", &work->flag);
+            json_get_string(json, L"exposure", work->exposure, _countof(work->exposure));
+            json_get_string(json, L"pin", pin, _countof(pin));
+            json_get_string(json, L"client", client, _countof(client));
+            WideCharToMultiByte(CP_UTF8, 0, pin, -1, work->pin, sizeof(work->pin), NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, client, -1, work->client, sizeof(work->client), NULL, NULL);
+            thread = CreateThread(NULL, 0, remote_work_thread, work, 0, NULL);
+        }
+        if (thread) CloseHandle(thread);
+        else free(work);
+    } else if (wcscmp(action, L"remoteOpenWeb") == 0) {
+        /* Only ever our own page on this PC. */
+        wchar_t url[3200] = L"";
+        json_get_string(json, L"url", url, _countof(url));
+        if (wcsncmp(url, L"http://127.0.0.1:", 17) == 0)
+            ShellExecuteW(g_hwnd_main, L"open", url, NULL, NULL, SW_SHOWNORMAL);
     } else if (wcscmp(action, L"labStart") == 0 || wcscmp(action, L"labStop") == 0) {
         LabWork *work = (LabWork *)calloc(1, sizeof(*work));
         HANDLE thread = NULL;
@@ -2203,6 +2299,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DOMAIN_PROGRESS:
         send_full_state();
+        return 0;
+    case WM_REMOTE_DONE:
+        finish_remote_work((RemoteWork *)lp);
         return 0;
     case WM_LAB_DONE:
         if (lp) {

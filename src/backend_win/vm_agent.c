@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
+#include "vm_stream.h"
 #include "asb_core.h"
 #include "hcn_network.h"
 #include "shared_appliance.h"
@@ -619,6 +620,18 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
         }
 
+        /* Moonlight: the agent checks Sunshine is set up as chosen, on its own
+           thread, and the relay gives clients a way to it. */
+        if (vm->stream_enabled && !vm_stream_unsupported_reason(vm)) {
+            char stream_cmd[400];
+            vm_stream_setup_command(vm, stream_cmd, sizeof(stream_cmd));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, stream_cmd, buf, sizeof(buf), 15000);
+            if (n <= 0) goto disconnected;
+            if (strncmp(buf, "ok", 2) != 0)
+                ui_log(L"The agent in \"%s\" could not set up streaming (%S).", vm->name, buf);
+            vm_stream_relay_start(vm);
+        }
+
         /* Configure the independent host-only NIC, then recreate signed global
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */
@@ -984,6 +997,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         (strncmp(command, "appliance_account:", 18) == 0 ||
          strncmp(command, "shared_smb_map:", 15) == 0 ||
          strncmp(command, "vpn_set:", 8) == 0 ||
+         strncmp(command, "stream_pin:", 11) == 0 ||
          strncmp(command, "domain_", 7) == 0);
 
     if (!conn || !instance->agent_online) {
