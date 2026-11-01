@@ -621,18 +621,6 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
         }
 
-        /* Moonlight: the agent checks Sunshine is set up as chosen, on its own
-           thread, and the relay gives clients a way to it. */
-        if (vm->stream_enabled && !vm_stream_unsupported_reason(vm)) {
-            char stream_cmd[400];
-            vm_stream_setup_command(vm, stream_cmd, sizeof(stream_cmd));
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, stream_cmd, buf, sizeof(buf), 15000);
-            if (n <= 0) goto disconnected;
-            if (strncmp(buf, "ok", 2) != 0)
-                ui_log(L"The agent in \"%s\" could not set up streaming (%S).", vm->name, buf);
-            vm_stream_relay_start(vm);
-        }
-
         /* Configure the independent host-only NIC, then recreate signed global
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */
@@ -782,6 +770,20 @@ shared_mapping_done:
         /* NAT-only VMs do not enter the appliance block above. */
         if (!nat_configured && !configure_guest_nat(s, vm, conn, buf, sizeof(buf)))
             goto disconnected;
+
+        /* Moonlight: the agent checks Sunshine is set up as chosen, on its own
+           thread, and the relay gives clients a way to it. After the network
+           setup above, because the setup downloads Sunshine and runs its
+           PowerShell alongside the guest's. */
+        if (vm->stream_enabled && !vm_stream_unsupported_reason(vm)) {
+            char stream_cmd[400];
+            vm_stream_setup_command(vm, stream_cmd, sizeof(stream_cmd));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, stream_cmd, buf, sizeof(buf), 15000);
+            if (n <= 0) goto disconnected;
+            if (strncmp(buf, "ok", 2) != 0)
+                ui_log(L"The agent in \"%s\" could not set up streaming (%S).", vm->name, buf);
+            vm_stream_relay_start(vm);
+        }
 
         /* Send GPU share info to agent (if GPU-PV is assigned).
            Fire-and-forget - no response expected, so no tagging needed. */
