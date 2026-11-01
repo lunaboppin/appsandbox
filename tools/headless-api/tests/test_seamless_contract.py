@@ -79,8 +79,9 @@ def main() -> None:
     assert 'title="Seamless mode"' in index
     assert ".icon-btn.seamless.hidden" in css
     assert 'L"seamless"' in headless and 'L"seamless/input"' in headless
+    assert 'L"seamless/picture"' in headless
     assert "seamless_unavailable" in headless and '\\"seamless\\":true' in headless
-    for name in ("seamless_open", "seamless_close", "seamless_status", "seamless_input"):
+    for name in ("seamless_open", "seamless_close", "seamless_status", "seamless_input", "seamless_picture"):
         assert "def %s(" % name in sdk, name
 
     print("OK")

@@ -340,6 +340,9 @@ c.seamless_close("dev")                   # the host windows close; the guest's 
   inside the window, `c` 0 left, 1 right, 2 middle), `wheel` (`a` delta), `keydown`, `keyup`
   (`a` virtual key), `activate`, `close`, `minimize`, `maximize`, `restore`, `position` (`a`,
   `b` on the host screen) or `size` (`a`, `b` content). `404 no_such_window` otherwise.
+- **`POST /v1/vms/{name}/seamless/picture`** takes `{"guest"}` and returns what that host
+  window shows, `{"width", "height", "bgra": base64}` with the top row first, so a script can
+  check a window without looking at the desktop.
 - A running VM needs one restart after an update that adds this: the channel is registered
   when the VM starts, and that's also when the helper reaches the guest.
 
