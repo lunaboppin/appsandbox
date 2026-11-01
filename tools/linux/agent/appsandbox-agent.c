@@ -485,6 +485,41 @@ static void *heartbeat_thread(void *arg)
 
 /* ---- Command handlers ---- */
 
+/* A profile that outranks the one the installer left, matched by MAC so a second
+ * adapter (shared drives) can't get this address. dns is "a, b" as for netplan. */
+static int nm_set_address(const char *ip, const char *prefix, const char *gw,
+                          const char *dns, const char *mac)
+{
+    static const char path[] = "/etc/NetworkManager/system-connections/appsandbox.nmconnection";
+    char dns_list[160], cmd[512];
+    size_t used = 0;
+    FILE *f;
+
+    for (const char *s = dns; *s && used + 2 < sizeof(dns_list); s++) {
+        if (*s == ' ') continue;
+        dns_list[used++] = *s == ',' ? ';' : *s;
+    }
+    dns_list[used] = '\0';
+    if (used && dns_list[used - 1] != ';' && used + 1 < sizeof(dns_list)) strcat(dns_list, ";");
+
+    f = fopen(path, "w");
+    if (!f) return 1;
+    fchmod(fileno(f), 0600);
+    fprintf(f,
+        "[connection]\nid=appsandbox\ntype=ethernet\nautoconnect-priority=100\n"
+        "[ethernet]\n%s%s%s"
+        "[ipv4]\nmethod=manual\naddress1=%s/%s,%s\ndns=%s\n"
+        "[ipv6]\nmethod=disabled\n",
+        mac[0] ? "mac-address=" : "", mac, mac[0] ? "\n" : "", ip, prefix, gw, dns_list);
+    fclose(f);
+
+    snprintf(cmd, sizeof(cmd),
+        "restorecon %s 2>/dev/null; nmcli connection load %s 2>&1; nmcli connection up appsandbox 2>&1; "
+        "for i in 1 2 3 4 5 6 7 8 9 10; do ip -4 addr show | grep -q '%s/' && exit 0; sleep 0.5; done; exit 1",
+        path, path, ip);
+    return run_sync(cmd);
+}
+
 /* set_ip:<ip>/<prefix>:<gw>
  *   e.g. set_ip:192.168.42.2/24:192.168.42.1
  *
@@ -502,7 +537,7 @@ static void *heartbeat_thread(void *arg)
  * Reply: "ok" on success, "error:..." on failure. */
 static void handle_set_ip(int fd, const char *tag, const char *args)
 {
-    char ip[64], prefix[8], gw[64], dns[160], match[64];
+    char ip[64], prefix[8], gw[64], dns[160], match[64], nm_mac[18] = "";
     char *field;
     const char *slash  = strchr(args, '/');
     const char *colon2 = slash ? strchr(slash, ':') : NULL;
@@ -545,7 +580,10 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
                 else *p = (char)tolower((unsigned char)*p);
                 if (!isxdigit((unsigned char)*p) && *p != ':') valid = 0;
             }
-            if (valid) snprintf(match, sizeof(match), "macaddress: \"%s\"", mac);
+            if (valid) {
+                snprintf(match, sizeof(match), "macaddress: \"%s\"", mac);
+                memcpy(nm_mac, mac, sizeof(nm_mac));
+            }
         }
         if (dns_field && dns_field[1]) {
             const char *p;
@@ -557,6 +595,14 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
             }
             snprintf(dns, sizeof(dns), "%s", dns_field + 1);
         }
+    }
+
+    /* Fedora has no netplan: the same address as a NetworkManager profile. */
+    if (run_sync("command -v netplan >/dev/null 2>&1") != 0) {
+        rc = nm_set_address(ip, prefix, gw, dns, nm_mac);
+        agent_log("set_ip: %s/%s via %s (NetworkManager) \xE2\x86\x92 rc=%d", ip, prefix, gw, rc);
+        send_reply(fd, tag, rc == 0 ? "ok" : "error:nmcli_failed");
+        return;
     }
 
     n = snprintf(cmd, sizeof(cmd),
@@ -849,6 +895,13 @@ static int deploy_ssh_key(const char *pubkey)
     chmod(authk, 0600);
     if (chown(sshdir, uid, gid) != 0 || chown(authk, uid, gid) != 0)
         agent_log("ssh key: chown warning: %s", strerror(errno));
+    /* SELinux: made by this service, these aren't labelled as ssh_home_t, and sshd
+       is refused them. Where there's no SELinux, restorecon just isn't there. */
+    {
+        char cmd[400];
+        snprintf(cmd, sizeof(cmd), "restorecon -R '%s' 2>/dev/null", sshdir);
+        run_sync(cmd);
+    }
     agent_log("ssh key: deployed to %s", authk);
     return 1;
 }
@@ -858,13 +911,14 @@ static int deploy_ssh_key(const char *pubkey)
  * calls just confirm state. */
 static void handle_ssh_enable(int fd, const char *tag)
 {
-    if (run_sync("systemctl is-active --quiet ssh") == 0) {
+    /* ssh on Ubuntu, sshd on Fedora. */
+    if (run_sync("systemctl is-active --quiet ssh || systemctl is-active --quiet sshd") == 0) {
         agent_log("ssh: already running");
         start_ssh_proxy();
         send_reply(fd, tag, "ssh_ready");
         return;
     }
-    int rc = run_sync("systemctl enable --now ssh 2>&1");
+    int rc = run_sync("systemctl enable --now ssh 2>&1 || systemctl enable --now sshd 2>&1");
     if (rc == 0) {
         agent_log("ssh: enabled and started");
         start_ssh_proxy();
@@ -1088,13 +1142,19 @@ static void handle_gpu_query_response(int fd, int n_shares)
 static int grow_root_filesystem(void)
 {
     const char *cmd =
-        "fstype=$(findmnt -n -o FSTYPE /) && [ \"$fstype\" = ext4 ] && "
-        "command -v growpart >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1 && "
-        "root=$(readlink -f \"$(findmnt -n -o SOURCE /)\") && "
+        /* -v: a btrfs subvolume's SOURCE is /dev/sda3[/root]. */
+        "fstype=$(findmnt -n -o FSTYPE /) && "
+        "command -v growpart >/dev/null 2>&1 && "
+        "root=$(readlink -f \"$(findmnt -nv -o SOURCE /)\") && "
         "part=$(lsblk -no PARTN \"$root\" | tr -d ' ') && "
         "parent=$(lsblk -no PKNAME \"$root\" | tr -d ' ') && "
         "[ -n \"$part\" ] && [ -n \"$parent\" ] && "
-        "growpart \"/dev/$parent\" \"$part\" && resize2fs \"$root\"";
+        "growpart \"/dev/$parent\" \"$part\" && "
+        "case \"$fstype\" in "
+        "ext4) resize2fs \"$root\" ;; "
+        "btrfs) btrfs filesystem resize max / ;; "
+        "*) false ;; "
+        "esac";
     int rc = run_sync(cmd);
     agent_log("grow_root: rc=%d", rc);
     return rc;
@@ -1260,7 +1320,8 @@ static int shared_unmap(const char *letter)
 
 /* ---- Apps chosen at creation ----
    install_apps:a,b,c, the command the Windows agent takes with winget IDs. Here
-   each name is an apt package, or else a snap. Kept in a file across reboots, and
+   each name is an apt package or else a snap, or on Fedora a dnf package or else a
+   flatpak from Flathub. Kept in a file across reboots, and
    a name that keeps failing is dropped after a few starts like the Windows agent. */
 
 #define APPS_FILE      "/var/lib/appsandbox/apps-pending"
@@ -1297,7 +1358,7 @@ static void *apps_thread(void *arg)
     char names[1024] = "", failed[1024] = "", ok[1024] = "";
     char *save = NULL, *name;
     FILE *f;
-    int attempts = 0, i;
+    int attempts = 0, i, is_dnf;
     (void)arg;
 
     f = fopen(APPS_FILE, "r");
@@ -1312,20 +1373,31 @@ static void *apps_thread(void *arg)
     f = fopen(APPS_ATTEMPTS, "w");
     if (f) { fprintf(f, "%d\n", attempts + 1); fclose(f); }
 
+    is_dnf = run_sync("command -v dnf >/dev/null 2>&1") == 0;
     /* Wait for the network the host configures after connecting. */
     for (i = 0; i < 60; i++) {
-        if (run_sync("getent hosts archive.ubuntu.com >/dev/null 2>&1") == 0) break;
+        if (run_sync(is_dnf ? "getent hosts mirrors.fedoraproject.org >/dev/null 2>&1"
+                            : "getent hosts archive.ubuntu.com >/dev/null 2>&1") == 0) break;
         sleep(5);
     }
     host_log("Installing the apps chosen for this VM: %s", names);
-    run_sync("DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1");
+    if (is_dnf)
+        run_sync("flatpak remote-add --system --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1");
+    else
+        run_sync("DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1");
     for (name = strtok_r(names, ",", &save); name; name = strtok_r(NULL, ",", &save)) {
         char cmd[512], *list = failed;
         if (apps_valid_name(name)) {
-            snprintf(cmd, sizeof(cmd),
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y %s >/dev/null 2>&1 || "
-                "snap install %s >/dev/null 2>&1 || snap install %s --classic >/dev/null 2>&1",
-                name, name, name);
+            if (is_dnf)
+                snprintf(cmd, sizeof(cmd),
+                    "dnf -y install %s >/dev/null 2>&1 || "
+                    "flatpak install --system --noninteractive -y flathub %s >/dev/null 2>&1",
+                    name, name);
+            else
+                snprintf(cmd, sizeof(cmd),
+                    "DEBIAN_FRONTEND=noninteractive apt-get install -y %s >/dev/null 2>&1 || "
+                    "snap install %s >/dev/null 2>&1 || snap install %s --classic >/dev/null 2>&1",
+                    name, name, name);
             if (run_sync(cmd) == 0) list = ok;
         }
         size_t used = strlen(list);

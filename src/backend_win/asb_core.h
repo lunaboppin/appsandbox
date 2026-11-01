@@ -71,6 +71,8 @@ typedef struct {
     const wchar_t *preinstall_apps; /* Windows: comma-separated winget IDs installed after first sign-in */
     BOOL   domain_member;          /* Windows: managed account, joins the AppSandbox domain */
     BOOL   lab_mode;               /* Windows: malware lab VM (isolated, disposable, recorded runs) */
+    const wchar_t *linux_distro;   /* Linux: L"fedora" downloads its own image, so image_path may be empty;
+                                      otherwise the ISO says which distribution it is */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -170,6 +172,7 @@ ASB_API AsbVm   asb_vm_find(const wchar_t *name);
 
 ASB_API const wchar_t *asb_vm_name(AsbVm vm);
 ASB_API const wchar_t *asb_vm_os_type(AsbVm vm);
+ASB_API const wchar_t *asb_vm_linux_distro(AsbVm vm);
 ASB_API BOOL    asb_vm_is_running(AsbVm vm);
 ASB_API BOOL    asb_vm_agent_online(AsbVm vm);
 /* TRUE when the VM is running, the guest agent is online, and the agent has reported
@@ -370,6 +373,7 @@ ASB_API void asb_vpn_gateway_get_status(VpnGatewayStatus *out);
 ASB_API HRESULT asb_vpn_gateway_stop(void);
 
 ASB_API VmInstance   *asb_vm_instance(AsbVm vm);
+void                  asb_vm_linux_install_done(VmInstance *inst);
 
 /* Look up a VmInstance by its stable unique_id. Returns NULL if no VM
    with that id exists (e.g. the VM was deleted). Long-lived background

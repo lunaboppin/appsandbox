@@ -31,6 +31,8 @@ for f in "$ROOT"/agent/51-appsandbox-audio.conf; do
     install -d /etc/wireplumber/wireplumber.conf.d
     install -m 0644 "$f" /etc/wireplumber/wireplumber.conf.d/
 done
+# SELinux, on Fedora: what was just installed came from under /var/lib.
+command -v restorecon >/dev/null 2>&1 && restorecon -RF /usr/local/bin /etc/systemd/system 2>/dev/null
 systemctl daemon-reload
 
 # VMs built before first boot did this.

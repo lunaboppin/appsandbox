@@ -58,7 +58,7 @@ doesn't justify.
 
 ## Platform support at a glance
 
-The host runs **Windows** and **Linux** (Ubuntu) guests. Guest support is
+The host runs **Windows** and **Linux** (Ubuntu and Fedora Workstation) guests. Guest support is
 enforced in create-validation (wrong `osType` → `400`). Snapshots & branches,
 templates (`isTemplate`, create-from-template), the display window
 (`/vms/{n}/display`), GPU, NAT/network modes, SSH server, SSH-key auto-deploy
@@ -418,7 +418,8 @@ rather than forwarding bad input to the core.
 | `adminPass` | required on Linux (≤255 bytes); optional on Windows |
 | `testMode` | skip interactive setup where supported |
 | `sshEnabled` | provision SSH + forward a loopback port |
-| `preinstallApps` | comma-separated apps to install after the first start: winget IDs on Windows, apt or snap names on Ubuntu |
+| `preinstallApps` | comma-separated apps to install after the first start: winget IDs on Windows, apt or snap names on Ubuntu, dnf names or Flathub IDs on Fedora |
+| `linuxDistro` | Linux only. `fedora` downloads and verifies Fedora's netinstall ISO if `imagePath` is empty, and needs `networkMode` NAT or External and at least 20 GB. Otherwise the ISO decides: a Fedora netinstall ISO installs Fedora, whatever this says. Status reports it back. |
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
 

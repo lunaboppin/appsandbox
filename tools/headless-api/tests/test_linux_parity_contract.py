@@ -1,4 +1,4 @@
-"""Contract: Ubuntu guests get what Windows guests get, where it can work.
+"""Contract: Ubuntu and Fedora guests get what Windows guests get, where it can work.
 
 Guest source ships with the app rather than coming from GitHub, and the package
 index covers the update pockets, without which a point-release ISO can't install
@@ -22,9 +22,10 @@ def main() -> None:
     agent = read("tools/linux/agent/appsandbox-agent.c")
     display = read("tools/linux/agent/appsandbox-display.c")
     drm = read("tools/linux/asb_drm/asb_drm_drv.c")
+    drm_header = read("tools/linux/asb_drm/asb_drm.h")
     deps = read("tools/iso-patch/prefetch_build_deps.c")
     repo = read("tools/iso-patch/prefetch_repo.c")
-    firstboot = read("tools/iso-patch/ubuntu_vhdx.c")
+    firstboot = read("tools/iso-patch/linux_firstboot.c")
     js = read("web/app.js")
     html = read("web/index.html")
     proj = read("AppSandbox.vcxproj")
@@ -82,6 +83,26 @@ def main() -> None:
     assert 'id="manage-linux-note-section"' in html
     assert '<label>Shared Drives:</label>' in html
     assert "manage-linux-note-section').style.display = vm.osType === 'Linux'" in js
+    # Fedora: same parity, through dnf and Kickstart instead of apt and the host-side
+    # rootfs. The agent can't assume Ubuntu's netplan, ext4 or snap.
+    kick = read("src/backend_win/fedora_install.c")
+    assert "FEDORA_NETINST_SHA256" in kick and "OEMDRV" in read("src/backend_win/disk_util.c")
+    assert "autopart --type=btrfs" in kick and "selinux --enforcing" in kick
+    assert "kernel-devel-matched" in kick, "DKMS needs headers for every future kernel"
+    assert "kernel-modules-extra" in kick, "snd-aloop, which audio needs, is in it"
+    assert "-gnome-initial-setup" in kick and "-gnome-tour" in kick, "first boot has no welcome wizard"
+    assert "--name=asb-updates" in kick, "Anaconda ignores a repo named updates"
+    assert "No match for argument" in kick, "a missing package must be named in the failure"
+    assert "welcome-dialog-last-shown-version" in firstboot
+    assert "hcs_detach_scsi(" in core, "the installer media comes off when the install is done"
+    assert "%%onerror" in kick and "asb_report_failure" in kick, "a failed install must reach the watchdog"
+    assert 'L"LinuxDistro=' in core and "inspect_linux_iso(" in core
+    assert "ASB_PKG" in firstboot and "dnf" in firstboot and "/etc/gdm" in firstboot
+    assert "nm_set_address" in agent, "Fedora has no netplan"
+    assert "btrfs" in agent and "flatpak install" in agent and "restorecon" in agent
+    assert "var PREINSTALL_APPS_FEDORA" in js and 'id="linux-distro"' in html
+    assert "drm_atomic_commit" in drm_header, "Linux 7.2 renamed drm_atomic_state"
+    assert "ASB_HAVE_DRM_ATOMIC_COMMIT" in read("tools/linux/asb_drm/Kbuild")
     print("[ok] Linux guest parity contract")
 
 

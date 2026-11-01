@@ -260,6 +260,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos  = append_wstr(out, cap, pos, v->name);
     pos += sprintf_s(out + pos, cap - pos, ",\"osType\":");
     pos  = append_wstr(out, cap, pos, v->os_type);
+    pos += sprintf_s(out + pos, cap - pos, ",\"linuxDistro\":");
+    pos  = append_wstr(out, cap, pos, v->linux_distro);
     pos += sprintf_s(out + pos, cap - pos,
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
@@ -555,12 +557,12 @@ static void trim_ws(wchar_t *s)
    would, rather than forwarding unvalidated input to asb_vm_create (the core trusts
    a pre-validated front end). Returns an English error (NULL = valid). */
 static const char *validate_create(const wchar_t *name, const wchar_t *os,
-                                   const wchar_t *user, const wchar_t *pass,
+                                   const wchar_t *distro, const wchar_t *user, const wchar_t *pass,
                                    const wchar_t *tpl, const wchar_t *img,
                                    BOOL is_template, int ram_mb, int hdd_gb,
                                    int cpu_cores, int gpu_mode, int net_mode)
 {
-    int i, len; BOOL is_linux, is_win, all_digits, from_template;
+    int i, len; BOOL is_linux, is_win, is_fedora, all_digits, from_template;
 
     is_linux = (_wcsicmp(os, L"Linux") == 0);
     is_win   = (_wcsicmp(os, L"Windows") == 0);
@@ -591,7 +593,8 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
     }
 
     /* image-or-template required; template constraints */
-    if (!from_template && (!img || !img[0])) return "An image (ISO) or template is required.";
+    is_fedora = is_linux && distro && _wcsicmp(distro, L"fedora") == 0;
+    if (!from_template && !is_fedora && (!img || !img[0])) return "An image (ISO) or template is required.";
     if (is_template && from_template)        return "Cannot create a template from another template.";
     if (is_template && !is_win)              return "Templates are only supported for Windows.";
 
@@ -643,6 +646,8 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
     if (cpu_cores != 0 && cpu_cores < 1) return "CPU cores must be at least 1.";
     if (gpu_mode < 0 || gpu_mode > 2)    return "gpuMode must be 0 (None), 1 (Default), or 2 (Try all).";
     if (net_mode < 0 || net_mode > 3)    return "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal).";
+    if (is_fedora && net_mode != 1 && net_mode != 2) return "Fedora's installer downloads its packages, so it needs NAT or External networking.";
+    if (is_fedora && hdd_gb != 0 && hdd_gb < 20)     return "Fedora needs a disk of at least 20 GB.";
 
     return NULL;
 }
@@ -853,12 +858,14 @@ static int handle_request(PHTTP_REQUEST req)
             wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0}, storage[MAX_PATH]={0}, exclusions[1024]={0};
             wchar_t apps[1024]={0};
+            wchar_t distro[16]={0};
             char nu[256]={0};
             body_to_wide(req, body, 8192);
             ZeroMemory(&cfg, sizeof(cfg));
             json_get_string(body, L"name", name, 256);
             json_get_string(body, L"osType", os, 32);
             json_get_string(body, L"imagePath", img, MAX_PATH);
+            json_get_string(body, L"linuxDistro", distro, _countof(distro));
             json_get_string(body, L"templateName", tpl, 256);
             json_get_string(body, L"adminUser", user, 128);
             json_get_string(body, L"adminPass", pass, 128);
@@ -868,6 +875,7 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_string(body, L"preinstallApps", apps, _countof(apps));
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
+            cfg.linux_distro = distro;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
             cfg.storage_parent = storage;
@@ -887,7 +895,7 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             {
-                const char *verr = validate_create(name, os, user, pass, tpl, img,
+                const char *verr = validate_create(name, os, distro, user, pass, tpl, img,
                     cfg.is_template, (int)cfg.ram_mb, (int)cfg.hdd_gb, (int)cfg.cpu_cores,
                     cfg.gpu_mode, cfg.network_mode);
                 if (verr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", verr); return 0; }
@@ -965,6 +973,11 @@ static int handle_request(PHTTP_REQUEST req)
                 if (json_get_int(body, L"networkMode", &iv)) {
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
+                }
+                /* Grow only; the guest expands into it on its next boot. */
+                if (json_get_int(body, L"hddGb", &iv)) {
+                    if (iv < 1 || (DWORD)iv <= inst->hdd_gb) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "hddGb must be larger than the current disk"); return 0; }
+                    hr = asb_vm_resize_disk(vm, (DWORD)iv);
                 }
                 asb_save();
                 if (SUCCEEDED(hr)) {

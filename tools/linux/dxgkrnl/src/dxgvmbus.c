@@ -3090,9 +3090,11 @@ int dxgvmb_send_wait_sync_object_gpu(struct dxgprocess *process,
 	command->object_count = object_count;
 	command->legacy_fence_object = legacy_fence;
 	current_pos = (u8 *) command->fence_values;
-	memcpy(current_pos, fences, fence_size);
+	/* fence_values is followed by the objects in the same allocation. Kernels
+	   with FORTIFY_SOURCE warn about this on every boot otherwise. */
+	unsafe_memcpy(current_pos, fences, fence_size, "sized with the message");
 	current_pos += fence_size;
-	memcpy(current_pos, objects, object_size);
+	unsafe_memcpy(current_pos, objects, object_size, "sized with the message");
 
 	if (dxgglobal->async_msg_enabled) {
 		command->hdr.async_msg = 1;

@@ -65,13 +65,13 @@ static void asb_crtc_disable_vblank(struct drm_crtc *crtc)
  * -------------------------------------------------------------------------- */
 
 static void asb_crtc_atomic_enable(struct drm_crtc *crtc,
-                                   struct drm_atomic_state *state)
+                                   struct asb_atomic_state *state)
 {
 	drm_crtc_vblank_on(crtc);
 }
 
 static void asb_crtc_atomic_disable(struct drm_crtc *crtc,
-                                    struct drm_atomic_state *state)
+                                    struct asb_atomic_state *state)
 {
 	struct asb_device *asb = crtc_to_asb(crtc);
 
@@ -81,7 +81,7 @@ static void asb_crtc_atomic_disable(struct drm_crtc *crtc,
 }
 
 static void asb_crtc_atomic_flush(struct drm_crtc *crtc,
-                                  struct drm_atomic_state *state)
+                                  struct asb_atomic_state *state)
 {
 	struct drm_pending_vblank_event *event = crtc->state->event;
 	unsigned long flags;

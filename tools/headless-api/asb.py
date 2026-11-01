@@ -117,7 +117,9 @@ class Client:
         hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, storageParent,
         adminUser,
         adminPass, testMode, sshEnabled, sshDeployKey, isTemplate, preinstallApps
-        (comma-separated winget IDs on Windows, apt or snap names on Ubuntu). sshDeployKey
+        (comma-separated winget IDs on Windows, apt or snap names on Ubuntu, dnf names
+        or Flathub IDs on Fedora), linuxDistro ("fedora" downloads its own image, so
+        imagePath can be left out). sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is
@@ -129,7 +131,8 @@ class Client:
 
     def edit(self, name, **fields):
         """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
-        (same ranges as create); name is fixed at create and any other key is ignored.
+        (same ranges as create) and hddGb (grow only, with no checkpoints); name is
+        fixed at create and any other key is ignored.
         Returns (status, body) -- 409 if the VM is running."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI

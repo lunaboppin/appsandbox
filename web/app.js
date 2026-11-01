@@ -62,7 +62,7 @@ function sendCmd(action, data) { hostBridge.send(action, data); }
 
 /* Apply Create-modal visibility rules for the currently selected OS type.
  *   Windows: .win-only shown, .needs-iso shown,             .needs-linux-version hidden
- *   Linux:   .win-only hidden, .needs-iso hidden,           .needs-linux-version shown
+ *   Linux:   .win-only hidden, .needs-iso shown,            .needs-linux-version shown
  *
  * Linux is back to user-picks-an-ISO (Ubuntu Desktop ISO etc.), same as
  * Windows. The version-dropdown / cloud-image flow is preserved in
@@ -79,10 +79,12 @@ function applyOsTypeUI() {
         winOnly[i].style.display = isWindows ? '' : 'none';
     /* ISO picker shows for both Windows and Linux now. */
     for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
-    /* Linux distribution dropdown is dormant — kept in the DOM but always
-       hidden so the cloud-image code path can be revived without
-       re-adding the markup. */
-    for (var k = 0; k < needsLinuxVersion.length; k++) needsLinuxVersion[k].style.display = 'none';
+    for (var k = 0; k < needsLinuxVersion.length; k++) needsLinuxVersion[k].style.display = isLinux ? '' : 'none';
+    var isFedora = isFedoraSelected();
+    document.getElementById('linux-distro-hint').textContent = isFedora
+        ? 'Needs internet in the VM while it installs (about 15 minutes on a fast connection). NAT or External network only.' : '';
+    document.getElementById('image-path').placeholder = isFedora
+        ? 'Leave empty to download Fedora, or pick a netinstall ISO...' : 'Path to ISO or VHDX...';
     /* Swap the default VM name between OS conventions, but only when the
        field still holds the *other* OS's untouched default — never clobber a
        name the user typed. Linux hostnames must be lowercase. */
@@ -362,8 +364,13 @@ function updateCreateButtons() {
     var osType = document.getElementById('os-type').value;
     var hasImage = (document.getElementById('image-path').value.trim() !== '');
     var hasTpl = document.getElementById('template-select').value !== '';
-    /* Guests build from a user-picked ISO — or a saved Windows template. */
-    var createOk = hasImage || hasTpl;
+    /* Guests build from a user-picked ISO or a saved Windows template. Fedora
+       downloads its own, but its installer needs a network that reaches the mirrors. */
+    var createOk = hasImage || hasTpl || isFedoraSelected();
+    if (isFedoraSelected()) {
+        var netMode = parseInt(document.getElementById('net-mode').value);
+        if (netMode !== 1 && netMode !== 2) createOk = false;
+    }
     /* A VPN VM needs a config to route through. */
     if (parseInt(document.getElementById('net-mode').value) === 4 &&
         !document.getElementById('vpn-config').value) createOk = false;
@@ -468,6 +475,23 @@ var PREINSTALL_APPS = [
     { id: 'EpicGames.EpicGamesLauncher', name: 'Epic Games' }
 ];
 /* Linux: an apt package name, or a snap if apt has none. */
+/* Fedora's repos lack some of these; Flathub has them under its own IDs. */
+var PREINSTALL_APPS_FEDORA = [
+    { id: 'com.visualstudio.code',  name: 'VS Code' },
+    { id: 'com.valvesoftware.Steam', name: 'Steam' },
+    { id: 'chromium',   name: 'Chromium' },
+    { id: 'com.discordapp.Discord', name: 'Discord' },
+    { id: 'vlc',        name: 'VLC' },
+    { id: 'git',        name: 'Git' },
+    { id: 'python3',    name: 'Python 3' },
+    { id: 'obs-studio', name: 'OBS Studio' },
+    { id: 'p7zip',      name: '7-Zip' },
+    { id: 'gimp',       name: 'GIMP' }
+];
+function isFedoraSelected() {
+    return document.getElementById('os-type').value === 'Linux' &&
+           document.getElementById('linux-distro').value === 'fedora';
+}
 var PREINSTALL_APPS_LINUX = [
     { id: 'code',       name: 'VS Code' },
     { id: 'steam',      name: 'Steam' },
@@ -486,16 +510,22 @@ function renderCreateApps() {
     var list = document.getElementById('create-app-list');
     if (!list) return;
     var isLinux = document.getElementById('os-type').value === 'Linux';
-    if (list.dataset.os === (isLinux ? 'Linux' : 'Windows')) return;
-    list.dataset.os = isLinux ? 'Linux' : 'Windows';
+    var isFedora = isFedoraSelected();
+    var listKey = isFedora ? 'Fedora' : isLinux ? 'Linux' : 'Windows';
+    if (list.dataset.os === listKey) return;
+    list.dataset.os = listKey;
     list.textContent = '';
-    document.getElementById('create-app-extra').placeholder = isLinux
+    document.getElementById('create-app-extra').placeholder = isFedora
+        ? 'More dnf names or Flathub IDs, comma-separated (e.g. com.spotify.Client)'
+        : isLinux
         ? 'More apt or snap names, comma-separated (e.g. spotify)'
         : 'More winget IDs, comma-separated (e.g. Spotify.Spotify)';
-    document.getElementById('create-app-hint').textContent = isLinux
+    document.getElementById('create-app-hint').textContent = isFedora
+        ? 'Installed with dnf, or from Flathub if dnf has none, once the VM has internet access. Not used for templates.'
+        : isLinux
         ? 'Installed with apt, or snap if apt has none, once the VM has internet access. Not used for templates.'
         : 'Installed with winget after your first sign-in. Needs internet access in the VM. Not used for templates.';
-    (isLinux ? PREINSTALL_APPS_LINUX : PREINSTALL_APPS).forEach(function(app) {
+    (isFedora ? PREINSTALL_APPS_FEDORA : isLinux ? PREINSTALL_APPS_LINUX : PREINSTALL_APPS).forEach(function(app) {
         var label = document.createElement('label');
         var cb = document.createElement('input');
         cb.type = 'checkbox';
@@ -935,8 +965,7 @@ function applyAccountModeUI() {
 
 function gatherConfig() {
     var osType = document.getElementById('os-type').value;
-    /* Same ISO-picker path for Windows and Linux. The cloud-image
-       Linux-version dropdown is dormant (see applyOsTypeUI). */
+    /* Same ISO-picker path for Windows and Linux. */
     var imagePath = document.getElementById('image-path').value.trim();
     var excluded = [];
     document.querySelectorAll('#create-shared-resource-list input[data-resource-id]').forEach(function(cb) {
@@ -945,6 +974,7 @@ function gatherConfig() {
     return {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
+        linuxDistro: isFedoraSelected() ? 'fedora' : '',
         imagePath:   imagePath,
         storageParent: document.getElementById('storage-parent').value.trim(),
         sharedResourceExclusions: excluded.join(','),
@@ -1269,7 +1299,7 @@ function buildRowCells(vm, i, statusTd) {
 
     var cells = [
         makeCell(vm.name, i, 0),
-        makeCell(vm.osType, i, 1),
+        makeCell(vm.linuxDistro === 'fedora' ? 'Fedora' : vm.osType, i, 1),
         statusTd,
         agentTd,
         makeCell(vm.cpuCores, i, 4, 'Number of virtual CPU cores assigned to this VM'),

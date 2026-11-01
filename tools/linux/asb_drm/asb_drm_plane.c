@@ -67,7 +67,7 @@ static const u64 asb_format_modifiers[] = {
  * -------------------------------------------------------------------------- */
 
 static int asb_primary_atomic_check(struct drm_plane *plane,
-                                    struct drm_atomic_state *state)
+                                    struct asb_atomic_state *state)
 {
 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state  *crtc_state;
@@ -86,7 +86,7 @@ static int asb_primary_atomic_check(struct drm_plane *plane,
 }
 
 static void asb_primary_atomic_update(struct drm_plane *plane,
-                                      struct drm_atomic_state *state)
+                                      struct asb_atomic_state *state)
 {
 	/* Virtual driver: nothing to push to hardware. The atomic helpers
 	 * have already updated plane->state with the new fb pointer, which
@@ -124,7 +124,7 @@ static const struct drm_plane_funcs asb_primary_funcs = {
  * -------------------------------------------------------------------------- */
 
 static int asb_cursor_atomic_check(struct drm_plane *plane,
-                                   struct drm_atomic_state *state)
+                                   struct asb_atomic_state *state)
 {
 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_framebuffer *fb = new_state->fb;
@@ -154,7 +154,7 @@ static int asb_cursor_atomic_check(struct drm_plane *plane,
 }
 
 static void asb_cursor_atomic_update(struct drm_plane *plane,
-                                     struct drm_atomic_state *state)
+                                     struct asb_atomic_state *state)
 {
 	/* The plane state already carries fb + crtc_x + crtc_y. The daemon
 	 * reads those via drmModeGetPlane on the next vblank — no driver
