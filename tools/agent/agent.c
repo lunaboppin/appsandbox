@@ -3004,7 +3004,9 @@ static void session_wait_signin(char *reply, size_t reply_size)
         if (signed_in && session_has_shell(session)) {
             sprintf_s(reply, reply_size, "ok:signed:%s", user);
             WTSFreeMemory(user);
-            Sleep(10000);
+            /* A first sign-in is still setting up the profile when the desktop process
+               appears. */
+            Sleep(30000);
             return;
         }
         if (user) WTSFreeMemory(user);
@@ -3742,9 +3744,13 @@ static int configure_shared_nic(const char *mac_a, const char *ip_a)
         " exit 1168\r\n"
         "}\r\n"
         "Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -Dhcp Disabled -InterfaceMetric 9999 -ErrorAction Stop\r\n"
-        "Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
-        "New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NET_IP -PrefixLength 24 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
-        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue\r\n"
+        /* Already right: leave it. A Game Streaming duplicate's user may be signing in
+           over this link, and losing it mid-way signs them out again. */
+        "if(-not (Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -eq $env:ASB_NET_IP})){\r\n"
+        " Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+        " New-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -IPAddress $env:ASB_NET_IP -PrefixLength 24 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\r\n"
+        " Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue\r\n"
+        "}\r\n"
         /* The share network is LAN-only: no route off it, and a firewall
            backstop in case DHCP or a stale config ever hands it a gateway.
            Scoped to this adapter, so a client VM's own NAT adapter is
