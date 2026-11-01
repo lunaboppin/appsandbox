@@ -2910,6 +2910,14 @@ static void session_autologon(const char *domain, const char *user, const char *
     RegSetKeyValueW(HKEY_LOCAL_MACHINE,
                     L"SOFTWARE\\Policies\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
                     L"SyncForegroundPolicy", REG_DWORD, &one, sizeof(one));
+    /* A new account's first sign-in plays an animation, and with no display client
+       connected Windows signs the user straight back out. */
+    {
+        DWORD off = 0;
+        RegSetKeyValueW(HKEY_LOCAL_MACHINE,
+                        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                        L"EnableFirstLogonAnimation", REG_DWORD, &off, sizeof(off));
+    }
     strcpy_s(reply, reply_size, "ok");
 }
 
@@ -3002,12 +3010,20 @@ static void session_wait_signin(char *reply, size_t reply_size)
             WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &user, &got) &&
             user[0] && _strnicmp(user, "defaultuser", 11) != 0;
         if (signed_in && session_has_shell(session)) {
+            char *still = NULL;
+            BOOL lasted;
             sprintf_s(reply, reply_size, "ok:signed:%s", user);
             WTSFreeMemory(user);
             /* A first sign-in is still setting up the profile when the desktop process
-               appears. */
+               appears, and can still end. Only one that lasts counts. */
             Sleep(30000);
-            return;
+            session = WTSGetActiveConsoleSessionId();
+            lasted = session != 0xFFFFFFFF &&
+                WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &still, &got) &&
+                still[0];
+            if (still) WTSFreeMemory(still);
+            if (lasted) return;
+            break;
         }
         if (user) WTSFreeMemory(user);
         Sleep(2000);
