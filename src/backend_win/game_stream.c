@@ -27,6 +27,7 @@
 #define GS_PASSWORD_KEEP_MS  (15ull * 60ull * 1000ull)
 #define GS_PASSWORD_BYTES    256      /* a multiple of CRYPTPROTECTMEMORY_BLOCK_SIZE */
 #define GS_START_TIMEOUT_MS  (35ul * 60ul * 1000ul)
+#define GS_SIGNIN_MS         (6ull * 60ull * 1000ull)
 #define GS_SIGNED_OUT_POLLS  3        /* of GS_WATCH_MS each, before a session counts as over */
 #define GS_WATCH_MS          10000
 #define GS_CATALOG_MAX       (4u * 1024u * 1024u)
@@ -756,7 +757,7 @@ static DWORD WINAPI session_thread(LPVOID param)
     BOOL lan, software = FALSE, anyone;
     DWORD ram = 4096, cpu = 4;
     int gpu = ASB_GPU_NONE, idle_minutes;
-    ULONGLONG deadline, idle_since;
+    ULONGLONG deadline, idle_since, signin_since;
     HRESULT hr;
 
     AcquireSRWLockShared(&g_lock);
@@ -816,6 +817,7 @@ static DWORD WINAPI session_thread(LPVOID param)
     /* Setup, the domain join and its restart, then the sign-in. */
     session_state(slot, "starting", "Setting up Windows");
     deadline = GetTickCount64() + GS_START_TIMEOUT_MS;
+    signin_since = 0;
     for (;;) {
         if (InterlockedCompareExchange(&s->stop, 0, 0) || g_shutting_down) goto cleanup;
         if (GetTickCount64() > deadline) {
@@ -835,6 +837,16 @@ static DWORD WINAPI session_thread(LPVOID param)
         if (vm->agent_online && !vm->agent_initializing) {
             if (console_user(vm, s->user, &anyone)) break;
             session_state(slot, "starting", vm->session_logon[0] ? "Setting up Windows" : "Joining the domain and signing you in");
+            /* The boot's sign-in is long over by now if it was going to happen. */
+            if (!vm->session_logon[0]) {
+                if (!signin_since) signin_since = GetTickCount64();
+                else if (GetTickCount64() - signin_since > GS_SIGNIN_MS) {
+                    if (vm_agent_send(vm, "session_signin_why", reply, sizeof(reply), 70000))
+                        ui_log(L"Game Streaming: no sign-in on \"%s\": %S", s->vm_name, reply);
+                    session_failed(slot, "Your VM couldn't sign you in. Try again, and if it happens again, ask your admin to check the App Sandbox log.");
+                    goto wait_to_clean;
+                }
+            }
         }
         Sleep(3000);
     }

@@ -2965,7 +2965,10 @@ static const char SESSION_SIGNIN_WHY_PS[] =
     "$w=Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'\r\n"
     "$e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625} -MaxEvents 1 -ErrorAction SilentlyContinue\r\n"
     "$f=if($e){ 'lastfail='+$e.Properties[5].Value+' status='+('{0:X}' -f [uint32]$e.Properties[7].Value)+' sub='+('{0:X}' -f [uint32]$e.Properties[9].Value) }else{ 'no failed sign-in recorded' }\r\n"
-    "Write-Output ('result:timeout autologon='+$w.AutoAdminLogon+' count='+$w.AutoLogonCount+' user='+$w.DefaultDomainName+'\\'+$w.DefaultUserName+' '+$f)\r\n";
+    "$n=Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='NETLOGON'} -MaxEvents 1 -ErrorAction SilentlyContinue\r\n"
+    "$l=if($n){ ' netlogon='+$n.Id+'@'+$n.TimeCreated.ToString('HH:mm:ss') }else{ '' }\r\n"
+    "$u=@(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress+'/'+$_.Store }) -join ','\r\n"
+    "Write-Output ('result:timeout autologon='+$w.AutoAdminLogon+' count='+$w.AutoLogonCount+' user='+$w.DefaultDomainName+'\\'+$w.DefaultUserName+' boot='+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('HH:mm:ss')+' '+$f+$l+' ips='+$u)\r\n";
 
 /* Hold the host's network setup back while the boot's sign-in runs: that setup replaces
    the link the sign-in is using. "ok" when someone is signed in, "ok:timeout" if not. */
@@ -2978,11 +2981,9 @@ static void session_wait_signin(char *reply, size_t reply_size)
         BOOL signed_in = session != 0xFFFFFFFF &&
             WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &user, &got) &&
             user[0] && _strnicmp(user, "defaultuser", 11) != 0;
+        if (signed_in) sprintf_s(reply, reply_size, "ok:signed:%s", user);
         if (user) WTSFreeMemory(user);
-        if (signed_in) {
-            strcpy_s(reply, reply_size, "ok");
-            return;
-        }
+        if (signed_in) return;
         Sleep(2000);
     }
     run_domain_script(SESSION_SIGNIN_WHY_PS, 60000, reply, reply_size);
@@ -3205,6 +3206,8 @@ static void session_command(char *cmd, char *reply, size_t reply_size)
         run_domain_script(SESSION_LINK_PS, 60000, reply, reply_size);
     } else if (strcmp(cmd, "session_wait_signin") == 0) {
         session_wait_signin(reply, reply_size);
+    } else if (strcmp(cmd, "session_signin_why") == 0) {
+        run_domain_script(SESSION_SIGNIN_WHY_PS, 60000, reply, reply_size);
     } else if (strcmp(cmd, "session_signed_in") == 0) {
         session_autologon_clear();
         strcpy_s(reply, reply_size, "ok");

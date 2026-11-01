@@ -637,11 +637,13 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         if (vm->session_clone && vm->session_signing_in) {
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, "session_wait_signin", buf, sizeof(buf), 5ul * 60ul * 1000ul);
             if (n <= 0) goto disconnected;
-            vm->session_signing_in = FALSE;
-            if (strcmp(buf, "ok") != 0) {
-                ui_log(L"Windows didn't sign the user in to \"%s\" (%S).", vm->name, buf);
+            ui_log(L"Waiting for the sign-in on \"%s\": %S", vm->name, buf);
+            /* The guest may answer on its way down to the restart: only a sign-in or
+               a full wait settles it. */
+            if (strncmp(buf, "ok:signed:", 10) == 0 || strncmp(buf, "ok:timeout", 10) == 0)
+                vm->session_signing_in = FALSE;
+            if (strncmp(buf, "ok:timeout", 10) == 0)
                 InterlockedExchange(&vm->session_signin_failed, 1);
-            }
         }
 
         /* Configure the independent host-only NIC, then recreate signed global
