@@ -2960,6 +2960,13 @@ static const char SESSION_LINK_PS[] =
     " Write-Output 'result:ok'; exit 0\r\n"
     "}catch{ Write-Output ('result:' + ($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
 
+/* Why a sign-in didn't happen, for the log. No password is involved. */
+static const char SESSION_SIGNIN_WHY_PS[] =
+    "$w=Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'\r\n"
+    "$e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625} -MaxEvents 1 -ErrorAction SilentlyContinue\r\n"
+    "$f=if($e){ 'lastfail='+$e.Properties[5].Value+' status='+('{0:X}' -f [uint32]$e.Properties[7].Value)+' sub='+('{0:X}' -f [uint32]$e.Properties[9].Value) }else{ 'no failed sign-in recorded' }\r\n"
+    "Write-Output ('result:timeout autologon='+$w.AutoAdminLogon+' count='+$w.AutoLogonCount+' user='+$w.DefaultDomainName+'\\'+$w.DefaultUserName+' '+$f)\r\n";
+
 /* Hold the host's network setup back while the boot's sign-in runs: that setup replaces
    the link the sign-in is using. "ok" when someone is signed in, "ok:timeout" if not. */
 static void session_wait_signin(char *reply, size_t reply_size)
@@ -2978,7 +2985,7 @@ static void session_wait_signin(char *reply, size_t reply_size)
         }
         Sleep(2000);
     }
-    strcpy_s(reply, reply_size, "ok:timeout");
+    run_domain_script(SESSION_SIGNIN_WHY_PS, 60000, reply, reply_size);
 }
 
 /* "ok:" alone, or "ok:<domain>\<user>" for whoever is at the console. */

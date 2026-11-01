@@ -639,7 +639,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             if (n <= 0) goto disconnected;
             vm->session_signing_in = FALSE;
             if (strcmp(buf, "ok") != 0) {
-                ui_log(L"Windows didn't sign the user in to \"%s\".", vm->name);
+                ui_log(L"Windows didn't sign the user in to \"%s\" (%S).", vm->name, buf);
                 InterlockedExchange(&vm->session_signin_failed, 1);
             }
         }
@@ -691,35 +691,39 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                rolled back to a checkpoint from before the join rejoins. */
             if (vm->domain_member) {
                 char join_cmd[1024];
-                /* Before the join: its restart is the boot that signs the user in. */
+                /* The join's restart is the boot that signs the user in, and that boot
+                   needs this link from its start. */
                 if (vm->session_logon[0]) {
-                    n = send_tagged_cmd(s, vm, &conn->cmd_seq, vm->session_logon, buf, sizeof(buf), 30000);
+                    char link_cmd[64];
+                    sprintf_s(link_cmd, sizeof(link_cmd), "session_link:%s", vm->share_ip);
+                    n = send_tagged_cmd(s, vm, &conn->cmd_seq, link_cmd, buf, sizeof(buf), 90000);
                     if (n <= 0) goto disconnected;
                     if (strcmp(buf, "ok") != 0) {
-                        ui_log(L"Setting up the sign-in on \"%s\" failed (%S).", vm->name, buf);
+                        ui_log(L"Saving the domain link on \"%s\" failed (%S).", vm->name, buf);
                         InterlockedExchange(&vm->session_signin_failed, 1);
                     }
-                    SecureZeroMemory(vm->session_logon, sizeof(vm->session_logon));
-                    {
-                        char link_cmd[64];
-                        sprintf_s(link_cmd, sizeof(link_cmd), "session_link:%s", vm->share_ip);
-                        n = send_tagged_cmd(s, vm, &conn->cmd_seq, link_cmd, buf, sizeof(buf), 90000);
-                        if (n <= 0) goto disconnected;
-                        if (strcmp(buf, "ok") != 0) {
-                            ui_log(L"Saving the domain link on \"%s\" failed (%S).", vm->name, buf);
-                            InterlockedExchange(&vm->session_signin_failed, 1);
-                        }
-                    }
-                    vm->session_signing_in = TRUE;
                 }
                 if (shared_appliance_domain_join_command(vm->share_host_ip,
                                                          join_cmd, sizeof(join_cmd))) {
                     n = send_tagged_cmd(s, vm, &conn->cmd_seq, join_cmd, buf, sizeof(buf), 300000);
                     SecureZeroMemory(join_cmd, sizeof(join_cmd));
                     if (n <= 0) goto disconnected;
-                    if (strcmp(buf, "ok:joined") == 0)
+                    if (strcmp(buf, "ok:joined") == 0) {
                         ui_log(L"\"%s\" joined the %S domain and restarts to finish.",
                                vm->name, ASB_DOMAIN_NETBIOS);
+                        /* After the join, which resets the automatic sign-in settings;
+                           the restart waits long enough for this. */
+                        if (vm->session_logon[0]) {
+                            n = send_tagged_cmd(s, vm, &conn->cmd_seq, vm->session_logon, buf, sizeof(buf), 10000);
+                            SecureZeroMemory(vm->session_logon, sizeof(vm->session_logon));
+                            if (n <= 0) goto disconnected;
+                            if (strcmp(buf, "ok") != 0) {
+                                ui_log(L"Setting up the sign-in on \"%s\" failed (%S).", vm->name, buf);
+                                InterlockedExchange(&vm->session_signin_failed, 1);
+                            }
+                            vm->session_signing_in = TRUE;
+                        }
+                    }
                     else if (strcmp(buf, "ok:already") != 0) {
                         ui_log(L"Joining \"%s\" to the domain failed (%S).", vm->name, buf);
                         if (vm->session_clone) InterlockedExchange(&vm->session_signin_failed, 1);

@@ -83,7 +83,9 @@ def main() -> None:
     assert 'PrefixLength 24 | Out-Null' in agent[agent.index("SESSION_LINK_PS[]"):agent.index("session_wait_signin(char")]
     assert "IMAGE_STATE_COMPLETE" in agent
     assert link.index('"session_wait_signin"') < link.index("Configure the independent host-only NIC")
-    assert link.index("vm->session_logon, buf") < link.index("shared_appliance_domain_join_command(vm->share_host_ip")
+    assert link.index('"session_link:%s"') < link.index("shared_appliance_domain_join_command(vm->share_host_ip")
+    # After the join, which resets the automatic sign-in settings.
+    assert link.index('strcmp(buf, "ok:joined") == 0') < link.index("vm->session_logon, buf")
     # A duplicate's unattend signs nobody in first.
     assert "if (session) {" in disk and "iso_create_session_resources" in core
 
