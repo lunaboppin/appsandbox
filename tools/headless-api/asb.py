@@ -222,6 +222,28 @@ class Client:
         status() reports displayOpen/displayView, which also clear if the user
         closes the window."""
         return self._req("POST", "/vms/%s/display" % name, {"view": view} if view else None)
+    def seamless_open(self, name, run=None):
+        """Start seamless mode: each guest window becomes a host window of its own.
+        Windows guests only (409 "seamless_unavailable" says why not). run: open an app
+        in the guest, a launch target or full path; 409 "seamless_not_connected" until
+        the session has connected, so poll seamless_status()["connected"] first."""
+        return self._req("POST", "/vms/%s/seamless" % name, {"run": run} if run else None)
+    def seamless_input(self, name, guest, event, a=0, b=0, c=0):
+        """Drive one seamless window, by its 'guest' id from seamless_status(), the way the
+        host user would. event: move, down, up (a, b: inside the window, c: 0 left, 1 right,
+        2 middle), wheel (a: delta), keydown, keyup (a: virtual key), activate, close,
+        minimize, maximize, restore, position (a, b: host screen), size (a, b: content)."""
+        return self._req("POST", "/vms/%s/seamless/input" % name,
+                         {"guest": guest, "event": event, "a": a, "b": b, "c": c})
+    def seamless_picture(self, name, guest):
+        """What the host window shows: {'width', 'height', 'bgra': base64, top row first}."""
+        return self._req("POST", "/vms/%s/seamless/picture" % name, {"guest": guest}, timeout=60)[1]
+    def seamless_close(self, name): return self._req("DELETE", "/vms/%s/seamless" % name)
+    def seamless_status(self, name):
+        """{'open', 'connected', 'secure', 'fallbackDisplay', 'status', 'guestScreen', 'apps',
+        'framesReceived', 'bytesReceived', 'windows': [{'guest', 'host', 'title', 'app', 'popup',
+        'state', 'guestRect', 'hostRect', 'border', 'picture', 'frames', 'bytes'}]}"""
+        return self._req("GET", "/vms/%s/seamless" % name)[1]
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
     def display_status(self, name):
         """{'open', 'ready', 'canOpen', 'view', 'following'}. 'ready' is the agent's

@@ -68,7 +68,7 @@ $required = @(
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
     'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
     'drivers\devcon.exe', 'web',
-    'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe',
+    'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe', 'resources\appsandbox-seamless.exe',
     'resources\appsandbox-clipboard.exe', 'resources\appsandbox-clipboard-reader.exe',
     'resources\appsandbox-displays.exe', 'resources\appsandbox-input.exe',
     'resources\linux\appsandbox-agent.c', 'resources\linux\guest-src\tools\linux\agent\appsandbox-agent.c', 'resources\win-mesa-gl\opengl32.dll',

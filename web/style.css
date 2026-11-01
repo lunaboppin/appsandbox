@@ -383,6 +383,8 @@ th.icon-col, td.icon-col {
 .icon-btn.ssh { color: var(--accent); font-family: monospace; font-weight: bold; }
 .icon-btn.ssh.inactive { color: #505050; }
 .icon-btn.ssh.hidden { display: none; }
+.icon-btn.seamless.hidden { display: none; }
+.icon-btn.seamless.on { outline: 1px solid var(--accent); border-radius: 3px; }
 .icon-btn.edit { color: var(--text-dim); }
 .icon-btn.edit:hover { color: var(--text); }
 .icon-btn.manage { color: var(--accent); }

@@ -71,7 +71,7 @@ try {
     }
 
     foreach ($f in @('AppSandbox.exe', 'appsandbox_core.dll', 'appsandbox-run.exe', 'appsandbox-shell.dll', 'shell-menu.ps1', 'iso-patch.exe', 'WebView2Loader.dll', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
-                     'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe',
+                     'resources\appsandbox-agent.exe', 'resources\appsandbox-audio.exe', 'resources\appsandbox-backstage.exe', 'resources\appsandbox-seamless.exe',
                      'resources\appsandbox-clipboard.exe', 'resources\appsandbox-clipboard-reader.exe',
                      'resources\appsandbox-displays.exe', 'resources\appsandbox-input.exe',
                      'resources\linux\appsandbox-agent.c', 'resources\win-mesa-gl\opengl32.dll',

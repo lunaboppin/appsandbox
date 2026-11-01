@@ -314,6 +314,38 @@ c.close_display("dev")              # or the user just closes it with the [X]
 
 ---
 
+### Seamless mode
+
+Windows guests only. Each guest window becomes a host window of its own; the windows
+appear on the host's interactive desktop, so this needs one (`409 no_display` otherwise).
+
+```python
+c.seamless_open("dev")                    # also brings its launcher forward
+c.seamless_status("dev")["connected"]     # wait for this before asking it to run anything
+c.seamless_open("dev", run="notepad.exe") # a launch target from the app list, or a full path
+c.seamless_status("dev")["windows"]       # guest id, title, guest and host rects, frames, bytes
+c.seamless_input("dev", guest_id, "down", 40, 12)   # drive one window from a script
+c.seamless_close("dev")                   # the host windows close; the guest's apps keep running
+```
+
+- **`POST /v1/vms/{name}/seamless`** takes an optional body `{"run": target}`. `409
+  seamless_unavailable` says why it can't work on this VM (a Linux guest or a malware lab
+  VM), `409 seamless_not_connected` means the session hasn't reached the guest yet.
+- **`GET`** returns `{"open", "connected", "secure", "fallbackDisplay", "status",
+  "guestScreen", "apps", "framesReceived", "bytesReceived", "windows": [...]}`. `secure` is
+  true while the sign-in screen, a lock or a UAC prompt has the guest's input; the normal
+  display opens until it's over (`fallbackDisplay`). **`DELETE`** leaves seamless mode.
+- **`POST /v1/vms/{name}/seamless/input`** takes `{"guest", "event", "a", "b", "c"}` and goes
+  through the same path as the host user's input. `event` is `move`, `down`, `up` (`a`, `b`
+  inside the window, `c` 0 left, 1 right, 2 middle), `wheel` (`a` delta), `keydown`, `keyup`
+  (`a` virtual key), `activate`, `close`, `minimize`, `maximize`, `restore`, `position` (`a`,
+  `b` on the host screen) or `size` (`a`, `b` content). `404 no_such_window` otherwise.
+- **`POST /v1/vms/{name}/seamless/picture`** takes `{"guest"}` and returns what that host
+  window shows, `{"width", "height", "bgra": base64}` with the top row first, so a script can
+  check a window without looking at the desktop.
+- A running VM needs one restart after an update that adds this: the channel is registered
+  when the VM starts, and that's also when the helper reaches the guest.
+
 ### Remote: Moonlight and browser
 
 Both are off until turned on, per VM. A browser session or a Moonlight stream controls
