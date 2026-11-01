@@ -26,6 +26,7 @@
 #include "vm_stream.h"
 #include "vm_agent.h"
 #include "asb_core.h"
+#include "game_stream.h"
 #include "ui.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -152,6 +153,7 @@ static LoginLimit g_limits[32];
 static SOCKET     g_listen_local = INVALID_SOCKET, g_listen_lan = INVALID_SOCKET;
 static int        g_port_local, g_port_lan;
 static volatile LONG g_conns;
+static BOOL       g_dashboard, g_dashboard_lan;
 static volatile LONG g_shutdown;
 
 /* ---- Small helpers ---- */
@@ -1846,14 +1848,34 @@ static void login_failed(ULONG ip)
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+/* A session for this VM and its Set-Cookie header. */
+static BOOL mint_vm_cookie(UINT64 vm_id, BOOL tls, char *cookie, size_t cookie_chars)
+{
+    char token[65];
+    int i, slot = 0;
+    ULONGLONG now = GetTickCount64(), oldest = ~0ull;
+    if (!random_hex(token, 64)) return FALSE;
+    AcquireSRWLockExclusive(&g_lock);
+    for (i = 0; i < WEB_MAX_SESSIONS; i++) {
+        if (g_cookies[i].expires < oldest) { oldest = g_cookies[i].expires; slot = i; }
+    }
+    strcpy_s(g_cookies[slot].token, sizeof(g_cookies[slot].token), token);
+    g_cookies[slot].vm_id = vm_id;
+    g_cookies[slot].tls = tls;
+    g_cookies[slot].expires = now + WEB_SESSION_MS;
+    ReleaseSRWLockExclusive(&g_lock);
+    sprintf_s(cookie, cookie_chars, "Set-Cookie: asb_%llx=%s; Path=/; HttpOnly; SameSite=Strict%s\r\n",
+              (unsigned long long)vm_id, token, tls ? "; Secure" : "");
+    SecureZeroMemory(token, sizeof(token));
+    return TRUE;
+}
+
 /* POST /api/login: body "<vm name>\n<key>". */
 static void handle_login(WebConn *c, const char *body, DWORD body_len, ULONG ip)
 {
-    char copy[1024], *nl, token[65], cookie[256], json[64];
+    char copy[1024], *nl, cookie[256], json[64];
     WebVm *entry;
     UINT64 vm_id = 0;
-    int i, slot = -1;
-    ULONGLONG now = GetTickCount64(), oldest = ~0ull;
 
     if (!login_allowed(ip)) {
         Sleep(1000);
@@ -1879,18 +1901,7 @@ static void handle_login(WebConn *c, const char *body, DWORD body_len, ULONG ip)
         http_text(c, "403 Forbidden", "That access key isn't right, or browser access is off for this VM.");
         return;
     }
-    if (!random_hex(token, 64)) { http_text(c, "500 Internal Server Error", "Random numbers failed"); return; }
-    AcquireSRWLockExclusive(&g_lock);
-    for (i = 0; i < WEB_MAX_SESSIONS; i++) {
-        if (g_cookies[i].expires < oldest) { oldest = g_cookies[i].expires; slot = i; }
-    }
-    strcpy_s(g_cookies[slot].token, sizeof(g_cookies[slot].token), token);
-    g_cookies[slot].vm_id = vm_id;
-    g_cookies[slot].tls = c->tls;
-    g_cookies[slot].expires = now + WEB_SESSION_MS;
-    ReleaseSRWLockExclusive(&g_lock);
-    sprintf_s(cookie, sizeof(cookie), "Set-Cookie: asb_%llx=%s; Path=/; HttpOnly; SameSite=Strict%s\r\n",
-              (unsigned long long)vm_id, token, c->tls ? "; Secure" : "");
+    if (!mint_vm_cookie(vm_id, c->tls, cookie, sizeof(cookie))) { http_text(c, "500 Internal Server Error", "Random numbers failed"); return; }
     sprintf_s(json, sizeof(json), "{\"ok\":true}");
     http_reply(c, "200 OK", "application/json", cookie, json, (DWORD)strlen(json));
 }
@@ -1920,6 +1931,156 @@ static BOOL session_cookie_ok(const char *headers, UINT64 vm_id, BOOL tls)
     }
     ReleaseSRWLockShared(&g_lock);
     return ok;
+}
+
+/* ---- The Game Streaming dashboard ----
+
+   Same checks as the rest of the gateway: Host and Origin first, then its own sign-in.
+   A domain password arrives here only in a POST body, and on the network only over
+   HTTPS, because that is the only network listener. */
+
+static BOOL app_cookie_token(const char *headers, char *token, size_t chars)
+{
+    char cookies[1024], *p;
+    size_t i = 0;
+    if (!http_header(headers, "Cookie", cookies, sizeof(cookies))) return FALSE;
+    p = strstr(cookies, "asb_app=");
+    if (!p || (p != cookies && p[-1] != ' ' && p[-1] != ';')) return FALSE;
+    p += 8;
+    while (i < chars - 1 && *p && *p != ';') token[i++] = *p++;
+    token[i] = 0;
+    return i == 64;
+}
+
+/* Split "a\nb\nc" in place. Returns how many fields. */
+static int split_lines(char *text, char **fields, int max)
+{
+    int n = 0;
+    fields[n++] = text;
+    for (; *text && n < max; text++)
+        if (*text == '\n') { *text = 0; fields[n++] = text + 1; }
+    return n;
+}
+
+static void dashboard_login(WebConn *c, char *body, ULONG ip)
+{
+    char *f[2], token[65], cookie[200], message[400] = "";
+    wchar_t user[24] = L"", password[128] = L"";
+    if (!login_allowed(ip)) {
+        Sleep(1000);
+        http_text(c, "429 Too Many Requests", "Too many tries. Wait a minute and try again.");
+        return;
+    }
+    if (split_lines(body, f, 2) != 2 ||
+        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, f[0], -1, user, _countof(user)) ||
+        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, f[1], -1, password, _countof(password))) {
+        http_text(c, "400 Bad Request", "Bad request");
+        return;
+    }
+    if (FAILED(game_stream_sign_in(user, password, c->tls, token, sizeof(token), message, sizeof(message)))) {
+        SecureZeroMemory(password, sizeof(password));
+        login_failed(ip);
+        ui_log(L"Game Streaming: a sign-in failed.");
+        http_text(c, "403 Forbidden", message[0] ? message : "That sign-in wasn't accepted.");
+        return;
+    }
+    SecureZeroMemory(password, sizeof(password));
+    ui_log(L"Game Streaming: %s signed in.", user);
+    sprintf_s(cookie, sizeof(cookie), "Set-Cookie: asb_app=%s; Path=/; HttpOnly; SameSite=Strict%s\r\n",
+              token, c->tls ? "; Secure" : "");
+    SecureZeroMemory(token, sizeof(token));
+    http_reply(c, "200 OK", "application/json", cookie, "{\"ok\":true}", 11);
+}
+
+static void dashboard_serve_catalog_file(WebConn *c, const char *leaf, const char *type)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE f;
+    DWORD size, got = 0;
+    BYTE *data;
+    if (!game_stream_catalog_file(leaf, path, MAX_PATH)) { http_text(c, "404 Not Found", "Not found"); return; }
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) { http_text(c, "404 Not Found", "Not found"); return; }
+    size = GetFileSize(f, NULL);
+    data = size < 8u * 1024u * 1024u ? (BYTE *)malloc(size ? size : 1) : NULL;
+    if (data && ReadFile(f, data, size, &got, NULL) && got == size)
+        http_reply(c, "200 OK", type, NULL, data, size);
+    else
+        http_text(c, "500 Internal Server Error", "Could not read the file");
+    free(data);
+    CloseHandle(f);
+}
+
+/* Routes under /api/app/ for a signed-in user; body may be NULL on a GET. */
+static void dashboard_api(WebConn *c, const char *path, BOOL post, const char *headers, char *body, ULONG ip)
+{
+    char token[80] = "", message[500] = "";
+    wchar_t user[24];
+
+    if (post && strcmp(path, "/api/app/login") == 0) {
+        dashboard_login(c, body, ip);
+        return;
+    }
+    if (!app_cookie_token(headers, token, sizeof(token)) || !game_stream_signed_in(token, c->tls, user, _countof(user))) {
+        http_text(c, "401 Unauthorized", "Sign in first.");
+        return;
+    }
+    if (post && strcmp(path, "/api/app/logout") == 0) {
+        game_stream_sign_out(token);
+        sprintf_s(message, sizeof(message), "Set-Cookie: asb_app=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict%s\r\n",
+                  c->tls ? "; Secure" : "");
+        http_reply(c, "200 OK", "application/json", message, "{\"ok\":true}", 11);
+    } else if (!post && strcmp(path, "/api/app/catalog") == 0) {
+        dashboard_serve_catalog_file(c, "catalog.json", "application/json");
+    } else if (!post && strncmp(path, "/api/app/art/", 13) == 0) {
+        dashboard_serve_catalog_file(c, path + 13, "image/jpeg");
+    } else if (!post && strcmp(path, "/api/app/session") == 0) {
+        char json[2048];
+        int n = game_stream_session_json(user, json, sizeof(json));
+        http_reply(c, "200 OK", "application/json", NULL, json, (DWORD)n);
+    } else if (post && strcmp(path, "/api/app/session") == 0) {
+        /* "<browser|moonlight>\n<item>", plus the password when the kept one has lapsed. */
+        char *f[3] = { NULL, NULL, NULL };
+        wchar_t password[128] = L"";
+        int n = split_lines(body, f, 3);
+        HRESULT hr;
+        if (n < 2) { http_text(c, "400 Bad Request", "Bad request"); return; }
+        if (n == 3) {
+            if (!login_allowed(ip)) {
+                http_text(c, "429 Too Many Requests", "Too many tries. Wait a minute and try again.");
+                return;
+            }
+            MultiByteToWideChar(CP_UTF8, 0, f[2], -1, password, _countof(password));
+        }
+        hr = game_stream_session_start(token, user, f[0], f[1], n == 3 ? password : NULL, message, sizeof(message));
+        SecureZeroMemory(password, sizeof(password));
+        if (hr == E_ACCESSDENIED) login_failed(ip);
+        if (FAILED(hr)) {
+            http_text(c, strcmp(message, "password") == 0 ? "401 Unauthorized" : "409 Conflict",
+                      message[0] ? message : "The session couldn't start.");
+            return;
+        }
+        http_reply(c, "200 OK", "application/json", NULL, "{\"ok\":true}", 11);
+    } else if (post && strcmp(path, "/api/app/session/end") == 0) {
+        game_stream_session_end(user);
+        http_reply(c, "200 OK", "application/json", NULL, "{\"ok\":true}", 11);
+    } else if (post && strcmp(path, "/api/app/session/pair") == 0) {
+        if (FAILED(game_stream_session_pair(user, body, message, sizeof(message)))) {
+            http_text(c, "409 Conflict", message[0] ? message : "Pairing failed. Check the PIN and try again from Moonlight.");
+            return;
+        }
+        http_reply(c, "200 OK", "application/json", NULL, "{\"ok\":true}", 11);
+    } else if (post && strcmp(path, "/api/app/session/open") == 0) {
+        /* Browser view without a VM key: the dashboard's sign-in vouches for it. */
+        char name[80] = "", cookie[200], json[160];
+        UINT64 vm_id = game_stream_session_vm(user, name, sizeof(name));
+        if (!vm_id) { http_text(c, "409 Conflict", "Your session isn't ready yet."); return; }
+        if (!mint_vm_cookie(vm_id, c->tls, cookie, sizeof(cookie))) { http_text(c, "500 Internal Server Error", "Random numbers failed"); return; }
+        sprintf_s(json, sizeof(json), "{\"path\":\"/vm/%s\"}", name);
+        http_reply(c, "200 OK", "application/json", cookie, json, (DWORD)strlen(json));
+    } else {
+        http_text(c, "404 Not Found", "Not found");
+    }
 }
 
 /* base64(SHA-1(key + GUID)), for the WebSocket handshake. */
@@ -1993,10 +2154,17 @@ static DWORD WINAPI http_conn_thread(LPVOID param)
             serve_file(c, L"remote-audio.js", "text/javascript; charset=utf-8");
         } else if (get && strcmp(path, "/remote.css") == 0) {
             serve_file(c, L"remote.css", "text/css; charset=utf-8");
-        } else if (post && strcmp(path, "/api/login") == 0) {
+        } else if (get && g_dashboard && (!c->tls || g_dashboard_lan) && strcmp(path, "/") == 0) {
+            serve_file(c, L"dash.html", "text/html; charset=utf-8");
+        } else if (get && g_dashboard && (!c->tls || g_dashboard_lan) && strcmp(path, "/dash.js") == 0) {
+            serve_file(c, L"dash.js", "text/javascript; charset=utf-8");
+        } else if (get && g_dashboard && (!c->tls || g_dashboard_lan) && strcmp(path, "/dash.css") == 0) {
+            serve_file(c, L"dash.css", "text/css; charset=utf-8");
+        } else if (post && (strcmp(path, "/api/login") == 0 ||
+                            (strncmp(path, "/api/app/", 9) == 0 && g_dashboard && (!c->tls || g_dashboard_lan)))) {
             char length[16];
             DWORD body_len, body_have;
-            const char *body = end + 4;
+            char *body = end + 4;
             if (!http_header(headers, "Content-Length", length, sizeof(length)) ||
                 (body_len = (DWORD)atoi(length)) >= 1024) {
                 http_text(c, "400 Bad Request", "Bad request");
@@ -2010,7 +2178,15 @@ static DWORD WINAPI http_conn_thread(LPVOID param)
                 body_have += (DWORD)n;
                 if (have >= WEB_MAX_HEADER) goto out;
             }
-            handle_login(c, body, body_len, ip);
+            if (strcmp(path, "/api/login") == 0) {
+                handle_login(c, body, body_len, ip);
+            } else {
+                body[body_len] = 0;
+                dashboard_api(c, path, TRUE, headers, body, ip);
+                SecureZeroMemory(body, body_len);
+            }
+        } else if (get && strncmp(path, "/api/app/", 9) == 0 && g_dashboard && (!c->tls || g_dashboard_lan)) {
+            dashboard_api(c, path, FALSE, headers, NULL, ip);
         } else if (get && strncmp(path, "/ws/", 4) == 0) {
             UINT64 vm_id = 0;
             char upgrade[32], key[64], accept_key[64], reply[256];
@@ -2139,7 +2315,7 @@ static BOOL any_lan_vm(void)
     int i;
     for (i = 0; i < ASB_MAX_VMS; i++)
         if (g_vms_web[i].vm_id && g_vms_web[i].lan) return TRUE;
-    return FALSE;
+    return g_dashboard && g_dashboard_lan;
 }
 
 static BOOL ensure_lan_listener(void)
@@ -2290,6 +2466,53 @@ int vm_web_status_json(VmInstance *vm, char *out, int cap)
         }
     }
     SecureZeroMemory(key, sizeof(key));
+    pos += sprintf_s(out + pos, cap - pos, "}");
+    return pos;
+}
+
+BOOL vm_web_connected(UINT64 vm_id)
+{
+    WebVm *entry;
+    BOOL connected;
+    AcquireSRWLockShared(&g_lock);
+    entry = web_vm_find_id(vm_id);
+    connected = entry && entry->session != NULL;
+    ReleaseSRWLockShared(&g_lock);
+    return connected;
+}
+
+HRESULT vm_web_dashboard_set(BOOL enabled, BOOL lan, wchar_t *err, size_t err_chars)
+{
+    BOOL keep_lan;
+    if (err && err_chars) err[0] = 0;
+    if (enabled) {
+        if (!ensure_local_listener()) {
+            if (err) wcsncpy_s(err, err_chars, L"Couldn't open a local port for the dashboard.", _TRUNCATE);
+            return E_FAIL;
+        }
+        if (lan && !ensure_lan_listener()) {
+            if (err) wcsncpy_s(err, err_chars, L"Couldn't set up HTTPS for the network. See the log.", _TRUNCATE);
+            return E_FAIL;
+        }
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    g_dashboard = enabled;
+    g_dashboard_lan = enabled && lan;
+    keep_lan = any_lan_vm();
+    ReleaseSRWLockExclusive(&g_lock);
+    if (!keep_lan) close_lan_listener();
+    return S_OK;
+}
+
+int vm_web_dashboard_json(char *out, int cap, int pos)
+{
+    pos += sprintf_s(out + pos, cap - pos, "{\"localUrl\":\"http://127.0.0.1:%d/\"", g_port_local);
+    if (g_dashboard_lan) {
+        pos += sprintf_s(out + pos, cap - pos, ",\"lanPort\":%d,\"fingerprint\":\"%s\",\"lanAddresses\":[",
+                         g_port_lan, g_fingerprint);
+        pos = vm_stream_append_host_addresses(out, cap, pos);
+        pos += sprintf_s(out + pos, cap - pos, "]");
+    }
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }

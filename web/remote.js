@@ -138,6 +138,7 @@ function connect() {
     closeDecoder();
     if (replaced) return;
     if (!opened && !everOpen) {
+      // A dashboard session arrives with its cookie, so the key is only asked for when that fails.
       panel('Sign in', 'Enter this VM\'s access key. It\'s in the App Sandbox window, under Manage > Remote.', { login: true });
       return;
     }

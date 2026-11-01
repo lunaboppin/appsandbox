@@ -167,6 +167,8 @@ typedef struct {
     int         stream_exposure;         /* ASB_STREAM_THIS_PC or ASB_STREAM_NETWORK */
     DWORD       stream_port;             /* Sunshine base port (47989 + 100 * n) */
     BOOL        stream_software;         /* TRUE = never use the guest GPU to encode */
+    BOOL        session_clone;           /* TRUE = Game Streaming duplicate: never saved, deleted when its session ends */
+    char        session_logon[1024];     /* the sign-in to set up in the guest; wiped once sent */
     volatile LONG web_session_active;    /* browser sessions using the guest channels; the display window lets go while > 0 */
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
     wchar_t     preinstall_apps[1024]; /* winget IDs not yet handed to the guest agent */

@@ -35,6 +35,9 @@ ASB_API HRESULT vm_stream_pair(VmInstance *vm, const char *pin, const char *clie
 /* Forget every paired client. */
 ASB_API HRESULT vm_stream_unpair_all(VmInstance *vm, char *message, int message_cap);
 
+/* When a Moonlight client last sent anything to this VM (GetTickCount64), or 0. */
+ULONGLONG vm_stream_last_activity(UINT64 vm_id);
+
 /* For the agent connection: the command that sets the guest up. */
 void vm_stream_setup_command(VmInstance *vm, char *cmd, int cap);
 

@@ -28,6 +28,7 @@
 #include "vpn_configs.h"
 #include "vpn_gateway.h"
 #include "sandbox_run.h"
+#include "game_stream.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -528,7 +529,7 @@ static BOOL save_vm_list(void)
 
     if (g_last_iso_path[0] != L'\0' || g_last_storage_parent[0] != L'\0' ||
         g_suppress_tray_warn || asb_get_last_sandbox_vm()[0] ||
-        g_settings_passthrough[0] != L'\0') {
+        game_stream_has_settings() || g_settings_passthrough[0] != L'\0') {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
@@ -538,13 +539,14 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"SuppressTrayWarn=1\n");
         if (asb_get_last_sandbox_vm()[0])
             fwprintf(f, L"LastSandboxVm=%s\n", asb_get_last_sandbox_vm());
+        game_stream_write_settings(f);
         if (g_settings_passthrough[0] != L'\0')
             fwprintf(f, L"%s", g_settings_passthrough);
         fwprintf(f, L"\n");
     }
 
     for (i = 0; i < g_vm_count; i++) {
-        if (g_vms[i].building_vhdx) continue;
+        if (g_vms[i].building_vhdx || g_vms[i].session_clone) continue;
         fwprintf(f, L"[VM]\n");
         fwprintf(f, L"Name=%s\n", g_vms[i].name);
         fwprintf(f, L"OsType=%s\n", g_vms[i].os_type);
@@ -689,6 +691,8 @@ static void load_vm_list(void)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
             else if (wcsncmp(line, L"LastSandboxVm=", 14) == 0)
                 asb_run_load_last_vm(line + 14);
+            else if (game_stream_read_setting(line))
+                ;
             else
                 preserve_config_line(g_settings_passthrough,
                                      _countof(g_settings_passthrough), line);
@@ -4059,6 +4063,7 @@ ASB_API HRESULT asb_init(void)
         }
     }
     scan_templates();
+    game_stream_init();
 
     if (g_vm_count > 0) asb_log(L"Loaded %d VM(s) from config.", g_vm_count);
     if (g_template_count > 0) asb_log(L"Found %d template(s).", g_template_count);
@@ -4074,6 +4079,7 @@ ASB_API void asb_cleanup(void)
     int i;
     if (!g_initialized) return;
 
+    game_stream_shutdown();
     vm_web_shutdown();
     for (i = 0; i < g_vm_count; i++) {
         hcs_stop_monitor(&g_vms[i]);
@@ -4210,6 +4216,13 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
     if (cfg.cpu_cores == 0) cfg.cpu_cores = 4;
 
+    /* A given base disk works like a template, without being listed as one. */
+    if (config->base_vhdx && config->base_vhdx[0]) {
+        if (is_template_create) return E_INVALIDARG;
+        from_template = TRUE;
+        wcscpy_s(cfg.os_type, 32, L"Windows");
+    }
+
     /* Resolve template */
     if (config->template_name && config->template_name[0] != L'\0') {
         int i;
@@ -4291,6 +4304,12 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     cfg.secure_boot_off = (_wcsicmp(cfg.os_type, L"Windows") == 0);
     inst->secure_boot_off = cfg.secure_boot_off;
     inst->domain_member = cfg.domain_member;
+    if (config->session_clone) {
+        inst->session_clone = TRUE;
+        inst->install_complete = TRUE;   /* Windows is already installed on its image */
+        if (config->session_logon)
+            strcpy_s(inst->session_logon, sizeof(inst->session_logon), config->session_logon);
+    }
     if (config->lab_mode) {
         inst->lab_mode = TRUE;
         inst->domain_member = cfg.domain_member = FALSE;
@@ -4537,9 +4556,11 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
        creates go through the use_linux_cloud branch above; Windows ISO
        installs go through use_vhdx_first above). */
     if (from_template) {
-        asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
+        const wchar_t *base_path = template_idx >= 0 ? g_templates[template_idx].vhdx_path : config->base_vhdx;
+        asb_log(L"Creating differencing VHDX over \"%s\"...",
+                template_idx >= 0 ? g_templates[template_idx].name : config->base_vhdx);
         DeleteFileW(cfg.vhdx_path);
-        hr = vhdx_create_differencing(cfg.vhdx_path, g_templates[template_idx].vhdx_path);
+        hr = vhdx_create_differencing(cfg.vhdx_path, base_path);
         if (FAILED(hr)) { asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr); remove_dir_recursive(vhdx_dir); return hr; }
         asb_log(L"Differencing VHDX created.");
     } else {
@@ -4570,8 +4591,11 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
         } else if (from_template) {
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.admin_pass[0] != L'\0') {
                 wchar_t template_lang[32] = L"en-US";
-                vm_load_language_json(g_templates[template_idx].vhdx_path, template_lang, 32);
-                hr = iso_create_instance_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
+                vm_load_language_json(template_idx >= 0 ? g_templates[template_idx].vhdx_path : config->base_vhdx,
+                                      template_lang, 32);
+                hr = config->session_clone
+                    ? iso_create_session_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass, template_lang)
+                    : iso_create_instance_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
                                                     res_dir_buf, cfg.ssh_enabled, template_lang);
                 if (SUCCEEDED(hr)) {
                     wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
@@ -4703,6 +4727,8 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
 #undef cfg
 }
 
+static SRWLOCK g_vm_create_lock = SRWLOCK_INIT;
+
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 {
     VmConfig *cfg_storage;
@@ -4715,7 +4741,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         return E_OUTOFMEMORY;
     }
 
+    /* The UI and Game Streaming's workers both add to g_vms[]. */
+    AcquireSRWLockExclusive(&g_vm_create_lock);
     hr = asb_vm_create_impl(config, cfg_storage);
+    ReleaseSRWLockExclusive(&g_vm_create_lock);
     SecureZeroMemory(cfg_storage, sizeof(*cfg_storage));
     HeapFree(GetProcessHeap(), 0, cfg_storage);
     return hr;
@@ -5079,6 +5108,25 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
 
     save_vm_list();
     return S_OK;
+}
+
+HRESULT asb_session_clone_delete(UINT64 vm_id)
+{
+    VmInstance *inst = asb_find_vm_by_id(vm_id);
+    int idx;
+    HRESULT hr;
+    if (!inst || !inst->session_clone) return E_INVALIDARG;
+    idx = (int)(inst - g_vms);
+    SecureZeroMemory(inst->session_logon, sizeof(inst->session_logon));
+    hr = asb_vm_delete(vm_handle(inst));
+    if (SUCCEEDED(hr) && g_removed_cb) g_removed_cb(idx, g_removed_ud);
+    return hr;
+}
+
+void asb_session_clone_remove_leftover(const wchar_t *name, const wchar_t *dir)
+{
+    if (name) hcs_destroy_stale(name);
+    remove_dir_recursive(dir);
 }
 
 /* ---- VM Queries ---- */

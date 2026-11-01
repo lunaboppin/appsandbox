@@ -162,6 +162,65 @@ HRESULT vhdx_merge(const wchar_t *child_path)
     return S_OK;
 }
 
+/* A new standalone VHDX with the whole contents of src, differencing chain included.
+   Waits for the copy; pct follows it, and cancel stops it when set non-zero. */
+HRESULT vhdx_copy_flat(const wchar_t *dst_path, const wchar_t *src_path,
+                       volatile LONG *pct, volatile LONG *cancel)
+{
+    VIRTUAL_STORAGE_TYPE storage_type;
+    CREATE_VIRTUAL_DISK_PARAMETERS params;
+    OVERLAPPED ov;
+    HANDLE vhd_handle = INVALID_HANDLE_VALUE;
+    DWORD result;
+    HRESULT hr = S_OK;
+
+    if (!dst_path || !src_path)
+        return E_INVALIDARG;
+
+    storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storage_type.VendorId = VHDX_VENDOR_MS;
+
+    ZeroMemory(&params, sizeof(params));
+    params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+    params.Version2.SourcePath = src_path;
+    params.Version2.SourceVirtualStorageType = storage_type;
+
+    ZeroMemory(&ov, sizeof(ov));
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent)
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    result = CreateVirtualDisk(&storage_type, dst_path, VIRTUAL_DISK_ACCESS_NONE, NULL,
+                               CREATE_VIRTUAL_DISK_FLAG_NONE, 0, &params, &ov, &vhd_handle);
+    if (result == ERROR_IO_PENDING) {
+        BOOL cancelled = FALSE;
+        DWORD bytes;
+        for (;;) {
+            VIRTUAL_DISK_PROGRESS progress;
+            if (WaitForSingleObject(ov.hEvent, 1000) == WAIT_OBJECT_0)
+                break;
+            if (pct && GetVirtualDiskOperationProgress(vhd_handle, &ov, &progress) == ERROR_SUCCESS &&
+                progress.OperationStatus == ERROR_IO_PENDING && progress.CompletionValue)
+                InterlockedExchange(pct, (LONG)(progress.CurrentValue * 100 / progress.CompletionValue));
+            if (!cancelled && cancel && InterlockedCompareExchange(cancel, 0, 0)) {
+                CancelIoEx(vhd_handle, &ov);
+                cancelled = TRUE;
+            }
+        }
+        if (!GetOverlappedResult(vhd_handle, &ov, &bytes, FALSE))
+            hr = HRESULT_FROM_WIN32(GetLastError());
+    } else if (result != ERROR_SUCCESS) {
+        hr = HRESULT_FROM_WIN32(result);
+    }
+
+    if (vhd_handle != INVALID_HANDLE_VALUE && vhd_handle != NULL)
+        CloseHandle(vhd_handle);
+    CloseHandle(ov.hEvent);
+    if (FAILED(hr))
+        DeleteFileW(dst_path);
+    return hr;
+}
+
 HRESULT vhdx_resize_grow(const wchar_t *path, ULONGLONG new_size_gb,
                          ULONGLONG *old_size_bytes, ULONGLONG *new_size_bytes)
 {
@@ -957,7 +1016,8 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
                                         const wchar_t *vm_name,
                                         const wchar_t *admin_user,
                                         const wchar_t *b64_password,
-                                        const wchar_t *lang)
+                                        const wchar_t *lang,
+                                        BOOL session)
 {
     FILE *f;
     wchar_t comp_name[16];
@@ -1056,7 +1116,23 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                    <Group>Administrators</Group>\n"
         L"                    <Password><Value>%s</Value><PlainText>false</PlainText></Password>\n"
         L"                </LocalAccount>\n"
-        L"            </LocalAccounts></UserAccounts>\n"
+        L"            </LocalAccounts></UserAccounts>\n",
+        comp_name,
+        lang_to_input_locale(lang), lang, lang, lang,
+        admin_user, b64_password);
+
+    /* A Game Streaming duplicate already has the agent, and its first sign-in
+       belongs to the user the host signs in, so it skips the local account's. */
+    if (session) {
+        fwprintf(f,
+            L"        </component>\n"
+            L"    </settings>\n"
+            L"</unattend>\n");
+        fclose(f);
+        return TRUE;
+    }
+
+    fwprintf(f,
         L"            <AutoLogon>\n"
         L"                <Enabled>true</Enabled>\n"
         L"                <Username>%s</Username>\n"
@@ -1074,9 +1150,6 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"        </component>\n"
         L"    </settings>\n"
         L"</unattend>\n",
-        comp_name,
-        lang_to_input_locale(lang), lang, lang, lang,
-        admin_user, b64_password,
         admin_user, b64_password);
 
     fclose(f);
@@ -1811,13 +1884,14 @@ cleanup:
 }
 
 
-HRESULT iso_create_instance_resources(const wchar_t *iso_path,
+static HRESULT iso_create_instance_iso(const wchar_t *iso_path,
                                        const wchar_t *vm_name,
                                        const wchar_t *admin_user,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
-                                       const wchar_t *lang)
+                                       const wchar_t *lang,
+                                       BOOL session)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -1852,11 +1926,12 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
 
     /* unattend.xml (NOT autounattend.xml — post-sysprep mini-setup uses this name) */
     swprintf_s(file_path, MAX_PATH, L"%s\\unattend.xml", staging);
-    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang))
+    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang, session))
         ui_log(L"Warning: failed to write instance unattend.xml");
 
     /* Agent exe + setup.cmd + SSH MSI */
-    stage_agent_and_setup(staging, res_dir, ssh_enabled);
+    if (!session)
+        stage_agent_and_setup(staging, res_dir, ssh_enabled);
 
     /* Build ISO */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1870,6 +1945,28 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
         ui_log(L"Instance resources ISO created: %s", iso_path);
 
     return hr;
+}
+
+HRESULT iso_create_instance_resources(const wchar_t *iso_path,
+                                       const wchar_t *vm_name,
+                                       const wchar_t *admin_user,
+                                       wchar_t *admin_pass,
+                                       const wchar_t *res_dir,
+                                       BOOL ssh_enabled,
+                                       const wchar_t *lang)
+{
+    return iso_create_instance_iso(iso_path, vm_name, admin_user, admin_pass,
+                                   res_dir, ssh_enabled, lang, FALSE);
+}
+
+HRESULT iso_create_session_resources(const wchar_t *iso_path,
+                                     const wchar_t *vm_name,
+                                     const wchar_t *admin_user,
+                                     wchar_t *admin_pass,
+                                     const wchar_t *lang)
+{
+    return iso_create_instance_iso(iso_path, vm_name, admin_user, admin_pass,
+                                   NULL, FALSE, lang, TRUE);
 }
 
 /* ---- VHDX-First VM Creation ---- */

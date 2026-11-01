@@ -68,6 +68,8 @@ typedef struct AgentConn {
 
 #define MAX_AGENTS 16
 static AgentConn g_conns[MAX_AGENTS];
+/* One caller at a time per connection slot; outlives the slot's reuse. */
+static SRWLOCK   g_conn_send_locks[MAX_AGENTS];
 static BOOL      g_wsa_init = FALSE;
 
 static AgentConn *find_conn(VmInstance *vm)
@@ -621,6 +623,15 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
         }
 
+        /* A Game Streaming duplicate's first boot: Windows setup has to finish
+           before anything here can restart the guest. */
+        if (vm->session_clone && vm->session_logon[0]) {
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "session_setup_wait", buf, sizeof(buf), 25ul * 60ul * 1000ul);
+            if (n <= 0) goto disconnected;
+            if (strcmp(buf, "ok") != 0)
+                ui_log(L"Windows setup in \"%s\": %S", vm->name, buf);
+        }
+
         /* Configure the independent host-only NIC, then recreate signed global
            SMB mappings after every agent connection. Credentials are redacted
            from logs and scrubbed immediately after delivery. */
@@ -668,6 +679,14 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                rolled back to a checkpoint from before the join rejoins. */
             if (vm->domain_member) {
                 char join_cmd[1024];
+                /* Before the join: its restart is the boot that signs the user in. */
+                if (vm->session_logon[0]) {
+                    n = send_tagged_cmd(s, vm, &conn->cmd_seq, vm->session_logon, buf, sizeof(buf), 30000);
+                    if (n <= 0) goto disconnected;
+                    if (strcmp(buf, "ok") != 0)
+                        ui_log(L"Setting up the sign-in on \"%s\" failed (%S).", vm->name, buf);
+                    SecureZeroMemory(vm->session_logon, sizeof(vm->session_logon));
+                }
                 if (shared_appliance_domain_join_command(vm->share_host_ip,
                                                          join_cmd, sizeof(join_cmd))) {
                     n = send_tagged_cmd(s, vm, &conn->cmd_seq, join_cmd, buf, sizeof(buf), 300000);
@@ -994,8 +1013,12 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
                    char *response, int response_max, DWORD timeout_ms)
 {
     AgentConn *conn = find_conn(instance);
+    SRWLOCK *send_lock;
     BOOL ok;
-    BOOL quiet = command && strncmp(command, "lab_chunk:", 10) == 0;
+    BOOL quiet = command && (strncmp(command, "lab_chunk:", 10) == 0 ||
+                             strcmp(command, "session_status") == 0 ||
+                             strncmp(command, "session_catalog_read:", 21) == 0 ||
+                             strcmp(command, "session_image_status") == 0);
     BOOL redact = command &&
         (strncmp(command, "appliance_account:", 18) == 0 ||
          strncmp(command, "shared_smb_map:", 15) == 0 ||
@@ -1004,14 +1027,20 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
          strncmp(command, "domain_", 7) == 0);
 
     if (!conn || !instance->agent_online) {
-        ui_log(L"Agent: not connected to \"%s\"", instance->name);
+        if (!quiet) ui_log(L"Agent: not connected to \"%s\"", instance->name);
         return FALSE;
     }
 
     /* Hand the command to the connection thread (it owns the socket and is the
-       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
-       so concurrent callers for the SAME VM would clobber -- safe here because
-       per VM only one caller exists (shutdown). */
+       sole sender). This is a single slot per VM (conn->cmd), not a queue, and
+       browser sessions and Game Streaming call from their own threads, so callers
+       for the same VM take turns. */
+    send_lock = &g_conn_send_locks[conn - g_conns];
+    AcquireSRWLockExclusive(send_lock);
+    if (find_conn(instance) != conn || !instance->agent_online) {
+        ReleaseSRWLockExclusive(send_lock);
+        return FALSE;
+    }
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     /* The connection thread must not give up on the reply before we do. */
@@ -1025,16 +1054,19 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
        we return immediately, so we never block the single-threaded HTTP request
        loop / the GUI thread. Delivery is confirmed by the HCS SystemExited
        monitor, not by this reply. */
-    if (timeout_ms == 0)
+    if (timeout_ms == 0) {
+        ReleaseSRWLockExclusive(send_lock);
         return TRUE;
+    }
 
     /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
        expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
        SetEvent()s cmd_done with an empty rsp on recv<=0, so we return FALSE. */
     if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
         if (redact) ui_log(L"Agent: credential-bearing command timed out");
-        else ui_log(L"Agent: command \"%S\" timed out", command);
+        else if (!quiet) ui_log(L"Agent: command \"%S\" timed out", command);
         conn->cmd_pending = FALSE;
+        ReleaseSRWLockExclusive(send_lock);
         return FALSE;
     }
 
@@ -1045,6 +1077,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     if (quiet) ;
     else if (redact) ui_log(L"Agent: credential-bearing command -> %.120S", conn->rsp);
     else ui_log(L"Agent: %S -> %.300S", command, conn->rsp);
+    ReleaseSRWLockExclusive(send_lock);
     return ok;
 }
 

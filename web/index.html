@@ -28,6 +28,7 @@
             <button onclick="openUpdatesModal()" title="See this App Sandbox version and check for updates.">Updates</button>
             <button class="win-host-only" onclick="openSettingsModal()" title="Open the shared appliance and shared resource settings.">Shared Resources</button>
             <button class="win-host-only" onclick="openDomainModal()" title="Manage the users and groups of the AppSandbox domain (Windows Server Core appliance).">Domain</button>
+            <button class="win-host-only" onclick="openGameStreamingModal()" title="Optional: domain users start games from a web dashboard, each in their own throwaway copy of a VM.">Game Streaming</button>
             <button class="win-host-only" onclick="openLabModal()" title="Isolated, disposable VMs for running suspicious files, with recorded analysis reports.">Malware Lab</button>
             <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
         </div>
@@ -421,6 +422,60 @@
         <div class="modal-buttons">
             <button type="button" onclick="refreshDomain()">Refresh</button>
             <button type="button" onclick="closeDomainModal()">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Game Streaming: a web dashboard and a throwaway duplicate of one VM per session -->
+<div class="modal-overlay win-host-only" id="gs-overlay">
+    <div class="modal manage-modal">
+        <h3>Game Streaming</h3>
+        <p id="gs-status">Loading...</p>
+        <div class="modal-buttons" id="gs-domain-row" style="justify-content:flex-start;display:none">
+            <button type="button" onclick="closeGameStreamingModal();openDomainModal()">Open Domain</button>
+        </div>
+        <div id="gs-settings" style="display:none">
+            <fieldset>
+                <legend>Settings</legend>
+                <div class="settings-form">
+                    <label for="gs-vm">Nominated VM:</label>
+                    <select id="gs-vm"></select>
+                    <label for="gs-max">Most sessions at once:</label>
+                    <input id="gs-max" type="number" min="1" max="8" value="2">
+                    <label for="gs-idle">End after idle (minutes, 0 = never):</label>
+                    <input id="gs-idle" type="number" min="0" max="1440" value="30">
+                    <label for="gs-group">Only this domain group:</label>
+                    <input id="gs-group" maxlength="64" spellcheck="false" placeholder="Any domain user">
+                </div>
+                <label class="manage-check"><input type="checkbox" id="gs-lan"> Allow other devices (private and domain networks, over HTTPS)</label>
+                <small>Each session is a new copy of the nominated VM's saved image. Whoever signs in gets full control of their copy, including everything installed in the image, and anything signed in there, like a launcher account. Sessions run on this PC's memory, CPU and GPU.</small>
+                <div class="modal-buttons" style="justify-content:flex-start">
+                    <button type="button" class="primary" onclick="saveGameStreaming()">Save</button>
+                </div>
+            </fieldset>
+            <fieldset>
+                <legend>Saved image</legend>
+                <p id="gs-image-state"></p>
+                <small>Building copies the VM's disk, so it needs that much free space, and the VM has to be shut down while it's copied. After that it's free to run. Refresh the image to pick up new or updated games.</small>
+                <p id="gs-image-error" class="manage-remote-error"></p>
+                <div class="modal-buttons" style="justify-content:flex-start">
+                    <button type="button" id="btn-gs-build" onclick="buildGameStreamingImage()">Build Image</button>
+                </div>
+            </fieldset>
+            <fieldset id="gs-dashboard-section">
+                <legend>Dashboard</legend>
+                <div id="gs-dashboard"></div>
+                <small id="gs-fingerprint"></small>
+            </fieldset>
+            <fieldset id="gs-sessions-section">
+                <legend>Active sessions</legend>
+                <div id="gs-sessions" class="settings-resource-list"></div>
+            </fieldset>
+            <small>Moonlight needs its address and a PIN for each session. Launchers like Steam and Epic may ask users to sign in each session, and only Desktop, Documents, Downloads and Pictures are kept between sessions.</small>
+        </div>
+        <div class="modal-buttons">
+            <button type="button" id="btn-gs-off" class="danger" onclick="turnOffGameStreaming()" style="display:none">Turn Off</button>
+            <button type="button" onclick="closeGameStreamingModal()">Close</button>
         </div>
     </div>
 </div>

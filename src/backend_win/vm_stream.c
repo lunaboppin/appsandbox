@@ -49,6 +49,7 @@ typedef struct StreamRelay {
     int      base_port;
     volatile BOOL stop;
     volatile LONG tcp_conns;
+    volatile ULONGLONG last_activity;
     SOCKET   tcp_listen[TCP_PORTS];
     SOCKET   udp_listen[UDP_PORTS];
     HANDLE   tcp_thread;
@@ -232,6 +233,7 @@ static DWORD WINAPI tcp_accept_thread(LPVOID param)
                     c->client = client;
                     c->guest_port = r->base_port + g_tcp_offsets[i];
                     InterlockedIncrement(&r->tcp_conns);
+                    r->last_activity = GetTickCount64();
                     t = CreateThread(NULL, 0, tcp_conn_thread, c, 0, NULL);
                     if (t) CloseHandle(t);
                     else { InterlockedDecrement(&r->tcp_conns); free(c); }
@@ -330,6 +332,7 @@ static DWORD WINAPI udp_thread(LPVOID param)
                         c = udp_client_for(clients, &from, i, r);
                         if (c) {
                             c->last_tick = now;
+                            r->last_activity = now;
                             send(c->upstream, buf, got, 0);
                         }
                     } else {
@@ -506,6 +509,21 @@ static DWORD pick_port(VmInstance *vm)
         if (!used) return port;
         port += STREAM_PORT_STEP;
     }
+}
+
+ULONGLONG vm_stream_last_activity(UINT64 vm_id)
+{
+    ULONGLONG when = 0;
+    int i;
+    AcquireSRWLockShared(&g_relay_lock);
+    for (i = 0; i < MAX_RELAYS; i++) {
+        if (g_relays[i] && g_relays[i]->vm_id == vm_id) {
+            when = g_relays[i]->last_activity;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_relay_lock);
+    return when;
 }
 
 void vm_stream_setup_command(VmInstance *vm, char *cmd, int cap)

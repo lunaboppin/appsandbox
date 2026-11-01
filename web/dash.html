@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Game Streaming</title>
+<link rel="stylesheet" href="/dash.css">
+</head>
+<body>
+<header id="top" hidden>
+  <h1>Game Streaming</h1>
+  <span id="who"></span>
+  <button id="btn-signout" type="button">Sign out</button>
+</header>
+
+<main>
+  <form id="signin" class="card" hidden>
+    <h1>Game Streaming</h1>
+    <p>Sign in with your domain account.</p>
+    <label for="user">User name</label>
+    <input id="user" autocomplete="username" spellcheck="false" maxlength="20" required>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <p id="signin-error" class="error" role="alert"></p>
+    <button type="submit" class="primary" id="btn-signin">Sign in</button>
+  </form>
+
+  <section id="library" hidden>
+    <p id="library-note" class="muted"></p>
+    <div id="tiles"></div>
+  </section>
+
+  <section id="session" class="card" hidden>
+    <h2 id="session-title"></h2>
+    <p id="session-detail" class="muted" role="status"></p>
+    <p id="session-wait" class="muted">Starting takes a few minutes. You can leave this page and come back.</p>
+    <p id="session-error" class="error" role="alert"></p>
+    <div id="session-browser" hidden>
+      <button type="button" class="primary" id="btn-open">Open browser view</button>
+    </div>
+    <div id="session-moonlight" hidden>
+      <h3>Connect with Moonlight</h3>
+      <ol>
+        <li>In Moonlight, choose <b>Add PC</b> and enter <code id="moonlight-address"></code>.</li>
+        <li>Pick that PC. Moonlight shows a 4-digit PIN: enter it here.</li>
+        <li>Open <b>Desktop</b> in Moonlight. What you picked is already open there.</li>
+      </ol>
+      <form id="pair">
+        <input id="pin" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" placeholder="PIN" aria-label="PIN Moonlight shows" required>
+        <button type="submit">Pair</button>
+        <span id="pair-result" class="muted" role="status"></span>
+      </form>
+    </div>
+    <div class="row">
+      <button type="button" id="btn-switch" hidden></button>
+      <button type="button" id="btn-end" class="danger">End session</button>
+    </div>
+    <p class="muted">Ending the session deletes this VM. Your Desktop, Documents, Downloads and Pictures stay on your H: drive; anything else you saved in it is lost.</p>
+  </section>
+</main>
+
+<dialog id="choose">
+  <form method="dialog" id="choose-form">
+    <h2 id="choose-title"></h2>
+    <p class="muted">How do you want to play?</p>
+    <div id="choose-password" hidden>
+      <label for="choose-pass">Your password is needed again to start a VM.</label>
+      <input id="choose-pass" type="password" autocomplete="current-password">
+    </div>
+    <p id="choose-error" class="error" role="alert"></p>
+    <div class="row">
+      <button type="button" class="primary" id="btn-browser">Browser view</button>
+      <button type="button" class="primary" id="btn-moonlight">Moonlight</button>
+      <button type="submit">Cancel</button>
+    </div>
+  </form>
+</dialog>
+<script src="/dash.js"></script>
+</body>
+</html>

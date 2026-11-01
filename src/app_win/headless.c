@@ -35,6 +35,7 @@
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_stream.h"
 #include "vm_web.h"
+#include "game_stream.h"
 #include "vm_display_auto.h"   /* display window (Hyper-V console while booting, then IDD) */
 #include "vm_seamless.h"       /* seamless mode: guest windows as host windows */
 
@@ -665,7 +666,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"streaming\":true,\"browserAccess\":true,\"runInSandbox\":true,\"seamless\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"streaming\":true,\"browserAccess\":true,\"gameStreaming\":true,\"runInSandbox\":true,\"seamless\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -833,6 +834,77 @@ static int handle_request(PHTTP_REQUEST req)
         HRESULT hr = asb_template_delete(name);
         char nu[256] = {0}; WideCharToMultiByte(CP_UTF8,0,name,-1,nu,sizeof(nu),NULL,NULL);
         send_hr(req->RequestId, "deleteTemplate", nu, hr);
+        return 0;
+    }
+
+    /* ---- /v1/domain/users ----
+         POST   /v1/domain/users         {name, password, enabled, groups}
+         DELETE /v1/domain/users/{name}                                     */
+    if (wcscmp(path, L"/v1/domain/users") == 0 || wcsncmp(path, L"/v1/domain/users/", 17) == 0) {
+        wchar_t message[512] = L"";
+        HRESULT hr;
+        if (verb == HttpVerbPOST && wcscmp(path, L"/v1/domain/users") == 0) {
+            wchar_t body[2048] = L"", name[64] = L"", password[128] = L"", groups[1024] = L"";
+            BOOL enabled = TRUE;
+            body_to_wide(req, body, _countof(body));
+            json_get_string(body, L"name", name, _countof(name));
+            json_get_string(body, L"password", password, _countof(password));
+            json_get_string(body, L"groups", groups, _countof(groups));
+            json_get_bool(body, L"enabled", &enabled);
+            hr = asb_domain_user_set(name, password[0] ? password : NULL, enabled, groups, message, _countof(message));
+            SecureZeroMemory(body, sizeof(body));
+            SecureZeroMemory(password, sizeof(password));
+        } else if (verb == HttpVerbDELETE && path[16] == L'/') {
+            hr = asb_domain_user_delete(path + 17, message, _countof(message));
+        } else {
+            send_err(req->RequestId, 404, "Not Found", "not_found", "no such route");
+            return 0;
+        }
+        if (FAILED(hr)) {
+            char m[600] = "the request could not be done";
+            if (message[0]) WideCharToMultiByte(CP_UTF8, 0, message, -1, m, sizeof(m), NULL, NULL);
+            send_err(req->RequestId, 409, "Conflict", "domain_refused", m);
+            return 0;
+        }
+        send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+        return 0;
+    }
+
+    /* ---- /v1/game-streaming ----
+         GET  /v1/game-streaming
+         POST /v1/game-streaming        {vm, maxSessions, idleMinutes, group, lan}
+         POST /v1/game-streaming/image  build or refresh the image
+         POST /v1/game-streaming/off    end every session and delete the image */
+    if (wcscmp(path, L"/v1/game-streaming") == 0 || wcsncmp(path, L"/v1/game-streaming/", 19) == 0) {
+        wchar_t message[512] = L"";
+        HRESULT hr = S_OK;
+        if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming") == 0) {
+            wchar_t body[1024] = L"", vm[256] = L"", group[65] = L"";
+            int max_sessions = 2, idle = 30;
+            BOOL lan = FALSE;
+            body_to_wide(req, body, _countof(body));
+            json_get_string(body, L"vm", vm, _countof(vm));
+            json_get_string(body, L"group", group, _countof(group));
+            json_get_int(body, L"maxSessions", &max_sessions);
+            json_get_int(body, L"idleMinutes", &idle);
+            json_get_bool(body, L"lan", &lan);
+            hr = game_stream_configure(vm, max_sessions, idle, group, lan, message, _countof(message));
+        } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/image") == 0) {
+            hr = game_stream_build_image(message, _countof(message));
+        } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/off") == 0) {
+            hr = game_stream_turn_off();
+        } else if (verb != HttpVerbGET || wcscmp(path, L"/v1/game-streaming") != 0) {
+            send_err(req->RequestId, 404, "Not Found", "not_found", "no such route");
+            return 0;
+        }
+        if (FAILED(hr)) {
+            char m[600] = "the request could not be done";
+            if (message[0]) WideCharToMultiByte(CP_UTF8, 0, message, -1, m, sizeof(m), NULL, NULL);
+            send_err(req->RequestId, 409, "Conflict", "game_streaming_refused", m);
+            return 0;
+        }
+        game_stream_status_json(buf, sizeof(buf));
+        send_json(req->RequestId, 200, "OK", buf);
         return 0;
     }
 

@@ -25,6 +25,7 @@
 #include <shlobj.h>
 #include <userenv.h>
 #include <ntsecapi.h>
+#include <wincrypt.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -40,6 +41,7 @@
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "crypt32.lib")
 
 /* GUID_DEVCLASS_DISPLAY = {4D36E968-E325-11CE-BFC1-08002BE10318} */
 static const GUID GUID_DISPLAY_CLASS =
@@ -2806,6 +2808,370 @@ static void stream_command(const char *cmd, char *reply, size_t reply_size)
     }
 }
 
+/* ---- Game Streaming ----
+
+   The appliance checks a dashboard sign-in and forgets duplicates' computer accounts.
+   A duplicate, booted from its generalized image, waits out Windows setup, then signs
+   its user in once. An image build scans for games and generalizes the disk. */
+static const char DOMAIN_VALIDATE_PS[] =
+        "function AsbText($v){ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$v)) }\r\n"
+        "try{\r\n"
+        " Add-Type -AssemblyName System.DirectoryServices.AccountManagement\r\n"
+        " $u=$env:ASB_DOM_USER; $p=AsbText $env:ASB_DOM_PW; $g=AsbText $env:ASB_DOM_GROUP\r\n"
+        " $c=New-Object DirectoryServices.AccountManagement.PrincipalContext([DirectoryServices.AccountManagement.ContextType]::Domain)\r\n"
+        " if(-not $c.ValidateCredentials($u,$p,[DirectoryServices.AccountManagement.ContextOptions]::Negotiate)){ Write-Output 'result:denied'; exit 0 }\r\n"
+        " if($g){\r\n"
+        "  $gp=[DirectoryServices.AccountManagement.GroupPrincipal]::FindByIdentity($c,$g)\r\n"
+        "  $up=[DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity($c,$u)\r\n"
+        "  if(-not $gp -or -not $up -or -not $up.IsMemberOf($gp)){ Write-Output 'result:not_allowed'; exit 0 }\r\n"
+        " }\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + ($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+
+static const char DOMAIN_COMPUTER_REMOVE_PS[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " $c=Get-ADComputer -Filter (\"Name -eq '\"+$env:ASB_DOM_USER+\"'\")\r\n"
+        " if($c){ Remove-ADObject -Identity $c -Recursive -Confirm:$false }\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + ($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+
+#define WINLOGON_KEY L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"
+
+/* The sign-in's password is an LSA secret, where Winlogon looks first: nothing readable
+   in the registry. NULL deletes it. */
+static BOOL set_autologon_secret(const wchar_t *password)
+{
+    LSA_OBJECT_ATTRIBUTES attrs;
+    LSA_HANDLE policy = NULL;
+    LSA_UNICODE_STRING key, data;
+    wchar_t name[] = L"DefaultPassword";
+    NTSTATUS status;
+
+    ZeroMemory(&attrs, sizeof(attrs));
+    if (LsaOpenPolicy(NULL, &attrs, POLICY_CREATE_SECRET, &policy) != 0) return FALSE;
+    key.Buffer = name;
+    key.Length = (USHORT)(wcslen(name) * sizeof(wchar_t));
+    key.MaximumLength = key.Length + sizeof(wchar_t);
+    if (password) {
+        data.Buffer = (PWSTR)password;
+        data.Length = (USHORT)(wcslen(password) * sizeof(wchar_t));
+        data.MaximumLength = data.Length + sizeof(wchar_t);
+    }
+    status = LsaStorePrivateData(policy, &key, password ? &data : NULL);
+    LsaClose(policy);
+    return status == 0;
+}
+
+static void winlogon_set(const wchar_t *name, const wchar_t *value)
+{
+    RegSetKeyValueW(HKEY_LOCAL_MACHINE, WINLOGON_KEY, name, REG_SZ, value,
+                    (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)));
+}
+
+/* domain_autologon:<netbios>:<user>:<base64 password>. The next boot signs in once. */
+static void session_autologon(const char *domain, const char *user, const char *b64,
+                              char *reply, size_t reply_size)
+{
+    BYTE raw[512];
+    wchar_t password[256], domain_w[32], user_w[64];
+    DWORD raw_len = sizeof(raw) - 1, one = 1;
+    int chars;
+
+    if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, raw, &raw_len, NULL, NULL)) {
+        strcpy_s(reply, reply_size, "error:invalid arguments");
+        return;
+    }
+    raw[raw_len] = 0;
+    chars = MultiByteToWideChar(CP_UTF8, 0, (const char *)raw, -1, password, _countof(password));
+    SecureZeroMemory(raw, sizeof(raw));
+    MultiByteToWideChar(CP_UTF8, 0, domain, -1, domain_w, _countof(domain_w));
+    MultiByteToWideChar(CP_UTF8, 0, user, -1, user_w, _countof(user_w));
+    if (chars <= 0 || !set_autologon_secret(password)) {
+        SecureZeroMemory(password, sizeof(password));
+        strcpy_s(reply, reply_size, "error:could not store the sign-in");
+        return;
+    }
+    SecureZeroMemory(password, sizeof(password));
+    RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, WINLOGON_KEY, L"DefaultPassword");
+    winlogon_set(L"DefaultDomainName", domain_w);
+    winlogon_set(L"DefaultUserName", user_w);
+    winlogon_set(L"AutoAdminLogon", L"1");
+    RegSetKeyValueW(HKEY_LOCAL_MACHINE, WINLOGON_KEY, L"AutoLogonCount", REG_DWORD, &one, sizeof(one));
+    /* A domain sign-in needs the network, so Winlogon has to wait for it. */
+    RegSetKeyValueW(HKEY_LOCAL_MACHINE,
+                    L"SOFTWARE\\Policies\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                    L"SyncForegroundPolicy", REG_DWORD, &one, sizeof(one));
+    strcpy_s(reply, reply_size, "ok");
+}
+
+static void session_autologon_clear(void)
+{
+    set_autologon_secret(NULL);
+    RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, WINLOGON_KEY, L"DefaultPassword");
+    RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, WINLOGON_KEY, L"AutoLogonCount");
+    winlogon_set(L"AutoAdminLogon", L"0");
+}
+
+/* Windows setup is still going after sysprep; a restart now would break it. */
+static void session_setup_wait(char *reply, size_t reply_size)
+{
+    int i;
+    for (i = 0; i < 240; i++) {
+        DWORD setup = 1, oobe = 1, size = sizeof(DWORD);
+        RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\Setup", L"SystemSetupInProgress",
+                     RRF_RT_REG_DWORD, NULL, &setup, &size);
+        size = sizeof(DWORD);
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\Setup", L"OOBEInProgress",
+                         RRF_RT_REG_DWORD, NULL, &oobe, &size) != ERROR_SUCCESS)
+            oobe = 0;
+        if (!setup && !oobe) {
+            strcpy_s(reply, reply_size, "ok");
+            return;
+        }
+        Sleep(5000);
+    }
+    strcpy_s(reply, reply_size, "error:Windows setup did not finish");
+}
+
+/* "ok:" alone, or "ok:<domain>\<user>" for whoever is at the console. */
+static void session_status(char *reply, size_t reply_size)
+{
+    DWORD session = WTSGetActiveConsoleSessionId(), got;
+    char *user = NULL, *domain = NULL;
+    strcpy_s(reply, reply_size, "ok:");
+    if (session != 0xFFFFFFFF &&
+        WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &user, &got) &&
+        WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSDomainName, &domain, &got) &&
+        user[0])
+        sprintf_s(reply, reply_size, "ok:%s\\%s", domain, user);
+    if (user) WTSFreeMemory(user);
+    if (domain) WTSFreeMemory(domain);
+}
+
+/* Open a launcher link in the signed-in user's session. */
+static BOOL session_open_target(const wchar_t *target, char *reply, size_t reply_size)
+{
+    DWORD session = WTSGetActiveConsoleSessionId();
+    HANDLE token = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    LPVOID env = NULL;
+    wchar_t line[1024];
+    BOOL ok;
+
+    if (session == 0xFFFFFFFF || !WTSQueryUserToken(session, &token)) {
+        strcpy_s(reply, reply_size, "error:no_user");
+        return FALSE;
+    }
+    swprintf_s(line, _countof(line), L"explorer.exe \"%s\"", target);
+    if (!CreateEnvironmentBlock(&env, token, FALSE)) env = NULL;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    ok = CreateProcessAsUserW(token, NULL, line, NULL, NULL, FALSE,
+                              env ? CREATE_UNICODE_ENVIRONMENT : 0, env, NULL, &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        strcpy_s(reply, reply_size, "ok");
+    } else {
+        sprintf_s(reply, reply_size, "error:could not open it (%lu)", GetLastError());
+    }
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(token);
+    return ok;
+}
+
+static BOOL session_digits(const char *s)
+{
+    if (!*s) return FALSE;
+    for (; *s; s++) if (!isdigit((unsigned char)*s)) return FALSE;
+    return TRUE;
+}
+
+/* session_launch:<catalog id>. Only ids the scan can produce, never a path or a link:
+   steam:<digits>, epic:<namespace>:<item>:<app>, gog:<digits>. */
+static void session_launch(const char *id, char *reply, size_t reply_size)
+{
+    wchar_t target[768];
+    if (strncmp(id, "steam:", 6) == 0 && session_digits(id + 6)) {
+        swprintf_s(target, _countof(target), L"steam://rungameid/%S", id + 6);
+    } else if (strncmp(id, "epic:", 5) == 0 && domain_field_ok(id + 5, ":-_", 400)) {
+        swprintf_s(target, _countof(target),
+                   L"com.epicgames.launcher://apps/%S?action=launch&silent=true", id + 5);
+    } else if (strncmp(id, "gog:", 4) == 0 && session_digits(id + 4)) {
+        wchar_t key[128];
+        DWORD size = sizeof(target);
+        swprintf_s(key, _countof(key), L"SOFTWARE\\WOW6432Node\\GOG.com\\Games\\%S", id + 4);
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"launchCommand", RRF_RT_REG_SZ, NULL, target, &size) != ERROR_SUCCESS) {
+            strcpy_s(reply, reply_size, "error:that game is not installed");
+            return;
+        }
+    } else {
+        strcpy_s(reply, reply_size, "error:invalid arguments");
+        return;
+    }
+    agent_log("Game Streaming: launching %s.", id);
+    session_open_target(target, reply, reply_size);
+}
+
+#define CATALOG_DIR L"C:\\ProgramData\\AppSandbox\\catalog"
+#define CATALOG_CHUNK 18000
+
+static const char SESSION_CATALOG_PS[] =
+    "$ErrorActionPreference='Continue'\r\n"
+    "$dir='C:\\ProgramData\\AppSandbox\\catalog'\r\n"
+    "Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue\r\n"
+    "New-Item -ItemType Directory -Force $dir | Out-Null\r\n"
+    "$games=New-Object System.Collections.ArrayList\r\n"
+    "function Add($id,$name,$source,$art){ [void]$games.Add(@{id=$id;name=$name;source=$source;art=$art}) }\r\n"
+    "$steam=(Get-ItemProperty 'HKLM:\\SOFTWARE\\WOW6432Node\\Valve\\Steam' -ErrorAction SilentlyContinue).InstallPath\r\n"
+    "if($steam -and (Test-Path $steam)){\r\n"
+    " $libs=@($steam)\r\n"
+    " $vdf=Join-Path $steam 'steamapps\\libraryfolders.vdf'\r\n"
+    " if(Test-Path $vdf){ foreach($m in [regex]::Matches((Get-Content $vdf -Raw),'\"path\"\\s+\"([^\"]+)\"')){ $libs+=$m.Groups[1].Value.Replace('\\\\','\\') } }\r\n"
+    " foreach($lib in ($libs | Sort-Object -Unique)){\r\n"
+    "  foreach($f in (Get-ChildItem (Join-Path $lib 'steamapps') -Filter 'appmanifest_*.acf' -ErrorAction SilentlyContinue)){\r\n"
+    "   $t=Get-Content $f.FullName -Raw\r\n"
+    "   $id=[regex]::Match($t,'\"appid\"\\s+\"(\\d+)\"').Groups[1].Value\r\n"
+    "   $n=[regex]::Match($t,'\"name\"\\s+\"([^\"]+)\"').Groups[1].Value\r\n"
+    "   if(-not $id -or -not $n -or $id -eq '228980' -or $n -like 'Steamworks*'){ continue }\r\n"
+    "   $art=''\r\n"
+    "   $cache=Join-Path $steam 'appcache\\librarycache'\r\n"
+    "   $pick=@(Get-Item (Join-Path $cache ($id+'_header.jpg')) -ErrorAction SilentlyContinue)+@(Get-ChildItem (Join-Path $cache $id) -Recurse -Filter 'header.jpg' -ErrorAction SilentlyContinue) | Where-Object { $_ -and $_.Length -lt 1048576 } | Select-Object -First 1\r\n"
+    "   if($pick){ $art='steam_'+$id+'.jpg'; Copy-Item $pick.FullName (Join-Path $dir $art) -Force }\r\n"
+    "   Add ('steam:'+$id) $n 'Steam' $art\r\n"
+    "  }\r\n"
+    " }\r\n"
+    "}\r\n"
+    "foreach($f in (Get-ChildItem 'C:\\ProgramData\\Epic\\EpicGamesLauncher\\Data\\Manifests' -Filter '*.item' -ErrorAction SilentlyContinue)){\r\n"
+    " try{ $j=Get-Content $f.FullName -Raw | ConvertFrom-Json }catch{ continue }\r\n"
+    " if($j.bIsIncompleteInstall){ continue }\r\n"
+    " $id=$j.CatalogNamespace+':'+$j.CatalogItemId+':'+$j.AppName\r\n"
+    " if($id -match '^[A-Za-z0-9:_-]+$' -and $j.DisplayName){ Add ('epic:'+$id) $j.DisplayName 'Epic Games' '' }\r\n"
+    "}\r\n"
+    "foreach($k in (Get-ChildItem 'HKLM:\\SOFTWARE\\WOW6432Node\\GOG.com\\Games' -ErrorAction SilentlyContinue)){\r\n"
+    " $g=Get-ItemProperty $k.PSPath\r\n"
+    " if($k.PSChildName -match '^\\d+$' -and $g.launchCommand){ Add ('gog:'+$k.PSChildName) $(if($g.gameName){$g.gameName}else{$g.GAMENAME}) 'GOG' '' }\r\n"
+    "}\r\n"
+    "$list=@($games | Sort-Object { $_.name })\r\n"
+    "[IO.File]::WriteAllText((Join-Path $dir 'catalog.json'),(ConvertTo-Json -InputObject $list -Compress),(New-Object Text.UTF8Encoding($false)))\r\n"
+    "Write-Output ('result:'+$list.Count)\r\n";
+
+/* session_catalog_read:<file>:<offset>: "ok:<total bytes>:<base64 piece>". */
+static void session_catalog_read(char *args, char *reply, size_t reply_size)
+{
+    char *f[3];
+    wchar_t path[MAX_PATH];
+    HANDLE file;
+    BYTE *chunk;
+    DWORD got = 0, cap, total;
+    int pos;
+    LONGLONG offset;
+    LARGE_INTEGER at;
+
+    if (domain_split(args, f, 3) != 2 || !f[0][0] || !domain_field_ok(f[0], "._", 64) ||
+        strstr(f[0], "..") || !session_digits(f[1])) {
+        strcpy_s(reply, reply_size, "error:invalid arguments");
+        return;
+    }
+    offset = _atoi64(f[1]);
+    swprintf_s(path, MAX_PATH, CATALOG_DIR L"\\%S", f[0]);
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        strcpy_s(reply, reply_size, "error:not_found");
+        return;
+    }
+    total = GetFileSize(file, NULL);
+    at.QuadPart = offset;
+    chunk = (BYTE *)malloc(CATALOG_CHUNK);
+    pos = sprintf_s(reply, reply_size, "ok:%lu:", total);
+    cap = (DWORD)(reply_size - pos);
+    if (chunk && SetFilePointerEx(file, at, NULL, FILE_BEGIN) &&
+        ReadFile(file, chunk, CATALOG_CHUNK, &got, NULL) && got) {
+        if (!CryptBinaryToStringA(chunk, got, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, reply + pos, &cap))
+            strcpy_s(reply, reply_size, "error:encode_failed");
+    }
+    free(chunk);
+    CloseHandle(file);
+}
+
+/* The last step of an image build. The AD account stays: it belongs to the VM this disk
+   was copied from, so the domain is left on this machine only (flags 0). Sysprep shuts
+   the VM down; if it doesn't, the status file says why. */
+static const char SESSION_IMAGE_PS[] =
+    "$s='C:\\ProgramData\\AppSandbox\\image-status.txt'\r\n"
+    "function St($t){ Set-Content -Path $s -Value $t -Encoding ascii }\r\n"
+    "try{\r\n"
+    " St 'cleaning'\r\n"
+    " Stop-Service SunshineService -Force -ErrorAction SilentlyContinue\r\n"
+    " $sun=Join-Path $env:ProgramFiles 'Sunshine\\config'\r\n"
+    " foreach($p in 'sunshine_state.json','credentials','sunshine.log'){ Remove-Item (Join-Path $sun $p) -Recurse -Force -ErrorAction SilentlyContinue }\r\n"
+    " foreach($p in 'webui.txt','status.txt'){ Remove-Item (Join-Path 'C:\\ProgramData\\AppSandbox\\stream' $p) -Force -ErrorAction SilentlyContinue }\r\n"
+    " Remove-Item 'C:\\ProgramData\\AppSandbox\\catalog' -Recurse -Force -ErrorAction SilentlyContinue\r\n"
+    " Remove-Item 'C:\\ProgramData\\AppSandbox\\user-drives.txt' -Force -ErrorAction SilentlyContinue\r\n"
+    " # Setup would prefer these older answer files to the duplicate's own.\r\n"
+    " foreach($p in 'C:\\Windows\\Panther\\unattend.xml','C:\\Windows\\Panther\\Unattend\\unattend.xml','C:\\Windows\\System32\\Sysprep\\unattend.xml'){ Remove-Item $p -Force -ErrorAction SilentlyContinue }\r\n"
+    " if((Get-CimInstance Win32_ComputerSystem).PartOfDomain){\r\n"
+    "  Add-Type 'using System.Runtime.InteropServices; public static class AsbJoin{[DllImport(\"netapi32.dll\",CharSet=CharSet.Unicode)] public static extern int NetUnjoinDomain(string s,string a,string p,int f);}'\r\n"
+    "  $r=[AsbJoin]::NetUnjoinDomain($null,$null,$null,0)\r\n"
+    "  if($r -ne 0){ throw \"Could not leave the domain (error $r).\" }\r\n"
+    " }\r\n"
+    " St 'sysprep'\r\n"
+    " $p=Start-Process (Join-Path $env:WINDIR 'System32\\Sysprep\\sysprep.exe') -ArgumentList '/generalize','/oobe','/shutdown','/mode:vm' -PassThru -Wait\r\n"
+    " Start-Sleep -Seconds 20\r\n"
+    " $why=Get-Content (Join-Path $env:WINDIR 'System32\\Sysprep\\Panther\\setuperr.log') -Tail 3 -ErrorAction SilentlyContinue\r\n"
+    " St ('failed|Windows Sysprep stopped (code '+$p.ExitCode+'). '+(($why -join ' ') -replace '[\\r\\n|]',' '))\r\n"
+    "}catch{ St ('failed|'+($_.Exception.Message -replace '[\\r\\n|]',' ')) }\r\n";
+
+static DWORD WINAPI session_image_thread(LPVOID param)
+{
+    static const wchar_t path[] = L"C:\\ProgramData\\AppSandbox\\image-prepare.ps1";
+    char out[512];
+    (void)param;
+    if (!write_agent_script(path, SESSION_IMAGE_PS))
+        run_agent_powershell_out(path, 60 * 60 * 1000, out, sizeof(out));
+    return 0;
+}
+
+static void session_command(char *cmd, char *reply, size_t reply_size)
+{
+    if (strcmp(cmd, "session_status") == 0) {
+        session_status(reply, reply_size);
+    } else if (strcmp(cmd, "session_setup_wait") == 0) {
+        session_setup_wait(reply, reply_size);
+    } else if (strcmp(cmd, "session_signed_in") == 0) {
+        session_autologon_clear();
+        strcpy_s(reply, reply_size, "ok");
+    } else if (strncmp(cmd, "session_launch:", 15) == 0) {
+        session_launch(cmd + 15, reply, reply_size);
+    } else if (strcmp(cmd, "session_catalog_scan") == 0) {
+        run_domain_script(SESSION_CATALOG_PS, 5 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "session_catalog_read:", 21) == 0) {
+        session_catalog_read(cmd + 21, reply, reply_size);
+    } else if (strcmp(cmd, "session_image_prepare") == 0) {
+        HANDLE t = CreateThread(NULL, 0, session_image_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+        strcpy_s(reply, reply_size, t ? "ok" : "error:could not start");
+    } else if (strcmp(cmd, "session_image_status") == 0) {
+        char text[400] = "";
+        DWORD got = 0;
+        HANDLE f = CreateFileW(L"C:\\ProgramData\\AppSandbox\\image-status.txt", GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            ReadFile(f, text, sizeof(text) - 1, &got, NULL);
+            CloseHandle(f);
+        }
+        text[got] = 0;
+        text[strcspn(text, "\r\n")] = 0;
+        sprintf_s(reply, reply_size, "ok:%s", text);
+    } else {
+        strcpy_s(reply, reply_size, "error:unknown");
+    }
+}
+
 static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
 {
     char *f[8];
@@ -2855,6 +3221,25 @@ static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
                           reply, reply_size);
     } else if (strcmp(cmd, "domain_ensure") == 0) {
         run_domain_script(DOMAIN_ENSURE_PS, 10 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_validate:", 16) == 0) {
+        n = domain_split(cmd + 16, f, 8);       /* user, pw, group or empty */
+        if (n != 3 || !domain_field_ok(f[0], "._-", 20) || !domain_field_ok(f[1], "+/=", 600) ||
+            !domain_field_ok(f[2], "+/=", 200)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_PW", f[1]);
+        SetEnvironmentVariableA("ASB_DOM_GROUP", f[2]);
+        run_domain_script(DOMAIN_VALIDATE_PS, 60000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_computer_remove:", 23) == 0) {
+        /* Only a duplicate's name: nothing else in the domain goes this way. */
+        char *name = cmd + 23;
+        if (strncmp(name, "GS-", 3) != 0 || !domain_field_ok(name, "-", 15)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_USER", name);
+        run_domain_script(DOMAIN_COMPUTER_REMOVE_PS, 60000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_autologon:", 17) == 0) {
+        n = domain_split(cmd + 17, f, 8);       /* NB, user, pw */
+        if (n != 3 || !f[0][0] || !f[1][0] || !domain_field_ok(f[0], "-", 15) ||
+            !domain_field_ok(f[1], "._-", 20) || !domain_field_ok(f[2], "+/=", 600)) goto invalid;
+        session_autologon(f[0], f[1], f[2], reply, reply_size);
     } else if (strncmp(cmd, "domain_join:", 12) == 0) {
         n = domain_split(cmd + 12, f, 8);       /* FQDN, NB, dc, NB\user, pw */
         if (n != 5 || !domain_field_ok(f[0], ".-", 200) || !domain_field_ok(f[1], "-", 15) ||
@@ -4015,8 +4400,11 @@ static void handle_client(AsbConn *client)
             agent_log("Command: shared_smb_map:<redacted>");
         else if (strncmp(cmd, "domain_", 7) == 0)
             agent_log("Command: %.20s<redacted>", cmd);
-        else if (strncmp(cmd, "lab_chunk:", 10) == 0)
-            ;   /* report transfer: one per 18 KB, not worth a log line each */
+        else if (strncmp(cmd, "lab_chunk:", 10) == 0 ||
+                 strcmp(cmd, "session_status") == 0 ||
+                 strncmp(cmd, "session_catalog_read:", 21) == 0 ||
+                 strcmp(cmd, "session_image_status") == 0)
+            ;   /* transfers and polls, not worth a log line each */
         else
             agent_log("Command: %s", buf);
 
@@ -4252,6 +4640,16 @@ static void handle_client(AsbConn *client)
             char reply[1024];
             stream_command(cmd, reply, sizeof(reply));
             REPLY(reply);
+        }
+        else if (strncmp(cmd, "session_", 8) == 0) {
+            char *reply = (char *)malloc(DOMAIN_OUT_MAX);
+            if (reply) {
+                session_command(cmd, reply, DOMAIN_OUT_MAX);
+                REPLY(reply);
+                free(reply);
+            } else {
+                REPLY("error:out of memory");
+            }
         }
         else if (strncmp(cmd, "grow_root:", 10) == 0) {
             REPLY(grow_root_partition() ? "ok" : "error:guest_grow_failed");

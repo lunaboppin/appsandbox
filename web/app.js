@@ -121,6 +121,7 @@ window.onHostMessage = function(msg) {
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
         case 'domainResult': onDomainResult(msg); break;
+        case 'gameStreamingResult': onGameStreamingResult(msg); break;
         case 'labResult': onLabResult(msg); break;
         case 'vpnConfigResult': onVpnConfigResult(msg); break;
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
@@ -945,6 +946,159 @@ function onDomainResult(msg) {
     refreshDomain();
 }
 
+/* ---- Game Streaming ---- */
+
+var gsStatus = null, gsTimer = null, gsFormLoaded = false;
+
+function openGameStreamingModal() {
+    gsFormLoaded = false;
+    document.getElementById('gs-overlay').classList.add('active');
+    renderGameStreaming();
+    gsPoll();
+}
+
+function closeGameStreamingModal() {
+    document.getElementById('gs-overlay').classList.remove('active');
+    clearTimeout(gsTimer);
+    gsTimer = null;
+}
+
+function gsPoll() {
+    sendCmd('gameStreamingStatus');
+}
+
+function onGameStreamingResult(msg) {
+    try { gsStatus = JSON.parse(msg.data || 'null'); } catch (e) { gsStatus = null; }
+    if (!msg.success) showModal('Game Streaming', msg.message || 'The request failed.', 'OK');
+    if (msg.action === 'gameStreamingConfigure' && msg.success) gsFormLoaded = false;
+    renderGameStreaming();
+    clearTimeout(gsTimer);
+    gsTimer = null;
+    if (document.getElementById('gs-overlay').classList.contains('active'))
+        gsTimer = setTimeout(gsPoll, 2000);
+}
+
+function gsVmChoices() {
+    return vms.filter(function(v) {
+        return v.osType === 'Windows' && !v.isTemplate && !v.labMode && !v.sessionClone && v.installComplete;
+    });
+}
+
+function renderGameStreaming() {
+    var status = document.getElementById('gs-status');
+    var s = gsStatus || {}, ready = domainState() === 'ready';
+    document.getElementById('gs-domain-row').style.display = ready || s.enabled ? 'none' : '';
+    document.getElementById('gs-settings').style.display = ready || s.enabled ? '' : 'none';
+    document.getElementById('btn-gs-off').style.display = s.enabled ? '' : 'none';
+    if (!ready && !s.enabled) {
+        status.textContent = 'Game Streaming signs people in with domain accounts, so it needs the AppSandbox domain. Set up the domain first.';
+        return;
+    }
+    status.textContent = s.enabled
+        ? (s.imageReady ? 'On. Domain users can start sessions from the dashboard.' : 'On, but there is no saved image yet, so nobody can start a session.')
+        : 'Off. Choose a VM and save to set it up.';
+
+    var select = document.getElementById('gs-vm');
+    if (!gsFormLoaded) {
+        select.innerHTML = '';
+        gsVmChoices().forEach(function(v) {
+            var option = document.createElement('option');
+            option.value = option.textContent = v.name;
+            select.appendChild(option);
+        });
+        if (s.vm) select.value = s.vm;
+        document.getElementById('gs-max').value = s.maxSessions || 2;
+        document.getElementById('gs-idle').value = s.idleMinutes === undefined ? 30 : s.idleMinutes;
+        document.getElementById('gs-group').value = s.group || '';
+        document.getElementById('gs-lan').checked = !!s.lan;
+        if (gsStatus) gsFormLoaded = true;
+    }
+
+    var state = document.getElementById('gs-image-state');
+    var build = document.getElementById('btn-gs-build');
+    if (s.building) {
+        state.textContent = (s.phase || 'Working') + (s.buildPct >= 0 ? ' (' + s.buildPct + '%)' : '') + '...';
+    } else if (s.imageReady) {
+        state.textContent = 'Ready: ' + s.games + (s.games === 1 ? ' game' : ' games') + ' found, plus the desktop.';
+    } else {
+        state.textContent = 'Not built yet.';
+    }
+    build.textContent = s.imageReady ? 'Refresh Image' : 'Build Image';
+    build.disabled = !s.enabled || !!s.building;
+    document.getElementById('gs-image-error').textContent = s.error || '';
+
+    var dash = document.getElementById('gs-dashboard');
+    var section = document.getElementById('gs-dashboard-section');
+    section.style.display = s.enabled && s.dashboard ? '' : 'none';
+    dash.innerHTML = '';
+    if (s.enabled && s.dashboard) {
+        var urls = [s.dashboard.localUrl];
+        (s.dashboard.lanAddresses || []).forEach(function(address) {
+            urls.push('https://' + address + ':' + s.dashboard.lanPort + '/');
+        });
+        urls.forEach(function(url) {
+            var line = document.createElement('div');
+            line.textContent = url;
+            line.style.userSelect = 'all';
+            dash.appendChild(line);
+        });
+        document.getElementById('gs-fingerprint').textContent = s.dashboard.fingerprint
+            ? 'Browsers warn about the certificate because it is self-signed. Its fingerprint: ' + s.dashboard.fingerprint
+            : '';
+    }
+
+    var list = document.getElementById('gs-sessions');
+    list.innerHTML = '';
+    document.getElementById('gs-sessions-section').style.display = (s.sessions || []).length ? '' : 'none';
+    (s.sessions || []).forEach(function(session) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var text = document.createElement('span');
+        text.textContent = session.user + ' on ' + session.vm + ': ' + session.state + (session.detail ? ' (' + session.detail + ')' : '');
+        var end = document.createElement('button');
+        end.type = 'button';
+        end.textContent = 'End';
+        end.onclick = function() {
+            showModal('End session', 'End ' + session.user + '\'s session and delete ' + session.vm + '? Anything not saved to their H: drive is lost.', 'End Session', { confirmClass: 'danger' }).then(function(ok) {
+                if (ok) sendCmd('gameStreamingEnd', { vm: session.vm });
+            });
+        };
+        row.appendChild(text);
+        row.appendChild(end);
+        list.appendChild(row);
+    });
+}
+
+function saveGameStreaming() {
+    var lan = document.getElementById('gs-lan').checked;
+    function save() {
+        sendCmd('gameStreamingConfigure', {
+            vm: document.getElementById('gs-vm').value,
+            maxSessions: parseInt(document.getElementById('gs-max').value, 10) || 0,
+            idleMinutes: parseInt(document.getElementById('gs-idle').value, 10) || 0,
+            group: document.getElementById('gs-group').value.trim(),
+            lan: lan
+        });
+    }
+    if (lan && !(gsStatus && gsStatus.lan)) {
+        showModal('Allow other devices', 'Anyone on your private or domain networks can then reach the dashboard\'s sign-in page, and Moonlight and browser view of each session. Signing in still needs a domain password.', 'Allow', { confirmClass: 'primary' }).then(function(ok) {
+            if (ok) save();
+        });
+    } else {
+        save();
+    }
+}
+
+function buildGameStreamingImage() {
+    sendCmd('gameStreamingBuild');
+}
+
+function turnOffGameStreaming() {
+    showModal('Turn off Game Streaming', 'End every session, delete their VMs and delete the saved image? The nominated VM itself is not touched.', 'Turn Off', { confirmClass: 'danger' }).then(function(ok) {
+        if (ok) sendCmd('gameStreamingOff');
+    });
+}
+
 /* Create dialog: Managed is offered once the domain exists. */
 function applyAccountModeUI() {
     var select = document.getElementById('account-mode');
@@ -1394,6 +1548,8 @@ function renderVmTable() {
     /* Skip the cell rebuild when button-relevant fields are unchanged; the
      * install progress tick would otherwise destroy the button DOM mid-click. */
     vms.forEach(function(vm, i) {
+        /* Game Streaming's duplicates are looked after in its own dialog. */
+        if (vm.sessionClone) return;
         var tr = rowCache[vm.name];
         var firstBuild = !tr;
         if (!tr) {

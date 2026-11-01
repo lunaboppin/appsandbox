@@ -34,6 +34,14 @@ ASB_API HRESULT vm_web_set(VmInstance *vm, BOOL enabled, BOOL lan, wchar_t *err,
 /* State as JSON: enabled, lan, url, lanUrls, fingerprint, reach, connected. */
 ASB_API int vm_web_status_json(VmInstance *vm, char *out, int cap);
 
+/* A browser is using this VM. */
+BOOL vm_web_connected(UINT64 vm_id);
+
+/* The Game Streaming dashboard, served at / by the same listeners. lan = TRUE adds the
+   network's HTTPS listener. Appends its addresses to out as JSON. */
+HRESULT vm_web_dashboard_set(BOOL enabled, BOOL lan, wchar_t *err, size_t err_chars);
+int vm_web_dashboard_json(char *out, int cap, int pos);
+
 /* Close every listener and session (app exit). */
 ASB_API void vm_web_shutdown(void);
 

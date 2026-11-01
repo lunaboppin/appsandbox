@@ -2876,6 +2876,57 @@ HRESULT shared_appliance_domain_user_set(const wchar_t *name, const wchar_t *pas
     return hr;
 }
 
+/* Is this a domain user's password? S_OK or a message saying why not. group, when
+   given, must have the user as a member. */
+HRESULT shared_appliance_domain_validate(const wchar_t *name, const wchar_t *password,
+                                         const wchar_t *group,
+                                         wchar_t *message, size_t message_chars)
+{
+    char command[1024], user[64], password_b64[512], group_b64[256], reply[1024];
+    HRESULT hr;
+    if (!domain_name_valid(name, FALSE) || !password || !password[0] || wcslen(password) > 120) {
+        domain_message(message, message_chars, "That user name or password isn't right.");
+        return E_ACCESSDENIED;
+    }
+    if (group && group[0] && !domain_name_valid(group, TRUE)) return E_INVALIDARG;
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, user, sizeof(user), NULL, NULL);
+    b64_utf8(password, password_b64, sizeof(password_b64));
+    b64_utf8(group ? group : L"", group_b64, sizeof(group_b64));
+    sprintf_s(command, sizeof(command), "domain_validate:%s:%s:%s", user, password_b64, group_b64);
+    hr = domain_send(command, reply, sizeof(reply), 90000, message, message_chars);
+    SecureZeroMemory(command, sizeof(command));
+    SecureZeroMemory(password_b64, sizeof(password_b64));
+    if (FAILED(hr)) return hr;
+    if (strcmp(reply, "ok") == 0) return S_OK;
+    domain_message(message, message_chars, strcmp(reply, "ok:not_allowed") == 0
+                   ? "This user isn't allowed to use Game Streaming."
+                   : "That user name or password isn't right.");
+    return E_ACCESSDENIED;
+}
+
+/* The sign-in command for a Game Streaming duplicate. */
+BOOL shared_appliance_domain_autologon_command(const wchar_t *name, const wchar_t *password,
+                                               char *command, size_t chars)
+{
+    char user[64], password_b64[512];
+    if (!domain_name_valid(name, FALSE) || !password || !password[0]) return FALSE;
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, user, sizeof(user), NULL, NULL);
+    b64_utf8(password, password_b64, sizeof(password_b64));
+    sprintf_s(command, chars, "domain_autologon:%s:%s:%s", ASB_DOMAIN_NETBIOS, user, password_b64);
+    SecureZeroMemory(password_b64, sizeof(password_b64));
+    return TRUE;
+}
+
+/* A duplicate's computer account, once the duplicate is gone. */
+HRESULT shared_appliance_domain_computer_remove(const wchar_t *name)
+{
+    char command[64], computer[32], reply[1024];
+    if (!name || wcsncmp(name, L"GS-", 3) != 0 || wcslen(name) > 15) return E_INVALIDARG;
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, computer, sizeof(computer), NULL, NULL);
+    sprintf_s(command, sizeof(command), "domain_computer_remove:%s", computer);
+    return domain_send(command, reply, sizeof(reply), 90000, NULL, 0);
+}
+
 HRESULT shared_appliance_domain_user_delete(const wchar_t *name,
                                             wchar_t *message, size_t message_chars)
 {
