@@ -82,6 +82,7 @@ def main() -> None:
     # boot, and the host's network setup waits for it to finish.
     assert 'PrefixLength 24 | Out-Null' in agent[agent.index("SESSION_LINK_PS[]"):agent.index("session_wait_signin(char")]
     assert "IMAGE_STATE_COMPLETE" in agent
+    assert "if (signed_in && session_has_shell(session))" in agent
     assert link.index('"session_wait_signin"') < link.index("Configure the independent host-only NIC")
     assert link.index('"session_link:%s"') < link.index("shared_appliance_domain_join_command(vm->share_host_ip")
     # After the join, which resets the automatic sign-in settings.

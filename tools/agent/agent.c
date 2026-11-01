@@ -2970,8 +2970,24 @@ static const char SESSION_SIGNIN_WHY_PS[] =
     "$u=@(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress+'/'+$_.Store }) -join ','\r\n"
     "Write-Output ('result:timeout autologon='+$w.AutoAdminLogon+' count='+$w.AutoLogonCount+' user='+$w.DefaultDomainName+'\\'+$w.DefaultUserName+' boot='+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('HH:mm:ss')+' '+$f+$l+' ips='+$u)\r\n";
 
+/* The desktop has loaded in this session. */
+static BOOL session_has_shell(DWORD session)
+{
+    WTS_PROCESS_INFOA *list = NULL;
+    DWORD count = 0, i;
+    BOOL found = FALSE;
+    if (WTSEnumerateProcessesA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &list, &count)) {
+        for (i = 0; i < count && !found; i++)
+            found = list[i].SessionId == session && _stricmp(list[i].pProcessName, "explorer.exe") == 0;
+        WTSFreeMemory(list);
+    }
+    return found;
+}
+
 /* Hold the host's network setup back while the boot's sign-in runs: that setup replaces
-   the link the sign-in is using. "ok" when someone is signed in, "ok:timeout" if not. */
+   the link the sign-in is using, and a name at the console only means it has started:
+   the profile and redirected folders still need that link. "ok:signed:<user>" once the
+   desktop is up, "ok:timeout ..." if it never comes. */
 static void session_wait_signin(char *reply, size_t reply_size)
 {
     int i;
@@ -2981,9 +2997,13 @@ static void session_wait_signin(char *reply, size_t reply_size)
         BOOL signed_in = session != 0xFFFFFFFF &&
             WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &user, &got) &&
             user[0] && _strnicmp(user, "defaultuser", 11) != 0;
-        if (signed_in) sprintf_s(reply, reply_size, "ok:signed:%s", user);
+        if (signed_in && session_has_shell(session)) {
+            sprintf_s(reply, reply_size, "ok:signed:%s", user);
+            WTSFreeMemory(user);
+            Sleep(10000);
+            return;
+        }
         if (user) WTSFreeMemory(user);
-        if (signed_in) return;
         Sleep(2000);
     }
     run_domain_script(SESSION_SIGNIN_WHY_PS, 60000, reply, reply_size);
