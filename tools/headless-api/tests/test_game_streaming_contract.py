@@ -78,6 +78,12 @@ def main() -> None:
     assert '"domain_validate:%s:%s:%s"' in appliance
     assert 'strncmp(command, "domain_", 7) == 0' in link
     assert 'agent_log("Command: %.20s<redacted>", cmd)' in agent
+    # The sign-in runs early in boot, so its link to the domain controller is saved for that
+    # boot, and the host's network setup waits for it to finish.
+    assert 'PrefixLength 24 | Out-Null' in agent[agent.index("SESSION_LINK_PS[]"):agent.index("session_wait_signin(char")]
+    assert "IMAGE_STATE_COMPLETE" in agent
+    assert link.index('"session_wait_signin"') < link.index("Configure the independent host-only NIC")
+    assert link.index("vm->session_logon, buf") < link.index("shared_appliance_domain_join_command(vm->share_host_ip")
     # A duplicate's unattend signs nobody in first.
     assert "if (session) {" in disk and "iso_create_session_resources" in core
 

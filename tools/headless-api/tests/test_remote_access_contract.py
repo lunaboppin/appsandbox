@@ -44,6 +44,8 @@ def main() -> None:
     assert link.index("!nat_configured && !configure_guest_nat") < link.index("vm_stream_setup_command(vm, stream_cmd")
     assert "catch [Net.WebException]" in agent
     assert "Status 'network'" in agent
+    # A failed setup's message reaches the host as one line; an empty one reads as a disconnect.
+    assert 'strcspn(msg, "\\r\\n")' in agent
     assert "Sunshine" in read("THIRD-PARTY-NOTICES.md") and "Not bundled" in read("THIRD-PARTY-NOTICES.md")
     assert not list((ROOT / "tools").rglob("sunshine*.msi"))
 

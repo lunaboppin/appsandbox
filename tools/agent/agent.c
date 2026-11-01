@@ -121,6 +121,12 @@ static void agent_log_to_host(const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     msg[sizeof(msg) - 1] = '\0';
+    /* One line: script output ends in a newline, and the host reads an empty line
+       as the connection closing. */
+    {
+        size_t end = strcspn(msg, "\r\n");
+        msg[end] = '\0';
+    }
 
     snprintf(line, sizeof(line), "log:%s", msg);
     line[sizeof(line) - 1] = '\0';
@@ -2589,7 +2595,10 @@ static const char stream_common_ps[] =
 static const char stream_setup_ps[] =
     "New-Item -ItemType Directory -Force $dir | Out-Null\r\n"
     "& icacls $dir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\\Administrators:(OI)(CI)F' | Out-Null\r\n"
-    "function Status($phase,$detail){ Set-Content -Path $statusFile -Value ($phase+'|'+$detail) -Encoding ascii }\r\n"
+    /* stream_status can be reading it at that moment. */
+    "function Status($phase,$detail){\r\n"
+    " for($i=0;;$i++){ try { Set-Content -Path $statusFile -Value ($phase+'|'+$detail) -Encoding ascii; return } catch { if($i -ge 40){ throw }; Start-Sleep -Milliseconds 250 } }\r\n"
+    "}\r\n"
     "function Fetch($url,$sha,$file){\r\n"
     " $f=Join-Path $dir $file\r\n"
     " if(-not ((Test-Path $f) -and (Get-FileHash $f -Algorithm SHA256).Hash -eq $sha)){\r\n"
@@ -2675,7 +2684,7 @@ static const char stream_setup_ps[] =
 
 static const char stream_status_ps[] =
     "$phase='none'; $detail=''\r\n"
-    "if(Test-Path $statusFile){ $parts=(Get-Content $statusFile -Raw).Trim().Split('|'); $phase=$parts[0]; if($parts.Count -gt 1){ $detail=$parts[1] } }\r\n"
+    "try { if(Test-Path $statusFile){ $parts=(Get-Content $statusFile -Raw).Trim().Split('|'); $phase=$parts[0]; if($parts.Count -gt 1){ $detail=$parts[1] } } } catch { $phase='configuring' }\r\n"
     "$svc=Get-Service SunshineService -ErrorAction SilentlyContinue\r\n"
     "$encoders=@{}\r\n"
     "$log=Join-Path $root 'config\\sunshine.log'\r\n"
@@ -2831,8 +2840,7 @@ static const char DOMAIN_VALIDATE_PS[] =
 static const char DOMAIN_COMPUTER_REMOVE_PS[] =
         "$ErrorActionPreference='Stop'\r\n"
         "try{\r\n"
-        " $c=Get-ADComputer -Filter (\"Name -eq '\"+$env:ASB_DOM_USER+\"'\")\r\n"
-        " if($c){ Remove-ADObject -Identity $c -Recursive -Confirm:$false }\r\n"
+        " foreach($c in @(Get-ADComputer -Filter (\"Name -like '\"+$env:ASB_DOM_USER+\"'\"))){ Remove-ADObject -Identity $c -Recursive -Confirm:$false }\r\n"
         " Write-Output 'result:ok'; exit 0\r\n"
         "}catch{ Write-Output ('result:' + ($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
 
@@ -2919,19 +2927,58 @@ static void session_setup_wait(char *reply, size_t reply_size)
     int i;
     for (i = 0; i < 240; i++) {
         DWORD setup = 1, oobe = 1, size = sizeof(DWORD);
+        wchar_t state[64] = L"";
+        /* The registry values clear before the out-of-box screens end; this is last. */
+        GetPrivateProfileStringW(L"State", L"ImageState", L"", state, _countof(state),
+                                 L"C:\\Windows\\Setup\\State\\State.ini");
         RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\Setup", L"SystemSetupInProgress",
                      RRF_RT_REG_DWORD, NULL, &setup, &size);
         size = sizeof(DWORD);
         if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\Setup", L"OOBEInProgress",
                          RRF_RT_REG_DWORD, NULL, &oobe, &size) != ERROR_SUCCESS)
             oobe = 0;
-        if (!setup && !oobe) {
+        if (!setup && !oobe && (!state[0] || wcscmp(state, L"IMAGE_STATE_COMPLETE") == 0)) {
             strcpy_s(reply, reply_size, "ok");
             return;
         }
         Sleep(5000);
     }
     strcpy_s(reply, reply_size, "error:Windows setup did not finish");
+}
+
+/* session_link:<ip>. The link to the domain controller is normally set up again at each
+   boot, by the agent, which is too late for a sign-in at boot. A duplicate's next boot
+   needs it from the start, and its DNS settings and name rule already persist. */
+static const char SESSION_LINK_PS[] =
+    "$ErrorActionPreference='Stop'\r\n"
+    "try{\r\n"
+    " $a=Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -eq $env:ASB_DOM_DC } | Select-Object -First 1\r\n"
+    " if(-not $a){ throw 'The link to the domain controller is not up.' }\r\n"
+    " # Without -PolicyStore it goes in both the active and the saved settings.\r\n"
+    " Remove-NetIPAddress -InterfaceIndex $a.InterfaceIndex -IPAddress $env:ASB_DOM_DC -Confirm:$false\r\n"
+    " New-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -IPAddress $env:ASB_DOM_DC -PrefixLength 24 | Out-Null\r\n"
+    " Write-Output 'result:ok'; exit 0\r\n"
+    "}catch{ Write-Output ('result:' + ($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+
+/* Hold the host's network setup back while the boot's sign-in runs: that setup replaces
+   the link the sign-in is using. "ok" when someone is signed in, "ok:timeout" if not. */
+static void session_wait_signin(char *reply, size_t reply_size)
+{
+    int i;
+    for (i = 0; i < 90; i++) {
+        DWORD session = WTSGetActiveConsoleSessionId(), got;
+        char *user = NULL;
+        BOOL signed_in = session != 0xFFFFFFFF &&
+            WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &user, &got) &&
+            user[0] && _strnicmp(user, "defaultuser", 11) != 0;
+        if (user) WTSFreeMemory(user);
+        if (signed_in) {
+            strcpy_s(reply, reply_size, "ok");
+            return;
+        }
+        Sleep(2000);
+    }
+    strcpy_s(reply, reply_size, "ok:timeout");
 }
 
 /* "ok:" alone, or "ok:<domain>\<user>" for whoever is at the console. */
@@ -3142,6 +3189,15 @@ static void session_command(char *cmd, char *reply, size_t reply_size)
         session_status(reply, reply_size);
     } else if (strcmp(cmd, "session_setup_wait") == 0) {
         session_setup_wait(reply, reply_size);
+    } else if (strncmp(cmd, "session_link:", 13) == 0) {
+        if (!domain_field_ok(cmd + 13, ".", 15) || !cmd[13]) {
+            strcpy_s(reply, reply_size, "error:invalid arguments");
+            return;
+        }
+        SetEnvironmentVariableA("ASB_DOM_DC", cmd + 13);
+        run_domain_script(SESSION_LINK_PS, 60000, reply, reply_size);
+    } else if (strcmp(cmd, "session_wait_signin") == 0) {
+        session_wait_signin(reply, reply_size);
     } else if (strcmp(cmd, "session_signed_in") == 0) {
         session_autologon_clear();
         strcpy_s(reply, reply_size, "ok");
@@ -3230,9 +3286,10 @@ static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
         SetEnvironmentVariableA("ASB_DOM_GROUP", f[2]);
         run_domain_script(DOMAIN_VALIDATE_PS, 60000, reply, reply_size);
     } else if (strncmp(cmd, "domain_computer_remove:", 23) == 0) {
-        /* Only a duplicate's name: nothing else in the domain goes this way. */
+        /* Only a duplicate's name, or GS-* for all of them: nothing else in the domain
+           goes this way. */
         char *name = cmd + 23;
-        if (strncmp(name, "GS-", 3) != 0 || !domain_field_ok(name, "-", 15)) goto invalid;
+        if (strncmp(name, "GS-", 3) != 0 || !domain_field_ok(name, "-*", 15)) goto invalid;
         SetEnvironmentVariableA("ASB_DOM_USER", name);
         run_domain_script(DOMAIN_COMPUTER_REMOVE_PS, 60000, reply, reply_size);
     } else if (strncmp(cmd, "domain_autologon:", 17) == 0) {

@@ -169,6 +169,8 @@ typedef struct {
     BOOL        stream_software;         /* TRUE = never use the guest GPU to encode */
     BOOL        session_clone;           /* TRUE = Game Streaming duplicate: never saved, deleted when its session ends */
     char        session_logon[1024];     /* the sign-in to set up in the guest; wiped once sent */
+    BOOL        session_signing_in;      /* the next boot signs the user in */
+    volatile LONG session_signin_failed; /* it didn't, or it can't happen */
     volatile LONG web_session_active;    /* browser sessions using the guest channels; the display window lets go while > 0 */
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
     wchar_t     preinstall_apps[1024]; /* winget IDs not yet handed to the guest agent */

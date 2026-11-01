@@ -346,6 +346,19 @@ c.seamless_close("dev")                   # the host windows close; the guest's 
 - A running VM needs one restart after an update that adds this: the channel is registered
   when the VM starts, and that's also when the helper reaches the guest.
 
+
+### Game Streaming
+
+Optional, and it needs the AppSandbox domain. `GET /v1/version` reports `capabilities.gameStreaming`.
+
+- **`GET /v1/game-streaming`** returns the settings, the image's state, the dashboard's addresses and the active sessions.
+- **`POST /v1/game-streaming`** takes `{"vm", "maxSessions", "idleMinutes", "group", "lan"}`, and turns it on.
+- **`POST /v1/game-streaming/image`** builds or refreshes the image. The nominated VM has to be shut down. Follow `building`, `phase` and `error` in the status.
+- **`POST /v1/game-streaming/off`** ends every session and deletes the image.
+- **`POST /v1/domain/users`** takes `{"name", "password", "enabled", "groups"}`; **`DELETE /v1/domain/users/{name}`** removes one.
+
+Duplicates appear in `/v1/vms` while their sessions last. They aren't saved, and they go away when the session ends.
+
 ### Remote: Moonlight and browser
 
 Both are off until turned on, per VM. A browser session or a Moonlight stream controls

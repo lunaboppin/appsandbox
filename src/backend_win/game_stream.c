@@ -828,6 +828,10 @@ static DWORD WINAPI session_thread(LPVOID param)
             session_failed(slot, "Your VM stopped while it was starting.");
             goto wait_to_clean;
         }
+        if (InterlockedCompareExchange(&vm->session_signin_failed, 0, 0)) {
+            session_failed(slot, "Your VM couldn't sign you in. Try again, and if it happens again, ask your admin to check the App Sandbox log.");
+            goto wait_to_clean;
+        }
         if (vm->agent_online && !vm->agent_initializing) {
             if (console_user(vm, s->user, &anyone)) break;
             session_state(slot, "starting", vm->session_logon[0] ? "Setting up Windows" : "Joining the domain and signing you in");
@@ -888,7 +892,7 @@ cleanup:
         if (vm) vm_web_set(vm, FALSE, FALSE, NULL, 0);
         asb_session_clone_delete(id);
     }
-    if (!g_shutting_down && SUCCEEDED(shared_appliance_domain_computer_remove(s->vm_name)))
+    if (SUCCEEDED(shared_appliance_domain_computer_remove(s->vm_name)))
         ui_log(L"Game Streaming: removed \"%s\" and its computer account.", s->vm_name);
     AcquireSRWLockExclusive(&g_lock);
     ZeroMemory(s, sizeof(*s));
@@ -1176,6 +1180,8 @@ static DWORD WINAPI turn_off_thread(LPVOID param)
     g_root[0] = 0;
     ReleaseSRWLockExclusive(&g_lock);
     if (root[0]) asb_session_clone_remove_leftover(NULL, root);
+    /* Anything an earlier crash left in the directory goes too. */
+    shared_appliance_domain_computer_remove(L"GS-*");
     asb_save();
     InterlockedDecrement(&g_threads);
     return 0;
@@ -1314,7 +1320,7 @@ void game_stream_shutdown(void)
     int i;
     InterlockedExchange(&g_shutting_down, 1);
     InterlockedExchange(&g_build.cancel, 1);
-    for (i = 0; i < 300 && InterlockedCompareExchange(&g_threads, 0, 0) > 0; i++) Sleep(100);
+    for (i = 0; i < 900 && InterlockedCompareExchange(&g_threads, 0, 0) > 0; i++) Sleep(100);
     AcquireSRWLockExclusive(&g_lock);
     SecureZeroMemory(g_logins, sizeof(g_logins));
     ReleaseSRWLockExclusive(&g_lock);
