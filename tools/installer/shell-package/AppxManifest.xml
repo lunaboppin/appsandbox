@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Gives App Sandbox a package identity so "Run in Sandbox" can sit on Windows 11's short
+     right-click menu. It holds only this file and the logo: the executable and DLL are the installed
+     ones, in the folder passed as the package's external location. build-installer.ps1 fills in
+     the version and publisher (the subject of the certificate it signs the package with). Windows
+     refuses an unsigned package that has an Application, so it can't go without a signature. -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+         xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+         xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+         IgnorableNamespaces="uap uap10 rescap desktop4 desktop5 com">
+  <Identity Name="AppSandbox.ShellMenu"
+            Publisher="@PUBLISHER@"
+            Version="@VERSION@"
+            ProcessorArchitecture="neutral" />
+  <Properties>
+    <DisplayName>App Sandbox</DisplayName>
+    <PublisherDisplayName>App Sandbox</PublisherDisplayName>
+    <Logo>logo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+  <Applications>
+    <Application Id="ShellMenu" Executable="appsandbox-run.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="App Sandbox" Description="Run in Sandbox"
+                          BackgroundColor="transparent" Square150x150Logo="logo.png" Square44x44Logo="logo.png" />
+      <Extensions>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <!-- Must match CLSID_RunInSandbox in tools\shell-launcher\appsandbox-shell.c. -->
+              <desktop5:Verb Id="RunInSandbox" Clsid="5E1C7A42-8D3B-4F6E-9A21-C470B62E13D8" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Run in Sandbox">
+              <com:Class Id="5E1C7A42-8D3B-4F6E-9A21-C470B62E13D8" Path="appsandbox-shell.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

@@ -27,6 +27,14 @@ The app finds a release through its asset, which must be named `AppSandbox-<vers
 
 The updater accepts only installers signed by a certificate pinned in `src/app_win/update_config.h`, by SHA-256. A valid signature from anyone else is refused, and an unsigned installer never updates anyone. To change certificate, first ship a release signed by the old one that adds the new pin. A fork must change the pin and the repository in that file.
 
+## The right-click menu
+
+Explorer's classic entry is a registry key, under **Show more options**. Windows 11's short menu only takes an `IExplorerCommand` from a package, so a signed installer also carries `AppSandbox-shell.msix`, which holds a manifest (`shell-package/`) pointing at the installed `appsandbox-shell.dll`. Windows shows the two as one entry. An unsigned installer has only the classic one.
+
+`shell-menu.ps1` adds and removes the package. Setup removes it before replacing files, because the package's process holds the DLL. A package belongs to one user, so it's registered for whoever ran Setup, even when elevating as another account. A failure there doesn't fail Setup, and the reason goes in `%TEMP%\AppSandbox-shell-menu.log`.
+
+Windows won't install an unsigned package with an `Application`, and only installs a signed one if it trusts the certificate. A publicly trusted certificate needs nothing more. A self-signed one is added to the machine's Trusted People store (not a root), since Setup signed by that same key already runs as administrator, and the uninstaller removes it.
+
 ## Testing it
 
 - `tools\headless-api\tests\test_installer_contract.py`: the rules, from the sources.

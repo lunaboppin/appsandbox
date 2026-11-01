@@ -1128,6 +1128,13 @@ static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
     if (ctx->hRecoveryTimer) {
         WdfTimerStop(ctx->hRecoveryTimer, TRUE);
     }
+    if (ctx->hModeWatchThread) {
+        SetEvent(ctx->hModeWatchStop);
+        WaitForSingleObject(ctx->hModeWatchThread, INFINITE);
+        CloseHandle(ctx->hModeWatchThread);
+        CloseHandle(ctx->hModeWatchStop);
+        ctx->hModeWatchThread = NULL;
+    }
     if (ctx->hModeTimer) {
         WdfTimerStop(ctx->hModeTimer, TRUE);
     }
@@ -1360,6 +1367,43 @@ static void VddRequestMode(VDD_DEVICE_CONTEXT* ctx, UINT width, UINT height)
     VddLog("Mode: host asks for %ux%u", width, height);
     VddSetWantedMode(ctx, width, height);
     VddModeTimerStart(ctx, 1);
+}
+
+/* A stream inside the guest asks for its client's size here: StreamMode under this
+   key = width << 16 | height, written by "appsandbox-displays --stream-prep". */
+#define VDD_MODE_KEY   L"SOFTWARE\\AppSandbox\\Display"
+#define VDD_MODE_VALUE L"StreamMode"
+
+static DWORD WINAPI VddModeWatchThread(LPVOID param)
+{
+    VDD_DEVICE_CONTEXT* ctx = (VDD_DEVICE_CONTEXT*)param;
+    HANDLE changed = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HANDLE waits[2] = { ctx->hModeWatchStop, changed };
+    HKEY key = NULL;
+    BOOL stale = TRUE;   /* what's there when the driver starts is an old stream's */
+    if (!changed) return 0;
+    for (;;) {
+        /* The key appears with the first request; until then, look again now and then. */
+        if (!key && RegOpenKeyExW(HKEY_LOCAL_MACHINE, VDD_MODE_KEY, 0,
+                                  KEY_READ | KEY_NOTIFY, &key) != ERROR_SUCCESS)
+            key = NULL;
+        if (key) {
+            DWORD value = 0, size = sizeof(value), type = 0;
+            RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, changed, TRUE);
+            /* Each request counts, even of the same size: the host may have moved the
+               display since the last stream. */
+            if (!stale && RegQueryValueExW(key, VDD_MODE_VALUE, NULL, &type, (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+                type == REG_DWORD && value) {
+                VddLog("Mode: a stream in the guest asks for %ux%u", value >> 16, value & 0xFFFF);
+                VddRequestMode(ctx, value >> 16, value & 0xFFFF);
+            }
+        }
+        stale = FALSE;
+        if (WaitForMultipleObjects(2, waits, FALSE, key ? INFINITE : 5000) == WAIT_OBJECT_0) break;
+    }
+    if (key) RegCloseKey(key);
+    CloseHandle(changed);
+    return 0;
 }
 
 static VOID VddModeTimerCallback(WDFTIMER Timer)
@@ -2093,6 +2137,13 @@ NTSTATUS VddDeviceAdd(
         if (NT_SUCCESS(st)) {
             WdfObjectGet_RecoveryTimerContext(hTimer)->pContext = ctx;
             ctx->hModeTimer = hTimer;
+            ctx->hModeWatchStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (ctx->hModeWatchStop)
+                ctx->hModeWatchThread = CreateThread(NULL, 0, VddModeWatchThread, ctx, 0, NULL);
+            if (!ctx->hModeWatchThread && ctx->hModeWatchStop) {
+                CloseHandle(ctx->hModeWatchStop);
+                ctx->hModeWatchStop = NULL;
+            }
         } else {
             VddLog("DeviceAdd: WdfTimerCreate FAILED st=0x%08X (mode changes disabled)", st);
         }

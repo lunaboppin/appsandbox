@@ -121,6 +121,18 @@ typedef struct {
     wchar_t     lab_report[MAX_PATH]; /* last report.html */
     DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */
     volatile LONG management_busy; /* serializes stopped-VM media/storage/disk operations */
+    /* Run in Sandbox (sandbox_run.h). Id, parent, overlay and file are in vms.cfg:
+       a set id means a throwaway checkpoint is waiting on the user's decision. */
+    wchar_t     sandbox_run_id[40];
+    wchar_t     sandbox_run_parent[MAX_PATH];  /* the disk to go back to */
+    wchar_t     sandbox_run_overlay[MAX_PATH]; /* the throwaway disk the VM boots from */
+    wchar_t     sandbox_run_file[260];
+    volatile LONG sandbox_worker;  /* a worker thread owns this VM's queue */
+    int         sandbox_phase;     /* AsbRunPhase */
+    int         sandbox_pct;
+    wchar_t     sandbox_message[512];
+    wchar_t     sandbox_guest_path[512];
+    BOOL        sandbox_want_display;
     wchar_t     config_passthrough[4096]; /* unrecognized vms.cfg keys */
     BOOL        building_vhdx;   /* TRUE during iso-patch VHDX creation */
     BOOL        vhdx_staging;    /* TRUE during file staging phase */
@@ -149,6 +161,11 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    BOOL        stream_enabled;          /* TRUE = Sunshine set up in the guest, for Moonlight clients */
+    int         stream_exposure;         /* ASB_STREAM_THIS_PC or ASB_STREAM_NETWORK */
+    DWORD       stream_port;             /* Sunshine base port (47989 + 100 * n) */
+    BOOL        stream_software;         /* TRUE = never use the guest GPU to encode */
+    volatile LONG web_session_active;    /* browser sessions using the guest channels; the display window lets go while > 0 */
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
     wchar_t     preinstall_apps[1024]; /* winget IDs not yet handed to the guest agent */
     HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
@@ -157,6 +174,9 @@ typedef struct {
     wchar_t     shared_resource_error[256];
     BOOL        shared_resource_pending;
 } VmInstance;
+
+/* Run in Sandbox's file channel: ASB_CH_FILEDROP in tools/transport/asb_transport.h. */
+#define ASB_FILE_DROP_CHANNEL 16
 
 /* Initialize HCS - loads computecore.dll dynamically.
    Returns TRUE if HCS is available. */

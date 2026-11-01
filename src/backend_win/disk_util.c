@@ -128,13 +128,15 @@ HRESULT vhdx_merge(const wchar_t *child_path)
     storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
     storage_type.VendorId = VHDX_VENDOR_MS;
 
+    /* A version 1 merge of depth 1 needs the child and its parent open read/write. */
     ZeroMemory(&open_params, sizeof(open_params));
-    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_1;
+    open_params.Version1.RWDepth = 2;
 
     result = OpenVirtualDisk(
         &storage_type,
         child_path,
-        VIRTUAL_DISK_ACCESS_NONE,
+        VIRTUAL_DISK_ACCESS_METAOPS,
         OPEN_VIRTUAL_DISK_FLAG_NONE,
         &open_params,
         &vhd_handle);

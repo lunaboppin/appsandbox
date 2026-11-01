@@ -1,0 +1,4 @@
+LIBRARY appsandbox-shell
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

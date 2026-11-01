@@ -14,10 +14,12 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 - **Tidy new installs:** new Windows VMs start with a clean taskbar (just Edge and File Explorer, no search box, widgets or Copilot).
 - **Checkpoints and branches:** freeze a VM's state and fork independent working copies from it.
 - **Disposable VMs:** every start begins from a clean checkpoint and throws away the last session's changes.
+- **Run in Sandbox:** right-click any file in Explorer to copy it into a VM and open it there on a throwaway checkpoint. When you're done, discard rolls the VM back and keep merges the changes. Your original file is only ever read, and shared drives and anything sent over the network aren't rolled back.
 - **Templates** for creating Windows VMs from a prepared state instead of reinstalling.
 - **Per-VM management:** installer media, storage relocation, grow-only disk resizing, Secure Boot and display preferences. The whole VM tree can be placed on any fixed NTFS/ReFS volume.
 - **Backstage session:** like ScreenConnect's Backstage, open a SYSTEM shell in a Windows VM's hidden session 0, in a window of its own, from the display window's menu. The signed-in user, or the sign-in screen, never sees it. It has a taskbar with Command Prompt, PowerShell, Task Manager, Registry Editor and more, plus an Explorer file browser, and everything opened from it runs there too.
 - **[Windows guests] Seamless mode:** each app in the VM opens as its own window on your desktop, with its own taskbar button and Alt+Tab entry, marked with a border in the VM's colour and the VM's name in the title. Start it with the window button in the VM's row. A small launcher lists the guest's apps and open windows; closing it leaves seamless mode and the apps keep running in the VM. The sign-in screen, a lock or a UAC prompt opens the normal display until it's over. Sound isn't carried in this mode. Ubuntu guests don't offer it: Wayland gives a helper no way to capture other apps' windows one by one.
+- **Remote access, off until you turn it on per VM:** use a VM from a web browser (video, sound, keyboard, mouse, clipboard), on this PC or over HTTPS on your network, with a key shown in Manage. Or stream it to Moonlight: the guest downloads the official Sunshine and you enter the PIN in the app. In Moonlight, **Desktop** works at the sign-in screen and scales to your device; **Desktop (resize to this device)** matches your device's size and needs someone signed in. Windows VMs only for Moonlight.
 - **Nested virtualization,** so Docker, WSL and Claude Cowork run inside the VM.
 
 ### Display, input and sound
@@ -65,7 +67,7 @@ The **Malware Lab** button builds an isolated, disposable Windows VM for running
 
 ## Installing and updating
 
-Download `AppSandbox-<version>-win-x64-setup.exe` from [Releases](https://github.com/lunaboppin/appsandbox/releases) and run it. It installs to Program Files, adds a Start Menu shortcut (and a desktop one if you tick it) and an entry in Apps & features. No driver or service is installed on your PC: the drivers it carries are copied into your VMs when they're provisioned.
+Download `AppSandbox-<version>-win-x64-setup.exe` from [Releases](https://github.com/lunaboppin/appsandbox/releases) and run it. It installs to Program Files, adds a Start Menu shortcut (and a desktop one if you tick it) and an entry in Apps & features. No driver or service is installed on your PC: the drivers it carries are copied into your VMs when they're provisioned. To put Run in Sandbox on Windows 11's right-click menu, it registers a small package for the user who ran Setup. Other users on the PC find the entry under **Show more options**. If the release's certificate is self-signed, Setup also adds it to the PC's Trusted People store, which Windows requires for the package. Uninstalling removes both.
 
 **Updates:** App Sandbox checks GitHub once a day, and when a newer release exists it shows a notice at the top of the window. The **Updates** button shows your version, checks on demand, and has the settings for automatic checks and for including pre-releases (off by default).
 

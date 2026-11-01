@@ -97,6 +97,7 @@ typedef struct AudioFrameHeader {
 } AudioFrameHeader;
 #pragma pack(pop)
 
+#define WM_IDD_DROP_CLIPBOARD (WM_APP + 141)   /* a browser session takes the clipboard channels */
 /* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
 
@@ -1537,7 +1538,12 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
     /* Outer retry loop — keep trying to connect to the guest capture helper */
     while (!d->stop) {
         GUID svc; hcs_service_guid(d->os_type, 4, &svc);
-        SOCKET s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
+        SOCKET s;
+        if (d->vm && d->vm->web_session_active) {   /* a browser has the sound */
+            Sleep(200);
+            continue;
+        }
+        s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
         if (s == INVALID_SOCKET) {
             int wait;
             for (wait = 0; wait < 2000 && !d->stop; wait += 200)
@@ -2369,6 +2375,22 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         SOCKET s;
         FrameHeader hdr;
 
+        /* A browser is using this VM (vm_web.c). The guest's channels serve one
+           client each, so let go of them all until it leaves. */
+        if (d->vm && d->vm->web_session_active) {
+            if (input_s != INVALID_SOCKET) {
+                d->input_socket = INVALID_SOCKET;
+                closesocket(input_s);
+                input_s = INVALID_SOCKET;
+            }
+            if (d->clipboard && d->hwnd)
+                PostMessageW(d->hwnd, WM_IDD_DROP_CLIPBOARD, 0, 0);
+            if (d->audio_socket != INVALID_SOCKET)
+                shutdown(d->audio_socket, SD_BOTH);
+            Sleep(250);
+            continue;
+        }
+
         /* Ensure input channel is connected (independent of frame channel) */
         if (input_s == INVALID_SOCKET) {
             GUID svc; hcs_service_guid(d->os_type, 3, &svc);
@@ -2680,6 +2702,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
 
             idd_lab_screenshot(d, &lab_shot_tick, &lab_shot_hash);
+
+            if (d->vm && d->vm->web_session_active)
+                break;
 
             /* Reconnect input socket if send_input flagged it dead */
             if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
@@ -3211,6 +3236,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_IDD_DROP_CLIPBOARD:
+        if (d && d->clipboard) {
+            vm_clipboard_destroy(d->clipboard);
+            d->clipboard = NULL;
+        }
+        return 0;
     case WM_CLIP_READER_APPLY:
         if (d && d->clipboard) {
             vm_clipboard_on_reader_apply(d->clipboard);

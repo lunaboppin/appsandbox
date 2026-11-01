@@ -107,6 +107,9 @@ window.onHostMessage = function(msg) {
         case 'fullState':     onFullState(msg); break;
         case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); refreshManageVm(); renderLab(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
+        case 'sandboxRequest': onSandboxRequest(msg); break;
+        case 'sandboxFinishPrompt': openSandboxFinish(msg.vmIndex); break;
+        case 'sandboxError': showAlertModal('Run in Sandbox', msg.message); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
@@ -121,6 +124,7 @@ window.onHostMessage = function(msg) {
         case 'sharedResourceResult': onSharedResourceResult(msg); break;
         case 'sharedDependencyUnavailable': onSharedDependencyUnavailable(msg); break;
         case 'manageResult':  onManageResult(msg); break;
+        case 'remoteStatus':  onRemoteStatus(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -1316,6 +1320,9 @@ function buildRowCells(vm, i, statusTd) {
 function renderVmTable() {
     var tbody = document.getElementById('vm-tbody');
 
+    renderSandboxRuns();
+    if (sandboxFiles.length) renderSandboxPicker();
+
     if (vms.length === 0) {
         rowCache = {};
         rowSigCache = {};
@@ -1690,10 +1697,15 @@ function openManageVm(idx) {
     managePending = false;
     document.getElementById('manage-vm-overlay').classList.add('active');
     refreshManageVm(true);
+    remoteState = null;
+    requestRemoteStatus();
+    clearInterval(remoteTimer);
+    remoteTimer = setInterval(requestRemoteStatus, 5000);
 }
 
 function closeManageVm() {
     if (managePending) return;
+    clearInterval(remoteTimer);
     document.getElementById('manage-vm-overlay').classList.remove('active');
     manageVmIndex = -1;
 }
@@ -2058,6 +2070,172 @@ function saveManageDisposable() {
     showModal('Make this VM disposable',
         'Checkpoint this VM as it is now and start every session from that clean copy? Anything saved inside the VM since its last start is thrown away at the next start, except on H: and shared drives.',
         'Make Disposable', { confirmClass: 'primary' }).then(function(ok) { if (ok) send(true); });
+}
+
+/* ---- Remote: browser access and Moonlight ---- */
+
+var remoteTimer = 0;
+var remoteBusy = false;
+var remoteState = null;
+
+function requestRemoteStatus() {
+    if (manageVmIndex < 0 || remoteBusy) return;
+    remoteBusy = true;
+    sendCmd('remoteGet', { vmIndex: manageVmIndex });
+}
+
+function remoteCommand(action, data) {
+    if (manageVmIndex < 0) return;
+    data.vmIndex = manageVmIndex;
+    remoteBusy = true;
+    document.getElementById('manage-remote-message').textContent = '';
+    sendCmd(action, data);
+}
+
+function streamGuestText(s) {
+    var g = s.guest;
+    if (!s.enabled) return '';
+    if (!g) return 'Sets up the next time the VM is running with its agent connected.';
+    var text = '';
+    switch (g.phase) {
+        case 'downloading': text = 'Downloading Sunshine in the VM from its official release...'; break;
+        case 'installing': text = 'Installing Sunshine in the VM...'; break;
+        case 'failed': text = 'Setup failed: ' + (g.detail || 'see the VM log.'); break;
+        case 'ready': text = g.running ? 'Sunshine is running.' : 'Sunshine is installed but not running.'; break;
+        default: text = g.detail || 'Getting Sunshine ready...';
+    }
+    var encoders = Object.keys(g.encoders || {}).map(function(k) { return g.encoders[k]; });
+    if (encoders.length) text += ' Encoders found: ' + encoders.join(', ') + '.';
+    if (g.phase === 'ready') text += g.gamepad ? ' Gamepads work.' : ' No gamepad driver yet, so gamepads won\'t work.';
+    return text;
+}
+
+function onRemoteStatus(msg) {
+    remoteBusy = false;
+    if (msg.vmIndex !== manageVmIndex) return;
+    remoteState = msg;
+    if (msg.message) document.getElementById('manage-remote-message').textContent = msg.message;
+    var w = msg.web, s = msg.stream;
+    if (!w || !s) return;
+
+    // Browser access
+    var webBox = document.getElementById('manage-web-enabled');
+    var lanBox = document.getElementById('manage-web-lan');
+    webBox.checked = !!w.enabled;
+    webBox.disabled = !!w.unsupported;
+    lanBox.checked = !!w.lan;
+    lanBox.disabled = !w.enabled;
+    document.getElementById('manage-web-reach').textContent = w.unsupported || w.reach || '';
+    document.getElementById('manage-web-details').style.display = w.enabled ? '' : 'none';
+    var urlBox = document.getElementById('manage-web-url');
+    if (urlBox.value !== (w.url || '')) urlBox.value = w.url || '';
+    var lanInfo = '';
+    if (w.enabled && w.lan) {
+        var links = (w.lanAddresses || []).map(function(a) {
+            return 'https://' + a + ':' + w.lanPort + w.lanPath;
+        });
+        lanInfo = 'From another device: ' + (links.join(' or ') || 'this PC has no network address right now') +
+            '. Access key: ' + w.key + '. Certificate fingerprint (SHA-256), to compare with what the browser shows: ' + w.fingerprint + '.';
+    }
+    if (w.connected) lanInfo = 'A browser is connected, so the display window is paused. ' + lanInfo;
+    document.getElementById('manage-web-lan-info').textContent = lanInfo;
+
+    // Moonlight
+    var streamBox = document.getElementById('manage-stream-enabled');
+    var options = document.getElementById('manage-stream-options');
+    var exposure = document.getElementById('manage-stream-exposure');
+    streamBox.checked = !!s.enabled;
+    streamBox.disabled = !!s.unsupported;
+    options.style.display = s.enabled ? '' : 'none';
+    exposure.value = s.exposure === 'network' ? 'network' : 'this_pc';
+    exposure.disabled = !!s.bridged;
+    document.getElementById('manage-stream-gpu').checked = s.encoder !== 'software';
+    var reach = s.unsupported || s.reach || '';
+    if (s.enabled && !s.bridged) {
+        var hosts = s.exposure === 'network' ? (s.addresses || []) : ['127.0.0.1'];
+        reach += ' Address: ' + hosts.map(function(a) {
+            return s.port === 47989 ? a : a + ':' + s.port;
+        }).join(' or ') + '.';
+    } else if (s.enabled && s.guest && s.guest.address) {
+        reach += ' Address: ' + s.guest.address + (s.port === 47989 ? '' : ':' + s.port) + '.';
+    }
+    if (s.relayError) reach += ' ' + s.relayError;
+    document.getElementById('manage-stream-reach').textContent = reach;
+    document.getElementById('manage-stream-state').textContent = streamGuestText(s);
+    document.getElementById('manage-stream-pair').style.display =
+        s.enabled && s.guest && s.guest.phase === 'ready' && s.guest.running ? '' : 'none';
+}
+
+function saveRemoteWeb() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-web-enabled');
+    var lan = document.getElementById('manage-web-lan');
+    var wasLan = !!(remoteState && remoteState.web && remoteState.web.lan);
+    function send() {
+        remoteCommand('remoteSetWeb', { enabled: box.checked, flag: box.checked && lan.checked });
+    }
+    if (box.checked && lan.checked && !wasLan) {
+        lan.checked = false;
+        showModal('Allow other devices', 'Anyone on your private or domain networks who has this VM\'s access key can then control it: screen, keyboard, mouse and clipboard. Traffic is encrypted with a self-signed certificate, so browsers warn about it; check its fingerprint. A firewall rule opens one port on those networks until you turn this off or close App Sandbox.', 'Allow', {confirmClass:'danger'}).then(function(ok) {
+            if (ok) { lan.checked = true; send(); }
+        });
+        return;
+    }
+    send();
+}
+
+function saveRemoteStream() {
+    if (manageVmIndex < 0) return;
+    var box = document.getElementById('manage-stream-enabled');
+    var exposure = document.getElementById('manage-stream-exposure');
+    var gpu = document.getElementById('manage-stream-gpu');
+    var was = remoteState && remoteState.stream ? remoteState.stream : {};
+    function send() {
+        remoteCommand('remoteSetStream', { enabled: box.checked, exposure: exposure.value, flag: !gpu.checked });
+    }
+    if (box.checked && !was.enabled) {
+        box.checked = false;
+        showModal('Stream with Moonlight', 'This downloads Sunshine, a separate GPL-3 program, from its official release into the VM, checks the download against a known hash, and installs it with a service that runs at startup. Only this PC can connect until you choose otherwise. Turning this off removes Sunshine again.', 'Set up', {confirmClass:'primary'}).then(function(ok) {
+            if (ok) { box.checked = true; gpu.checked = false; send(); }
+        });
+        return;
+    }
+    if (box.checked && exposure.value === 'network' && was.exposure !== 'network') {
+        exposure.value = 'this_pc';
+        showModal('Allow other devices', 'Any device that can reach this PC on a private or domain network can then try to pair, and Windows may count VPNs like Tailscale as private. Pairing needs a PIN you enter here. A paired device controls the VM, including at the sign-in screen, until you unpair it.', 'Allow', {confirmClass:'danger'}).then(function(ok) {
+            if (ok) { exposure.value = 'network'; send(); }
+        });
+        return;
+    }
+    send();
+}
+
+function openRemoteWeb() {
+    var url = document.getElementById('manage-web-url').value;
+    if (url) sendCmd('remoteOpenWeb', { url: url });
+}
+
+function copyRemoteWeb() {
+    var box = document.getElementById('manage-web-url');
+    box.select();
+    document.execCommand('copy');
+}
+
+function pairRemoteStream() {
+    var box = document.getElementById('manage-stream-pin');
+    var pin = box.value.trim();
+    if (!/^[0-9]{4}$/.test(pin)) {
+        document.getElementById('manage-remote-message').textContent = 'The PIN is the 4 digits Moonlight shows.';
+        return;
+    }
+    box.value = '';
+    remoteCommand('remotePair', { pin: pin, client: 'Moonlight' });
+}
+
+function unpairRemoteStream() {
+    showModal('Unpair all', 'Forget every Moonlight device paired with this VM? They would have to pair again with a new PIN.', 'Unpair', {}).then(function(ok) {
+        if (ok) remoteCommand('remoteUnpair', {});
+    });
 }
 
 function saveManageDomainMember() {
@@ -2564,6 +2742,222 @@ function installUpdate() {
         : 'App Sandbox downloads version ' + s.version + size + ', verifies it, closes, installs it and reopens. A running shared appliance stops with it.';
     showModal('Install update', message, blockers.length ? 'Install After They Stop' : 'Install', { confirmClass: 'primary' })
         .then(function(ok) { if (ok) sendCmd('updateInstall'); });
+}
+
+/* ---- Run in Sandbox ---- */
+
+var sandboxFiles = [];          /* files waiting on the picker */
+var sandboxPicked = null;       /* name of the VM selected in the picker */
+var sandboxFinishVm = null;     /* name of the VM the finish dialog is about */
+var sandboxStoppedAsked = {};   /* run id -> already asked since the VM stopped */
+
+/* Types that only mean something on Windows, to warn before they land on Linux. */
+var SANDBOX_WINDOWS_ONLY = /\.(exe|msi|bat|cmd|com|scr|ps1|msix|appx|reg|lnk|dll)$/i;
+
+function showAlertModal(title, text) {
+    showModal(title, text, 'OK', { confirmClass: 'primary' });
+    document.getElementById('modal-cancel-btn').style.display = 'none';
+    /* Don't leave the single button behind for the next caller. */
+    pendingConfirm.resolve = function() {
+        document.getElementById('modal-cancel-btn').style.display = '';
+    };
+}
+
+function onSandboxRequest(msg) {
+    if (!sandboxFiles.some(function(f) { return f.path === msg.path; }))
+        sandboxFiles.push(msg);
+    renderSandboxPicker();
+    document.getElementById('sandbox-overlay').classList.add('active');
+}
+
+function sandboxDefaultVm() {
+    var usable = vms.filter(function(v) { return !v.runUnsuitable; });
+    var pick = usable.filter(function(v) { return v.sandboxLast; })[0];
+    /* Next best is one with nothing to interrupt, Windows first since most of what
+       gets right-clicked on a Windows host is for Windows. */
+    if (!pick) pick = usable.filter(function(v) { return !v.running && v.osType.toLowerCase().indexOf('win') === 0; })[0];
+    if (!pick) pick = usable.filter(function(v) { return !v.running; })[0];
+    if (!pick) pick = usable.filter(function(v) { return v.runActive; })[0];
+    return pick || usable[0] || null;
+}
+
+function renderSandboxPicker() {
+    if (!sandboxFiles.length) return;
+    var list = document.getElementById('sandbox-vm-list');
+    var notes = document.getElementById('sandbox-notes');
+    var buttons = document.getElementById('sandbox-buttons');
+    var fileLine = sandboxFiles[0].name;
+    if (sandboxFiles[0].sizeMb >= 1) fileLine += ' (' + sandboxFiles[0].sizeMb + ' MB)';
+    if (sandboxFiles.length > 1) fileLine += ' and ' + (sandboxFiles.length - 1) + ' more';
+    document.getElementById('sandbox-file').textContent = fileLine;
+
+    var usable = vms.filter(function(v) { return !v.runUnsuitable; });
+    if (!usable.some(function(v) { return v.name === sandboxPicked; })) {
+        var def = sandboxDefaultVm();
+        sandboxPicked = def ? def.name : null;
+    }
+
+    list.innerHTML = '';
+    vms.forEach(function(vm) {
+        var label = document.createElement('label');
+        label.className = 'sandbox-vm' + (vm.runUnsuitable ? ' unsuitable' : '');
+        var radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'sandbox-vm';
+        radio.disabled = !!vm.runUnsuitable;
+        radio.checked = vm.name === sandboxPicked;
+        radio.onchange = function() { sandboxPicked = vm.name; renderSandboxPicker(); };
+        var text = document.createElement('span');
+        text.textContent = vm.name + ' ';
+        var small = document.createElement('small');
+        small.textContent = vm.runUnsuitable ? vm.runUnsuitable
+            : vm.runActive ? 'Already in a run: the file joins it.'
+            : vm.running ? 'Running' : 'Stopped';
+        text.appendChild(small);
+        label.appendChild(radio);
+        label.appendChild(text);
+        list.appendChild(label);
+    });
+
+    buttons.innerHTML = '';
+    notes.innerHTML = '';
+    function button(text, cls, handler) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        if (cls) b.className = cls;
+        b.onclick = handler;
+        buttons.appendChild(b);
+    }
+    function note(text, warn) {
+        var p = document.createElement('p');
+        p.textContent = text;
+        if (warn) p.className = 'warn';
+        notes.appendChild(p);
+    }
+    button('Cancel', '', closeSandboxPicker);
+
+    var vm = vms.filter(function(v) { return v.name === sandboxPicked; })[0];
+    if (!vm) {
+        note(vms.length ? 'None of your VMs can take a file right now, for the reasons above.'
+                        : 'You don\'t have a VM to run this in yet.');
+        button('Create a VM', 'primary', function() { closeSandboxPicker(); openCreateModal(); });
+        return;
+    }
+
+    if (vm.osType.toLowerCase().indexOf('win') !== 0 &&
+        sandboxFiles.some(function(f) { return SANDBOX_WINDOWS_ONLY.test(f.name); }))
+        note('This is a Windows file type, and ' + vm.name + ' runs Linux. It will be copied in but probably won\'t open.', true);
+    if (vm.networkMode !== 0)
+        note('The file can use this VM\'s network access while it runs.');
+    note('Rolling back covers this VM\'s own disk. Anything it writes to shared drives or sends over the network stays.');
+    if (vm.disposable)
+        note('This VM is disposable, so its next normal start replaces whatever you keep from this run.');
+
+    if (vm.runActive) {
+        button('Add to this run', 'primary', function() { startSandboxRun('checkpoint'); });
+    } else if (vm.running) {
+        note(vm.name + ' is running, and a checkpoint needs it off. Shutting it down closes its apps: save your work there first. ' +
+             'Opening without a checkpoint leaves it running, but nothing the file does can be rolled back.', true);
+        button('Open without checkpoint', 'danger', function() { startSandboxRun('no-checkpoint'); });
+        button('Shut down and checkpoint', 'primary', function() { startSandboxRun('shutdown-first'); });
+    } else {
+        button('Run', 'primary', function() { startSandboxRun('checkpoint'); });
+    }
+}
+
+function startSandboxRun(mode) {
+    var idx = vms.findIndex(function(v) { return v.name === sandboxPicked; });
+    if (idx < 0) return;
+    sandboxFiles.forEach(function(f) {
+        sendCmd('sandboxRun', { vmIndex: idx, path: f.path, mode: mode });
+    });
+    closeSandboxPicker();
+}
+
+function closeSandboxPicker() {
+    sandboxFiles = [];
+    sandboxPicked = null;
+    document.getElementById('sandbox-overlay').classList.remove('active');
+}
+
+function renderSandboxRuns() {
+    var host = document.getElementById('sandbox-runs');
+    if (!host) return;
+    host.innerHTML = '';
+    vms.forEach(function(vm, idx) {
+        /* Stopped with a run open: from a shutdown inside the guest, or from before the
+           app last closed. Ask once per stop, and leave the banner for later. */
+        if (vm.runActive && vm.running) delete sandboxStoppedAsked[vm.runId];
+        if (vm.runActive && !vm.running && !vm.runBusy && !sandboxStoppedAsked[vm.runId]) {
+            sandboxStoppedAsked[vm.runId] = true;
+            openSandboxFinish(idx);
+        }
+        if (!vm.runActive && !vm.runBusy && !vm.runMessage) return;
+
+        var box = document.createElement('div');
+        box.className = 'sandbox-run' + (vm.runPhase === 9 ? ' failed' : '');
+        var text = document.createElement('div');
+        text.className = 'sandbox-run-text';
+        text.textContent = vm.name + (vm.runFile ? ': ' + vm.runFile : '');
+        var small = document.createElement('small');
+        small.textContent = vm.runMessage ||
+            (vm.runActive ? 'This run is still open. Its changes are kept until you finish it.' : '');
+        text.appendChild(small);
+        if (vm.runGuestPath) {
+            var where = document.createElement('small');
+            where.textContent = 'In the VM: ' + vm.runGuestPath;
+            text.appendChild(where);
+        }
+        box.appendChild(text);
+        if (vm.runBusy && vm.runPhase === 5) {
+            var bar = document.createElement('progress');
+            bar.max = 100;
+            bar.value = vm.runPct;
+            box.appendChild(bar);
+        }
+        function action(label, handler, cls) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            if (cls) b.className = cls;
+            b.onclick = handler;
+            box.appendChild(b);
+        }
+        if (vm.running)
+            action('Open display', function() { sendCmd('connectIddVm', { vmIndex: idx }); });
+        if (vm.runActive && !vm.runBusy)
+            action('Finish...', function() { openSandboxFinish(idx); }, 'primary');
+        if (!vm.runActive && !vm.runBusy)
+            action('Dismiss', function() { sendCmd('sandboxDismiss', { vmIndex: idx }); });
+        host.appendChild(box);
+    });
+}
+
+function openSandboxFinish(idx) {
+    var vm = vms[idx];
+    if (!vm || !vm.runActive) return;
+    sandboxFinishVm = vm.name;
+    document.getElementById('sandbox-finish-title').textContent = 'Finish the run on ' + vm.name + '?';
+    document.getElementById('sandbox-finish-text').textContent =
+        (vm.runFile ? vm.runFile + ' was opened on a throwaway checkpoint. ' : '') +
+        'Discarding rolls ' + vm.name + ' back to before the run: everything changed since is deleted' +
+        (vm.running ? ' and the VM stops at once, without saving' : '') + '. ' +
+        'Keeping merges the changes into its disk' +
+        (vm.running ? ' after shutting it down cleanly' : '') + '. ' +
+        'Not yet leaves the run open.';
+    document.getElementById('sandbox-finish-overlay').classList.add('active');
+}
+
+function closeSandboxFinish() {
+    sandboxFinishVm = null;
+    document.getElementById('sandbox-finish-overlay').classList.remove('active');
+}
+
+function finishSandbox(keep) {
+    var idx = vms.findIndex(function(v) { return v.name === sandboxFinishVm; });
+    closeSandboxFinish();
+    if (idx >= 0) sendCmd('sandboxFinish', { vmIndex: idx, keep: keep });
 }
 
 function showModal(title, message, confirmText, opts) {

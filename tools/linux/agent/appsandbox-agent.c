@@ -38,6 +38,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -1918,6 +1919,299 @@ static void on_term(int sig)
 
 /* ---- Main ---- */
 
+/* ---- Run in Sandbox: files the host copies in (vsock :16) ----
+ *
+ * Mirror of tools/agent/file_drop.c, same wire protocol:
+ *   host:  "ASBDROP1 <size>\n<file name, UTF-8>\n"
+ *   guest: "ready\n" | "error:<code>\n"
+ *   host:  <size> bytes
+ *   guest: "saved:<guest path, UTF-8>\n" | "error:<code>\n"
+ *   host:  "open\n"
+ *   guest: "opened\n" | "nohandler\n" | "nosession\n" | "error:<code>\n"
+ */
+
+#define DROP_PORT           16
+#define DROP_NAME_BYTES     200     /* well under NAME_MAX, whatever the encoding */
+#define DROP_SPARE_BYTES    (64ull * 1024 * 1024)
+#define DROP_SESSION_WAIT_S 300     /* long enough for someone to sign in at the display */
+#define DROP_OPEN_WAIT_S    15
+
+static int drop_recv_line(int fd, char *buf, size_t cap)
+{
+    size_t pos = 0;
+    while (pos + 1 < cap) {
+        char c;
+        ssize_t n = read(fd, &c, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        if (c == '\n') break;
+        if (c != '\r') buf[pos++] = c;
+    }
+    buf[pos] = '\0';
+    return (int)pos;
+}
+
+static int drop_send_line(int fd, const char *msg)
+{
+    size_t len = strlen(msg);
+    char line[1200];
+    if (len + 2 > sizeof(line)) return -1;
+    memcpy(line, msg, len);
+    line[len] = '\n';
+    return write(fd, line, len + 1) == (ssize_t)(len + 1) ? 0 : -1;
+}
+
+/* The name is only ever a base name: no separator survives this, and the agent
+   runs as root. Shortens on a UTF-8 boundary, keeping the extension. */
+static void drop_sanitize_name(const char *in, char *out, size_t cap)
+{
+    size_t len = 0;
+    const char *p;
+    for (p = in; *p && len + 1 < cap; p++)
+        out[len++] = ((unsigned char)*p < 32 || *p == '/' || *p == '\\') ? '_' : *p;
+    out[len] = '\0';
+    if (!len || strcmp(out, ".") == 0 || strcmp(out, "..") == 0)
+        snprintf(out, cap, "file");
+    if (strlen(out) > DROP_NAME_BYTES) {
+        const char *dot = strrchr(out, '.');
+        size_t ext = dot ? strlen(dot) : 0, keep;
+        if (ext > 32) ext = 0;
+        keep = DROP_NAME_BYTES - ext;
+        while (keep && ((unsigned char)out[keep] & 0xC0) == 0x80) keep--;
+        if (ext) memmove(out + keep, out + strlen(out) - ext, ext + 1);
+        else out[keep] = '\0';
+    }
+}
+
+/* Whose desktop this goes on: whoever is signed in, else the first real user. */
+static struct passwd *drop_target_user(void)
+{
+    uid_t uid = find_graphical_session_uid();
+    struct passwd *pw;
+    if (uid) return getpwuid(uid);
+    setpwent();
+    while ((pw = getpwent())) {
+        if (pw->pw_uid >= 1000 && pw->pw_uid < 65534 && uid_is_real_user(pw->pw_uid)) {
+            endpwent();
+            return pw;
+        }
+    }
+    endpwent();
+    return NULL;
+}
+
+/* A new file that doesn't overwrite an earlier copy: "name (2).ext". O_NOFOLLOW
+   because this is root writing into a folder the user owns. */
+static int drop_create_unique(const char *folder, const char *name, char *path, size_t cap)
+{
+    const char *dot = strrchr(name, '.');
+    int stem = dot && dot != name ? (int)(dot - name) : (int)strlen(name);
+    const char *ext = dot && dot != name ? dot : "";
+    int n;
+    for (n = 1; n < 1000; n++) {
+        int fd;
+        if (n == 1) snprintf(path, cap, "%s/%s", folder, name);
+        else snprintf(path, cap, "%s/%.*s (%d)%s", folder, stem, name, n, ext);
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+    return -1;
+}
+
+/* Run xdg-open as the user. A small watcher reports through a pipe, so a handler
+   that stays in the foreground isn't waited for and isn't left a zombie.
+   Returns the exit status, -1 if it is still running, -2 if it never ran. */
+static int drop_xdg_open(const struct passwd *pw, const char *path)
+{
+    int pipefd[2], status = -2;
+    pid_t watcher;
+    struct pollfd pfd;
+
+    if (pipe(pipefd) != 0) return -2;
+    watcher = fork();
+    if (watcher < 0) { close(pipefd[0]); close(pipefd[1]); return -2; }
+    if (watcher == 0) {
+        char env_rt[64], env_bus[96], xauth[512] = {0};
+        pid_t child;
+        int devnull, i;
+        close(pipefd[0]);
+        setsid();
+        if (setgid(pw->pw_gid) < 0 || initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+            setuid(pw->pw_uid) < 0)
+            _exit(127);
+        snprintf(env_rt, sizeof(env_rt), "/run/user/%u", (unsigned)pw->pw_uid);
+        snprintf(env_bus, sizeof(env_bus), "unix:path=/run/user/%u/bus", (unsigned)pw->pw_uid);
+        find_mutter_xauth(pw->pw_uid, xauth, sizeof(xauth));
+        if (!xauth[0]) snprintf(xauth, sizeof(xauth), "%s/.Xauthority", pw->pw_dir);
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        setenv("DISPLAY", ":0", 1);
+        setenv("WAYLAND_DISPLAY", "wayland-0", 1);
+        setenv("XDG_RUNTIME_DIR", env_rt, 1);
+        setenv("DBUS_SESSION_BUS_ADDRESS", env_bus, 1);
+        setenv("XDG_CURRENT_DESKTOP", "ubuntu:GNOME", 1);
+        setenv("XDG_SESSION_TYPE", "wayland", 1);
+        setenv("XAUTHORITY", xauth, 1);
+        if (chdir(pw->pw_dir) != 0) { /* xdg-open doesn't need it */ }
+        child = fork();
+        if (child < 0) _exit(127);
+        if (child == 0) {
+            devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) {
+                dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2);
+                if (devnull > 2) close(devnull);
+            }
+            close(pipefd[1]);
+            /* An argv element, never a shell string: any name is safe here. */
+            execlp("xdg-open", "xdg-open", path, (char *)NULL);
+            _exit(127);
+        }
+        for (i = 0; i < DROP_OPEN_WAIT_S * 10; i++) {
+            int st;
+            if (waitpid(child, &st, WNOHANG) == child) {
+                int code = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+                if (write(pipefd[1], &code, sizeof(code)) < 0) _exit(1);
+                _exit(0);
+            }
+            usleep(100 * 1000);
+        }
+        {
+            int still = -1;
+            if (write(pipefd[1], &still, sizeof(still)) < 0) _exit(1);
+        }
+        _exit(0);   /* the handler carries on, reparented to init */
+    }
+    close(pipefd[1]);
+    pfd.fd = pipefd[0];
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, (DROP_OPEN_WAIT_S + 5) * 1000) > 0 &&
+        read(pipefd[0], &status, sizeof(status)) != sizeof(status))
+        status = -2;
+    close(pipefd[0]);
+    waitpid(watcher, NULL, 0);
+    return status;
+}
+
+static const char *drop_open(const char *path, const char *folder)
+{
+    uid_t uid = 0;
+    struct passwd *pw;
+    int waited, rc;
+
+    for (waited = 0; waited < DROP_SESSION_WAIT_S && !g_stop; waited++) {
+        uid = find_graphical_session_uid();
+        if (uid && is_user_session_ready(uid)) break;
+        uid = 0;
+        sleep(1);
+    }
+    if (!uid) return "nosession";
+    pw = getpwuid(uid);
+    if (!pw) return "error:user";
+    rc = drop_xdg_open(pw, path);
+    if (rc == 0 || rc == -1) return "opened";
+    if (rc == -2) return "error:spawn";
+    /* xdg-open failing means nothing here handles this type. Show the file in its
+       folder so it's at least in front of the user. */
+    agent_log("file drop: xdg-open exited %d", rc);
+    drop_xdg_open(pw, folder);
+    return "nohandler";
+}
+
+static void drop_handle(int fd)
+{
+    char line[1200], name[256], folder[512], path[1024], reply[1100], *buf;
+    unsigned long long size = 0, left;
+    struct passwd *pw;
+    struct statvfs vfs;
+    uid_t uid;
+    gid_t gid;
+    int file, ok = 1;
+
+    if (drop_recv_line(fd, line, sizeof(line)) < 0) return;
+    if (sscanf(line, "ASBDROP1 %llu", &size) != 1) { drop_send_line(fd, "error:protocol"); return; }
+    if (drop_recv_line(fd, line, sizeof(line)) < 0) return;
+    drop_sanitize_name(line, name, sizeof(name));
+
+    pw = drop_target_user();
+    if (!pw) { drop_send_line(fd, "error:nouser"); return; }
+    uid = pw->pw_uid;
+    gid = pw->pw_gid;
+    snprintf(folder, sizeof(folder), "%s/Run in Sandbox", pw->pw_dir);
+    if (mkdir(folder, 0755) != 0 && errno != EEXIST) { drop_send_line(fd, "error:folder"); return; }
+    if (lchown(folder, uid, gid) != 0) agent_log("file drop: chown folder: %s", strerror(errno));
+    if (statvfs(folder, &vfs) == 0 &&
+        (unsigned long long)vfs.f_bavail * vfs.f_frsize < size + DROP_SPARE_BYTES) {
+        drop_send_line(fd, "error:nospace");
+        return;
+    }
+    file = drop_create_unique(folder, name, path, sizeof(path));
+    if (file < 0) { drop_send_line(fd, "error:create"); return; }
+    if (fchown(file, uid, gid) != 0) agent_log("file drop: chown file: %s", strerror(errno));
+    buf = malloc(1024 * 1024);
+    if (!buf) { close(file); unlink(path); drop_send_line(fd, "error:memory"); return; }
+
+    if (drop_send_line(fd, "ready") != 0) ok = 0;
+    left = size;
+    while (ok && left) {
+        ssize_t got = read(fd, buf, left < 1024 * 1024 ? left : 1024 * 1024), off = 0;
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) { ok = 0; break; }
+        while (off < got) {
+            ssize_t w = write(file, buf + off, (size_t)(got - off));
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) { ok = 0; drop_send_line(fd, "error:write"); break; }
+            off += w;
+        }
+        left -= (unsigned long long)got;
+    }
+    free(buf);
+    if (ok && fsync(file) != 0) ok = 0;
+    close(file);
+    if (!ok) {
+        /* Never leave half a file where someone could mistake it for the real one. */
+        unlink(path);
+        agent_log("file drop: copy ended early with %llu bytes to go", left);
+        return;
+    }
+    snprintf(reply, sizeof(reply), "saved:%s", path);
+    drop_send_line(fd, reply);
+    agent_log("file drop: saved %llu bytes", size);
+
+    if (drop_recv_line(fd, line, sizeof(line)) >= 0 && strcmp(line, "open") == 0)
+        drop_send_line(fd, drop_open(path, folder));
+}
+
+static void *drop_thread(void *arg)
+{
+    int ls = -1;
+    (void)arg;
+    while (!g_stop) {
+        int c;
+        if (ls < 0) {
+            ls = vsock_bind_listen_privileged(DROP_PORT);
+            if (ls < 0) { sleep(3); continue; }
+            agent_log("file drop: listening on AF_VSOCK :%d", DROP_PORT);
+        }
+        c = accept(ls, NULL, NULL);
+        if (c < 0) {
+            if (errno != EINTR) { close(ls); ls = -1; sleep(1); }
+            continue;
+        }
+        drop_handle(c);
+        close(c);
+    }
+    if (ls >= 0) close(ls);
+    return NULL;
+}
+
+static void start_file_drop(void)
+{
+    pthread_t t;
+    if (pthread_create(&t, NULL, drop_thread, NULL) == 0) pthread_detach(t);
+    else agent_log("file drop: pthread_create failed: %s", strerror(errno));
+}
+
 int main(int argc, char **argv)
 {
     struct sigaction sa;
@@ -1943,6 +2237,9 @@ int main(int argc, char **argv)
 
     /* Apps left over from an earlier start (see apps_thread). */
     start_app_install();
+
+    /* Run in Sandbox: files the host copies in. */
+    start_file_drop();
 
     while (!g_stop) {
         int c = accept(ls, NULL, NULL);

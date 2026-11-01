@@ -16,6 +16,9 @@
 #include "vm_display_auto.h"
 #include "vm_seamless.h"
 #include "vm_agent.h"
+#include "sandbox_run.h"
+#include "vm_stream.h"
+#include "vm_web.h"
 #include "webview2_bridge.h"
 #include "update_ui.h"
 #include "prereq.h"
@@ -57,6 +60,8 @@ static VmDisplayAuto *g_vm_displays[ASB_MAX_VMS];
 static VmDisplay *g_appliance_display = NULL;
 
 /* Custom window messages */
+/* From appsandbox-run.exe: a file to run, as a NUL-terminated absolute path. */
+#define ASB_COPYDATA_RUN_FILE  0x41534252
 #define WM_VM_STATE_CHANGED    (WM_APP + 1)
 #define WM_VM_AGENT_STATUS     (WM_APP + 2)
 #define WM_VM_AGENT_SHUTDOWN   (WM_APP + 3)
@@ -233,6 +238,12 @@ static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
     jb_string(jb, key, buf);
 }
 
+/* Paths Explorer sent before the page could show them. */
+#define SANDBOX_PENDING_MAX 32
+static wchar_t *g_sandbox_pending[SANDBOX_PENDING_MAX];
+static int g_sandbox_pending_count;
+static BOOL g_sandbox_ui_ready;
+
 static void build_vm_json(JsonBuilder *jb, int i)
 {
     VmInstance *v = asb_vm_instance(asb_vm_get(i));
@@ -272,6 +283,21 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"secureBoot", !v->secure_boot_off);
     jb_bool(jb, L"domainMember", v->domain_member);
     jb_bool(jb, L"disposable", v->disposable_snap[0] != L'\0');
+    {
+        AsbRunStatus run;
+        const wchar_t *unsuitable = asb_run_unsuitable_reason(asb_vm_get(i));
+        asb_run_get_status(asb_vm_get(i), &run);
+        jb_bool(jb, L"runActive", run.active);
+        jb_bool(jb, L"runBusy", run.busy);
+        jb_int(jb, L"runPhase", run.phase);
+        jb_int(jb, L"runPct", run.pct);
+        jb_string(jb, L"runId", run.id);
+        jb_string(jb, L"runFile", run.file);
+        jb_string(jb, L"runMessage", run.message);
+        jb_string(jb, L"runGuestPath", run.guest_path);
+        jb_string(jb, L"runUnsuitable", unsuitable ? unsuitable : L"");
+        jb_bool(jb, L"sandboxLast", _wcsicmp(asb_get_last_sandbox_vm(), v->name) == 0);
+    }
     jb_bool(jb, L"labMode", v->lab_mode);
     jb_bool(jb, L"labRunning", v->lab_running != 0);
     jb_bool(jb, L"seamlessOpen", vm_seamless_is_open(v->unique_id));
@@ -827,6 +853,43 @@ static void main_window_to_tray(HWND hwnd)
     tray_explain_once();
 }
 
+/* Ask the page to offer this file. The picker is where anything gets decided. */
+static void post_sandbox_request(const wchar_t *path)
+{
+    static wchar_t buf[8192];
+    JsonBuilder jb;
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    const wchar_t *slash = wcsrchr(path, L'\\');
+    ULONGLONG size = 0;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &info))
+        size = ((ULONGLONG)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+    jb_init(&jb, buf, _countof(buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"sandboxRequest");
+    jb_string(&jb, L"path", path);
+    jb_string(&jb, L"name", slash ? slash + 1 : path);
+    jb_int(&jb, L"sizeMb", (int)(size / (1024 * 1024)));
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
+static void flush_sandbox_pending(void)
+{
+    int i;
+    for (i = 0; i < g_sandbox_pending_count; i++) {
+        post_sandbox_request(g_sandbox_pending[i]);
+        free(g_sandbox_pending[i]);
+    }
+    g_sandbox_pending_count = 0;
+}
+
+static void post_sandbox_finish_prompt(int idx)
+{
+    wchar_t json[96];
+    swprintf_s(json, _countof(json), L"{\"type\":\"sandboxFinishPrompt\",\"vmIndex\":%d}", idx);
+    webview2_post(json);
+}
+
 static void main_window_show(HWND hwnd)
 {
     /* SW_RESTORE would also take a maximized window out of being maximized. */
@@ -1160,6 +1223,7 @@ typedef struct {
 } LabWork;
 
 #define WM_LAB_DONE (WM_APP + 23)
+#define WM_REMOTE_DONE (WM_APP + 25)
 
 static DWORD WINAPI lab_work_thread(LPVOID param)
 {
@@ -1192,6 +1256,76 @@ static void finish_lab_work(LabWork *w)
     if (SUCCEEDED(w->result) && w->report[0])
         ShellExecuteW(g_hwnd_main, L"open", w->report, NULL, NULL, SW_SHOWNORMAL);
     send_vm_list();
+}
+
+/* Remote access: asking the guest can take seconds, so a worker does it and the
+   result comes back as a remoteStatus message. */
+typedef struct {
+    wchar_t action[24];
+    int     vm_index;
+    BOOL    enabled, flag;
+    wchar_t exposure[16];
+    char    pin[8], client[64];
+    wchar_t message[512];
+    char    stream[16384], web[8192];
+} RemoteWork;
+
+static DWORD WINAPI remote_work_thread(LPVOID param)
+{
+    RemoteWork *w = (RemoteWork *)param;
+    VmInstance *v = asb_vm_instance(asb_vm_get(w->vm_index));
+    HRESULT hr = S_OK;
+    char message[400] = "";
+    if (v) {
+        if (wcscmp(w->action, L"remoteSetStream") == 0)
+            hr = vm_stream_configure(v, w->enabled,
+                                     wcscmp(w->exposure, L"network") == 0 ? ASB_STREAM_NETWORK : ASB_STREAM_THIS_PC,
+                                     w->flag, w->message, _countof(w->message));
+        else if (wcscmp(w->action, L"remotePair") == 0)
+            hr = vm_stream_pair(v, w->pin, w->client, message, sizeof(message));
+        else if (wcscmp(w->action, L"remoteUnpair") == 0)
+            hr = vm_stream_unpair_all(v, message, sizeof(message));
+        else if (wcscmp(w->action, L"remoteSetWeb") == 0)
+            hr = vm_web_set(v, w->enabled, w->flag, w->message, _countof(w->message));
+        if (FAILED(hr) && !w->message[0]) {
+            if (message[0]) MultiByteToWideChar(CP_UTF8, 0, message, -1, w->message, _countof(w->message));
+            else wcscpy_s(w->message, _countof(w->message), L"That didn't work. Is the VM on, with its agent running?");
+        }
+        vm_stream_status_json(v, w->stream, sizeof(w->stream));
+        vm_web_status_json(v, w->web, sizeof(w->web));
+    }
+    if (!PostMessageW(g_hwnd_main, WM_REMOTE_DONE, 0, (LPARAM)w)) free(w);
+    return 0;
+}
+
+static void finish_remote_work(RemoteWork *w)
+{
+    static wchar_t out[32768];
+    JsonBuilder jb;
+    size_t len;
+    int n;
+    jb_init(&jb, out, _countof(out));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"remoteStatus");
+    jb_string(&jb, L"action", w->action);
+    jb_int(&jb, L"vmIndex", w->vm_index);
+    jb_string(&jb, L"message", w->message);
+    jb_object_end(&jb);
+    len = wcslen(out);
+    if (len && out[len - 1] == L'}' && w->stream[0] && w->web[0]) {
+        len--;
+        wcscpy_s(out + len, _countof(out) - len, L",\"stream\":");
+        len = wcslen(out);
+        n = MultiByteToWideChar(CP_UTF8, 0, w->stream, -1, out + len, (int)(_countof(out) - len));
+        if (n > 0) len += n - 1;
+        wcscat_s(out, _countof(out), L",\"web\":");
+        len = wcslen(out);
+        n = MultiByteToWideChar(CP_UTF8, 0, w->web, -1, out + len, (int)(_countof(out) - len));
+        if (n > 0) len += n - 1;
+        wcscat_s(out, _countof(out), L"}");
+    }
+    webview2_post(out);
+    free(w);
 }
 
 /* Domain management talks to the appliance, which may have to start first
@@ -1400,6 +1534,8 @@ static void on_webview2_message(const wchar_t *json)
         g_prereq_ok = TRUE;
         asb_init();
         send_full_state();
+        g_sandbox_ui_ready = TRUE;
+        flush_sandbox_pending();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1507,6 +1643,51 @@ static void on_webview2_message(const wchar_t *json)
             asb_vm_stop(asb_vm_get(idx));
             send_vm_list();
         }
+    } else if (wcscmp(action, L"sandboxRun") == 0) {
+        static wchar_t path[4096];
+        wchar_t mode[24] = L"", error[256] = L"";
+        int idx = -1;
+        path[0] = L'\0';
+        json_get_string(json, L"path", path, _countof(path));
+        json_get_string(json, L"mode", mode, _countof(mode));
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            HRESULT hr = asb_run_file(asb_vm_get(idx), path,
+                wcscmp(mode, L"shutdown-first") == 0 ? ASB_RUN_MODE_SHUTDOWN_FIRST
+                : wcscmp(mode, L"no-checkpoint") == 0 ? ASB_RUN_MODE_NO_CHECKPOINT
+                                                      : ASB_RUN_MODE_CHECKPOINT,
+                error, _countof(error));
+            if (FAILED(hr)) {
+                wchar_t out[512];
+                JsonBuilder jb;
+                jb_init(&jb, out, _countof(out));
+                jb_object_begin(&jb);
+                jb_string(&jb, L"type", L"sandboxError");
+                jb_string(&jb, L"message", error[0] ? error : L"Could not run this file.");
+                jb_object_end(&jb);
+                webview2_post(out);
+            }
+        }
+    } else if (wcscmp(action, L"sandboxFinish") == 0) {
+        wchar_t error[256] = L"";
+        int idx = -1;
+        BOOL keep = FALSE;
+        /* Discard is destructive, so it has to be asked for by name. */
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count() &&
+            json_get_bool(json, L"keep", &keep) &&
+            FAILED(asb_run_finish(asb_vm_get(idx), keep, error, _countof(error)))) {
+            wchar_t out[512];
+            JsonBuilder jb;
+            jb_init(&jb, out, _countof(out));
+            jb_object_begin(&jb);
+            jb_string(&jb, L"type", L"sandboxError");
+            jb_string(&jb, L"message", error[0] ? error : L"Could not finish the run.");
+            jb_object_end(&jb);
+            webview2_post(out);
+        }
+    } else if (wcscmp(action, L"sandboxDismiss") == 0) {
+        int idx = -1;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count())
+            asb_run_clear_status(asb_vm_get(idx));
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         /* optional "view": "auto" (default) | "console" | "idd" */
         int idx;
@@ -1870,6 +2051,29 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &vi) && json_get_bool(json, L"enabled", &enabled))
             hr = asb_vm_set_secure_boot(asb_vm_get(vi), enabled);
         send_manage_result(0, hr); send_vm_list();
+    } else if (wcsncmp(action, L"remote", 6) == 0 && wcscmp(action, L"remoteOpenWeb") != 0) {
+        RemoteWork *work = (RemoteWork *)calloc(1, sizeof(*work));
+        HANDLE thread = NULL;
+        if (work && json_get_int(json, L"vmIndex", &work->vm_index)) {
+            wchar_t pin[8] = L"", client[32] = L"";
+            wcsncpy_s(work->action, _countof(work->action), action, _TRUNCATE);
+            json_get_bool(json, L"enabled", &work->enabled);
+            json_get_bool(json, L"flag", &work->flag);
+            json_get_string(json, L"exposure", work->exposure, _countof(work->exposure));
+            json_get_string(json, L"pin", pin, _countof(pin));
+            json_get_string(json, L"client", client, _countof(client));
+            WideCharToMultiByte(CP_UTF8, 0, pin, -1, work->pin, sizeof(work->pin), NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, client, -1, work->client, sizeof(work->client), NULL, NULL);
+            thread = CreateThread(NULL, 0, remote_work_thread, work, 0, NULL);
+        }
+        if (thread) CloseHandle(thread);
+        else free(work);
+    } else if (wcscmp(action, L"remoteOpenWeb") == 0) {
+        /* Only ever our own page on this PC. */
+        wchar_t url[3200] = L"";
+        json_get_string(json, L"url", url, _countof(url));
+        if (wcsncmp(url, L"http://127.0.0.1:", 17) == 0)
+            ShellExecuteW(g_hwnd_main, L"open", url, NULL, NULL, SW_SHOWNORMAL);
     } else if (wcscmp(action, L"labStart") == 0 || wcscmp(action, L"labStop") == 0) {
         LabWork *work = (LabWork *)calloc(1, sizeof(*work));
         HANDLE thread = NULL;
@@ -2111,6 +2315,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
                         L"App Sandbox", MB_ICONERROR);
         }
+        /* appsandbox-run.exe isn't elevated either. */
+        ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);
         /* Explorer isn't elevated, so without the filter this never reaches us. */
         g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
         if (g_wm_taskbar_created)
@@ -2144,6 +2350,37 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_COPYDATA:
+    {
+        /* From another process at a lower integrity level: check it all. It only ever
+           opens the picker, so a bogus path gets no further than a dialog. */
+        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
+        const wchar_t *path;
+        size_t chars;
+        if (!cds || cds->dwData != ASB_COPYDATA_RUN_FILE || !cds->lpData ||
+            cds->cbData < 4 * sizeof(wchar_t) || cds->cbData % sizeof(wchar_t) ||
+            cds->cbData > 4096 * sizeof(wchar_t))
+            return 0;
+        path = (const wchar_t *)cds->lpData;
+        chars = cds->cbData / sizeof(wchar_t);
+        if (path[chars - 1] != L'\0' || wcslen(path) != chars - 1) return 0;
+        if (!((iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') ||
+              (path[0] == L'\\' && path[1] == L'\\')))
+            return 0;
+        if (g_sandbox_ui_ready) {
+            post_sandbox_request(path);
+        } else {
+            wchar_t *copy;
+            /* Refused means the launcher tries again in a moment. */
+            if (g_sandbox_pending_count >= SANDBOX_PENDING_MAX) return 0;
+            copy = _wcsdup(path);
+            if (!copy) return 0;
+            g_sandbox_pending[g_sandbox_pending_count++] = copy;
+        }
+        main_window_show(hwnd);
+        return 1;
+    }
+
     case WM_VM_STATE_CHANGED:
     {
         /* Library already handled cleanup - just refresh UI and manage displays */
@@ -2154,6 +2391,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (idx >= 0 && !running) {
             safe_destroy_display(idx);
         }
+        if (idx >= 0 && asb_run_take_display_request(vm))
+            do_connect_vm(idx, VDA_VIEW_AUTO);
 
         send_vm_list();
         update_ui_on_vm_state();
@@ -2219,6 +2458,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DOMAIN_PROGRESS:
         send_full_state();
+        return 0;
+    case WM_REMOTE_DONE:
+        finish_remote_work((RemoteWork *)lp);
         return 0;
     case WM_LAB_DONE:
         if (lp) {
@@ -2291,6 +2533,11 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
                 /* wp 0 = Hyper-V console, 1 = IDD: either way the window is gone */
                 safe_destroy_display(i);
+                /* Closing the window is how most people say they are done. */
+                if (asb_run_active(asb_vm_get(i))) {
+                    main_window_show(hwnd);
+                    post_sandbox_finish_prompt(i);
+                }
                 break;
             }
         }

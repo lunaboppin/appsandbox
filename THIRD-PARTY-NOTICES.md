@@ -7,6 +7,12 @@ MIT License and remain under their own licenses and copyrights. Each vendored
 source file additionally carries its own `SPDX-License-Identifier` header, which
 governs that file.
 
+**Not bundled:** turning on Moonlight streaming for a VM makes that VM download
+[Sunshine](https://github.com/LizardByte/Sunshine) (GPL-3.0) and
+[ViGEmBus](https://github.com/nefarius/ViGEmBus) (BSD-3-Clause) from their official
+releases and install them inside the guest, each checked against a pinned SHA-256.
+App Sandbox does not ship, link or modify either one.
+
 ---
 
 ## tools/linux/dxgkrnl/ — Microsoft WSL2 `dxgkrnl` GPU driver
