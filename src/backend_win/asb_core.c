@@ -1003,7 +1003,8 @@ static void refresh_guest_helpers(wchar_t drive, const wchar_t *source_dir)
     static const wchar_t *helpers[] = {
         L"appsandbox-input.exe", L"appsandbox-clipboard.exe",
         L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe",
-        L"appsandbox-displays.exe", L"+appsandbox-backstage.exe", NULL
+        L"appsandbox-displays.exe", L"+appsandbox-backstage.exe",
+        L"+appsandbox-seamless.exe", NULL
     };
     wchar_t source[MAX_PATH], dest[MAX_PATH], temp[MAX_PATH];
     BYTE a[32], b[32];
@@ -1094,7 +1095,7 @@ static void guest_payload_stamp(wchar_t *out, size_t chars)
 {
     static const wchar_t *files[] = {
         L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-audio.exe",
-        L"appsandbox-backstage.exe", L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys",
+        L"appsandbox-backstage.exe", L"appsandbox-seamless.exe", L"*AppSandboxVDD.dll", L"*AppSandboxVAD.sys",
         L"*AppSandboxVDD.inf", L"*AppSandboxVAD.inf", NULL   /* '*' = in the drivers folder */
     };
     wchar_t module[MAX_PATH], dir[MAX_PATH], drivers_dir[MAX_PATH], path[MAX_PATH], *slash;

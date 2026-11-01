@@ -14,6 +14,7 @@
 #include "vm_display.h"
 #include "vm_display_idd.h"
 #include "vm_display_auto.h"
+#include "vm_seamless.h"
 #include "vm_agent.h"
 #include "webview2_bridge.h"
 #include "update_ui.h"
@@ -273,6 +274,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"disposable", v->disposable_snap[0] != L'\0');
     jb_bool(jb, L"labMode", v->lab_mode);
     jb_bool(jb, L"labRunning", v->lab_running != 0);
+    jb_bool(jb, L"seamlessOpen", vm_seamless_is_open(v->unique_id));
+    /* Empty unless it could never work here; a stopped VM just greys the button. */
+    jb_string(jb, L"seamlessUnavailable",
+              _wcsicmp(v->os_type, L"Windows") != 0 ? L"Seamless mode needs a Windows guest: Ubuntu's Wayland desktop gives a helper no way to capture other apps' windows one by one."
+              : v->lab_mode ? L"Seamless mode is off for malware lab VMs." : L"");
     jb_int(jb, L"labShots", (int)v->lab_shots);
     jb_int(jb, L"labSeconds", v->lab_running ? (int)((GetTickCount64() - v->lab_t0) / 1000) : 0);
     jb_string(jb, L"labReport", v->lab_report);
@@ -1510,6 +1516,16 @@ static void on_webview2_message(const wchar_t *json)
             do_connect_vm(idx, wcscmp(view, L"console") == 0 ? VDA_VIEW_CONSOLE
                              : wcscmp(view, L"idd") == 0     ? VDA_VIEW_IDD
                                                              : VDA_VIEW_AUTO);
+    } else if (wcscmp(action, L"seamlessVm") == 0) {
+        /* Opens seamless mode, or brings its launcher to the front. */
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            VmInstance *v = asb_vm_instance(asb_vm_get(idx));
+            const wchar_t *why = vm_seamless_unavailable(v);
+            if (why) ui_log(L"%s", why);
+            else vm_seamless_open(v, g_hInstance);
+            send_vm_list();
+        }
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {

@@ -33,6 +33,7 @@
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_auto.h"   /* display window (Hyper-V console while booting, then IDD) */
+#include "vm_seamless.h"       /* seamless mode: guest windows as host windows */
 
 #pragma comment(lib, "httpapi.lib")
 
@@ -640,7 +641,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"customStorage\":true,\"sharedResources\":true,\"seamless\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -1048,6 +1049,97 @@ static int handle_request(PHTTP_REQUEST req)
                 (unsigned long)v->ssh_port, user, ssh_rep, v->ssh_enabled ? "true" : "false",
                 v->ssh_key_deployed ? "true" : "false");
             send_json(req->RequestId, 200, "OK", buf);
+            return 0;
+        }
+
+        if (wcscmp(sub, L"seamless/picture") == 0 && verb == HttpVerbPOST) {
+            /* POST {"guest":id}: what the host window shows, so a script can check it
+               without looking at the desktop. */
+            VmInstance *v = asb_vm_instance(vm);
+            wchar_t body[128];
+            int guest = 0;
+            char *picture;
+            if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
+            body_to_wide(req, body, _countof(body));
+            json_get_int(body, L"guest", &guest);
+            picture = vm_seamless_picture_json(v->unique_id, (UINT32)guest);
+            if (!picture) {
+                send_err(req->RequestId, 404, "Not Found", "no_such_window", "no such seamless window");
+                return 0;
+            }
+            send_json(req->RequestId, 200, "OK", picture);
+            free(picture);
+            return 0;
+        }
+
+        if (wcscmp(sub, L"seamless/input") == 0) {
+            /* POST {"guest":id,"event":"down","a":10,"b":20,"c":0}: see vm_seamless_input. */
+            VmInstance *v = asb_vm_instance(vm);
+            wchar_t body[512], event[32] = L"";
+            int guest = 0, a = 0, b = 0, c = 0;
+            if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
+            if (verb != HttpVerbPOST) {
+                send_err(req->RequestId, 405, "Method Not Allowed", "method", "use POST");
+                return 0;
+            }
+            body_to_wide(req, body, _countof(body));
+            json_get_string(body, L"event", event, _countof(event));
+            json_get_int(body, L"guest", &guest);
+            json_get_int(body, L"a", &a);
+            json_get_int(body, L"b", &b);
+            json_get_int(body, L"c", &c);
+            if (!vm_seamless_input(v->unique_id, (UINT32)guest, event, a, b, c)) {
+                send_err(req->RequestId, 404, "Not Found", "no_such_window", "no such seamless window or event");
+                return 0;
+            }
+            send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+            return 0;
+        }
+
+        if (wcscmp(sub, L"seamless") == 0) {
+            /* GET: state and windows. POST {"run": target}?: start it (or bring its
+               launcher forward), and open an app in the guest once connected.
+               DELETE: leave seamless mode; the guest's programs keep running. */
+            VmInstance *v = asb_vm_instance(vm);
+            if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
+            if (verb == HttpVerbPOST) {
+                wchar_t body[2048], run[1024] = L"";
+                const wchar_t *why = vm_seamless_unavailable(v);
+                if (why) {
+                    char why_utf8[300];
+                    WideCharToMultiByte(CP_UTF8, 0, why, -1, why_utf8, sizeof(why_utf8), NULL, NULL);
+                    send_err(req->RequestId, 409, "Conflict", "seamless_unavailable", why_utf8);
+                    return 0;
+                }
+                if (!host_can_show_window()) {
+                    send_err(req->RequestId, 409, "Conflict", "no_display",
+                             "no local interactive desktop is available to show windows on");
+                    return 0;
+                }
+                body_to_wide(req, body, _countof(body));
+                json_get_string(body, L"run", run, _countof(run));
+                vm_seamless_open(v, g_hinst);
+                if (run[0] && !vm_seamless_run(v->unique_id, run)) {
+                    send_err(req->RequestId, 409, "Conflict", "seamless_not_connected",
+                             "seamless mode has not connected to the guest yet; try again shortly");
+                    return 0;
+                }
+                send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+                return 0;
+            }
+            if (verb == HttpVerbDELETE) {
+                vm_seamless_close(v->unique_id);
+                send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+                return 0;
+            }
+            if (verb == HttpVerbGET) {
+                static char status[512 * 1024];   /* the request loop is single-threaded */
+                vm_seamless_status_json(v->unique_id, status, sizeof(status));
+                send_json(req->RequestId, 200, "OK", status);
+                return 0;
+            }
+            send_err(req->RequestId, 405, "Method Not Allowed", "method",
+                     "use GET for state and windows, POST to start, DELETE to leave");
             return 0;
         }
 

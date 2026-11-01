@@ -808,6 +808,7 @@ static HRESULT iso_create_resources_ex(const wchar_t *iso_path,
                 "    if exist \"%~dp0appsandbox-clipboard-reader.exe\" copy /Y \"%~dp0appsandbox-clipboard-reader.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
                 "    if exist \"%~dp0appsandbox-audio.exe\" copy /Y \"%~dp0appsandbox-audio.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
                 "    if exist \"%~dp0appsandbox-backstage.exe\" copy /Y \"%~dp0appsandbox-backstage.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+                "    if exist \"%~dp0appsandbox-seamless.exe\" copy /Y \"%~dp0appsandbox-seamless.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
                 "    \"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
                 ")\r\n"
                 "echo === setup.cmd finished === >> \"%LOG%\"\r\n",
@@ -1224,6 +1225,26 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 ui_log(L"Warning: appsandbox-backstage.exe not found at %s", bs_src);
             }
         }
+
+        /* appsandbox-seamless.exe — same directory as agent */
+        {
+            wchar_t sl_src[MAX_PATH], sl_dst[MAX_PATH];
+            wcscpy_s(sl_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(sl_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(sl_src, MAX_PATH, L"appsandbox-seamless.exe");
+            swprintf_s(sl_dst, MAX_PATH, L"%s\\appsandbox-seamless.exe", staging);
+            if (GetFileAttributesW(sl_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(sl_src, sl_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-seamless.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-seamless.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-seamless.exe not found at %s", sl_src);
+            }
+        }
     } else {
         ui_log(L"Warning: appsandbox-agent.exe not found");
     }
@@ -1364,6 +1385,7 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 "    if exist \"%~dp0appsandbox-clipboard-reader.exe\" copy /Y \"%~dp0appsandbox-clipboard-reader.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
                 "    if exist \"%~dp0appsandbox-audio.exe\" copy /Y \"%~dp0appsandbox-audio.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
                 "    if exist \"%~dp0appsandbox-backstage.exe\" copy /Y \"%~dp0appsandbox-backstage.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+                "    if exist \"%~dp0appsandbox-seamless.exe\" copy /Y \"%~dp0appsandbox-seamless.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
                 "    \"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
                 ")\r\n"
                 "echo === instance setup.cmd finished === >> \"%LOG%\"\r\n",
@@ -2178,7 +2200,7 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
 
     /* 2. Agent + input helper executables */
     {
-        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe", L"appsandbox-backstage.exe" };
+        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe", L"appsandbox-backstage.exe", L"appsandbox-seamless.exe" };
         int bi;
         for (bi = 0; bi < (int)(sizeof(bins) / sizeof(bins[0])); bi++) {
             BOOL found = FALSE;

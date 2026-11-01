@@ -1213,7 +1213,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         wchar_t guid_str[64];
         unsigned port;
         service_table[0] = L'\0';
-        for (port = 1; port <= 8; port++) {
+        for (port = 1; port <= 9; port++) {
             if (port == 7) continue;   /* SSH: works without an entry; left as it was */
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,

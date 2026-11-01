@@ -1297,6 +1297,12 @@ function buildRowCells(vm, i, statusTd) {
             }
         }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected checkpoint/branch)'),
         makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (shows the Hyper-V boot screen until the guest display is up, then switches to it)'),
+        makeIconCell('seamless', '\uD83E\uDE9F', vm.running && !bld && vm.agentOnline && !vm.seamlessUnavailable,
+            function() { sendCmd('seamlessVm', {vmIndex: i}); },
+            vm.seamlessUnavailable ? 'hidden' : (vm.seamlessOpen ? 'on' : ''),
+            vm.seamlessUnavailable || (vm.seamlessOpen
+                ? 'Seamless mode is on: show its launcher'
+                : 'Seamless mode: each app in the VM opens as its own window on this desktop')),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),

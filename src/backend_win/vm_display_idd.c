@@ -2926,6 +2926,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
         AddClipboardFormatListener(hwnd);
+        if (((VmDisplayIdd *)cs->lpCreateParams)->vm)
+            ((VmDisplayIdd *)cs->lpCreateParams)->vm->idd_window = hwnd;
         return 0;
     }
 
@@ -3075,6 +3077,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
+        if (d && d->vm && d->vm->idd_window == hwnd) d->vm->idd_window = NULL;
         KillTimer(hwnd, IDT_PRESENT);
         KillTimer(hwnd, IDT_INPUT);
         KillTimer(hwnd, IDT_RESIZE);

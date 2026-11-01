@@ -73,7 +73,7 @@ def main() -> None:
     assert 'strcmp(cmd, "backstage") == 0 || strcmp(cmd, "backstage_stop") == 0' in agent
 
     # Host: channel 8 allowed, helper staged, viewer window, menus.
-    assert "for (port = 1; port <= 8; port++)" in hcs
+    assert "for (port = 1; port <= 9; port++)" in hcs
     assert 'L"+appsandbox-backstage.exe"' in core and disk.count("appsandbox-backstage.exe") >= 6
     assert "hcs_service_guid(v->os_type, BS_CHANNEL, &addr.ServiceId);" in view
     assert 'vm_agent_send(v->vm, "backstage", reply' in view

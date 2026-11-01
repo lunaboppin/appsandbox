@@ -17,7 +17,7 @@
     <AsbVersionMajor>0</AsbVersionMajor>
     <AsbVersionMinor>1</AsbVersionMinor>
     <AsbVersionPatch>7</AsbVersionPatch>
-    <AsbVersionRevision>4</AsbVersionRevision>
+    <AsbVersionRevision>5</AsbVersionRevision>
 
     <!-- Derived forms - do not edit. -->
     <AsbVersion>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch).$(AsbVersionRevision)</AsbVersion>

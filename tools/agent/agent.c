@@ -966,6 +966,81 @@ static void backstage_start(char *reply, size_t cap)
                          "(see C:\\Windows\\AppSandbox\\backstage.log in the VM)");
 }
 
+/* ---- Seamless mode (appsandbox-seamless.exe) ----
+   Started on the host's request in the signed-in user's session, and ends by
+   itself when the host's connection does. It runs as the user, not as SYSTEM,
+   because Windows.Graphics.Capture doesn't work under SYSTEM; with the user's
+   full token where UAC split it, so that input reaches elevated windows too. */
+static HANDLE g_seamless_process;
+static DWORD  g_seamless_session = 0xFFFFFFFF;
+
+static void seamless_start(char *reply, size_t cap)
+{
+    DWORD session = WTSGetActiveConsoleSessionId();
+    HANDLE user_token = NULL, run_token;
+    TOKEN_LINKED_TOKEN linked;
+    DWORD got = 0;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t exe_path[MAX_PATH], *slash;
+    LPVOID env = NULL;
+
+    if (g_seamless_process && WaitForSingleObject(g_seamless_process, 0) != WAIT_OBJECT_0) {
+        if (session == g_seamless_session) {
+            strcpy_s(reply, cap, "ok:running");
+            return;
+        }
+        TerminateProcess(g_seamless_process, 0);
+        WaitForSingleObject(g_seamless_process, 3000);
+    }
+    if (g_seamless_process) {
+        CloseHandle(g_seamless_process);
+        g_seamless_process = NULL;
+    }
+
+    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
+    slash = wcsrchr(exe_path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe_path, MAX_PATH, L"appsandbox-seamless.exe");
+    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
+        strcpy_s(reply, cap, "error:appsandbox-seamless.exe is not in the VM yet; restart the VM to add it");
+        return;
+    }
+    if (session == 0xFFFFFFFF || !WTSQueryUserToken(session, &user_token)) {
+        strcpy_s(reply, cap, "error:no_user");   /* the sign-in screen; the host shows the display */
+        return;
+    }
+    run_token = user_token;
+    linked.LinkedToken = NULL;
+    if (GetTokenInformation(user_token, TokenLinkedToken, &linked, sizeof(linked), &got) && linked.LinkedToken) {
+        DWORD elevated = 0;
+        TOKEN_ELEVATION_TYPE type = TokenElevationTypeDefault;
+        if (GetTokenInformation(user_token, TokenElevationType, &type, sizeof(type), &elevated) &&
+            type == TokenElevationTypeLimited)
+            run_token = linked.LinkedToken;
+    }
+    if (!CreateEnvironmentBlock(&env, user_token, FALSE)) env = NULL;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessAsUserW(run_token, exe_path, NULL, NULL, NULL, FALSE,
+                              CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                              env, NULL, &si, &pi)) {
+        sprintf_s(reply, cap, "error:could not start the seamless helper (%lu)", GetLastError());
+    } else {
+        agent_log("Seamless helper: spawned PID %lu in session %lu%s.", pi.dwProcessId, session,
+                  run_token == user_token ? "" : " (full token)");
+        g_seamless_process = pi.hProcess;
+        g_seamless_session = session;
+        CloseHandle(pi.hThread);
+        strcpy_s(reply, cap, "ok:started");
+    }
+    if (env) DestroyEnvironmentBlock(env);
+    if (linked.LinkedToken) CloseHandle(linked.LinkedToken);
+    CloseHandle(user_token);
+}
+
 /* Spawn appsandbox-input.exe as SYSTEM in the given session.
    Duplicates our own token, sets the session ID, then CreateProcessAsUser. */
 static BOOL spawn_input_in_session(DWORD session_id)
@@ -3874,6 +3949,11 @@ static void handle_client(AsbConn *client)
             char reply[256];
             if (strcmp(cmd, "backstage") == 0) backstage_start(reply, sizeof(reply));
             else backstage_stop(reply, sizeof(reply));
+            REPLY(reply);
+        }
+        else if (strcmp(cmd, "seamless") == 0) {
+            char reply[256];
+            seamless_start(reply, sizeof(reply));
             REPLY(reply);
         }
         else if (strcmp(cmd, "lab_start") == 0 || strcmp(cmd, "lab_stop") == 0 ||
