@@ -38,6 +38,12 @@ def main() -> None:
     assert "github.com/LizardByte/Sunshine/releases/download/" in agent
     assert "failed its hash check" in agent
     assert "Remove-Item $f -Force" in agent
+
+    # Setup needs the network: it starts after the guest's network is configured,
+    # and a download waits out network errors rather than failing the setup.
+    assert link.index("!nat_configured && !configure_guest_nat") < link.index("vm_stream_setup_command(vm, stream_cmd")
+    assert "catch [Net.WebException]" in agent
+    assert "Status 'network'" in agent
     assert "Sunshine" in read("THIRD-PARTY-NOTICES.md") and "Not bundled" in read("THIRD-PARTY-NOTICES.md")
     assert not list((ROOT / "tools").rglob("sunshine*.msi"))
 

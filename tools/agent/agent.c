@@ -2591,7 +2591,16 @@ static const char stream_setup_ps[] =
     "function Fetch($url,$sha,$file){\r\n"
     " $f=Join-Path $dir $file\r\n"
     " if(-not ((Test-Path $f) -and (Get-FileHash $f -Algorithm SHA256).Hash -eq $sha)){\r\n"
-    "  Invoke-WebRequest -Uri $url -OutFile $f -UseBasicParsing\r\n"
+    /* The guest's network can come up after this starts, and a VPN VM's only
+       once its tunnel does, so wait out network errors rather than failing. */
+    "  for($try=1;;$try++){\r\n"
+    "   try { Invoke-WebRequest -Uri $url -OutFile $f -UseBasicParsing; break }\r\n"
+    "   catch [Net.WebException] {\r\n"
+    "    if($_.Exception.Status -eq [Net.WebExceptionStatus]::ProtocolError -or $try -ge 40){ throw }\r\n"
+    "    Status 'network' 'Waiting for the VM to reach the internet so it can download Sunshine...'\r\n"
+    "    Start-Sleep -Seconds 15\r\n"
+    "   }\r\n"
+    "  }\r\n"
     "  $h=(Get-FileHash $f -Algorithm SHA256).Hash\r\n"
     "  if($h -ne $sha){ Remove-Item $f -Force; throw \"$file failed its hash check (got $h)\" }\r\n"
     " }\r\n"
