@@ -26,6 +26,13 @@
 #include <drm/drm_plane.h>
 #include <drm/drm_writeback.h>
 
+/* See Kbuild. */
+#ifdef ASB_HAVE_DRM_ATOMIC_COMMIT
+#define asb_atomic_state drm_atomic_commit
+#else
+#define asb_atomic_state drm_atomic_state
+#endif
+
 /* --------------------------------------------------------------------------
  * Tunables. Module params override these at load time where applicable.
  * -------------------------------------------------------------------------- */

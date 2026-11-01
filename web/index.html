@@ -113,10 +113,11 @@
 
             <label class="needs-linux-version">Distribution:</label>
             <div class="form-row needs-linux-version">
-                <select id="linux-version">
-                    <option value="ubuntu-26.04" selected>Ubuntu 26.04 LTS</option>
+                <select id="linux-distro" onchange="applyOsTypeUI()">
+                    <option value="ubuntu" selected>Ubuntu</option>
+                    <option value="fedora">Fedora Workstation</option>
                 </select>
-                <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
+                <span class="host-info" id="linux-distro-hint"></span>
             </div>
 
             <label for="hdd-size">HDD Size:</label>
@@ -321,7 +322,7 @@
         </fieldset>
 
         <fieldset id="manage-linux-note-section" style="display:none">
-            <legend>Not available on Ubuntu</legend>
+            <legend>Not available on Linux</legend>
             <small>Secure Boot: the App Sandbox display and GPU drivers are built on the VM and are not signed for it. Domain: joining uses the Windows domain tools. Backstage: it runs in the Windows hidden session 0. Malware Lab: its recorder is a Windows program. Templates: they rely on Windows Sysprep. Shared drives appear under /mnt/appsandbox and in the Files sidebar.</small>
         </fieldset>
         <fieldset id="manage-secure-boot-section">

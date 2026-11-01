@@ -253,6 +253,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_object_begin(jb);
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
+    jb_string(jb, L"linuxDistro", v->linux_distro);
     jb_bool(jb, L"running", v->running);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
     jb_bool(jb, L"agentOnline", v->agent_online);
@@ -1545,6 +1546,7 @@ static void on_webview2_message(const wchar_t *json)
         }
         AsbVmConfig cfg;
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
+        wchar_t distro_buf[16] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
         wchar_t adapter_buf[256] = {0}, storage_buf[MAX_PATH] = {0}, exclusions_buf[1024] = {0};
         wchar_t vpn_buf[ASB_VPN_ID_CHARS] = {0};
@@ -1556,6 +1558,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"name", name_buf, 256);
         json_get_string(json, L"osType", os_buf, 32);
         json_get_string(json, L"imagePath", img_buf, MAX_PATH);
+        json_get_string(json, L"linuxDistro", distro_buf, _countof(distro_buf));
         json_get_string(json, L"templateName", tpl_buf, 256);
         json_get_string(json, L"adminUser", user_buf, 128);
         json_get_string(json, L"adminPass", pass_buf, 128);
@@ -1571,6 +1574,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.name = name_buf;
         cfg.os_type = os_buf;
         cfg.image_path = img_buf;
+        cfg.linux_distro = distro_buf;
         cfg.template_name = tpl_buf;
         cfg.username = user_buf;
         cfg.password = pass_buf;

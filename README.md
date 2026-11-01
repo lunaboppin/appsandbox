@@ -9,7 +9,7 @@ It runs on **Windows 11 Home or Pro (x64), without Hyper-V**, and is free and op
 ## Features
 
 ### Virtual machines
-- **Windows 11 and Ubuntu 26.04 LTS** guests, installed with zero touch from your own ISO. Windows VMs get the **Pro** edition from the ISO.
+- **Windows 11, Ubuntu 26.04 LTS and Fedora Workstation** guests, installed with zero touch. Windows and Ubuntu install from your own ISO, and Fedora can download and verify its own. Windows VMs get the **Pro** edition from the ISO.
 - **Apps on first boot:** pick apps when creating a VM. On Windows that's Claude, Steam, VS Code, Notepad++, Everything, 7-Zip and more, or any winget ID, installed after the first sign-in. On Ubuntu it's any apt or snap name, installed once the VM has internet access.
 - **Tidy new installs:** new Windows VMs start with a clean taskbar (just Edge and File Explorer, no search box, widgets or Copilot).
 - **Checkpoints and branches:** freeze a VM's state and fork independent working copies from it.

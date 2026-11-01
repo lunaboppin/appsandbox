@@ -21,7 +21,7 @@ def function(source: str, signature: str) -> str:
 
 
 def main() -> None:
-    guest = read("tools/iso-patch/ubuntu_vhdx.c")
+    guest = read("tools/iso-patch/linux_firstboot.c")
     core = read("src/backend_win/asb_core.c")
     agent = read("src/backend_win/vm_agent.c")
     headless = read("src/app_win/headless.c")

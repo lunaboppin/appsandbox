@@ -572,6 +572,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
             vm_save_state_json(vm->vhdx_path, TRUE);
             ui_log(L"Install complete for \"%s\".", vm->name);
+            asb_vm_linux_install_done(vm);
         }
 
         /* A host VHDX grow is irreversible, while guest partition/filesystem

@@ -161,6 +161,8 @@
   <ItemGroup>
     <ClCompile Include="iso-patch.c" />
     <ClCompile Include="ubuntu_vhdx.c" />
+    <ClCompile Include="linux_firstboot.c" />
+    <ClCompile Include="download_verify.c" />
     <ClCompile Include="prefetch_build_deps.c" />
     <ClCompile Include="prefetch_wsl_deps.c" />
     <ClCompile Include="prefetch_repo.c" />
@@ -192,6 +194,8 @@
     <ClInclude Include="iso_patch_log.h" />
     <ClInclude Include="target_arch.h" />
     <ClInclude Include="ubuntu_vhdx.h" />
+    <ClInclude Include="linux_firstboot.h" />
+    <ClInclude Include="download_verify.h" />
     <ClInclude Include="prefetch_build_deps.h" />
     <ClInclude Include="prefetch_wsl_deps.h" />
     <ClInclude Include="prefetch_repo.h" />

@@ -21,6 +21,8 @@
 #include <stdio.h>
 
 #include "ubuntu_vhdx.h"
+#include "linux_firstboot.h"
+#include "download_verify.h"
 #include "prefetch_build_deps.h"
 #include "prefetch_wsl_deps.h"
 #include "prefetch_repo.h"
@@ -3216,6 +3218,30 @@ int wmain(int argc, wchar_t *argv[])
             return 1;
         }
         return do_prefetch_build_deps(codename, kver, out_dir, mirror);
+    }
+
+    if (_wcsicmp(argv[1], L"--write-firstboot") == 0) {
+        if (argc == 4 && _wcsicmp(argv[2], L"--out-dir") == 0)
+            return do_write_firstboot(argv[3]);
+        log_err(L"--write-firstboot requires --out-dir <dir>");
+        return 1;
+    }
+
+    if (_wcsicmp(argv[1], L"--download") == 0) {
+        const wchar_t *urls[8];
+        const wchar_t *sha256 = NULL, *out = NULL, *label = L"Downloading";
+        int url_count = 0;
+        for (int i = 2; i + 1 < argc; i += 2) {
+            if (_wcsicmp(argv[i], L"--url") == 0) { if (url_count < 8) urls[url_count++] = argv[i + 1]; }
+            else if (_wcsicmp(argv[i], L"--sha256") == 0) sha256 = argv[i + 1];
+            else if (_wcsicmp(argv[i], L"--out") == 0) out = argv[i + 1];
+            else if (_wcsicmp(argv[i], L"--label") == 0) label = argv[i + 1];
+        }
+        if (url_count == 0 || !sha256 || !out) {
+            log_err(L"--download requires --url, --sha256 and --out");
+            return 1;
+        }
+        return do_download_verify(urls, url_count, sha256, out, label);
     }
 
     if (_wcsicmp(argv[1], L"--ubuntu-to-vhdx") == 0) {

@@ -13,6 +13,7 @@
 #include "gpu_enum.h"
 #include "hcn_network.h"
 #include "disk_util.h"
+#include "fedora_install.h"
 #include "d3dlayers.h"
 #include "snapshot.h"
 #include "vmms_cert.h"
@@ -547,6 +548,8 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"[VM]\n");
         fwprintf(f, L"Name=%s\n", g_vms[i].name);
         fwprintf(f, L"OsType=%s\n", g_vms[i].os_type);
+        if (g_vms[i].linux_distro[0])
+            fwprintf(f, L"LinuxDistro=%s\n", g_vms[i].linux_distro);
         fwprintf(f, L"ImagePath=%s\n", g_vms[i].image_path);
         fwprintf(f, L"VhdxPath=%s\n", g_vms[i].vhdx_path);
         if (g_vms[i].storage_root[0] != L'\0')
@@ -698,6 +701,8 @@ static void load_vm_list(void)
             wcscpy_s(vm->name, 256, line + 5);
         else if (wcsncmp(line, L"OsType=", 7) == 0)
             wcscpy_s(vm->os_type, 32, line + 7);
+        else if (wcsncmp(line, L"LinuxDistro=", 12) == 0)
+            wcsncpy_s(vm->linux_distro, _countof(vm->linux_distro), line + 12, _TRUNCATE);
         else if (wcsncmp(line, L"ImagePath=", 10) == 0)
             wcscpy_s(vm->image_path, MAX_PATH, line + 10);
         else if (wcsncmp(line, L"VhdxPath=", 9) == 0)
@@ -2752,28 +2757,15 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
     return n;
 }
 
-/* ---- Detect the Ubuntu release codename + kernel version from an ISO.
- *
- * Mounts the ISO read-only via VirtDisk, reads:
- *   - the only subdir under <iso>:\dists\        -> codename (e.g. "resolute")
- *   - <iso>:\pool\main\l\linux\linux-image-*-generic_*.deb
- *     -> kernel version (e.g. "7.0.0-14-generic") parsed from filename
- *
- * Returns 0 on success and fills the two output buffers; non-zero on
- * any error (caller logs + skips the build-deps prefetch).
- *
- * Output buffers should be at least 64 wchars each. */
-static int detect_iso_kernel(const wchar_t *iso_path,
-                             wchar_t *codename_out, size_t codename_cap,
-                             wchar_t *kver_out, size_t kver_cap)
+/* Mount an ISO read-only and wait until its files can be listed. The drive letter
+ * appears before the volume's FS is ready to serve directory enumeration: without
+ * the wait, FindFirstFileW on <drive>:\dists\ returns ERROR_PATH_NOT_FOUND even
+ * though the path exists. Detach with iso_unmount. */
+static int iso_mount(const wchar_t *iso_path, HANDLE *handle_out, wchar_t *drive_out)
 {
     HANDLE iso_handle = INVALID_HANDLE_VALUE;
     DWORD cdrom_before, cdrom_after, newly;
     wchar_t iso_drive = 0;
-    int rc = -1;
-
-    codename_out[0] = 0;
-    kver_out[0]     = 0;
 
     /* Snapshot current CD-ROM drive letters before mount. */
     cdrom_before = 0;
@@ -2795,21 +2787,19 @@ static int detect_iso_kernel(const wchar_t *iso_path,
                             VIRTUAL_DISK_ACCESS_READ,
                             OPEN_VIRTUAL_DISK_FLAG_NONE,
                             &op, &iso_handle) != ERROR_SUCCESS) {
-            asb_log(L"detect_iso_kernel: OpenVirtualDisk failed (%lu)",
-                    GetLastError());
+            asb_log(L"iso_mount: OpenVirtualDisk failed (%lu)", GetLastError());
             return -1;
         }
         if (AttachVirtualDisk(iso_handle, NULL,
                               ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
                               0, NULL, NULL) != ERROR_SUCCESS) {
-            asb_log(L"detect_iso_kernel: AttachVirtualDisk failed (%lu)",
-                    GetLastError());
+            asb_log(L"iso_mount: AttachVirtualDisk failed (%lu)", GetLastError());
             CloseHandle(iso_handle);
             return -1;
         }
     }
 
-    /* Wait for the drive letter (≤10 s). */
+    /* Wait for the drive letter (<=10 s). */
     for (int i = 0; i < 20; i++) {
         cdrom_after = 0;
         for (int b = 0; b < 26; b++) {
@@ -2825,32 +2815,95 @@ static int detect_iso_kernel(const wchar_t *iso_path,
         }
         Sleep(500);
     }
-    if (!iso_drive) {
-        asb_log(L"detect_iso_kernel: ISO mounted but no drive letter");
-        goto cleanup;
-    }
-
-    /* Wait for the filesystem to become accessible (the drive letter
-     * appears before the volume's FS is ready to serve directory
-     * enumeration — without this wait, FindFirstFileW on <drive>:\dists\
-     * returns ERROR_PATH_NOT_FOUND even though the path exists). Same
-     * pattern as ubuntu_vhdx.c's iso mount: poll GetVolumeInformationW
-     * until it succeeds. Up to ~15 s. */
-    {
+    if (iso_drive) {
         wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", iso_drive);
         wchar_t vol_label[64];
-        int ready = 0;
         for (int i = 0; i < 30; i++) {
             if (GetVolumeInformationW(root, vol_label, 64, NULL, NULL, NULL, NULL, 0)) {
-                ready = 1; break;
+                *handle_out = iso_handle;
+                *drive_out = iso_drive;
+                return 0;
             }
             Sleep(500);
         }
-        if (!ready) {
-            asb_log(L"detect_iso_kernel: %c:\\ never became accessible", iso_drive);
-            goto cleanup;
+    }
+    asb_log(L"iso_mount: %s never became accessible", iso_path);
+    DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    CloseHandle(iso_handle);
+    return -1;
+}
+
+static void iso_unmount(HANDLE iso_handle)
+{
+    if (iso_handle == INVALID_HANDLE_VALUE) return;
+    DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    CloseHandle(iso_handle);
+}
+
+/* What a Linux ISO is, going by the layout of its files. */
+typedef enum { LINUX_ISO_UNKNOWN, LINUX_ISO_UBUNTU, LINUX_ISO_FEDORA, LINUX_ISO_FEDORA_LIVE } LinuxIsoKind;
+
+static LinuxIsoKind inspect_linux_iso(const wchar_t *iso_path, char *release, size_t release_cap)
+{
+    HANDLE iso_handle = INVALID_HANDLE_VALUE;
+    wchar_t drive = 0, path[MAX_PATH];
+    LinuxIsoKind kind = LINUX_ISO_UNKNOWN;
+
+    release[0] = '\0';
+    if (iso_mount(iso_path, &iso_handle, &drive) != 0) return LINUX_ISO_UNKNOWN;
+
+    swprintf_s(path, MAX_PATH, L"%c:\\images\\install.img", drive);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        FILE *f = NULL;
+        kind = LINUX_ISO_FEDORA;
+        /* .discinfo: build timestamp, then the release, then the architecture. */
+        swprintf_s(path, MAX_PATH, L"%c:\\.discinfo", drive);
+        if (_wfopen_s(&f, path, L"r") == 0 && f) {
+            char line[64];
+            if (fgets(line, sizeof(line), f) && fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\r\n ")] = '\0';
+                strcpy_s(release, release_cap, line);
+            }
+            fclose(f);
+        }
+    } else {
+        swprintf_s(path, MAX_PATH, L"%c:\\casper", drive);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            kind = LINUX_ISO_UBUNTU;
+        } else {
+            swprintf_s(path, MAX_PATH, L"%c:\\LiveOS", drive);
+            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+                kind = LINUX_ISO_FEDORA_LIVE;
         }
     }
+    iso_unmount(iso_handle);
+    return kind;
+}
+
+/* ---- Detect the Ubuntu release codename + kernel version from an ISO.
+ *
+ * Mounts the ISO read-only via VirtDisk, reads:
+ *   - the only subdir under <iso>:\dists\        -> codename (e.g. "resolute")
+ *   - <iso>:\pool\main\l\linux\linux-image-*-generic_*.deb
+ *     -> kernel version (e.g. "7.0.0-14-generic") parsed from filename
+ *
+ * Returns 0 on success and fills the two output buffers; non-zero on
+ * any error (caller logs + skips the build-deps prefetch).
+ *
+ * Output buffers should be at least 64 wchars each. */
+static int detect_iso_kernel(const wchar_t *iso_path,
+                             wchar_t *codename_out, size_t codename_cap,
+                             wchar_t *kver_out, size_t kver_cap)
+{
+    HANDLE iso_handle = INVALID_HANDLE_VALUE;
+    wchar_t iso_drive = 0;
+    int rc = -1;
+
+    codename_out[0] = 0;
+    kver_out[0]     = 0;
+
+    if (iso_mount(iso_path, &iso_handle, &iso_drive) != 0)
+        return -1;
 
     /* 1. Codename: first non-dotfile subdir under <iso>:\dists\ */
     {
@@ -2925,10 +2978,7 @@ static int detect_iso_kernel(const wchar_t *iso_path,
     rc = 0;
 
 cleanup:
-    if (iso_handle != INVALID_HANDLE_VALUE) {
-        DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-        CloseHandle(iso_handle);
-    }
+    iso_unmount(iso_handle);
     return rc;
 }
 
@@ -2966,21 +3016,18 @@ static int spawn_iso_patch_prefetch(const wchar_t *args)
     return ec == 0 ? 0 : -1;
 }
 
-/* ---- Run iso-patch.exe --ubuntu-to-vhdx and stream its progress. ----
+/* ---- Run iso-patch.exe and stream its progress. ----
  *
  * Parallel helper for the Linux flow. Spawns iso-patch.exe, parses
  * STATUS:/PROGRESS:/ERROR:/DONE: stdout lines, updates the per-VM
  * progress callback. Same shape as the iso-patch invocation block
- * inside vhdx_create_thread, but for the Ubuntu mode (no LANG: handling).
+ * inside vhdx_create_thread, but with no LANG: handling.
  */
-static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
-                                     const wchar_t *vhdx_path,
-                                     ULONG hdd_gb,
-                                     const wchar_t *manifest_path,
-                                     UINT64 vm_unique_id,
-                                     wchar_t *error_msg, size_t error_msg_cap)
+static HRESULT run_iso_patch_streamed(const wchar_t *args,
+                                      UINT64 vm_unique_id,
+                                      wchar_t *error_msg, size_t error_msg_cap)
 {
-    wchar_t exe_dir[MAX_PATH], cmdline[2048];
+    wchar_t exe_dir[MAX_PATH], cmdline[4096];
     wchar_t *slash;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -2994,15 +3041,7 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
     GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
     slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
 
-    if (manifest_path && manifest_path[0]) {
-        swprintf_s(cmdline, 2048,
-            L"\"%s\\iso-patch.exe\" --ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu --stage \"%s\"",
-            exe_dir, iso_path, vhdx_path, hdd_gb, manifest_path);
-    } else {
-        swprintf_s(cmdline, 2048,
-            L"\"%s\\iso-patch.exe\" --ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu",
-            exe_dir, iso_path, vhdx_path, hdd_gb);
-    }
+    swprintf_s(cmdline, _countof(cmdline), L"\"%s\\iso-patch.exe\" %s", exe_dir, args);
 
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = NULL;
@@ -3094,6 +3133,132 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
     return result;
 }
 
+static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
+                                     const wchar_t *vhdx_path,
+                                     ULONG hdd_gb,
+                                     const wchar_t *manifest_path,
+                                     UINT64 vm_unique_id,
+                                     wchar_t *error_msg, size_t error_msg_cap)
+{
+    wchar_t args[2048];
+    if (manifest_path && manifest_path[0])
+        swprintf_s(args, 2048, L"--ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu --stage \"%s\"",
+                   iso_path, vhdx_path, hdd_gb, manifest_path);
+    else
+        swprintf_s(args, 2048, L"--ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu",
+                   iso_path, vhdx_path, hdd_gb);
+    return run_iso_patch_streamed(args, vm_unique_id, error_msg, error_msg_cap);
+}
+
+/* Download the pinned Fedora netinstall ISO into the shared cache, or check the
+   copy already there. */
+static HRESULT fedora_fetch_iso(UINT64 vm_unique_id, wchar_t *iso_out, size_t iso_cap,
+                                wchar_t *error_msg, size_t error_msg_cap)
+{
+    wchar_t cache[MAX_PATH], args[4096];
+    size_t used;
+    int i;
+
+#if defined(_M_ARM64)
+    (void)vm_unique_id; (void)iso_out; (void)iso_cap;
+    swprintf_s(error_msg, error_msg_cap, L"App Sandbox only downloads Fedora for x64. Choose an aarch64 netinstall ISO.");
+    return E_NOTIMPL;
+#else
+    ExpandEnvironmentStringsW(L"%ProgramData%\\AppSandbox\\cache", cache, MAX_PATH);
+    CreateDirectoryW(cache, NULL);
+    wcscat_s(cache, MAX_PATH, L"\\fedora");
+    CreateDirectoryW(cache, NULL);
+    swprintf_s(iso_out, iso_cap, L"%s\\%s", cache, FEDORA_NETINST_NAME);
+    used = (size_t)swprintf_s(args, _countof(args), L"--download --sha256 %s --out \"%s\" --label \"Downloading Fedora\"",
+                              FEDORA_NETINST_SHA256, iso_out);
+    for (i = 0; i < FEDORA_NETINST_URL_COUNT; i++)
+        used += (size_t)swprintf_s(args + used, _countof(args) - used, L" --url \"%s\"", FEDORA_NETINST_URLS[i]);
+    asb_log(L"Fetching %s...", FEDORA_NETINST_NAME);
+    return run_iso_patch_streamed(args, vm_unique_id, error_msg, error_msg_cap);
+#endif
+}
+
+/* Copy each manifest line's file to <dir>\<dest>. The Ubuntu path writes these into
+   its ext4 image (stage_manifest_into_rootfs); here they travel on the install media. */
+static BOOL fedora_copy_manifest(const wchar_t *manifest, const wchar_t *dir)
+{
+    FILE *f = NULL;
+    wchar_t line[2048];
+    BOOL ok = TRUE;
+
+    if (_wfopen_s(&f, manifest, L"r, ccs=UTF-8") != 0 || !f) return FALSE;
+    while (fgetws(line, _countof(line), f)) {
+        wchar_t *tab, dest[MAX_PATH], *p;
+        line[wcscspn(line, L"\r\n")] = L'\0';
+        tab = wcschr(line, L'\t');
+        if (!tab) continue;
+        *tab = L'\0';
+        if (swprintf_s(dest, MAX_PATH, L"%s%s", dir, tab + 1) < 0) { ok = FALSE; break; }
+        for (p = dest; *p; p++) if (*p == L'/') *p = L'\\';
+        /* mkdir -p, past the drive and the part of dir that already exists. */
+        for (p = dest + wcslen(dir) + 1; *p; p++) {
+            if (*p == L'\\') {
+                *p = L'\0';
+                CreateDirectoryW(dest, NULL);
+                *p = L'\\';
+            }
+        }
+        if (!CopyFileW(line, dest, FALSE)) {
+            asb_log(L"Fedora media: could not copy %s (%lu)", line, GetLastError());
+            ok = FALSE;
+            break;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+/* Build the OEMDRV disc: ks.cfg, first-boot files, and rootfs\ for Anaconda to copy
+   over the installed system. Needs the VM's address, so it comes after the network. */
+static HRESULT fedora_build_media(const VmConfig *config, const wchar_t *vhdx_dir,
+                                  const wchar_t *manifest, const char *release,
+                                  const char *host_locale, const char *host_xkb, const char *host_tz,
+                                  const char *nat_ip, const GUID *endpoint_id,
+                                  wchar_t *iso_out, size_t iso_cap)
+{
+    wchar_t media[MAX_PATH], rootfs[MAX_PATH], ks_path[MAX_PATH], args[1024];
+    FedoraKickstart ks;
+    HRESULT hr;
+
+    swprintf_s(media, MAX_PATH, L"%s\\_fedora_media", vhdx_dir);
+    swprintf_s(rootfs, MAX_PATH, L"%s\\rootfs", media);
+    swprintf_s(ks_path, MAX_PATH, L"%s\\ks.cfg", media);
+    swprintf_s(iso_out, iso_cap, L"%s\\fedora-install.iso", vhdx_dir);
+    CreateDirectoryW(media, NULL);
+    CreateDirectoryW(rootfs, NULL);
+
+    if (!fedora_copy_manifest(manifest, rootfs)) { hr = E_FAIL; goto done; }
+    swprintf_s(args, _countof(args), L"--write-firstboot --out-dir \"%s\"", media);
+    if (spawn_iso_patch_prefetch(args) != 0) { hr = E_FAIL; goto done; }
+
+    ZeroMemory(&ks, sizeof(ks));
+    strcpy_s(ks.release, sizeof(ks.release), release);
+    WideCharToMultiByte(CP_UTF8, 0, config->name, -1, ks.hostname, sizeof(ks.hostname), NULL, NULL);
+    strcpy_s(ks.locale, sizeof(ks.locale), host_locale);
+    strcpy_s(ks.keyboard, sizeof(ks.keyboard), host_xkb);
+    strcpy_s(ks.tz, sizeof(ks.tz), host_tz);
+    if (config->network_mode == NET_NAT && nat_ip && nat_ip[0]) {
+        char *p;
+        strcpy_s(ks.static_ip, sizeof(ks.static_ip), nat_ip);
+        sprintf_s(ks.gateway, sizeof(ks.gateway), "%s.1", hcn_nat_subnet_base());
+        if (SUCCEEDED(hcn_get_endpoint_mac(endpoint_id, ks.mac, sizeof(ks.mac))))
+            for (p = ks.mac; *p; p++) if (*p == '-') *p = ':';
+    }
+    if (!fedora_kickstart_write(ks_path, &ks)) { hr = E_FAIL; goto done; }
+
+    hr = iso_create_fedora_media(iso_out, media);
+
+done:
+    /* The markers include the password hash; the ISO alone carries it from here. */
+    remove_dir_recursive(media);
+    return hr;
+}
+
 /* ---- Linux first-boot watchdog ----
  *
  * A Linux VM is "installing" until its agent first connects, and the agent is
@@ -3106,13 +3271,15 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
  *
  * FAIL is the normal way to learn of a failure, seconds after it happens. The
  * deadlines catch the guest that can't say so. They only start once the VM is on,
- * so slow downloads don't count: everything is fetched during "building", and
- * firstboot.sh installs from the VM's own disk. A timeout is a judgment, not a
+ * so slow downloads don't count on Ubuntu: everything is fetched during "building",
+ * and firstboot.sh installs from the VM's own disk. Fedora downloads inside the VM,
+ * and its Kickstart sends these same reports all through that. A timeout is a judgment, not a
  * fact, so it's withdrawn if the guest reports again; and the agent connecting
  * always clears the error (vm_agent.c), so a slow host only ever sees it early.
  *
  * Worst case to an error: 15 min to start + 30 min (the unit's TimeoutStartSec)
  * + 15 min for the agent. A normal install takes 3.5 to 5 minutes in all. */
+#define FEDORA_MIN_DISK_GB 20
 #define INSTALL_WATCH_NO_REPORT_MS (15 * 60 * 1000ULL)
 #define INSTALL_WATCH_SILENCE_MS   (10 * 60 * 1000ULL)
 #define INSTALL_WATCH_AGENT_MS     (15 * 60 * 1000ULL)
@@ -3376,11 +3543,74 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
     wchar_t staging[MAX_PATH], manifest[MAX_PATH];
     wchar_t *slash;
+    BOOL is_fedora = _wcsicmp(args->config.linux_distro, L"fedora") == 0;
+    char fedora_release[16] = "";
+
+    /* ---- 0. What are we installing? Fedora brings its own image if none was
+       picked. The ISO has the last word, so the right thing happens whatever
+       was selected. ---- */
+    if (is_fedora && args->config.image_path[0] == L'\0') {
+        hr = fedora_fetch_iso(args->vm_unique_id, args->config.image_path, MAX_PATH,
+                              args->error_msg, 512);
+        if (FAILED(hr)) {
+            args->result = hr;
+            if (args->error_msg[0] == L'\0')
+                swprintf_s(args->error_msg, 512, L"Could not download Fedora (0x%08X)", hr);
+            goto done;
+        }
+        EnterCriticalSection(&g_cs);
+        {
+            VmInstance *self = asb_find_vm_by_id(args->vm_unique_id);
+            if (self) wcscpy_s(self->image_path, MAX_PATH, args->config.image_path);
+        }
+        LeaveCriticalSection(&g_cs);
+    }
+    switch (inspect_linux_iso(args->config.image_path, fedora_release, sizeof(fedora_release))) {
+    case LINUX_ISO_FEDORA:
+        is_fedora = TRUE;
+        break;
+    case LINUX_ISO_FEDORA_LIVE:
+        args->result = E_INVALIDARG;
+        swprintf_s(args->error_msg, 512,
+                   L"This is a live ISO, which can't install by itself. Leave OS Image empty to "
+                   L"download Fedora, or choose a Fedora netinstall ISO.");
+        goto done;
+    case LINUX_ISO_UBUNTU:
+        is_fedora = FALSE;
+        break;
+    default:
+        break;
+    }
+    if (is_fedora) {
+        if (!fedora_release[0]) {
+            args->result = E_INVALIDARG;
+            swprintf_s(args->error_msg, 512, L"Could not tell which Fedora release this ISO installs.");
+            goto done;
+        }
+        if (args->config.network_mode != NET_NAT && args->config.network_mode != NET_EXTERNAL) {
+            args->result = E_INVALIDARG;
+            swprintf_s(args->error_msg, 512,
+                       L"Fedora's installer downloads its packages, so it needs NAT or External networking.");
+            goto done;
+        }
+        if (args->config.hdd_gb < FEDORA_MIN_DISK_GB) {
+            args->result = E_INVALIDARG;
+            swprintf_s(args->error_msg, 512, L"Fedora needs a disk of at least %d GB.", FEDORA_MIN_DISK_GB);
+            goto done;
+        }
+    }
+    EnterCriticalSection(&g_cs);
+    {
+        VmInstance *self = asb_find_vm_by_id(args->vm_unique_id);
+        if (self) wcscpy_s(self->linux_distro, _countof(self->linux_distro), is_fedora ? L"fedora" : L"");
+    }
+    LeaveCriticalSection(&g_cs);
 
     /* ---- 1. Build the VHDX directly from the Ubuntu ISO via iso-patch.
        Host-side install (squashfs -> ext4), no in-guest installer. The
        first-boot service planted inside the rootfs handles per-VM
-       configuration. ---- */
+       configuration. Fedora starts with an empty disk and installs in the
+       VM, at step 6. ---- */
     asb_log(L"Building Linux VHDX from %s (size=%lu GB)...",
             args->config.image_path, args->config.hdd_gb);
     DeleteFileW(args->config.vhdx_path);
@@ -3425,7 +3655,9 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            Needs (codename, kernel) detected from the ISO. */
         asb_log(L"Prefetch 2/3: apt build-deps closure...");
         wchar_t codename[64] = L"", kver[64] = L"";
-        if (detect_iso_kernel(args->config.image_path,
+        if (is_fedora) {
+            /* dnf gets these from Fedora's mirrors inside the VM (fedora_install.c). */
+        } else if (detect_iso_kernel(args->config.image_path,
                               codename, ARRAYSIZE(codename),
                               kver,     ARRAYSIZE(kver)) == 0) {
             wchar_t apt_out[MAX_PATH];
@@ -3493,10 +3725,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         goto done;
     }
 
-    hr = run_iso_patch_ubuntu(args->config.image_path, args->config.vhdx_path,
-                              args->config.hdd_gb,
-                              n_staged > 0 ? manifest : NULL,
-                              args->vm_unique_id, args->error_msg, 512);
+    hr = is_fedora
+        ? vhdx_create(args->config.vhdx_path, (ULONGLONG)args->config.hdd_gb)
+        : run_iso_patch_ubuntu(args->config.image_path, args->config.vhdx_path,
+                               args->config.hdd_gb,
+                               n_staged > 0 ? manifest : NULL,
+                               args->vm_unique_id, args->error_msg, 512);
     if (FAILED(hr)) {
         args->result = hr;
         if (args->error_msg[0] == L'\0')
@@ -3510,8 +3744,11 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        set, hcs_vm.c attaches it at SCSI slot 1 alongside the installed
        VHDX, and Hyper-V's UEFI firmware sometimes picks the ISO's
        /EFI/BOOT/BOOTX64.EFI instead of ours. Detach the ISO from the
-       runtime VM — the installed VHDX is fully self-bootable. */
-    args->config.image_path[0] = L'\0';
+       runtime VM — the installed VHDX is fully self-bootable. Fedora's disk is
+       still empty: its ISO is what boots, and asb_vm_start drops it once the
+       install has finished. */
+    if (!is_fedora)
+        args->config.image_path[0] = L'\0';
 
     /* ---- 2. NAT IP allocation. The chosen static /24 address is baked
        into the HCN endpoint policy below and pushed to the guest at
@@ -3556,6 +3793,31 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         }
         if (FAILED(hr))
             args->config.network_mode = NET_NONE;
+    }
+
+    if (is_fedora) {
+        char nat_ip_copy[64] = "";
+        if (args->vm_index >= 0 && args->vm_index < g_vm_count)
+            strcpy_s(nat_ip_copy, sizeof(nat_ip_copy), g_vms[args->vm_index].nat_ip);
+        hr = args->has_network
+            ? fedora_build_media(&args->config, args->vhdx_dir, manifest, fedora_release,
+                                 host_locale, host_xkb, host_tz, nat_ip_copy, &args->endpoint_id,
+                                 args->config.resources_iso_path, MAX_PATH)
+            : HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE);
+        remove_dir_recursive(staging);
+        if (FAILED(hr)) {
+            args->result = hr;
+            swprintf_s(args->error_msg, 512, args->has_network
+                       ? L"Could not build the Fedora install media (0x%08X)"
+                       : L"Fedora's installer needs a network, and this VM's couldn't be set up (0x%08X)", hr);
+            goto done;
+        }
+        EnterCriticalSection(&g_cs);
+        {
+            VmInstance *self = asb_find_vm_by_id(args->vm_unique_id);
+            if (self) wcscpy_s(self->resources_iso_path, MAX_PATH, args->config.resources_iso_path);
+        }
+        LeaveCriticalSection(&g_cs);
     }
 
     /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
@@ -3889,6 +4151,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     /* Copy config strings into local VmConfig */
     wcscpy_s(cfg.name, 256, config->name);
     if (config->os_type) wcscpy_s(cfg.os_type, 32, config->os_type);
+    if (config->linux_distro) wcsncpy_s(cfg.linux_distro, _countof(cfg.linux_distro), config->linux_distro, _TRUNCATE);
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
     if (config->username) wcscpy_s(cfg.admin_user, 128, config->username);
     if (config->password) wcscpy_s(cfg.admin_pass, 128, config->password);
@@ -3975,7 +4238,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             asb_log(L"Error: Linux cannot be created from a template.");
             return E_INVALIDARG;
         }
-        if (cfg.image_path[0] == L'\0') {
+        if (cfg.image_path[0] == L'\0' && _wcsicmp(cfg.linux_distro, L"fedora") != 0) {
             asb_log(L"Error: Linux requires an ISO path.");
             return E_INVALIDARG;
         }
@@ -4195,13 +4458,14 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
            to the guest's firstboot as a $6$ hash (see linux_create_thread). */
         BOOL use_linux_cloud = (!from_template && !is_template_create &&
                                 _wcsicmp(cfg.os_type, L"Linux") == 0 &&
-                                cfg.image_path[0] != L'\0');
+                                (cfg.image_path[0] != L'\0' || _wcsicmp(cfg.linux_distro, L"fedora") == 0));
 
         if (use_linux_cloud) {
             LinuxCreateArgs *args;
 
             wcscpy_s(inst->name, 256, cfg.name);
             wcscpy_s(inst->os_type, 32, cfg.os_type);
+            wcscpy_s(inst->linux_distro, _countof(inst->linux_distro), cfg.linux_distro);
             wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
             wcscpy_s(inst->storage_root, MAX_PATH, cfg.storage_root);
             /* image_path isn't used by Linux but copy it through anyway so
@@ -4244,7 +4508,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
-            asb_log(L"Building Linux VM \"%s\" (direct ISO->VHDX, ~3 minutes)...", cfg.name);
+            asb_log(L"Building Linux VM \"%s\"...", cfg.name);
             {
                 HANDLE worker=CreateThread(NULL,0,linux_create_thread,args,0,NULL);
                 if(!worker){HRESULT thr=HRESULT_FROM_WIN32(GetLastError());HeapFree(GetProcessHeap(),0,args);g_vm_count--;remove_dir_recursive(vhdx_dir);SecureZeroMemory(cfg.admin_pass,sizeof(cfg.admin_pass));return thr;}
@@ -4500,6 +4764,8 @@ HRESULT asb_disposable_new_session(AsbVm vm)
 
 /* ---- VM Start ---- */
 
+static void linux_forget_install_media(VmInstance *inst);
+
 ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
                                 const wchar_t *branch_name,
                                 BOOL allow_missing_shared_resources)
@@ -4599,6 +4865,9 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
             return E_OUTOFMEMORY;
         }
         args->vm = inst;
+        /* Normally gone already (asb_vm_linux_install_done). */
+        if (_wcsicmp(inst->os_type, L"Linux") == 0 && inst->install_complete && !inst->is_appliance)
+            linux_forget_install_media(inst);
         wcscpy_s(args->config.name, 256, inst->name);
         wcscpy_s(args->config.os_type, 32, inst->os_type);
         wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
@@ -4837,6 +5106,37 @@ ASB_API const wchar_t *asb_vm_name(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
     return inst ? inst->name : L"";
+}
+
+static void linux_forget_install_media(VmInstance *inst)
+{
+    if (!inst->image_path[0] && !inst->resources_iso_path[0]) return;
+    if (inst->resources_iso_path[0]) DeleteFileW(inst->resources_iso_path);
+    inst->resources_iso_path[0] = L'\0';
+    inst->image_path[0] = L'\0';
+    save_vm_list();
+}
+
+/* The install is over, so a Fedora VM's discs have no more use: without this they
+   sit mounted on the guest's desktop until its next power-off, one of them holding
+   the password hash. Only the running VM's copy is at stake if this fails, and the
+   next start tidies up. */
+void asb_vm_linux_install_done(VmInstance *inst)
+{
+    if (_wcsicmp(inst->os_type, L"Linux") != 0 || inst->is_appliance) return;
+    if (!inst->image_path[0] && !inst->resources_iso_path[0]) return;
+    if ((inst->image_path[0] && FAILED(hcs_detach_scsi(inst, 1))) ||
+        (inst->resources_iso_path[0] && FAILED(hcs_detach_scsi(inst, 2)))) {
+        asb_log(L"Could not detach the install media from \"%s\" while it runs; it goes at the next start.", inst->name);
+        return;
+    }
+    linux_forget_install_media(inst);
+}
+
+ASB_API const wchar_t *asb_vm_linux_distro(AsbVm vm)
+{
+    VmInstance *inst = (VmInstance *)vm;
+    return inst ? inst->linux_distro : L"";
 }
 
 ASB_API const wchar_t *asb_vm_os_type(AsbVm vm)

@@ -1597,6 +1597,26 @@ static HRESULT hcs_apply_gpu(VmInstance *instance)
     return hr;
 }
 
+HRESULT hcs_detach_scsi(VmInstance *instance, int slot)
+{
+    HCS_OPERATION op;
+    HRESULT hr;
+    wchar_t modify_json[256];
+
+    if (!pfnModify || !instance->handle)
+        return E_NOT_VALID_STATE;
+
+    swprintf_s(modify_json, _countof(modify_json),
+        L"{\"ResourcePath\":\"VirtualMachine/Devices/Scsi/Primary/Attachments/%d\",\"RequestType\":\"Remove\"}",
+        slot);
+
+    op = pfnCreateOp(NULL, NULL);
+    if (!op) return E_OUTOFMEMORY;
+
+    hr = pfnModify(instance->handle, op, modify_json, NULL);
+    return hcs_exec_and_wait(hr, op);
+}
+
 HRESULT hcs_start_vm(VmInstance *instance)
 {
     HCS_OPERATION op;

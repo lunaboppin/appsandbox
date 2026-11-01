@@ -128,6 +128,10 @@ BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars);
    units + modprobe.d/modules-load.d + wsl-mesa + wsl-deps under
    <staging>/extras/. The direct-ISO->VHDX flow populates this dir (via
    the prefetch modules) and turns it into a manifest for iso-patch --stage. */
+/* Install media for a Fedora VM: media_dir as an ISO labelled OEMDRV, which is
+   where Anaconda looks for ks.cfg without being told. */
+HRESULT iso_create_fedora_media(const wchar_t *iso_path, const wchar_t *media_dir);
+
 void stage_linux_agent_and_extras(const wchar_t *staging,
                                   const wchar_t *res_dir,
                                   BOOL ssh_enabled);

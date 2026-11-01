@@ -1700,6 +1700,15 @@ cleanup:
 }
 
 
+HRESULT iso_create_fedora_media(const wchar_t *iso_path, const wchar_t *media_dir)
+{
+    /* This runs on a worker thread that has no COM of its own. */
+    HRESULT init = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    HRESULT hr = create_iso_from_dir(iso_path, media_dir, L"OEMDRV");
+    if (SUCCEEDED(init)) CoUninitialize();
+    return hr;
+}
+
 /* NoCloud seed for the VPN gateway: an Ubuntu VM with WireGuard and the
    AppSandbox Linux agent, which runs the tunnels and routing on the host's
    command. Both adapters are static and matched by MAC: the uplink on the

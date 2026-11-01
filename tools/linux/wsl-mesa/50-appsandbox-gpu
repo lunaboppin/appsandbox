@@ -35,4 +35,12 @@ if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
     echo "__GLX_VENDOR_LIBRARY_NAME=mesa"
     [ -e "$WSL_MESA/share/vulkan/icd.d/dzn_icd.x86_64.json" ] && \
         echo "VK_DRIVER_FILES=$WSL_MESA/share/vulkan/icd.d/dzn_icd.x86_64.json"
+elif [ -e /dev/dxg ] && [ -e /usr/lib64/dri/d3d12_dri.so ]; then
+    # Fedora: its own Mesa has d3d12 and dzn, so there's no tarball to prefer.
+    echo "LD_LIBRARY_PATH=$WSL_LIB"
+    echo "GALLIUM_DRIVER=d3d12"
+    echo "MESA_LOADER_DRIVER_OVERRIDE=d3d12"
+    echo "__GLX_VENDOR_LIBRARY_NAME=mesa"
+    [ -e /usr/share/vulkan/icd.d/dzn_icd.x86_64.json ] && \
+        echo "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/dzn_icd.x86_64.json"
 fi

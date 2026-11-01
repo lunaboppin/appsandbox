@@ -34,6 +34,7 @@ typedef void *HCS_OPERATION;
 typedef struct {
     wchar_t name[256];
     wchar_t os_type[32];          /* L"Windows" or L"Linux" */
+    wchar_t linux_distro[16];     /* L"fedora", or empty: decided by the ISO */
     wchar_t image_path[MAX_PATH]; /* ISO path */
     wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
     wchar_t data_vhdx_path[MAX_PATH]; /* optional appliance-owned data disk */
@@ -70,6 +71,7 @@ typedef struct {
     HCS_SYSTEM  handle;
     wchar_t     name[256];
     wchar_t     os_type[32];
+    wchar_t     linux_distro[16];  /* L"fedora"; empty = Ubuntu, and VMs from before Fedora */
     wchar_t     vhdx_path[MAX_PATH];
     wchar_t     data_vhdx_path[MAX_PATH];
     wchar_t     storage_root[MAX_PATH];
@@ -193,6 +195,9 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance);
 
 /* Start a previously created VM. */
 HRESULT hcs_start_vm(VmInstance *instance);
+
+/* Remove the disk or DVD at a SCSI slot from a running VM. */
+HRESULT hcs_detach_scsi(VmInstance *instance, int slot);
 
 /* Graceful shutdown. */
 HRESULT hcs_stop_vm(VmInstance *instance);

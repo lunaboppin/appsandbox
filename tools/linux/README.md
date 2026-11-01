@@ -114,7 +114,8 @@ Windows / 7-Zip / WinRAR equivalents all handle `.tar.gz` fine.
 
 The app build copies this tree to `resources\linux\guest-src` next to
 `AppSandbox.exe`, with line endings converted to LF (`tools/normalize-eol.ps1`).
-Creating an Ubuntu VM stages that copy, and the VM's first boot compiles the
+Creating a Linux VM stages that copy (Ubuntu in its rootfs, Fedora on the Kickstart
+disc, see `src/backend_win/fedora_install.c`), and the VM's first boot compiles the
 daemons and builds the modules with DKMS, so a local build tests local guest
 changes without pushing anything.
 
