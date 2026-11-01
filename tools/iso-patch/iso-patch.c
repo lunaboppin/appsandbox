@@ -637,6 +637,162 @@ static BOOL unmount_volume_from_dir(const wchar_t *mount_dir)
     return DeleteVolumeMountPointW(mount_dir);
 }
 
+/* Map a volume GUID path (\\?\Volume{guid}\) to its NT device path
+   (\Device\HarddiskVolumeN), which bcdedit accepts as hd_partition=<path>
+   for volumes that have no drive letter. */
+static BOOL volume_nt_device(const wchar_t *vol_path, wchar_t *out, DWORD out_len)
+{
+    wchar_t name[MAX_PATH];
+    size_t len;
+
+    if (wcsncmp(vol_path, L"\\\\?\\", 4) != 0) return FALSE;
+    wcscpy_s(name, MAX_PATH, vol_path + 4);
+    len = wcslen(name);
+    if (len > 0 && name[len - 1] == L'\\') name[len - 1] = L'\0';
+    return QueryDosDeviceW(name, out, out_len) != 0;
+}
+
+/* Set Description\System, TreatAsSystem and KeyName in a BCD store file, the
+   values that mark it as a system store. Edits the hive file with the offline
+   registry library: on hosts where bcdboot hits the BCD00000000 collision,
+   loading any hive into the registry fails too (reg load: "The filename or
+   extension is too long"), so RegLoadKey/reg.exe can't be used. */
+typedef void *ORHKEY;
+typedef DWORD (WINAPI *OROpenHive_t)(PCWSTR, ORHKEY *);
+typedef DWORD (WINAPI *ORCreateKey_t)(ORHKEY, PCWSTR, PWSTR, DWORD,
+                                      PSECURITY_DESCRIPTOR, ORHKEY *, PDWORD);
+typedef DWORD (WINAPI *ORSetValue_t)(ORHKEY, PCWSTR, DWORD, const BYTE *, DWORD);
+typedef DWORD (WINAPI *ORSaveHive_t)(ORHKEY, PCWSTR, DWORD, DWORD);
+typedef DWORD (WINAPI *ORClose_t)(ORHKEY);
+
+static BOOL mark_bcd_system_store(const wchar_t *store)
+{
+    static const wchar_t key_name[] = L"BCD00000000";
+    HMODULE offreg = LoadLibraryExW(L"offreg.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    OROpenHive_t open_hive;
+    ORCreateKey_t create_key;
+    ORSetValue_t set_value;
+    ORSaveHive_t save_hive;
+    ORClose_t close_key, close_hive;
+    ORHKEY root = NULL, desc = NULL;
+    wchar_t saved[MAX_PATH];
+    DWORD one = 1, err;
+    BOOL ok = FALSE;
+
+    if (!offreg) {
+        log_msg(L"offreg.dll not available (error %lu); cannot mark the BCD store.", GetLastError());
+        return FALSE;
+    }
+    open_hive  = (OROpenHive_t)GetProcAddress(offreg, "OROpenHive");
+    create_key = (ORCreateKey_t)GetProcAddress(offreg, "ORCreateKey");
+    set_value  = (ORSetValue_t)GetProcAddress(offreg, "ORSetValue");
+    save_hive  = (ORSaveHive_t)GetProcAddress(offreg, "ORSaveHive");
+    close_key  = (ORClose_t)GetProcAddress(offreg, "ORCloseKey");
+    close_hive = (ORClose_t)GetProcAddress(offreg, "ORCloseHive");
+    if (!open_hive || !create_key || !set_value || !save_hive || !close_key || !close_hive) {
+        log_msg(L"offreg.dll is missing an export; cannot mark the BCD store.");
+        goto done;
+    }
+
+    if ((err = open_hive(store, &root)) != ERROR_SUCCESS ||
+        (err = create_key(root, L"Description", NULL, 0, NULL, &desc, NULL)) != ERROR_SUCCESS ||
+        (err = set_value(desc, L"System", REG_DWORD, (const BYTE *)&one, sizeof(one))) != ERROR_SUCCESS ||
+        (err = set_value(desc, L"TreatAsSystem", REG_DWORD, (const BYTE *)&one, sizeof(one))) != ERROR_SUCCESS ||
+        (err = set_value(desc, L"KeyName", REG_SZ, (const BYTE *)key_name, sizeof(key_name))) != ERROR_SUCCESS) {
+        log_msg(L"Editing the BCD store failed (error %lu).", err);
+        goto done;
+    }
+
+    /* ORSaveHive won't overwrite, so save beside the store and swap it in. */
+    swprintf_s(saved, MAX_PATH, L"%s.asb", store);
+    DeleteFileW(saved);
+    if ((err = save_hive(root, saved, 6, 1)) != ERROR_SUCCESS) {
+        log_msg(L"Saving the BCD store failed (error %lu).", err);
+        goto done;
+    }
+    close_key(desc); desc = NULL;
+    close_hive(root); root = NULL;
+    if (!MoveFileExW(saved, store, MOVEFILE_REPLACE_EXISTING)) {
+        log_msg(L"Replacing the BCD store failed (error %lu).", GetLastError());
+        DeleteFileW(saved);
+        goto done;
+    }
+    ok = TRUE;
+
+done:
+    if (desc) close_key(desc);
+    if (root) close_hive(root);
+    FreeLibrary(offreg);
+    return ok;
+}
+
+/* Write the ESP's BCD store with bcdedit, for when bcdboot copied the boot
+   files but could not build the store. bcdboot loads a new store under the
+   fixed key HKLM\BCD00000000, which collides with the host's own system store
+   on some hosts (BFSVC "Failed to create a new system store", c0000035);
+   bcdedit /createstore loads it under a key of its own and works. */
+static BOOL write_bcd_store(const wchar_t *efi_clean, const wchar_t *efi_vol,
+                            const wchar_t *win_vol, const wchar_t *locale)
+{
+    /* Fixed id for the single Windows loader entry. */
+    static const wchar_t *loader = L"{a5b0cafe-0b00-4000-8000-000000000001}";
+    wchar_t sys_dir[MAX_PATH], store[MAX_PATH], efi_dev[MAX_PATH], win_dev[MAX_PATH];
+    wchar_t bootmgr_efi[MAX_PATH], log_path[MAX_PATH];
+    wchar_t sets[12][256];
+    wchar_t cmd[1024];
+    int i, n = 0;
+
+    swprintf_s(bootmgr_efi, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\bootmgfw.efi", efi_clean);
+    if (GetFileAttributesW(bootmgr_efi) == INVALID_FILE_ATTRIBUTES) {
+        log_msg(L"No boot manager on the ESP; cannot write the BCD store.");
+        return FALSE;
+    }
+    if (!volume_nt_device(efi_vol, efi_dev, MAX_PATH) ||
+        !volume_nt_device(win_vol, win_dev, MAX_PATH)) {
+        log_msg(L"Could not resolve partition device paths (error %lu).", GetLastError());
+        return FALSE;
+    }
+
+    GetSystemDirectoryW(sys_dir, MAX_PATH);
+    swprintf_s(store, MAX_PATH, L"%s\\EFI\\Microsoft\\Boot\\BCD", efi_clean);
+    /* Drop any partial store a failed bcdboot left behind. */
+    DeleteFileW(store);
+    swprintf_s(log_path, MAX_PATH, L"%s.LOG", store);  DeleteFileW(log_path);
+    swprintf_s(log_path, MAX_PATH, L"%s.LOG1", store); DeleteFileW(log_path);
+    swprintf_s(log_path, MAX_PATH, L"%s.LOG2", store); DeleteFileW(log_path);
+
+    swprintf_s(cmd, 1024, L"%s\\bcdedit.exe /createstore \"%s\"", sys_dir, store);
+    if (run_command_logged(cmd) != 0) return FALSE;
+
+    swprintf_s(sets[n++], 256, L"/create {bootmgr} /d \"Windows Boot Manager\"");
+    /* hd_partition, not partition: these volumes live in a VHDX attached on
+       the host, and partition= records them as vhd=[C:]\...\disk.vhdx, a
+       host path the guest can't resolve. hd_partition stores the raw GPT
+       partition, as bcdboot does. */
+    swprintf_s(sets[n++], 256, L"/set {bootmgr} device hd_partition=%s", efi_dev);
+    swprintf_s(sets[n++], 256, L"/set {bootmgr} path \\EFI\\Microsoft\\Boot\\bootmgfw.efi");
+    swprintf_s(sets[n++], 256, L"/set {bootmgr} locale %s", locale);
+    swprintf_s(sets[n++], 256, L"/create %s /d \"Windows\" /application osloader", loader);
+    swprintf_s(sets[n++], 256, L"/set %s device hd_partition=%s", loader, win_dev);
+    swprintf_s(sets[n++], 256, L"/set %s osdevice hd_partition=%s", loader, win_dev);
+    swprintf_s(sets[n++], 256, L"/set %s path \\Windows\\system32\\winload.efi", loader);
+    swprintf_s(sets[n++], 256, L"/set %s systemroot \\Windows", loader);
+    swprintf_s(sets[n++], 256, L"/set %s locale %s", loader, locale);
+    swprintf_s(sets[n++], 256, L"/set {bootmgr} default %s", loader);
+    swprintf_s(sets[n++], 256, L"/set {bootmgr} displayorder %s", loader);
+
+    for (i = 0; i < n; i++) {
+        swprintf_s(cmd, 1024, L"%s\\bcdedit.exe /store \"%s\" %s", sys_dir, store, sets[i]);
+        if (run_command_logged(cmd) != 0) return FALSE;
+    }
+
+    /* Flag it as a system store, as bcdboot does. Without System/TreatAsSystem
+       Windows boots from it, but Setup's specialize pass (spbcd) rejects it
+       ("File is not system store") and stops with "Windows Setup could not
+       configure Windows to run on this computer's hardware". */
+    return mark_bcd_system_store(store);
+}
+
 /* Format a volume using format.exe. fs_type is "FAT32" or "NTFS".
    vol_path is e.g. \\?\Volume{guid}\ — but format.exe needs a drive letter
    or mount point. We pass the mount_dir which has a trailing backslash. */
@@ -817,6 +973,9 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
     wchar_t win_mount[MAX_PATH] = {0};
     BOOL efi_mounted = FALSE;
     BOOL win_mounted = FALSE;
+    wchar_t efi_vol[MAX_PATH] = {0};
+    wchar_t win_vol[MAX_PATH] = {0};
+    wchar_t image_locale[32] = L"en-US";
 
     /* WIM/ESD path found on ISO */
     wchar_t wim_path[MAX_PATH];
@@ -957,6 +1116,7 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
             }
         }
         printf("LANG:%s\n", detected_lang);
+        MultiByteToWideChar(CP_UTF8, 0, detected_lang, -1, image_locale, 32);
         fflush(stdout);
     }
 
@@ -1150,7 +1310,6 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
     /* ---- Step 6: Find and mount the EFI and Windows volumes ---- */
     log_msg(L"Formatting partitions...");
     {
-        wchar_t efi_vol[MAX_PATH];
         if (!find_volume_for_partition(disk_number, 1, efi_vol, MAX_PATH)) {
             log_err(L"Could not find EFI partition volume");
             goto cleanup;
@@ -1167,7 +1326,6 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
     }
 
     {
-        wchar_t win_vol[MAX_PATH];
         if (!find_volume_for_partition(disk_number, 3, win_vol, MAX_PATH)) {
             log_err(L"Could not find Windows partition volume");
             goto cleanup;
@@ -1269,6 +1427,14 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
                         L"%sWindows\\System32\\bcdboot.exe \"%s\" /s \"%s\" /f UEFI",
                         win_mount, windows_dir, efi_clean);
             ret = run_command_logged(cmd);
+        }
+        if (ret != 0) {
+            /* Both bcdboots failed. If the boot files did land on the ESP
+               (the host-store collision fails only the BCD step), write the
+               store ourselves. */
+            log_msg(L"bcdboot failed (exit %d); writing the BCD store with bcdedit...", ret);
+            if (write_bcd_store(efi_clean, efi_vol, win_vol, image_locale))
+                ret = 0;
         }
         if (ret != 0) {
             log_err(L"Failed to install boot files (bcdboot exit code %d)", ret);
@@ -2925,6 +3091,11 @@ fail:
 
 int wmain(int argc, wchar_t *argv[])
 {
+    /* No modal loader dialogs: a child that can't load a DLL (e.g. the image's
+       own bcdboot hitting a code-integrity block, "Bad Image") must fail
+       instead of waiting on an OK click. Children inherit this mode. */
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+
     if (argc < 2) {
         wprintf(L"Usage:\n");
         wprintf(L"  iso-patch.exe <windows.iso>\n");
