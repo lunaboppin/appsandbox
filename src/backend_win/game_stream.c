@@ -752,7 +752,7 @@ static DWORD WINAPI session_thread(LPVOID param)
     AsbVmConfig config;
     VmInstance *vm, *source;
     wchar_t sessions[MAX_PATH], base[MAX_PATH], nominated[256], err[300];
-    char logon[1024], reply[512];
+    char logon[1024], reply[1600];
     UINT64 id = 0;
     BOOL lan, software = FALSE, anyone;
     DWORD ram = 4096, cpu = 4;
@@ -943,6 +943,28 @@ HRESULT game_stream_session_start(const char *token, const wchar_t *user, const 
         utf8_message(message, message_cap, "That game isn't in the list.");
         return E_INVALIDARG;
     }
+    /* Refuse what's going to be refused before the kept password is used up. */
+    source = asb_vm_instance(asb_vm_find(g_nominated));
+    if (source) need_bytes = (ULONGLONG)source->ram_mb * 1024ull * 1024ull;
+    mem.dwLength = sizeof(mem);
+    if (GlobalMemoryStatusEx(&mem) && mem.ullAvailPhys < need_bytes) {
+        utf8_message(message, message_cap, "This PC doesn't have enough free memory for another VM right now.");
+        return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
+    }
+    AcquireSRWLockShared(&g_lock);
+    for (i = 0; i < GS_MAX_SESSIONS; i++)
+        if (g_sessions[i].used) active++;
+    if (find_session(user) >= 0) {
+        utf8_message(message, message_cap, "You already have a session.");
+        slot = -2;
+    } else if (active >= g_max_sessions) {
+        utf8_message(message, message_cap, "All the sessions are in use. Try again later.");
+        slot = -2;
+    }
+    ReleaseSRWLockShared(&g_lock);
+    if (slot == -2) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    active = 0;
+
     start = (GsStart *)calloc(1, sizeof(*start));
     if (!start) return E_OUTOFMEMORY;
     /* A password typed now, once the kept one has lapsed, is checked like a sign-in. */
@@ -965,15 +987,6 @@ HRESULT game_stream_session_start(const char *token, const wchar_t *user, const 
         return HRESULT_FROM_WIN32(ERROR_NOT_AUTHENTICATED);
     }
 
-    source = asb_vm_instance(asb_vm_find(g_nominated));
-    if (source) need_bytes = (ULONGLONG)source->ram_mb * 1024ull * 1024ull;
-    mem.dwLength = sizeof(mem);
-    if (GlobalMemoryStatusEx(&mem) && mem.ullAvailPhys < need_bytes) {
-        SecureZeroMemory(start, sizeof(*start));
-        free(start);
-        utf8_message(message, message_cap, "This PC doesn't have enough free memory for another VM right now.");
-        return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
-    }
     if (!random_hex_upper(suffix, 6)) {
         SecureZeroMemory(start, sizeof(*start));
         free(start);

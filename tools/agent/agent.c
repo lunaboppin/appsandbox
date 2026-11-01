@@ -2968,7 +2968,11 @@ static const char SESSION_SIGNIN_WHY_PS[] =
     "$n=Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='NETLOGON'} -MaxEvents 1 -ErrorAction SilentlyContinue\r\n"
     "$l=if($n){ ' netlogon='+$n.Id+'@'+$n.TimeCreated.ToString('HH:mm:ss') }else{ '' }\r\n"
     "$u=@(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress+'/'+$_.Store }) -join ','\r\n"
-    "Write-Output ('result:timeout autologon='+$w.AutoAdminLogon+' count='+$w.AutoLogonCount+' user='+$w.DefaultDomainName+'\\'+$w.DefaultUserName+' boot='+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('HH:mm:ss')+' '+$f+$l+' ips='+$u)\r\n";
+    "$q=(& quser.exe 2>&1 | Out-String) -replace '\\s+',' '\r\n"
+    "$o=@(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4647,4634} -MaxEvents 3 -ErrorAction SilentlyContinue | ForEach-Object { ''+$_.Id+'@'+$_.TimeCreated.ToString('HH:mm:ss')+'='+$_.Properties[1].Value }) -join ','\r\n"
+    "$p=@(Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='Microsoft-Windows-User Profiles Service','Microsoft-Windows-User Profile Service';Level=1,2,3} -MaxEvents 3 -ErrorAction SilentlyContinue | ForEach-Object { ''+$_.Id+'@'+$_.TimeCreated.ToString('HH:mm:ss') }) -join ','\r\n"
+    "$c=@(Get-WinEvent -FilterHashtable @{LogName='Application';Id=1000,1002} -MaxEvents 3 -ErrorAction SilentlyContinue | ForEach-Object { ''+$_.Id+'@'+$_.TimeCreated.ToString('HH:mm:ss')+'='+$_.Properties[0].Value }) -join ','\r\n"
+    "Write-Output ('result:timeout quser=['+$q+'] logoffs=['+$o+'] profile=['+$p+'] crashes=['+$c+'] autologon='+$w.AutoAdminLogon+' count='+$w.AutoLogonCount+' user='+$w.DefaultDomainName+'\\'+$w.DefaultUserName+' boot='+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('HH:mm:ss')+' '+$f+$l+' ips='+$u)\r\n";
 
 /* The desktop has loaded in this session. */
 static BOOL session_has_shell(DWORD session)
@@ -5119,6 +5123,13 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
 
     if (ctrl == SERVICE_CONTROL_SESSIONCHANGE) {
         WTSSESSION_NOTIFICATION *sn = (WTSSESSION_NOTIFICATION *)event_data;
+        {
+            /* In the host's log too: a sign-in that doesn't last is otherwise invisible. */
+            static const char *const names[] = { "?", "console connect", "console disconnect",
+                "remote connect", "remote disconnect", "logon", "logoff", "lock", "unlock" };
+            agent_log_to_host("Windows session %lu: %s (console is %lu).", sn ? sn->dwSessionId : 0,
+                              event_type <= 8 ? names[event_type] : "other", WTSGetActiveConsoleSessionId());
+        }
         if (event_type == WTS_SESSION_LOGOFF) {
             agent_log("Session logoff detected (session %lu).",
                        sn ? sn->dwSessionId : 0);
