@@ -2929,7 +2929,12 @@ static void session_autologon_clear(void)
     winlogon_set(L"AutoAdminLogon", L"0");
 }
 
-/* Windows setup is still going after sysprep; a restart now would break it. */
+/* Sign-outs since this boot began. */
+static volatile LONG g_session_logoffs;
+
+/* Windows setup is still going after sysprep; a restart now would break it. Its last
+   step is a temporary session of its own: restart before that has signed out, and Windows
+   finishes it at the next boot, signing out whoever is signed in by then. */
 static void session_setup_wait(char *reply, size_t reply_size)
 {
     int i;
@@ -2946,6 +2951,8 @@ static void session_setup_wait(char *reply, size_t reply_size)
                          RRF_RT_REG_DWORD, NULL, &oobe, &size) != ERROR_SUCCESS)
             oobe = 0;
         if (!setup && !oobe && (!state[0] || wcscmp(state, L"IMAGE_STATE_COMPLETE") == 0)) {
+            for (i = 0; i < 180 && !InterlockedCompareExchange(&g_session_logoffs, 0, 0); i++)
+                Sleep(1000);
             strcpy_s(reply, reply_size, "ok");
             return;
         }
@@ -5153,6 +5160,7 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
                               event_type <= 8 ? names[event_type] : "other", WTSGetActiveConsoleSessionId());
         }
         if (event_type == WTS_SESSION_LOGOFF) {
+            InterlockedIncrement(&g_session_logoffs);
             agent_log("Session logoff detected (session %lu).",
                        sn ? sn->dwSessionId : 0);
             /* Do NOT restart the VDD device here.  IddCx handles the DWM
