@@ -123,6 +123,7 @@ typedef struct {
     wchar_t     lab_report[MAX_PATH]; /* last report.html */
     DWORD       guest_grow_target_gb; /* one-shot root partition/filesystem grow request */
     volatile LONG management_busy; /* serializes stopped-VM media/storage/disk operations */
+    volatile LONG stopping;        /* asb_vm_stop is still tearing down after running went FALSE */
     /* Run in Sandbox (sandbox_run.h). Id, parent, overlay and file are in vms.cfg:
        a set id means a throwaway checkpoint is waiting on the user's decision. */
     wchar_t     sandbox_run_id[40];

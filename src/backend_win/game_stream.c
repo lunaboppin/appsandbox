@@ -477,14 +477,18 @@ static HRESULT collect_catalog(VmInstance *vm, const wchar_t *image_dir)
 
 /* ---- Building the image ---- */
 
+/* Gives up early if the copy stops after it started: nothing would bring it back. */
 static BOOL wait_for_agent(UINT64 id, DWORD timeout_ms)
 {
     ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    BOOL started = FALSE;
     while (GetTickCount64() < deadline) {
         VmInstance *vm;
         if (InterlockedCompareExchange(&g_build.cancel, 0, 0) || g_shutting_down) return FALSE;
         vm = asb_find_vm_by_id(id);
         if (!vm) return FALSE;
+        if (vm->running) started = TRUE;
+        else if (started) return FALSE;
         if (vm->agent_online && !vm->agent_initializing) return TRUE;
         Sleep(2000);
     }
@@ -549,6 +553,11 @@ static HRESULT build_steps(const wchar_t *source_vhdx, const wchar_t *image_dir,
         return hr;
     }
     if (!wait_for_agent(id, 15 * 60 * 1000)) {
+        vm = asb_find_vm_by_id(id);
+        if (vm && !vm->running) {
+            wcscpy_s(error, error_chars, L"The copy stopped before the image was finished.");
+            return E_ABORT;
+        }
         wcscpy_s(error, error_chars, L"The copy didn't start. If BitLocker is on in this VM, turn it off, then build the image again.");
         return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     }
@@ -558,6 +567,10 @@ static HRESULT build_steps(const wchar_t *source_vhdx, const wchar_t *image_dir,
     for (;;) {
         vm = asb_find_vm_by_id(id);
         if (!vm || InterlockedCompareExchange(&g_build.cancel, 0, 0) || g_shutting_down) return E_ABORT;
+        if (!vm->running) {
+            wcscpy_s(error, error_chars, L"The copy stopped before the image was finished.");
+            return E_ABORT;
+        }
         reply[0] = 0;
         if (vm_agent_send(vm, "stream_status", reply, sizeof(reply), 35000)) {
             if (strstr(reply, "\"phase\":\"ready\"")) break;

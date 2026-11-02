@@ -5022,6 +5022,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
     if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
 
+    InterlockedIncrement(&inst->stopping);
     inst->running = FALSE;
     inst->shutdown_requested = FALSE;
     inst->hyperv_video_off = FALSE;
@@ -5044,6 +5045,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
     asb_log(L"VM \"%s\" terminated.", inst->name);
     save_vm_list();
+    InterlockedDecrement(&inst->stopping);
 
     if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
     return S_OK;
@@ -5120,7 +5122,16 @@ HRESULT asb_session_clone_delete(UINT64 vm_id)
     VmInstance *inst = asb_find_vm_by_id(vm_id);
     int idx;
     HRESULT hr;
+    ULONGLONG deadline = GetTickCount64() + 120000;
     if (!inst || !inst->session_clone) return E_INVALIDARG;
+    /* Game Streaming deletes a duplicate once it sees it isn't running, which a force
+       stop says before it has finished with the VM. Deleting under it hangs the stop. */
+    while (InterlockedCompareExchange(&inst->stopping, 0, 0) && GetTickCount64() < deadline) {
+        Sleep(200);
+        inst = asb_find_vm_by_id(vm_id);   /* other VMs' deletes move the list */
+        if (!inst) return E_INVALIDARG;
+    }
+    if (InterlockedCompareExchange(&inst->stopping, 0, 0)) return HRESULT_FROM_WIN32(ERROR_BUSY);
     idx = (int)(inst - g_vms);
     SecureZeroMemory(inst->session_logon, sizeof(inst->session_logon));
     if (inst->session_identity) {

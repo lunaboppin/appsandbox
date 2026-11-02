@@ -61,6 +61,14 @@ def main() -> None:
     assert "/generalize" in agent
     # A failed refresh leaves the working image in place.
     assert "wcscpy_s(g_image, MAX_PATH, base)" in gs
+    # A build VM that stops is noticed at once, not after the waits time out.
+    assert "else if (started) return FALSE;" in gs
+    assert gs.count('L"The copy stopped before the image was finished."') == 2
+    # ...and its delete waits for a force stop that is still tearing it down.
+    stop = core[core.index("ASB_API HRESULT asb_vm_stop"):core.index("/* ---- VM Delete ---- */")]
+    assert stop.index("InterlockedIncrement(&inst->stopping)") < stop.index("inst->running = FALSE")
+    assert "InterlockedDecrement(&inst->stopping)" in stop
+    assert "while (InterlockedCompareExchange(&inst->stopping, 0, 0)" in core
 
     # The password: checked on the appliance, encrypted while kept, and gone after use.
     assert "ValidateCredentials" in agent
