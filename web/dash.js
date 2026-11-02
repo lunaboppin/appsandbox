@@ -185,7 +185,10 @@ function renderSession(s) {
   $('btn-end').textContent = s.state === 'failed' ? 'Start over' : 'End session';
   $('btn-end').hidden = s.state === 'ending';
   renderMode(ready);
-  if (ready) $('moonlight-address').textContent = moonlightAddress(s);
+  if (ready) {
+    $('moonlight-address').textContent = moonlightAddress(s);
+    $('moonlight-known').hidden = !s.moonlightKnown;
+  }
 }
 
 async function poll() {

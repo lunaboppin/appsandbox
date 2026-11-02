@@ -632,6 +632,30 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 ui_log(L"Windows setup in \"%s\": %S", vm->name, buf);
         }
 
+        /* The user's own Sunshine identity, before streaming is set up below. If it
+           doesn't arrive, their devices pair again and everything else still works. */
+        if (vm->session_clone && vm->session_identity) {
+            char *line = vm->session_identity;
+            BOOL restored = TRUE;
+            while (line && *line) {
+                char *next = strchr(line, '\n'), saved = 0;
+                if (next) { saved = *next; *next = 0; }
+                n = send_tagged_cmd(s, vm, &conn->cmd_seq, line, buf, sizeof(buf), 60000);
+                if (next) *next = saved;
+                if (n <= 0) goto disconnected;
+                if (strcmp(buf, "ok") != 0) {
+                    ui_log(L"Restoring the Moonlight identity on \"%s\" failed (%S).", vm->name, buf);
+                    restored = FALSE;
+                    break;
+                }
+                line = next ? next + 1 : NULL;
+            }
+            if (restored) ui_log(L"Restored the user's Moonlight identity on \"%s\".", vm->name);
+            SecureZeroMemory(vm->session_identity, strlen(vm->session_identity));
+            free(vm->session_identity);
+            vm->session_identity = NULL;
+        }
+
         /* A duplicate's boot after its domain join: leave the network alone while
            Windows signs the user in over the link saved for this boot. */
         if (vm->session_clone && vm->session_signing_in) {
@@ -1051,6 +1075,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     BOOL quiet = command && (strncmp(command, "lab_chunk:", 10) == 0 ||
                              strcmp(command, "session_status") == 0 ||
                              strncmp(command, "session_catalog_read:", 21) == 0 ||
+                             strncmp(command, "domain_identity_", 16) == 0 ||
                              strcmp(command, "session_image_status") == 0);
     BOOL redact = command &&
         (strncmp(command, "appliance_account:", 18) == 0 ||

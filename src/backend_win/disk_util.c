@@ -1109,6 +1109,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>\n"
         L"                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>\n"
         L"                <ProtectYourPC>3</ProtectYourPC>\n"
+        L"%s"
         L"            </OOBE>\n"
         L"            <UserAccounts><LocalAccounts>\n"
         L"                <LocalAccount wcm:action=\"add\">\n"
@@ -1119,6 +1120,10 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"            </LocalAccounts></UserAccounts>\n",
         comp_name,
         lang_to_input_locale(lang), lang, lang, lang,
+        /* Nobody is at a duplicate to answer the out-of-box screens. They run an update
+           check that can take minutes, and can stop at an error page wanting a click. */
+        session ? L"                <SkipMachineOOBE>true</SkipMachineOOBE>\n"
+                  L"                <SkipUserOOBE>true</SkipUserOOBE>\n" : L"",
         admin_user, b64_password);
 
     /* A Game Streaming duplicate already has the agent, and its first sign-in

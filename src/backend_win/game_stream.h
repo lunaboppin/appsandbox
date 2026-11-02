@@ -21,6 +21,10 @@
  *  - The dashboard uses the browser gateway's listeners and checks (vm_web.c): network
  *    access is HTTPS only, and only when the admin chose it.
  *  - A duplicate's image holds no pairing or Sunshine password of the source VM.
+ *  - Moonlight sees one PC per user across sessions: each user's Sunshine identity
+ *    (host ID, certificate and paired devices) is kept on the host, readable only by
+ *    SYSTEM and administrators, and restored only into that user's own duplicates. A
+ *    device a user paired can't reach anyone else's session, whose identity differs.
  */
 
 /* ---- Settings (vms.cfg [Settings]) ---- */
@@ -49,6 +53,9 @@ ASB_API HRESULT game_stream_build_image(wchar_t *err, size_t err_chars);
 /* End one session by its VM's name, or turn the feature off and delete its image. */
 ASB_API HRESULT game_stream_end_session_of_vm(const wchar_t *vm_name);
 ASB_API HRESULT game_stream_turn_off(void);
+
+/* A domain user is gone: end their session and delete their Moonlight identity. */
+void game_stream_forget_user(const wchar_t *user);
 
 /* ---- The dashboard (vm_web.c) ---- */
 

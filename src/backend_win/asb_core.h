@@ -76,6 +76,9 @@ typedef struct {
     const wchar_t *base_vhdx;      /* Windows: start as a differencing disk over this disk */
     BOOL   session_clone;          /* Game Streaming duplicate: never saved, deleted with its session */
     const char *session_logon;     /* for a duplicate: the sign-in to set up in the guest */
+    const char *session_identity;  /* for a duplicate: commands restoring the user's Sunshine identity */
+    const char *stream_name;       /* for a duplicate: the name Moonlight shows */
+    DWORD  stream_port;            /* for a duplicate: the user's own port */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
