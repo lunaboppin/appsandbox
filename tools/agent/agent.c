@@ -2929,12 +2929,28 @@ static void session_autologon_clear(void)
     winlogon_set(L"AutoAdminLogon", L"0");
 }
 
-/* Sign-outs since this boot began. */
-static volatile LONG g_session_logoffs;
+/* Is Windows setup's temporary account signed in? */
+static BOOL setup_session_present(void)
+{
+    WTS_SESSION_INFOA *list = NULL;
+    DWORD count = 0, i;
+    BOOL found = FALSE;
+    if (!WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &list, &count)) return FALSE;
+    for (i = 0; i < count && !found; i++) {
+        char *user = NULL;
+        DWORD got;
+        if (WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, list[i].SessionId, WTSUserName, &user, &got) && user)
+            found = _strnicmp(user, "defaultuser", 11) == 0;
+        if (user) WTSFreeMemory(user);
+    }
+    WTSFreeMemory(list);
+    return found;
+}
 
-/* Windows setup is still going after sysprep; a restart now would break it. Its last
-   step is a temporary session of its own: restart before that has signed out, and Windows
-   finishes it at the next boot, signing out whoever is signed in by then. */
+/* Windows setup is still going after sysprep; a restart now would break it. A duplicate
+   skips the out-of-box screens, but if setup does use its temporary session, a restart
+   before that has signed out makes Windows finish it at the next boot, signing out
+   whoever is signed in by then. */
 static void session_setup_wait(char *reply, size_t reply_size)
 {
     int i;
@@ -2951,9 +2967,13 @@ static void session_setup_wait(char *reply, size_t reply_size)
                          RRF_RT_REG_DWORD, NULL, &oobe, &size) != ERROR_SUCCESS)
             oobe = 0;
         if (!setup && !oobe && (!state[0] || wcscmp(state, L"IMAGE_STATE_COMPLETE") == 0)) {
-            /* Usually under a minute, but its update check can take several. */
-            for (i = 0; i < 900 && !InterlockedCompareExchange(&g_session_logoffs, 0, 0); i++)
+            /* It can appear a moment after the rest of setup says it's done, so it has
+               to stay away for a while. */
+            int clear = 0;
+            for (i = 0; i < 900 && clear < 30; i++) {
+                clear = setup_session_present() ? 0 : clear + 1;
                 Sleep(1000);
+            }
             strcpy_s(reply, reply_size, "ok");
             return;
         }
@@ -5224,7 +5244,6 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
                               event_type <= 8 ? names[event_type] : "other", WTSGetActiveConsoleSessionId());
         }
         if (event_type == WTS_SESSION_LOGOFF) {
-            InterlockedIncrement(&g_session_logoffs);
             agent_log("Session logoff detected (session %lu).",
                        sn ? sn->dwSessionId : 0);
             /* Do NOT restart the VDD device here.  IddCx handles the DWM

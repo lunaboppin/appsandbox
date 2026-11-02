@@ -82,9 +82,10 @@ def main() -> None:
     # boot, and the host's network setup waits for it to finish.
     assert 'PrefixLength 24 | Out-Null' in agent[agent.index("SESSION_LINK_PS[]"):agent.index("session_wait_signin(char")]
     assert "IMAGE_STATE_COMPLETE" in agent
-    # Setup's own last session has to end before the join restarts the guest.
-    assert "InterlockedIncrement(&g_session_logoffs)" in agent
-    assert "!InterlockedCompareExchange(&g_session_logoffs, 0, 0)" in agent
+    # Nobody is there to answer setup's screens, and if its temporary session runs anyway
+    # it has to end before the join restarts the guest.
+    assert "<SkipMachineOOBE>true</SkipMachineOOBE>" in disk and "<SkipUserOOBE>true</SkipUserOOBE>" in disk
+    assert "clear = setup_session_present() ? 0 : clear + 1" in agent
     assert "if (signed_in && session_has_shell(session))" in agent
     # The network setup doesn't remove a link that's already right.
     assert "Where-Object {$_.IPAddress -eq $env:ASB_NET_IP})){" in agent
