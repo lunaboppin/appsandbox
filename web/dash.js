@@ -252,8 +252,9 @@ async function enter() {
   poll();
 }
 
-// Returning from browser view shouldn't send you straight back there.
-autoOpened = document.referrer !== '' || performance.getEntriesByType('navigation')[0]?.type === 'back_forward';
+// Browser view opens by itself only for a session started on this page, so coming back
+// from it, or to it, shows the session rather than sending you straight back in.
+autoOpened = true;
 api('/api/app/session')
   .then((s) => { if (s.mode) sessionMode = s.mode; return enter(); })
   .catch(() => show('signin'));

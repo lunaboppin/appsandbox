@@ -195,13 +195,40 @@ static DWORD WINAPI tcp_conn_thread(LPVOID param)
             for (i = 0; i < 2 && ok; i++) {
                 if (fds[i].revents & (POLLRDNORM | POLLHUP | POLLERR)) {
                     int got = recv(fds[i].fd, buf, 65536, 0);
-                    if (got <= 0 || !send_all(fds[1 - i].fd, buf, got)) ok = FALSE;
+                    BOOL closing = FALSE;
+                    /* Sunshine closes after each pairing reply. If the client gets the
+                       reply well before the close, it reuses the connection, loses the
+                       next request and sends it again, and Sunshine ends the pairing over
+                       the repeat. So a reply and its close arrive together. */
+                    if (got > 0 && i == 1) {
+                        WSAPOLLFD peek;
+                        char one;
+                        peek.fd = guest;
+                        peek.events = POLLRDNORM;
+                        peek.revents = 0;
+                        if (WSAPoll(&peek, 1, 15) > 0 && recv(guest, &one, 1, MSG_PEEK) == 0)
+                            closing = TRUE;
+                    }
+                    if (got <= 0 || !send_all(fds[1 - i].fd, buf, got) || closing) ok = FALSE;
                 }
             }
             if (!ok) break;
         }
     }
     if (guest != INVALID_SOCKET) closesocket(guest);
+    /* Closing with unread data would reset the connection and could take the last
+       reply with it, so say we're done and read what's left. */
+    shutdown(c->client, SD_SEND);
+    if (buf) {
+        WSAPOLLFD drain;
+        int waits = 0;
+        drain.fd = c->client;
+        drain.events = POLLRDNORM;
+        while (waits++ < 10 && !r->stop) {
+            drain.revents = 0;
+            if (WSAPoll(&drain, 1, 100) > 0 && recv(c->client, buf, 65536, 0) <= 0) break;
+        }
+    }
     closesocket(c->client);
     free(buf);
     InterlockedDecrement(&r->tcp_conns);

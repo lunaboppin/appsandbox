@@ -60,6 +60,8 @@ def main() -> None:
     assert "vm->stream_enabled && !vm_stream_unsupported_reason(vm)" in link
     assert '"stream_pin:"' in link   # the PIN stays out of the log
 
+    # Relay: a pairing reply and its close arrive together, and it closes without a reset.
+    assert "recv(guest, &one, 1, MSG_PEEK) == 0" in stream and "shutdown(c->client, SD_SEND)" in stream
     # Relay: loopback unless network; the firewall rule stays off public networks.
     assert "ASB_STREAM_NETWORK" in stream and "INADDR_LOOPBACK" in stream
     assert "profile=private,domain" in stream and "profile=private,domain" in web
