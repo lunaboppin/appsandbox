@@ -19,6 +19,7 @@
 #include "sandbox_run.h"
 #include "vm_stream.h"
 #include "vm_web.h"
+#include "game_stream.h"
 #include "webview2_bridge.h"
 #include "update_ui.h"
 #include "prereq.h"
@@ -283,6 +284,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"autoOpenDisplay", v->auto_open_display);
     jb_bool(jb, L"secureBoot", !v->secure_boot_off);
     jb_bool(jb, L"domainMember", v->domain_member);
+    jb_bool(jb, L"sessionClone", v->session_clone);
     jb_bool(jb, L"disposable", v->disposable_snap[0] != L'\0');
     {
         AsbRunStatus run;
@@ -1451,6 +1453,55 @@ static void finish_domain_work(DomainWork *w)
     send_full_state();
 }
 
+/* The Game Streaming dialog. None of these block: long work runs on the backend's own
+   workers, and the dialog follows it by asking for the status. */
+static void game_streaming_command(const wchar_t *action, const wchar_t *json)
+{
+    char *status = (char *)malloc(32768);
+    wchar_t *status_w = (wchar_t *)malloc(32768 * sizeof(wchar_t));
+    wchar_t *out = (wchar_t *)malloc(80000 * sizeof(wchar_t));
+    wchar_t message[512] = L"";
+    HRESULT hr = S_OK;
+    JsonBuilder jb;
+
+    if (status && status_w && out) {
+        if (wcscmp(action, L"gameStreamingConfigure") == 0) {
+            wchar_t vm[256] = L"", group[65] = L"";
+            int max_sessions = 2, idle = 30;
+            BOOL lan = FALSE;
+            json_get_string(json, L"vm", vm, _countof(vm));
+            json_get_string(json, L"group", group, _countof(group));
+            json_get_int(json, L"maxSessions", &max_sessions);
+            json_get_int(json, L"idleMinutes", &idle);
+            json_get_bool(json, L"lan", &lan);
+            hr = game_stream_configure(vm, max_sessions, idle, group, lan, message, _countof(message));
+        } else if (wcscmp(action, L"gameStreamingBuild") == 0) {
+            hr = game_stream_build_image(message, _countof(message));
+        } else if (wcscmp(action, L"gameStreamingEnd") == 0) {
+            wchar_t vm[64] = L"";
+            json_get_string(json, L"vm", vm, _countof(vm));
+            hr = game_stream_end_session_of_vm(vm);
+        } else if (wcscmp(action, L"gameStreamingOff") == 0) {
+            hr = game_stream_turn_off();
+        }
+        if (FAILED(hr) && !message[0]) format_hresult_message(hr, message, _countof(message));
+        game_stream_status_json(status, 32768);
+        MultiByteToWideChar(CP_UTF8, 0, status, -1, status_w, 32768);
+        jb_init(&jb, out, 80000);
+        jb_object_begin(&jb);
+        jb_string(&jb, L"type", L"gameStreamingResult");
+        jb_string(&jb, L"action", action);
+        jb_bool(&jb, L"success", SUCCEEDED(hr));
+        if (FAILED(hr)) jb_string(&jb, L"message", message);
+        jb_string(&jb, L"data", status_w);
+        jb_object_end(&jb);
+        webview2_post(out);
+    }
+    free(status);
+    free(status_w);
+    free(out);
+}
+
 /* Mount, open, unmount and purge can start the appliance and wait minutes
    for it, so they run on a worker and finish on the UI thread. */
 typedef struct {
@@ -1996,6 +2047,8 @@ static void on_webview2_message(const wchar_t *json)
           if (FAILED(hr)) jb_string(&sj,L"message",message);
           jb_object_end(&sj);webview2_post(out); }
         send_full_state();
+    } else if (wcsncmp(action, L"gameStreaming", 13) == 0) {
+        game_streaming_command(action, json);
     } else if (wcsncmp(action, L"domain", 6) == 0) {
         DomainWork *work = (DomainWork *)calloc(1, sizeof(*work));
         HANDLE thread = NULL;

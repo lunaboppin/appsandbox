@@ -119,6 +119,12 @@ HRESULT shared_appliance_domain_list(char *json, size_t chars,
 HRESULT shared_appliance_domain_user_set(const wchar_t *name, const wchar_t *password,
                                          BOOL enabled, const wchar_t *groups,
                                          wchar_t *message, size_t message_chars);
+HRESULT shared_appliance_domain_validate(const wchar_t *name, const wchar_t *password,
+                                         const wchar_t *group,
+                                         wchar_t *message, size_t message_chars);
+BOOL shared_appliance_domain_autologon_command(const wchar_t *name, const wchar_t *password,
+                                               char *command, size_t chars);
+HRESULT shared_appliance_domain_computer_remove(const wchar_t *name);
 HRESULT shared_appliance_domain_user_delete(const wchar_t *name,
                                             wchar_t *message, size_t message_chars);
 HRESULT shared_appliance_domain_group_add(const wchar_t *name,

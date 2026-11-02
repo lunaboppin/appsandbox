@@ -44,6 +44,8 @@ def main() -> None:
     assert link.index("!nat_configured && !configure_guest_nat") < link.index("vm_stream_setup_command(vm, stream_cmd")
     assert "catch [Net.WebException]" in agent
     assert "Status 'network'" in agent
+    # A failed setup's message reaches the host as one line; an empty one reads as a disconnect.
+    assert 'strcspn(msg, "\\r\\n")' in agent
     assert "Sunshine" in read("THIRD-PARTY-NOTICES.md") and "Not bundled" in read("THIRD-PARTY-NOTICES.md")
     assert not list((ROOT / "tools").rglob("sunshine*.msi"))
 
@@ -58,6 +60,8 @@ def main() -> None:
     assert "vm->stream_enabled && !vm_stream_unsupported_reason(vm)" in link
     assert '"stream_pin:"' in link   # the PIN stays out of the log
 
+    # Relay: a pairing reply and its close arrive together, and it closes without a reset.
+    assert "recv(guest, &one, 1, MSG_PEEK) == 0" in stream and "shutdown(c->client, SD_SEND)" in stream
     # Relay: loopback unless network; the firewall rule stays off public networks.
     assert "ASB_STREAM_NETWORK" in stream and "INADDR_LOOPBACK" in stream
     assert "profile=private,domain" in stream and "profile=private,domain" in web

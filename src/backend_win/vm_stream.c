@@ -49,6 +49,7 @@ typedef struct StreamRelay {
     int      base_port;
     volatile BOOL stop;
     volatile LONG tcp_conns;
+    volatile ULONGLONG last_activity;
     SOCKET   tcp_listen[TCP_PORTS];
     SOCKET   udp_listen[UDP_PORTS];
     HANDLE   tcp_thread;
@@ -194,13 +195,40 @@ static DWORD WINAPI tcp_conn_thread(LPVOID param)
             for (i = 0; i < 2 && ok; i++) {
                 if (fds[i].revents & (POLLRDNORM | POLLHUP | POLLERR)) {
                     int got = recv(fds[i].fd, buf, 65536, 0);
-                    if (got <= 0 || !send_all(fds[1 - i].fd, buf, got)) ok = FALSE;
+                    BOOL closing = FALSE;
+                    /* Sunshine closes after each pairing reply. If the client gets the
+                       reply well before the close, it reuses the connection, loses the
+                       next request and sends it again, and Sunshine ends the pairing over
+                       the repeat. So a reply and its close arrive together. */
+                    if (got > 0 && i == 1) {
+                        WSAPOLLFD peek;
+                        char one;
+                        peek.fd = guest;
+                        peek.events = POLLRDNORM;
+                        peek.revents = 0;
+                        if (WSAPoll(&peek, 1, 15) > 0 && recv(guest, &one, 1, MSG_PEEK) == 0)
+                            closing = TRUE;
+                    }
+                    if (got <= 0 || !send_all(fds[1 - i].fd, buf, got) || closing) ok = FALSE;
                 }
             }
             if (!ok) break;
         }
     }
     if (guest != INVALID_SOCKET) closesocket(guest);
+    /* Closing with unread data would reset the connection and could take the last
+       reply with it, so say we're done and read what's left. */
+    shutdown(c->client, SD_SEND);
+    if (buf) {
+        WSAPOLLFD drain;
+        int waits = 0;
+        drain.fd = c->client;
+        drain.events = POLLRDNORM;
+        while (waits++ < 10 && !r->stop) {
+            drain.revents = 0;
+            if (WSAPoll(&drain, 1, 100) > 0 && recv(c->client, buf, 65536, 0) <= 0) break;
+        }
+    }
     closesocket(c->client);
     free(buf);
     InterlockedDecrement(&r->tcp_conns);
@@ -232,6 +260,7 @@ static DWORD WINAPI tcp_accept_thread(LPVOID param)
                     c->client = client;
                     c->guest_port = r->base_port + g_tcp_offsets[i];
                     InterlockedIncrement(&r->tcp_conns);
+                    r->last_activity = GetTickCount64();
                     t = CreateThread(NULL, 0, tcp_conn_thread, c, 0, NULL);
                     if (t) CloseHandle(t);
                     else { InterlockedDecrement(&r->tcp_conns); free(c); }
@@ -330,6 +359,7 @@ static DWORD WINAPI udp_thread(LPVOID param)
                         c = udp_client_for(clients, &from, i, r);
                         if (c) {
                             c->last_tick = now;
+                            r->last_activity = now;
                             send(c->upstream, buf, got, 0);
                         }
                     } else {
@@ -506,6 +536,21 @@ static DWORD pick_port(VmInstance *vm)
         if (!used) return port;
         port += STREAM_PORT_STEP;
     }
+}
+
+ULONGLONG vm_stream_last_activity(UINT64 vm_id)
+{
+    ULONGLONG when = 0;
+    int i;
+    AcquireSRWLockShared(&g_relay_lock);
+    for (i = 0; i < MAX_RELAYS; i++) {
+        if (g_relays[i] && g_relays[i]->vm_id == vm_id) {
+            when = g_relays[i]->last_activity;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_relay_lock);
+    return when;
 }
 
 void vm_stream_setup_command(VmInstance *vm, char *cmd, int cap)

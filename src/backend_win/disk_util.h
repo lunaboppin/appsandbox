@@ -22,6 +22,8 @@ HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *paren
 
 /* Merge a differencing VHDX into its parent.
    After merge, child_path can be deleted. */
+HRESULT vhdx_copy_flat(const wchar_t *dst_path, const wchar_t *src_path,
+                       volatile LONG *pct, volatile LONG *cancel);
 HRESULT vhdx_merge(const wchar_t *child_path);
 
 /* Grow an existing VHDX to new_size_gb. Shrinking is rejected. */
@@ -55,6 +57,14 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
                                        const wchar_t *lang);
+
+/* The same for a Game Streaming duplicate: its image already has the agent, and
+   no local account signs in first. */
+HRESULT iso_create_session_resources(const wchar_t *iso_path,
+                                     const wchar_t *vm_name,
+                                     const wchar_t *admin_user,
+                                     wchar_t *admin_pass,
+                                     const wchar_t *lang);
 
 /* Provisioning media for the hidden shared-storage appliance. */
 HRESULT iso_create_appliance_cloud_init(const wchar_t *iso_path,

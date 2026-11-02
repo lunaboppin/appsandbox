@@ -73,6 +73,9 @@ typedef struct {
     BOOL   lab_mode;               /* Windows: malware lab VM (isolated, disposable, recorded runs) */
     const wchar_t *linux_distro;   /* Linux: L"fedora" downloads its own image, so image_path may be empty;
                                       otherwise the ISO says which distribution it is */
+    const wchar_t *base_vhdx;      /* Windows: start as a differencing disk over this disk */
+    BOOL   session_clone;          /* Game Streaming duplicate: never saved, deleted with its session */
+    const char *session_logon;     /* for a duplicate: the sign-in to set up in the guest */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -154,6 +157,11 @@ ASB_API HRESULT asb_vm_start_ex(AsbVm vm, int snap_idx, int branch_idx,
 void asb_notify_vm_state(AsbVm vm);
 BOOL asb_save_checked(void);
 HRESULT asb_disposable_new_session(AsbVm vm);
+
+/* Internal: delete a Game Streaming duplicate from a worker thread, telling the
+   UI it is gone; and remove what a crash left behind of one. */
+HRESULT asb_session_clone_delete(UINT64 vm_id);
+void asb_session_clone_remove_leftover(const wchar_t *name, const wchar_t *dir);
 
 /* Graceful shutdown (sends ACPI shutdown signal). */
 ASB_API HRESULT asb_vm_shutdown(AsbVm vm);
