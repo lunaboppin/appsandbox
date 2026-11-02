@@ -875,7 +875,7 @@ static DWORD WINAPI session_thread(LPVOID param)
         if (vm_web_connected(id) || now - vm_stream_last_activity(id) < 30000)
             idle_since = now;
         else if (idle_minutes > 0 && now - idle_since > (ULONGLONG)idle_minutes * 60000ull) {
-            ui_log(L"Game Streaming: ending \"%s\": nobody has connected for %d minutes.", s->vm_name, idle_minutes);
+            ui_log(L"Game Streaming: ending \"%s\": nobody has connected for %d min.", s->vm_name, idle_minutes);
             break;
         }
         /* The user's own sign-out ends the session. */
