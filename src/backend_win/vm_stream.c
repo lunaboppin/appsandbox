@@ -560,8 +560,12 @@ void vm_stream_setup_command(VmInstance *vm, char *cmd, int cap)
         sprintf_s(allowed, sizeof(allowed), "%s.1", hcn_nat_subnet_base());   /* the relay */
     else
         strcpy_s(allowed, sizeof(allowed), "LocalSubnet");
-    sprintf_s(cmd, cap, "stream_setup:%lu:%s:%s:%S", (unsigned long)vm->stream_port,
-              vm->stream_software ? "software" : "auto", allowed, vm->name);
+    if (vm->stream_name[0])
+        sprintf_s(cmd, cap, "stream_setup:%lu:%s:%s:%s", (unsigned long)vm->stream_port,
+                  vm->stream_software ? "software" : "auto", allowed, vm->stream_name);
+    else
+        sprintf_s(cmd, cap, "stream_setup:%lu:%s:%s:%S", (unsigned long)vm->stream_port,
+                  vm->stream_software ? "software" : "auto", allowed, vm->name);
 }
 
 HRESULT vm_stream_configure(VmInstance *vm, BOOL enabled, int exposure, BOOL software_encoder,

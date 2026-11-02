@@ -117,6 +117,20 @@ def main() -> None:
     # The page keeps nothing secret.
     assert not re.search(r"(localStorage|sessionStorage)\.\w+\([^)]*(password|pass|token)", dash, re.I)
 
+    # One Moonlight identity per user: kept for admins only, restored before streaming is
+    # set up, saved after a pairing, per-user, and gone with the user or the feature.
+    assert 'L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"' in gs
+    assert "identity_commands(s->user)" in gs and "config.stream_port = user_stream_port(s->user)" in gs
+    assert 'identity_path(user, name, temp, MAX_PATH)' in gs and "identity_save(vm, user)" in gs
+    assert link.index("vm->session_identity) {") < link.index("vm_stream_setup_command(vm, stream_cmd")
+    assert "if (SUCCEEDED(hr)) game_stream_forget_user(name);" in core
+    assert "asb_session_clone_remove_leftover(NULL, root);" in gs     # Turn Off takes identities too
+    # A key never reaches a log: the commands are redacted, quiet, and only name three files.
+    assert 'strncmp(command, "domain_identity_", 16) == 0' in link
+    assert 'strncmp(cmd, "domain_identity_", 16) == 0' in agent
+    assert re.search(r'identity_file\(const char \*leaf.*?"state".*?"cert".*?"key"', agent, re.S)
+    assert "SecureZeroMemory(vm->session_identity" in link
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")

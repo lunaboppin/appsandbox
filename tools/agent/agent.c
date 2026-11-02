@@ -2951,7 +2951,8 @@ static void session_setup_wait(char *reply, size_t reply_size)
                          RRF_RT_REG_DWORD, NULL, &oobe, &size) != ERROR_SUCCESS)
             oobe = 0;
         if (!setup && !oobe && (!state[0] || wcscmp(state, L"IMAGE_STATE_COMPLETE") == 0)) {
-            for (i = 0; i < 180 && !InterlockedCompareExchange(&g_session_logoffs, 0, 0); i++)
+            /* Usually under a minute, but its update check can take several. */
+            for (i = 0; i < 900 && !InterlockedCompareExchange(&g_session_logoffs, 0, 0); i++)
                 Sleep(1000);
             strcpy_s(reply, reply_size, "ok");
             return;
@@ -3164,26 +3165,16 @@ static const char SESSION_CATALOG_PS[] =
     "[IO.File]::WriteAllText((Join-Path $dir 'catalog.json'),(ConvertTo-Json -InputObject $list -Compress),(New-Object Text.UTF8Encoding($false)))\r\n"
     "Write-Output ('result:'+$list.Count)\r\n";
 
-/* session_catalog_read:<file>:<offset>: "ok:<total bytes>:<base64 piece>". */
-static void session_catalog_read(char *args, char *reply, size_t reply_size)
+/* "ok:<total bytes>:<base64 piece>" for a file, from an offset. */
+static void read_file_piece(const wchar_t *path, LONGLONG offset, char *reply, size_t reply_size)
 {
-    char *f[3];
-    wchar_t path[MAX_PATH];
     HANDLE file;
     BYTE *chunk;
     DWORD got = 0, cap, total;
     int pos;
-    LONGLONG offset;
     LARGE_INTEGER at;
 
-    if (domain_split(args, f, 3) != 2 || !f[0][0] || !domain_field_ok(f[0], "._", 64) ||
-        strstr(f[0], "..") || !session_digits(f[1])) {
-        strcpy_s(reply, reply_size, "error:invalid arguments");
-        return;
-    }
-    offset = _atoi64(f[1]);
-    swprintf_s(path, MAX_PATH, CATALOG_DIR L"\\%S", f[0]);
-    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         strcpy_s(reply, reply_size, "error:not_found");
         return;
@@ -3200,6 +3191,65 @@ static void session_catalog_read(char *args, char *reply, size_t reply_size)
     }
     free(chunk);
     CloseHandle(file);
+}
+
+/* session_catalog_read:<file>:<offset>. */
+static void session_catalog_read(char *args, char *reply, size_t reply_size)
+{
+    char *f[3];
+    wchar_t path[MAX_PATH];
+
+    if (domain_split(args, f, 3) != 2 || !f[0][0] || !domain_field_ok(f[0], "._", 64) ||
+        strstr(f[0], "..") || !session_digits(f[1])) {
+        strcpy_s(reply, reply_size, "error:invalid arguments");
+        return;
+    }
+    swprintf_s(path, MAX_PATH, CATALOG_DIR L"\\%S", f[0]);
+    read_file_piece(path, _atoi64(f[1]), reply, reply_size);
+}
+
+/* A user's Sunshine identity moves between the guest and the host in these pieces: the
+   three files that make Moonlight see the same PC and accept the devices it has paired. */
+static BOOL identity_file(const char *leaf, wchar_t *path, size_t chars)
+{
+    const wchar_t *tail = strcmp(leaf, "state") == 0 ? L"sunshine_state.json"
+                        : strcmp(leaf, "cert") == 0 ? L"credentials\\cacert.pem"
+                        : strcmp(leaf, "key") == 0 ? L"credentials\\cakey.pem" : NULL;
+    wchar_t root[MAX_PATH];
+    if (!tail || !GetEnvironmentVariableW(L"ProgramFiles", root, MAX_PATH)) return FALSE;
+    return swprintf_s(path, chars, L"%s\\Sunshine\\config\\%s", root, tail) > 0;
+}
+
+/* domain_identity_put:<state|cert|key>:<offset>:<base64>. Offset 0 starts the file again. */
+static void identity_put(const char *leaf, const char *offset, const char *b64, char *reply, size_t reply_size)
+{
+    wchar_t path[MAX_PATH], dir[MAX_PATH], *slash;
+    BYTE raw[1536];
+    DWORD raw_len = sizeof(raw), wrote = 0;
+    LONGLONG at = _atoi64(offset);
+    HANDLE file;
+    BOOL ok;
+
+    if (!identity_file(leaf, path, MAX_PATH) ||
+        !CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, raw, &raw_len, NULL, NULL)) {
+        strcpy_s(reply, reply_size, "error:invalid arguments");
+        return;
+    }
+    wcscpy_s(dir, MAX_PATH, path);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = 0;
+    CreateDirectoryW(dir, NULL);
+    file = CreateFileW(path, FILE_APPEND_DATA | GENERIC_WRITE, 0, NULL, at == 0 ? CREATE_ALWAYS : OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        sprintf_s(reply, reply_size, "error:could not write it (%lu)", GetLastError());
+        SecureZeroMemory(raw, sizeof(raw));
+        return;
+    }
+    SetFilePointer(file, 0, NULL, FILE_END);
+    ok = WriteFile(file, raw, raw_len, &wrote, NULL) && wrote == raw_len;
+    CloseHandle(file);
+    SecureZeroMemory(raw, sizeof(raw));
+    strcpy_s(reply, reply_size, ok ? "ok" : "error:could not write it");
 }
 
 /* The last step of an image build. The AD account stays: it belongs to the VM this disk
@@ -3356,6 +3406,19 @@ static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
         if (n != 3 || !f[0][0] || !f[1][0] || !domain_field_ok(f[0], "-", 15) ||
             !domain_field_ok(f[1], "._-", 20) || !domain_field_ok(f[2], "+/=", 600)) goto invalid;
         session_autologon(f[0], f[1], f[2], reply, reply_size);
+    } else if (strcmp(cmd, "domain_identity_begin") == 0) {
+        /* Sunshine starts with Windows, and made a new identity of its own on this boot. */
+        run_domain_script("Stop-Service SunshineService -Force -ErrorAction SilentlyContinue\r\nWrite-Output 'result:ok'\r\n",
+                          60000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_identity_put:", 20) == 0) {
+        n = domain_split(cmd + 20, f, 8);       /* state|cert|key, offset, data */
+        if (n != 3 || !session_digits(f[1]) || !domain_field_ok(f[2], "+/=", 1900)) goto invalid;
+        identity_put(f[0], f[1], f[2], reply, reply_size);
+    } else if (strncmp(cmd, "domain_identity_get:", 20) == 0) {
+        wchar_t path[MAX_PATH];
+        n = domain_split(cmd + 20, f, 8);       /* state|cert|key, offset */
+        if (n != 2 || !session_digits(f[1]) || !identity_file(f[0], path, MAX_PATH)) goto invalid;
+        read_file_piece(path, _atoi64(f[1]), reply, reply_size);
     } else if (strncmp(cmd, "domain_join:", 12) == 0) {
         n = domain_split(cmd + 12, f, 8);       /* FQDN, NB, dc, NB\user, pw */
         if (n != 5 || !domain_field_ok(f[0], ".-", 200) || !domain_field_ok(f[1], "-", 15) ||
@@ -4523,7 +4586,8 @@ static void handle_client(AsbConn *client)
         else if (strncmp(cmd, "lab_chunk:", 10) == 0 ||
                  strcmp(cmd, "session_status") == 0 ||
                  strncmp(cmd, "session_catalog_read:", 21) == 0 ||
-                 strcmp(cmd, "session_image_status") == 0)
+                 strcmp(cmd, "session_image_status") == 0 ||
+                 strncmp(cmd, "domain_identity_", 16) == 0)
             ;   /* transfers and polls, not worth a log line each */
         else
             agent_log("Command: %s", buf);

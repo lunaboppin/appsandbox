@@ -15,6 +15,7 @@
 #include <bcrypt.h>
 #include <dpapi.h>
 #include <ctype.h>
+#include <sddl.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,11 @@
 #define GS_SIGNED_OUT_POLLS  3        /* of GS_WATCH_MS each, before a session counts as over */
 #define GS_WATCH_MS          10000
 #define GS_CATALOG_MAX       (4u * 1024u * 1024u)
+#define GS_IDENTITY_MAX      (1024u * 1024u)
+#define GS_IDENTITY_PIECE    1000     /* bytes per command; base64 stays well under the agent's limit */
+#define GS_PORT_FIRST        50000    /* users' own Moonlight ports, one per GS_PORT_STEP */
+#define GS_PORT_STEP         100
+#define GS_PORT_COUNT        150
 
 typedef struct {
     BOOL      used;
@@ -712,6 +718,260 @@ HRESULT game_stream_build_image(wchar_t *err, size_t err_chars)
     return S_OK;
 }
 
+/* ---- A user's Moonlight identity ----
+
+   Everything that makes Moonlight see the same PC: Sunshine's state (its host ID and
+   paired devices) with its certificate and key, plus the user's own port. */
+
+static const char *const g_identity_leaves[] = { "state", "cert", "key" };
+
+/* <root>\identities[\<user>[\<leaf>]]. User names are already checked by the domain's
+   rules, so they are safe in a path. */
+static BOOL identity_path(const wchar_t *user, const wchar_t *leaf, wchar_t *path, size_t chars)
+{
+    wchar_t root[MAX_PATH];
+    AcquireSRWLockShared(&g_lock);
+    wcscpy_s(root, MAX_PATH, g_root);
+    ReleaseSRWLockShared(&g_lock);
+    if (!root[0]) return FALSE;
+    if (user && leaf) return _snwprintf_s(path, chars, _TRUNCATE, L"%s\\identities\\%s\\%s", root, user, leaf) >= 0;
+    if (user) return _snwprintf_s(path, chars, _TRUNCATE, L"%s\\identities\\%s", root, user) >= 0;
+    return _snwprintf_s(path, chars, _TRUNCATE, L"%s\\identities", root) >= 0;
+}
+
+/* The folder holds private keys: SYSTEM and administrators only, nothing inherited. */
+static BOOL identity_dirs(const wchar_t *user)
+{
+    wchar_t path[MAX_PATH];
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    BOOL ok;
+    if (!identity_path(NULL, NULL, path, MAX_PATH)) return FALSE;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+                                                              SDDL_REVISION_1, &sd, NULL))
+        return FALSE;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    ok = CreateDirectoryW(path, &sa) || GetLastError() == ERROR_ALREADY_EXISTS;
+    LocalFree(sd);
+    if (ok && user) {
+        identity_path(user, NULL, path, MAX_PATH);
+        ok = CreateDirectoryW(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+    return ok;
+}
+
+static BYTE *identity_read(const wchar_t *user, const char *leaf, DWORD *size)
+{
+    wchar_t name[16], path[MAX_PATH];
+    HANDLE f;
+    BYTE *data = NULL;
+    DWORD got = 0;
+    swprintf_s(name, _countof(name), L"%S", leaf);
+    if (!identity_path(user, name, path, MAX_PATH)) return NULL;
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    *size = GetFileSize(f, NULL);
+    if (*size && *size < GS_IDENTITY_MAX) data = (BYTE *)malloc(*size);
+    if (data && (!ReadFile(f, data, *size, &got, NULL) || got != *size)) {
+        SecureZeroMemory(data, *size);
+        free(data);
+        data = NULL;
+    }
+    CloseHandle(f);
+    return data;
+}
+
+/* The commands that put a user's identity in their duplicate, one per line, or NULL
+   when they have none yet: a device has to pair first. */
+static char *identity_commands(const wchar_t *user)
+{
+    BYTE *files[3] = { NULL, NULL, NULL };
+    DWORD sizes[3] = { 0, 0, 0 };
+    char *out = NULL;
+    size_t cap = 64, pos = 0;
+    int i;
+    BOOL complete = TRUE;
+    for (i = 0; i < 3; i++) {
+        files[i] = identity_read(user, g_identity_leaves[i], &sizes[i]);
+        if (!files[i]) complete = FALSE;
+        cap += (size_t)sizes[i] * 2 + 64 * ((size_t)sizes[i] / GS_IDENTITY_PIECE + 1);
+    }
+    if (complete && (out = (char *)malloc(cap)) != NULL) {
+        pos = sprintf_s(out, cap, "domain_identity_begin");
+        for (i = 0; i < 3; i++) {
+            DWORD at;
+            for (at = 0; at < sizes[i]; at += GS_IDENTITY_PIECE) {
+                DWORD piece = min(GS_IDENTITY_PIECE, sizes[i] - at), b64 = 0;
+                pos += sprintf_s(out + pos, cap - pos, "\ndomain_identity_put:%s:%lu:", g_identity_leaves[i], at);
+                b64 = (DWORD)(cap - pos);
+                if (!CryptBinaryToStringA(files[i] + at, piece, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, out + pos, &b64)) {
+                    SecureZeroMemory(out, cap);
+                    free(out);
+                    out = NULL;
+                    goto done;
+                }
+                pos += b64;
+            }
+        }
+    }
+done:
+    for (i = 0; i < 3; i++) {
+        if (files[i]) {
+            SecureZeroMemory(files[i], sizes[i]);
+            free(files[i]);
+        }
+    }
+    return out;
+}
+
+/* Fetch one file of the identity out of the guest. */
+static BOOL identity_fetch(VmInstance *vm, const char *leaf, const wchar_t *path)
+{
+    char *reply = (char *)malloc(ASB_DOMAIN_REPLY_MAX);
+    BYTE *chunk = (BYTE *)malloc(ASB_DOMAIN_REPLY_MAX);
+    HANDLE f = INVALID_HANDLE_VALUE;
+    ULONGLONG offset = 0, total = 1;
+    BOOL ok = FALSE;
+
+    if (!reply || !chunk) goto done;
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) goto done;
+    while (offset < total) {
+        char cmd[64], *colon;
+        DWORD bytes = ASB_DOMAIN_REPLY_MAX, wrote = 0;
+        sprintf_s(cmd, sizeof(cmd), "domain_identity_get:%s:%llu", leaf, offset);
+        if (!vm_agent_send(vm, cmd, reply, ASB_DOMAIN_REPLY_MAX, 30000)) goto done;
+        total = _strtoui64(reply + 3, &colon, 10);
+        if (*colon != ':' || !colon[1]) goto done;
+        if (!CryptStringToBinaryA(colon + 1, 0, CRYPT_STRING_BASE64, chunk, &bytes, NULL, NULL) ||
+            !bytes || !WriteFile(f, chunk, bytes, &wrote, NULL)) goto done;
+        offset += bytes;
+    }
+    ok = total > 0;
+done:
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (reply) SecureZeroMemory(reply, ASB_DOMAIN_REPLY_MAX);
+    if (chunk) SecureZeroMemory(chunk, ASB_DOMAIN_REPLY_MAX);
+    free(reply);
+    free(chunk);
+    if (!ok) DeleteFileW(path);
+    return ok;
+}
+
+/* After a pairing: keep what's now in the guest. All three files or none, so a failure
+   leaves the identity the user already had. */
+static BOOL identity_save(VmInstance *vm, const wchar_t *user)
+{
+    wchar_t temp[MAX_PATH], final_path[MAX_PATH], name[24];
+    int i;
+    BOOL ok;
+    if (!identity_dirs(user)) return FALSE;
+    ok = TRUE;
+    for (i = 0; i < 3 && ok; i++) {
+        swprintf_s(name, _countof(name), L"%S.new", g_identity_leaves[i]);
+        ok = identity_path(user, name, temp, MAX_PATH) && identity_fetch(vm, g_identity_leaves[i], temp);
+    }
+    for (i = 0; i < 3 && ok; i++) {
+        swprintf_s(name, _countof(name), L"%S.new", g_identity_leaves[i]);
+        identity_path(user, name, temp, MAX_PATH);
+        swprintf_s(name, _countof(name), L"%S", g_identity_leaves[i]);
+        identity_path(user, name, final_path, MAX_PATH);
+        ok = MoveFileExW(temp, final_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
+    for (i = 0; i < 3; i++) {
+        swprintf_s(name, _countof(name), L"%S.new", g_identity_leaves[i]);
+        if (identity_path(user, name, temp, MAX_PATH)) DeleteFileW(temp);
+    }
+    return ok;
+}
+
+static BOOL identity_exists(const wchar_t *user)
+{
+    wchar_t path[MAX_PATH];
+    return identity_path(user, L"state", path, MAX_PATH) &&
+           GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static BOOL port_taken(DWORD port)
+{
+    wchar_t dir[MAX_PATH], pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW d;
+    HANDLE h;
+    BOOL taken = FALSE;
+    int i, count = asb_vm_count();
+    for (i = 0; i < count; i++) {
+        VmInstance *other = asb_vm_instance(asb_vm_get(i));
+        if (other && other->stream_port == port) return TRUE;
+    }
+    if (!identity_path(NULL, NULL, dir, MAX_PATH)) return FALSE;
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
+    h = FindFirstFileW(pattern, &d);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        FILE *f;
+        unsigned long saved = 0;
+        if (d.cFileName[0] == L'.') continue;
+        swprintf_s(path, MAX_PATH, L"%s\\%s\\port", dir, d.cFileName);
+        if (_wfopen_s(&f, path, L"r") == 0 && f) {
+            if (fscanf_s(f, "%lu", &saved) == 1 && saved == port) taken = TRUE;
+            fclose(f);
+        }
+    } while (!taken && FindNextFileW(h, &d));
+    FindClose(h);
+    return taken;
+}
+
+/* This user's own port, kept for good, so the address Moonlight saved stays right. 0 if
+   they can't have one, and the VM gets the next free port as any other would. */
+static DWORD user_stream_port(const wchar_t *user)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    unsigned long port = 0;
+    int i;
+    AcquireSRWLockExclusive(&lock);
+    if (identity_dirs(user) && identity_path(user, L"port", path, MAX_PATH)) {
+        if (_wfopen_s(&f, path, L"r") == 0 && f) {
+            if (fscanf_s(f, "%lu", &port) != 1) port = 0;
+            fclose(f);
+        }
+        for (i = 0; !port && i < GS_PORT_COUNT; i++) {
+            DWORD candidate = GS_PORT_FIRST + (DWORD)i * GS_PORT_STEP;
+            if (!port_taken(candidate)) {
+                port = candidate;
+                if (_wfopen_s(&f, path, L"w") == 0 && f) {
+                    fprintf(f, "%lu\n", port);
+                    fclose(f);
+                }
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return port;
+}
+
+/* Sunshine's name for this user's PC: letters, digits and '-' only. */
+static void user_stream_name(const wchar_t *user, char *out, size_t chars)
+{
+    size_t i, pos = (size_t)sprintf_s(out, chars, "Games-");
+    for (i = 0; user[i] && pos + 1 < chars; i++, pos++)
+        out[pos] = (user[i] < 128 && isalnum((unsigned char)user[i])) ? (char)user[i] : '-';
+    out[pos] = 0;
+}
+
+void game_stream_forget_user(const wchar_t *user)
+{
+    wchar_t path[MAX_PATH];
+    game_stream_session_end(user);
+    if (identity_path(user, NULL, path, MAX_PATH) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        asb_session_clone_remove_leftover(NULL, path);
+        ui_log(L"Game Streaming: deleted %s's Moonlight identity.", user);
+    }
+}
+
 /* ---- A session ---- */
 
 static void session_state(int slot, const char *state, const char *detail)
@@ -752,7 +1012,8 @@ static DWORD WINAPI session_thread(LPVOID param)
     AsbVmConfig config;
     VmInstance *vm, *source;
     wchar_t sessions[MAX_PATH], base[MAX_PATH], nominated[256], err[300];
-    char logon[1024], reply[1600];
+    char logon[1024], reply[1600], stream_name[32];
+    char *identity = NULL;
     UINT64 id = 0;
     BOOL lan, software = FALSE, anyone;
     DWORD ram = 4096, cpu = 4;
@@ -796,8 +1057,18 @@ static DWORD WINAPI session_thread(LPVOID param)
     config.domain_member = TRUE;
     config.session_clone = TRUE;
     config.session_logon = logon;
+    identity = identity_commands(s->user);
+    user_stream_name(s->user, stream_name, sizeof(stream_name));
+    config.session_identity = identity;
+    config.stream_name = stream_name;
+    config.stream_port = user_stream_port(s->user);
     hr = asb_vm_create(&config);
     SecureZeroMemory(logon, sizeof(logon));
+    if (identity) {
+        SecureZeroMemory(identity, strlen(identity));
+        free(identity);
+        identity = NULL;
+    }
     if (FAILED(hr)) {
         sprintf_s(reply, sizeof(reply), "The VM couldn't be created (0x%08X).", hr);
         session_failed(slot, reply);
@@ -1072,12 +1343,21 @@ HRESULT game_stream_session_pair(const wchar_t *user, const char *pin, char *mes
     UINT64 id = game_stream_session_vm(user, NULL, 0);
     VmInstance *vm = id ? asb_find_vm_by_id(id) : NULL;
     char name[64];
+    HRESULT hr;
     if (!vm) {
         utf8_message(message, message_cap, "Your session isn't ready yet.");
         return HRESULT_FROM_WIN32(ERROR_NOT_READY);
     }
     WideCharToMultiByte(CP_UTF8, 0, user, -1, name, sizeof(name), NULL, NULL);
-    return vm_stream_pair(vm, pin, name, message, message_cap);
+    hr = vm_stream_pair(vm, pin, name, message, message_cap);
+    /* Their devices stay paired in later sessions. */
+    if (SUCCEEDED(hr)) {
+        id = game_stream_session_vm(user, NULL, 0);
+        vm = id ? asb_find_vm_by_id(id) : NULL;
+        if (!vm || !identity_save(vm, user))
+            ui_log(L"Game Streaming: couldn't save %s's Moonlight identity, so that device will pair again next session.", user);
+    }
+    return hr;
 }
 
 UINT64 game_stream_session_vm(const wchar_t *user, char *name, size_t name_chars)
@@ -1116,8 +1396,8 @@ int game_stream_session_json(const wchar_t *user, char *out, int cap)
     pos = json_append_wide(out, cap, pos, "vm", copy.vm_name);
     vm = copy.vm_id ? asb_find_vm_by_id(copy.vm_id) : NULL;
     if (vm && strcmp(copy.state, "ready") == 0) {
-        pos += sprintf_s(out + pos, cap - pos, ",\"moonlightPort\":%lu,\"moonlightAddresses\":[",
-                         (unsigned long)vm->stream_port);
+        pos += sprintf_s(out + pos, cap - pos, ",\"moonlightKnown\":%s,\"moonlightPort\":%lu,\"moonlightAddresses\":[",
+                         identity_exists(user) ? "true" : "false", (unsigned long)vm->stream_port);
         if (vm->stream_exposure == ASB_STREAM_NETWORK)
             pos = vm_stream_append_host_addresses(out, cap, pos);
         else

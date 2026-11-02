@@ -4309,6 +4309,11 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
         inst->install_complete = TRUE;   /* Windows is already installed on its image */
         if (config->session_logon)
             strcpy_s(inst->session_logon, sizeof(inst->session_logon), config->session_logon);
+        if (config->session_identity)
+            inst->session_identity = _strdup(config->session_identity);
+        if (config->stream_name)
+            strcpy_s(inst->stream_name, sizeof(inst->stream_name), config->stream_name);
+        inst->stream_port = config->stream_port;
     }
     if (config->lab_mode) {
         inst->lab_mode = TRUE;
@@ -5118,6 +5123,11 @@ HRESULT asb_session_clone_delete(UINT64 vm_id)
     if (!inst || !inst->session_clone) return E_INVALIDARG;
     idx = (int)(inst - g_vms);
     SecureZeroMemory(inst->session_logon, sizeof(inst->session_logon));
+    if (inst->session_identity) {
+        SecureZeroMemory(inst->session_identity, strlen(inst->session_identity));
+        free(inst->session_identity);
+        inst->session_identity = NULL;
+    }
     hr = asb_vm_delete(vm_handle(inst));
     if (SUCCEEDED(hr) && g_removed_cb) g_removed_cb(idx, g_removed_ud);
     return hr;
@@ -6470,7 +6480,12 @@ ASB_API HRESULT asb_domain_user_set(const wchar_t *name, const wchar_t *password
                                     const wchar_t *groups, wchar_t *message, size_t message_chars)
 { return shared_appliance_domain_user_set(name, password, enabled, groups, message, message_chars); }
 ASB_API HRESULT asb_domain_user_delete(const wchar_t *name, wchar_t *message, size_t message_chars)
-{ return shared_appliance_domain_user_delete(name, message, message_chars); }
+{
+    HRESULT hr = shared_appliance_domain_user_delete(name, message, message_chars);
+    /* A later user with this name mustn't inherit this one's paired devices. */
+    if (SUCCEEDED(hr)) game_stream_forget_user(name);
+    return hr;
+}
 ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size_t message_chars)
 { return shared_appliance_domain_group_add(name, message, message_chars); }
 ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars)

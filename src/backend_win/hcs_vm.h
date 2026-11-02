@@ -169,6 +169,8 @@ typedef struct {
     BOOL        stream_software;         /* TRUE = never use the guest GPU to encode */
     BOOL        session_clone;           /* TRUE = Game Streaming duplicate: never saved, deleted when its session ends */
     char        session_logon[1024];     /* the sign-in to set up in the guest; wiped once sent */
+    char       *session_identity;        /* commands restoring the user's Sunshine identity, one per line; wiped and freed once sent */
+    char        stream_name[32];         /* the name Moonlight shows, when not the VM's */
     BOOL        session_signing_in;      /* the next boot signs the user in */
     volatile LONG session_signin_failed; /* it didn't, or it can't happen */
     volatile LONG web_session_active;    /* browser sessions using the guest channels; the display window lets go while > 0 */
