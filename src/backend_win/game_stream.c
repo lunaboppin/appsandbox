@@ -34,7 +34,7 @@
 #define GS_CATALOG_MAX       (4u * 1024u * 1024u)
 #define GS_IDENTITY_MAX      (1024u * 1024u)
 #define GS_IDENTITY_PIECE    1000     /* bytes per command; base64 stays well under the agent's limit */
-#define GS_PORT_FIRST        50000    /* users' own Moonlight ports, one per GS_PORT_STEP */
+#define GS_PORT_FIRST        40000    /* users' own Moonlight ports, below Windows' dynamic range; one per GS_PORT_STEP */
 #define GS_PORT_STEP         100
 #define GS_PORT_COUNT        150
 
@@ -923,8 +923,9 @@ static BOOL port_taken(DWORD port)
     return taken;
 }
 
-/* This user's own port, kept for good, so the address Moonlight saved stays right. 0 if
-   they can't have one, and the VM gets the next free port as any other would. */
+/* This user's own port, kept while it works, so the address Moonlight saved stays right.
+   If something else has taken it they get a new one. 0 if they can't have one, and the VM
+   gets the next free port as any other would. */
 static DWORD user_stream_port(const wchar_t *user)
 {
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -938,9 +939,14 @@ static DWORD user_stream_port(const wchar_t *user)
             if (fscanf_s(f, "%lu", &port) != 1) port = 0;
             fclose(f);
         }
+        if (port && !vm_stream_port_free(port)) {
+            ui_log(L"Game Streaming: %s's port %lu can't be used now; they get a new one, and Moonlight needs the new address.", user, port);
+            DeleteFileW(path);
+            port = 0;
+        }
         for (i = 0; !port && i < GS_PORT_COUNT; i++) {
             DWORD candidate = GS_PORT_FIRST + (DWORD)i * GS_PORT_STEP;
-            if (!port_taken(candidate)) {
+            if (!port_taken(candidate) && vm_stream_port_free(candidate)) {
                 port = candidate;
                 if (_wfopen_s(&f, path, L"w") == 0 && f) {
                     fprintf(f, "%lu\n", port);

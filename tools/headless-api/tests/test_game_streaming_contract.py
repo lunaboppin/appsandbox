@@ -125,6 +125,9 @@ def main() -> None:
     assert link.index("vm->session_identity) {") < link.index("vm_stream_setup_command(vm, stream_cmd")
     assert "if (SUCCEEDED(hr)) game_stream_forget_user(name);" in core
     assert "asb_session_clone_remove_leftover(NULL, root);" in gs     # Turn Off takes identities too
+    # A user's port is tested before use, and sits below Windows' dynamic range.
+    assert "#define GS_PORT_FIRST        40000" in gs
+    assert "port && !vm_stream_port_free(port)" in gs and "vm_stream_port_free(candidate)" in gs
     # A key never reaches a log: the commands are redacted, quiet, and only name three files.
     assert 'strncmp(command, "domain_identity_", 16) == 0' in link
     assert 'strncmp(cmd, "domain_identity_", 16) == 0' in agent

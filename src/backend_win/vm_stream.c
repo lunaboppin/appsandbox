@@ -523,6 +523,35 @@ const wchar_t *vm_stream_unsupported_reason(VmInstance *vm)
 
 /* Sunshine must know its own port, so each VM keeps a distinct range. The first
    one gets Moonlight's default, which clients find without being told a port. */
+/* Windows reserves blocks of ports for itself and Hyper-V, and they move between boots,
+   so the only real test of a port is binding it. */
+static BOOL bind_free(int type, int protocol, int port)
+{
+    SOCKET s = socket(AF_INET, type, protocol);
+    struct sockaddr_in a;
+    BOOL ok;
+    if (s == INVALID_SOCKET) return FALSE;
+    ZeroMemory(&a, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons((u_short)port);
+    ok = bind(s, (struct sockaddr *)&a, sizeof(a)) == 0;
+    closesocket(s);
+    return ok;
+}
+
+BOOL vm_stream_port_free(DWORD port)
+{
+    WSADATA wsa;
+    int i;
+    BOOL ok = TRUE;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    for (i = 0; i < TCP_PORTS && ok; i++) ok = bind_free(SOCK_STREAM, IPPROTO_TCP, (int)port + g_tcp_offsets[i]);
+    for (i = 0; i < UDP_PORTS && ok; i++) ok = bind_free(SOCK_DGRAM, IPPROTO_UDP, (int)port + g_udp_offsets[i]);
+    WSACleanup();
+    return ok;
+}
+
 static DWORD pick_port(VmInstance *vm)
 {
     DWORD port = STREAM_DEFAULT_PORT;
@@ -533,7 +562,7 @@ static DWORD pick_port(VmInstance *vm)
             VmInstance *other = asb_vm_instance(asb_vm_get(i));
             if (other && other != vm && other->stream_port == port) { used = TRUE; break; }
         }
-        if (!used) return port;
+        if (!used && vm_stream_port_free(port)) return port;
         port += STREAM_PORT_STEP;
     }
 }

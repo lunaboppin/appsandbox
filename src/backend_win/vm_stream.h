@@ -35,6 +35,9 @@ ASB_API HRESULT vm_stream_pair(VmInstance *vm, const char *pin, const char *clie
 /* Forget every paired client. */
 ASB_API HRESULT vm_stream_unpair_all(VmInstance *vm, char *message, int message_cap);
 
+/* All the ports Moonlight uses around this one can be bound right now. */
+BOOL vm_stream_port_free(DWORD port);
+
 /* When a Moonlight client last sent anything to this VM (GetTickCount64), or 0. */
 ULONGLONG vm_stream_last_activity(UINT64 vm_id);
 
