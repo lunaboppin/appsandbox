@@ -209,6 +209,15 @@ def main() -> None:
     assert "sdr_ours();" in prep[:prep.index("int main(")]
     assert 'strncmp(output, "applied: colour", 15) == 0' in agent
 
+    # Moonlight checks its certificate in the last step of pairing, so a device pairing
+    # again must not be listed twice even for a moment: entries are set aside first.
+    pin_ps = agent[agent.index("static const char stream_pin_ps[]"):agent.index("static const char stream_unpair_ps[]")]
+    assert pin_ps.index("WebUi '/api/clients/unpair'") < pin_ps.index("WebUi '/api/pin' @{pairing_id")
+    assert pin_ps.index("WebUi '/api/pin' @{pairing_id") < pin_ps.index(" Restore-Pairings\\r\\n")
+    assert "-not $certs.ContainsKey([string]$_.cert)" in pin_ps and "try { Restore-Pairings } catch {}" in pin_ps
+    assert "stream_run(vars, stream_pin_ps, 60000" in agent
+    assert "vm_agent_send(vm, cmd, reply, sizeof(reply), 70000)" in read("src/backend_win/vm_stream.c")
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")

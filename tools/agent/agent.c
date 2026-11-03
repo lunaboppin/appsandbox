@@ -2820,14 +2820,47 @@ static const char stream_status_ps[] =
     "$o=@{phase=$phase;detail=$detail;running=[bool]($svc -and $svc.Status -eq 'Running');gamepad=[bool](Get-Service ViGEmBus -ErrorAction SilentlyContinue);encoders=$encoders;address=$address}\r\n"
     "Write-Output ('json:'+($o|ConvertTo-Json -Compress))\r\n";
 
+/* Pairing a device that is already paired adds a second entry for its certificate, and
+   Sunshine then refuses that certificate, during the last step of the pairing itself
+   (error 401). So the existing entries are set aside while the device pairs and put back
+   afterwards, apart from any for the certificate that just paired. Putting some back
+   restarts Sunshine, which reads its list only at start. */
 static const char stream_pin_ps[] =
+    "$state=Join-Path $root 'config\\sunshine_state.json'\r\n"
+    "$saved=@()\r\n"
+    "function Restore-Pairings(){\r\n"
+    " if($saved.Count -eq 0 -or -not (Test-Path $state)){ return }\r\n"
+    " $now=@((Get-Content $state -Raw | ConvertFrom-Json).root.named_devices | Where-Object { $_ })\r\n"
+    " $certs=@{}; foreach($d in $now){ $certs[[string]$d.cert]=1 }\r\n"
+    " if(@($saved | Where-Object { -not $certs.ContainsKey([string]$_.cert) }).Count -eq 0){ return }\r\n"
+    " Stop-Service SunshineService -Force\r\n"
+    " try {\r\n"
+    "  $s=Get-Content $state -Raw | ConvertFrom-Json\r\n"
+    "  $now=@($s.root.named_devices | Where-Object { $_ }); $certs=@{}; foreach($d in $now){ $certs[[string]$d.cert]=1 }\r\n"
+    "  $s.root.named_devices=@($saved | Where-Object { -not $certs.ContainsKey([string]$_.cert) })+$now\r\n"
+    "  [IO.File]::WriteAllText($state,($s | ConvertTo-Json -Depth 8),(New-Object Text.UTF8Encoding $false))\r\n"
+    " } finally { Start-Service SunshineService -ErrorAction SilentlyContinue }\r\n"
+    "}\r\n"
     "try {\r\n"
     " $waiting=@((WebUi '/api/pin' $null).pairings)\r\n"
     " if($waiting.Count -eq 0){ Write-Output 'result:No device is waiting to pair. Start pairing in Moonlight first, then enter the PIN it shows.'; exit 1 }\r\n"
     " if($waiting.Count -gt 1){ Write-Output 'result:More than one device is waiting to pair. Cancel the others, then try again.'; exit 1 }\r\n"
+    " if(Test-Path $state){ $saved=@((Get-Content $state -Raw | ConvertFrom-Json).root.named_devices | Where-Object { $_ }) }\r\n"
+    " foreach($d in $saved){ $null=WebUi '/api/clients/unpair' @{uuid=[string]$d.uuid} }\r\n"
     " $r=WebUi '/api/pin' @{pairing_id=$waiting[0].id;pin=$pin;name=$client}\r\n"
-    " if($r.status -eq $true -or $r.status -eq 'true'){ Write-Output 'result:ok' } else { Write-Output 'result:Pairing failed. Check the PIN and try again from Moonlight.'; exit 1 }\r\n"
-    "} catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
+    " $ok=($r.status -eq $true -or $r.status -eq 'true')\r\n"
+    " if($ok){\r\n"
+    "  # Moonlight finishes the pairing on its own after the PIN.\r\n"
+    "  for($i=0;$i -lt 60;$i++){ if(@((WebUi '/api/clients/list' $null).named_certs).Count -gt 0){ break }; Start-Sleep -Milliseconds 250 }\r\n"
+    "  Start-Sleep -Seconds 2\r\n"
+    " }\r\n"
+    " Restore-Pairings\r\n"
+    " if($ok){ Write-Output 'result:ok' } else { Write-Output 'result:Pairing failed. Check the PIN and try again from Moonlight.'; exit 1 }\r\n"
+    "} catch {\r\n"
+    " $m=$_.Exception.Message\r\n"
+    " try { Restore-Pairings } catch {}\r\n"
+    " Write-Output ('result:'+($m -replace '[\\r\\n]',' ')); exit 1\r\n"
+    "}\r\n";
 
 static const char stream_unpair_ps[] =
     "try { $r=WebUi '/api/clients/unpair-all' @{}; Write-Output 'result:ok' } catch { Write-Output ('result:'+($_.Exception.Message -replace '[\\r\\n]',' ')); exit 1 }\r\n";
@@ -2932,7 +2965,7 @@ static void stream_command(const char *cmd, char *reply, size_t reply_size)
             return;
         }
         sprintf_s(vars, sizeof(vars), "$pin='%s'\r\n$client='%s'\r\n", pin, client);
-        stream_run(vars, stream_pin_ps, 30000, reply, reply_size);
+        stream_run(vars, stream_pin_ps, 60000, reply, reply_size);
     } else if (strcmp(cmd, "stream_unpair") == 0) {
         stream_run("", stream_unpair_ps, 30000, reply, reply_size);
     } else if (strcmp(cmd, "stream_off") == 0) {
