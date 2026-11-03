@@ -185,6 +185,20 @@ def main() -> None:
     assert "session_hide_setup_disc();" in signed_in[:300]
     assert '_wcsicmp(label, L"APPSETUP") != 0' in agent and "DeleteVolumeMountPointW(root)" in agent
 
+    # Moonlight is refused (401) when Sunshine finds its certificate paired more than once:
+    # setup keeps the latest pairing of each device before Sunshine starts.
+    setup = agent[agent.index("static const char stream_setup_ps[]"):]
+    setup = setup[:setup.index("static DWORD WINAPI stream_setup_thread")]
+    assert setup.index("named_devices=$keep") < setup.index(r" Start-Service SunshineService\r\n")
+    assert "$seen.ContainsKey([string]$devs[$i].cert)" in setup
+    # Streams aren't washed out: the AppSandbox display is kept out of wide colour (FP16).
+    displays = read("tools/agent/appsandbox-displays.c")
+    assert "DISPLAYCONFIG_DEVICE_INFO_SET_WCG_STATE" in displays and "DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR" in displays
+    assert "colour = sdr_only(&paths[ours]);" in displays
+    prep = displays[displays.index("static int stream_prep(void)"):]
+    assert "sdr_ours();" in prep[:prep.index("int main(")]
+    assert 'strncmp(output, "applied: colour", 15) == 0' in agent
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")

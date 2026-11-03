@@ -2072,9 +2072,18 @@ static void keep_only_appsandbox_display(void)
     CloseHandle(pi.hThread);
     CloseHandle(hReadPipe);
 
+    /* This runs every 20 seconds: when Windows won't take a change, say so once. */
+    if (strstr(output, "still not SDR") || strstr(output, "colour: error")) {
+        static char last_colour[256];
+        if (strcmp(last_colour, output) == 0) return;
+        strcpy_s(last_colour, sizeof(last_colour), output);
+    }
     if (strncmp(output, "applied", 7) == 0 || strncmp(output, "error", 5) == 0) {
         agent_log("Displays: %s", output);
-        if (strncmp(output, "applied", 7) == 0)
+        if (strncmp(output, "applied: colour", 15) == 0)
+            agent_log_to_host("Turned off wide colour on the VM's display so streams "
+                              "aren't washed out (%s).", output);
+        else if (strncmp(output, "applied", 7) == 0)
             agent_log_to_host("Switched off an extra monitor in the VM so the AppSandbox "
                               "display is the only one (%s).", output);
     }
@@ -2718,6 +2727,22 @@ static const char stream_setup_ps[] =
     " Get-NetFirewallRule -DisplayName 'Sunshine*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
     " Get-NetFirewallRule -Group 'AppSandboxStream' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
     " New-NetFirewallRule -DisplayName 'App Sandbox streaming' -Group 'AppSandboxStream' -Direction Inbound -Action Allow -Program $exe -RemoteAddress $allowed | Out-Null\r\n"
+    /* Pairing the same Moonlight device again adds another entry with the same
+       certificate, and Sunshine refuses a certificate that matches more than one
+       ("Client certificate identity is not enabled", error 401 in Moonlight). A
+       user's pairings follow them from session to session, so keep the latest one. */
+    " $state=Join-Path $root 'config\\sunshine_state.json'\r\n"
+    " if(Test-Path $state){ try {\r\n"
+    "  $s=Get-Content $state -Raw | ConvertFrom-Json\r\n"
+    "  $devs=@($s.root.named_devices | Where-Object { $_ })\r\n"
+    "  $seen=@{}; $keep=@()\r\n"
+    "  for($i=$devs.Count-1;$i -ge 0;$i--){ if(-not $seen.ContainsKey([string]$devs[$i].cert)){ $seen[[string]$devs[$i].cert]=1; $keep=@($devs[$i])+$keep } }\r\n"
+    "  if($keep.Count -ne $devs.Count){\r\n"
+    "   $s.root.named_devices=$keep\r\n"
+    "   [IO.File]::WriteAllText($state,($s | ConvertTo-Json -Depth 8),(New-Object Text.UTF8Encoding $false))\r\n"
+    "   Add-Content (Join-Path $dir 'pairing.log') ((Get-Date -Format s)+' removed '+($devs.Count-$keep.Count)+' duplicate paired device(s)')\r\n"
+    "  }\r\n"
+    " } catch { Add-Content (Join-Path $dir 'pairing.log') ((Get-Date -Format s)+' '+$_.Exception.Message) } }\r\n"
     " Set-Service SunshineService -StartupType Automatic\r\n"
     " Start-Service SunshineService\r\n"
     " Status 'ready' ''\r\n"
