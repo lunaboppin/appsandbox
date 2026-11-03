@@ -465,14 +465,19 @@ void vm_stream_relay_start(VmInstance *vm)
     int i, slot = -1;
     WSADATA wsa;
 
-    if (!vm || !vm->stream_enabled || vm->network_mode != NET_NAT || !vm->nat_ip[0]) return;
+    /* A VPN VM's traffic leaves through its tunnel, but the host still has an
+       address on the VPN network, so the relay reaches it there directly. */
+    const char *guest = !vm ? "" : vm->network_mode == NET_NAT ? vm->nat_ip
+                      : vm->network_mode == NET_VPN ? vm->vpn_ip : "";
+
+    if (!vm || !vm->stream_enabled || !guest[0]) return;
     vm_stream_relay_stop(vm);
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     r = (StreamRelay *)calloc(1, sizeof(*r));
     if (!r) return;
     r->vm_id = vm->unique_id;
-    strcpy_s(r->guest_ip, sizeof(r->guest_ip), vm->nat_ip);
+    strcpy_s(r->guest_ip, sizeof(r->guest_ip), guest);
     r->base_port = (int)vm->stream_port;
     addr = vm->stream_exposure == ASB_STREAM_NETWORK ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);
     for (i = 0; i < TCP_PORTS; i++) r->tcp_listen[i] = INVALID_SOCKET;
@@ -516,8 +521,8 @@ const wchar_t *vm_stream_unsupported_reason(VmInstance *vm)
     if (vm->is_template || vm->is_appliance) return L"Only regular VMs can stream.";
     if (_wcsicmp(vm->os_type, L"Windows") != 0)
         return L"Moonlight needs a Windows guest for now: Sunshine can't capture the Ubuntu guest display or use its GPU yet. Browser access works on Ubuntu guests.";
-    if (vm->network_mode != NET_NAT && vm->network_mode != NET_EXTERNAL)
-        return L"Moonlight needs a NAT or bridged network on this VM. Change it under Network.";
+    if (vm->network_mode != NET_NAT && vm->network_mode != NET_EXTERNAL && vm->network_mode != NET_VPN)
+        return L"Moonlight needs a NAT, bridged or VPN network on this VM. Change it under Network.";
     return NULL;
 }
 
@@ -587,6 +592,8 @@ void vm_stream_setup_command(VmInstance *vm, char *cmd, int cap)
     char allowed[32];
     if (vm->network_mode == NET_NAT)
         sprintf_s(allowed, sizeof(allowed), "%s.1", hcn_nat_subnet_base());   /* the relay */
+    else if (vm->network_mode == NET_VPN)
+        sprintf_s(allowed, sizeof(allowed), "%s.1", hcn_vpn_subnet_base());   /* the relay */
     else
         strcpy_s(allowed, sizeof(allowed), "LocalSubnet");
     if (vm->stream_name[0])

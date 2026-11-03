@@ -1011,6 +1011,7 @@ function renderGameStreaming() {
         document.getElementById('gs-idle').value = s.idleMinutes === undefined ? 30 : s.idleMinutes;
         document.getElementById('gs-group').value = s.group || '';
         document.getElementById('gs-lan').checked = !!s.lan;
+        renderGsNetworkAndDrives(s);
         if (gsStatus) gsFormLoaded = true;
     }
 
@@ -1069,6 +1070,38 @@ function renderGameStreaming() {
     });
 }
 
+/* Sessions get their own network and drives, whatever the nominated VM uses. */
+function renderGsNetworkAndDrives(s) {
+    var vpn = document.getElementById('gs-vpn');
+    vpn.innerHTML = '';
+    var nat = document.createElement('option');
+    nat.value = ''; nat.textContent = 'NAT (this PC\'s connection)';
+    vpn.appendChild(nat);
+    (vpnConfigs || []).forEach(function(c) {
+        var o = document.createElement('option');
+        o.value = c.id; o.textContent = 'VPN: ' + c.name;
+        vpn.appendChild(o);
+    });
+    vpn.value = (vpnConfigs || []).some(function(c) { return c.id === s.vpn; }) ? s.vpn : '';
+
+    var off = (s.drivesOff || '').split(',');
+    var box = document.getElementById('gs-drives');
+    box.innerHTML = '';
+    document.getElementById('gs-drives-row').style.display = sharedResources.length ? '' : 'none';
+    sharedResources.forEach(function(r) {
+        var label = document.createElement('label');
+        label.className = 'manage-check';
+        var check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'gs-drive';
+        check.value = r.id;
+        check.checked = off.indexOf(r.id) < 0;
+        label.appendChild(check);
+        label.appendChild(document.createTextNode(' ' + r.driveLetter + ': ' + r.name + (r.groups ? ' (only for ' + r.groups + ')' : '') + (r.enabled ? '' : ' (disabled)')));
+        box.appendChild(label);
+    });
+}
+
 function saveGameStreaming() {
     var lan = document.getElementById('gs-lan').checked;
     function save() {
@@ -1077,7 +1110,11 @@ function saveGameStreaming() {
             maxSessions: parseInt(document.getElementById('gs-max').value, 10) || 0,
             idleMinutes: parseInt(document.getElementById('gs-idle').value, 10) || 0,
             group: document.getElementById('gs-group').value.trim(),
-            lan: lan
+            lan: lan,
+            vpn: document.getElementById('gs-vpn').value,
+            drivesOff: Array.prototype.filter.call(document.querySelectorAll('#gs-drives .gs-drive'), function(c) {
+                return !c.checked;
+            }).map(function(c) { return c.value; }).join(',')
         });
     }
     if (lan && !(gsStatus && gsStatus.lan)) {

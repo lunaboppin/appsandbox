@@ -2947,6 +2947,26 @@ static void session_autologon_clear(void)
     winlogon_set(L"AutoAdminLogon", L"0");
 }
 
+/* The disc that set this duplicate up has nothing for its user, so it loses its drive
+   letter and leaves This PC. It stays attached for the host. */
+static void session_hide_setup_disc(void)
+{
+    wchar_t root[4] = L"A:\\", label[MAX_PATH + 1];
+    DWORD drives = GetLogicalDrives();
+    int i;
+    for (i = 0; i < 26; i++) {
+        if (!(drives & (1u << i))) continue;
+        root[0] = (wchar_t)(L'A' + i);
+        if (GetDriveTypeW(root) != DRIVE_CDROM) continue;
+        if (!GetVolumeInformationW(root, label, _countof(label), NULL, NULL, NULL, NULL, 0) ||
+            _wcsicmp(label, L"APPSETUP") != 0) continue;
+        if (DeleteVolumeMountPointW(root))
+            agent_log("Session: removed drive %lc: (the setup disc).", root[0]);
+        else
+            agent_log("Session: could not remove drive %lc: (%lu).", root[0], GetLastError());
+    }
+}
+
 /* Is Windows setup's temporary account signed in? */
 static BOOL setup_session_present(void)
 {
@@ -3356,6 +3376,7 @@ static void session_command(char *cmd, char *reply, size_t reply_size)
         run_domain_script(SESSION_SIGNIN_WHY_PS, 60000, reply, reply_size);
     } else if (strcmp(cmd, "session_signed_in") == 0) {
         session_autologon_clear();
+        session_hide_setup_disc();
         strcpy_s(reply, reply_size, "ok");
     } else if (strncmp(cmd, "session_launch:", 15) == 0) {
         session_launch(cmd + 15, reply, reply_size);

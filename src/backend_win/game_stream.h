@@ -45,7 +45,8 @@ ASB_API int game_stream_status_json(char *out, int cap);
 
 /* Turn it on or change its settings. err gets the reason on failure. */
 ASB_API HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle_minutes,
-                                      const wchar_t *group, BOOL lan, wchar_t *err, size_t err_chars);
+                                      const wchar_t *group, BOOL lan, const wchar_t *vpn_id,
+                                      const wchar_t *drives_off, wchar_t *err, size_t err_chars);
 
 /* Build or refresh the image, on a worker; progress shows in the status. */
 ASB_API HRESULT game_stream_build_image(wchar_t *err, size_t err_chars);

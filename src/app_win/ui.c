@@ -1466,7 +1466,7 @@ static void game_streaming_command(const wchar_t *action, const wchar_t *json)
 
     if (status && status_w && out) {
         if (wcscmp(action, L"gameStreamingConfigure") == 0) {
-            wchar_t vm[256] = L"", group[65] = L"";
+            wchar_t vm[256] = L"", group[65] = L"", vpn[40] = L"", drives_off[1024] = L"";
             int max_sessions = 2, idle = 30;
             BOOL lan = FALSE;
             json_get_string(json, L"vm", vm, _countof(vm));
@@ -1474,7 +1474,9 @@ static void game_streaming_command(const wchar_t *action, const wchar_t *json)
             json_get_int(json, L"maxSessions", &max_sessions);
             json_get_int(json, L"idleMinutes", &idle);
             json_get_bool(json, L"lan", &lan);
-            hr = game_stream_configure(vm, max_sessions, idle, group, lan, message, _countof(message));
+            json_get_string(json, L"vpn", vpn, _countof(vpn));
+            json_get_string(json, L"drivesOff", drives_off, _countof(drives_off));
+            hr = game_stream_configure(vm, max_sessions, idle, group, lan, vpn, drives_off, message, _countof(message));
         } else if (wcscmp(action, L"gameStreamingBuild") == 0) {
             hr = game_stream_build_image(message, _countof(message));
         } else if (wcscmp(action, L"gameStreamingEnd") == 0) {

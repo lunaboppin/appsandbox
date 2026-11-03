@@ -72,6 +72,8 @@ static int       g_max_sessions = 2;
 static int       g_idle_minutes = 30;
 static wchar_t   g_group[65];
 static BOOL      g_lan;
+static wchar_t   g_vpn[40];           /* a VPN config's id, or empty for NAT */
+static wchar_t   g_drives_off[1024];  /* shared resources left off, comma-separated ids */
 static wchar_t   g_root[MAX_PATH];    /* <parent>\GameStreaming */
 static wchar_t   g_image[MAX_PATH];   /* the current image's base.vhdx */
 
@@ -239,6 +241,8 @@ void game_stream_write_settings(FILE *f)
              g_nominated, g_max_sessions, g_idle_minutes);
     if (g_group[0]) fwprintf(f, L"GameStreamGroup=%s\n", g_group);
     if (g_lan) fwprintf(f, L"GameStreamLan=1\n");
+    if (g_vpn[0]) fwprintf(f, L"GameStreamVpn=%s\n", g_vpn);
+    if (g_drives_off[0]) fwprintf(f, L"GameStreamDrivesOff=%s\n", g_drives_off);
     if (g_root[0]) fwprintf(f, L"GameStreamRoot=%s\n", g_root);
     if (g_image[0]) fwprintf(f, L"GameStreamImage=%s\n", g_image);
 }
@@ -251,6 +255,8 @@ BOOL game_stream_read_setting(const wchar_t *line)
     else if (wcsncmp(line, L"GameStreamIdle=", 15) == 0) g_idle_minutes = _wtoi(line + 15);
     else if (wcsncmp(line, L"GameStreamGroup=", 16) == 0) wcscpy_s(g_group, _countof(g_group), line + 16);
     else if (wcsncmp(line, L"GameStreamLan=", 14) == 0) g_lan = _wtoi(line + 14) != 0;
+    else if (wcsncmp(line, L"GameStreamVpn=", 14) == 0) wcsncpy_s(g_vpn, _countof(g_vpn), line + 14, _TRUNCATE);
+    else if (wcsncmp(line, L"GameStreamDrivesOff=", 20) == 0) wcsncpy_s(g_drives_off, _countof(g_drives_off), line + 20, _TRUNCATE);
     else if (wcsncmp(line, L"GameStreamRoot=", 15) == 0) wcscpy_s(g_root, MAX_PATH, line + 15);
     else if (wcsncmp(line, L"GameStreamImage=", 16) == 0) wcscpy_s(g_image, MAX_PATH, line + 16);
     else return FALSE;
@@ -1030,7 +1036,7 @@ static DWORD WINAPI session_thread(LPVOID param)
     GsSession *s = &g_sessions[slot];
     AsbVmConfig config;
     VmInstance *vm, *source;
-    wchar_t sessions[MAX_PATH], base[MAX_PATH], nominated[256], err[300];
+    wchar_t sessions[MAX_PATH], base[MAX_PATH], nominated[256], err[300], vpn[40], drives_off[1024];
     char logon[1024], reply[1600], stream_name[32];
     char *identity = NULL;
     UINT64 id = 0;
@@ -1046,7 +1052,14 @@ static DWORD WINAPI session_thread(LPVOID param)
     wcscpy_s(nominated, _countof(nominated), g_nominated);
     lan = g_lan;
     idle_minutes = g_idle_minutes;
+    wcscpy_s(vpn, _countof(vpn), g_vpn);
+    wcscpy_s(drives_off, _countof(drives_off), g_drives_off);
     ReleaseSRWLockShared(&g_lock);
+    /* A VPN deleted since it was chosen: the session goes out through NAT instead. */
+    if (vpn[0] && !vpn_configs_find(vpn, NULL)) {
+        ui_log(L"Game Streaming: the chosen VPN no longer exists, so \"%s\" uses NAT.", s->vm_name);
+        vpn[0] = 0;
+    }
 
     source = asb_vm_instance(asb_vm_find(nominated));
     if (source) {
@@ -1072,7 +1085,10 @@ static DWORD WINAPI session_thread(LPVOID param)
     config.ram_mb = ram;
     config.cpu_cores = cpu;
     config.gpu_mode = gpu;
-    config.network_mode = ASB_NET_NAT;
+    config.network_mode = vpn[0] ? ASB_NET_VPN : ASB_NET_NAT;
+    config.vpn_id = vpn;
+    /* The drives chosen for Game Streaming, whatever the nominated VM maps. */
+    config.shared_resource_exclusions = drives_off;
     config.domain_member = TRUE;
     config.session_clone = TRUE;
     config.session_logon = logon;
@@ -1430,7 +1446,8 @@ int game_stream_session_json(const wchar_t *user, char *out, int cap)
 /* ---- Admin ---- */
 
 HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle_minutes,
-                              const wchar_t *group, BOOL lan, wchar_t *err, size_t err_chars)
+                              const wchar_t *group, BOOL lan, const wchar_t *vpn_id,
+                              const wchar_t *drives_off, wchar_t *err, size_t err_chars)
 {
     SharedApplianceStatus appliance;
     VmInstance *vm = asb_vm_instance(asb_vm_find(vm_name ? vm_name : L""));
@@ -1454,6 +1471,15 @@ HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle
         if (err) swprintf_s(err, err_chars, L"Sessions must be 1 to %d, and the idle time 0 to 1440 minutes.", GS_MAX_SESSIONS);
         return E_INVALIDARG;
     }
+    if (vpn_id && vpn_id[0] && !vpn_configs_find(vpn_id, NULL)) {
+        if (err) wcsncpy_s(err, err_chars, L"That VPN config no longer exists. Choose another.", _TRUNCATE);
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    if (drives_off && (wcslen(drives_off) >= _countof(g_drives_off) ||
+                       wcsspn(drives_off, L"0123456789abcdefABCDEF-{},") != wcslen(drives_off))) {
+        if (err) wcsncpy_s(err, err_chars, L"The drive list isn't valid.", _TRUNCATE);
+        return E_INVALIDARG;
+    }
     if (vm->storage_root[0]) {
         wchar_t *slash;
         wcscpy_s(root, MAX_PATH, vm->storage_root);
@@ -1474,6 +1500,8 @@ HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle
     g_idle_minutes = idle_minutes;
     wcsncpy_s(g_group, _countof(g_group), group ? group : L"", _TRUNCATE);
     g_lan = lan;
+    wcsncpy_s(g_vpn, _countof(g_vpn), vpn_id ? vpn_id : L"", _TRUNCATE);
+    wcsncpy_s(g_drives_off, _countof(g_drives_off), drives_off ? drives_off : L"", _TRUNCATE);
     /* A new VM means a new image; running sessions keep the old one until they end. */
     if (!g_root[0]) wcscpy_s(g_root, MAX_PATH, root);
     if (changed_vm) g_image[0] = 0;
@@ -1521,6 +1549,8 @@ HRESULT game_stream_turn_off(void)
     g_image[0] = 0;
     g_group[0] = 0;
     g_lan = FALSE;
+    g_vpn[0] = 0;
+    g_drives_off[0] = 0;
     for (i = 0; i < GS_MAX_LOGINS; i++) SecureZeroMemory(&g_logins[i], sizeof(g_logins[i]));
     for (i = 0; i < GS_MAX_SESSIONS; i++)
         if (g_sessions[i].used) InterlockedExchange(&g_sessions[i].stop, 1);
@@ -1543,7 +1573,7 @@ int game_stream_status_json(char *out, int cap)
     int pos = 0, i, games = 0, listed = 0;
     char *catalog = read_catalog(), *p;
     GsSession copy[GS_MAX_SESSIONS];
-    wchar_t nominated[256], group[65], phase[160], error[400];
+    wchar_t nominated[256], group[65], phase[160], error[400], vpn[40], drives_off[1024];
     BOOL enabled, lan, image;
     int max_sessions, idle;
 
@@ -1559,6 +1589,8 @@ int game_stream_status_json(char *out, int cap)
     idle = g_idle_minutes;
     wcscpy_s(nominated, _countof(nominated), g_nominated);
     wcscpy_s(group, _countof(group), g_group);
+    wcscpy_s(vpn, _countof(vpn), g_vpn);
+    wcscpy_s(drives_off, _countof(drives_off), g_drives_off);
     wcscpy_s(phase, _countof(phase), g_build.phase);
     wcscpy_s(error, _countof(error), g_build.error);
     memcpy(copy, g_sessions, sizeof(copy));
@@ -1572,6 +1604,10 @@ int game_stream_status_json(char *out, int cap)
     pos = json_append_wide(out, cap, pos, "vm", nominated);
     pos += sprintf_s(out + pos, cap - pos, ",");
     pos = json_append_wide(out, cap, pos, "group", group);
+    pos += sprintf_s(out + pos, cap - pos, ",");
+    pos = json_append_wide(out, cap, pos, "vpn", vpn);
+    pos += sprintf_s(out + pos, cap - pos, ",");
+    pos = json_append_wide(out, cap, pos, "drivesOff", drives_off);
     pos += sprintf_s(out + pos, cap - pos, ",");
     pos = json_append_wide(out, cap, pos, "phase", phase);
     pos += sprintf_s(out + pos, cap - pos, ",");
