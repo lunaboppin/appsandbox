@@ -4631,6 +4631,8 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
 
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
+    /* The VPN gateway reads the config from the instance when it sets up the network. */
+    wcscpy_s(inst->vpn_id, _countof(inst->vpn_id), config->vpn_id ? config->vpn_id : L"");
 
     /* Create disk (synchronous path: from-template only — Linux ISO
        creates go through the use_linux_cloud branch above; Windows ISO
@@ -4643,6 +4645,12 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
         hr = vhdx_create_differencing(cfg.vhdx_path, base_path);
         if (FAILED(hr)) { asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr); remove_dir_recursive(vhdx_dir); return hr; }
         asb_log(L"Differencing VHDX created.");
+        /* A Game Streaming image keeps the agent it was built with; each duplicate gets
+           this version's before its first boot. */
+        if (config->session_clone) {
+            HRESULT up = upgrade_windows_agent_offline(cfg.vhdx_path);
+            if (FAILED(up)) asb_log(L"Warning: could not update the agent on \"%s\" (0x%08X).", cfg.name, up);
+        }
     } else {
         asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
         hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);

@@ -174,6 +174,12 @@ def main() -> None:
     assert 'sprintf_s(allowed, sizeof(allowed), "%s.1", hcn_vpn_subnet_base());' in stream
     assert 'json_get_string(json, L"drivesOff"' in ui and 'json_get_string(body, L"drivesOff"' in headless
     assert 'id="gs-vpn"' in html and 'id="gs-drives"' in html and "drivesOff:" in js
+    # From an image, the VPN choice reaches the instance before its network is set up,
+    # and each duplicate gets this version's agent rather than the image's.
+    sync = core[core.index("/* ---- Synchronous path (from-template"):]
+    sync = sync[:sync.index("/* Create HCS VM */")]
+    assert sync.index("wcscpy_s(inst->vpn_id, _countof(inst->vpn_id), config->vpn_id") < sync.index("vpn_gateway_prepare_client(inst")
+    assert sync.index("upgrade_windows_agent_offline(cfg.vhdx_path)") < sync.index("Resources ISO")
     # The disc that set a duplicate up leaves This PC once its user is signed in.
     signed_in = agent[agent.index('strcmp(cmd, "session_signed_in") == 0'):]
     assert "session_hide_setup_disc();" in signed_in[:300]
