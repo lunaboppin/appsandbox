@@ -13,7 +13,8 @@
  * With GPU-PV the host GPU's driver can expose a display output of its own,
  * which Windows may make the main monitor; the AppSandbox window then shows
  * the secondary one. Prints "unchanged", "no appsandbox display",
- * "applied: N other display(s) off" or "error ...".
+ * "applied: N other display(s) off" or "error ...". It also keeps the AppSandbox
+ * display in SDR (see sdr_only), adding "colour: ..." when that changed something.
  *
  * --stream-prep: run by Sunshine before a stream. Asks the display driver for
  * the size in SUNSHINE_CLIENT_WIDTH/HEIGHT and waits for it to appear, so capture
@@ -45,8 +46,64 @@ static BOOL is_appsandbox_display(const wchar_t *gdi_name)
     }
 }
 
+/* Windows can compose an SDR display in FP16 scRGB (Auto Color Management, or "wide
+   color"). The driver's own frames are converted back to 8-bit, but Desktop
+   Duplication hands out the FP16 desktop, and Sunshine and Parsec gamma-correct it a
+   second time, so streams look washed out. The AppSandbox display is SDR only: turn
+   wide color and HDR off on it. Returns what changed, or NULL. */
+static const char *sdr_only(const DISPLAYCONFIG_PATH_INFO *path)
+{
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 info2;
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO info;
+    ZeroMemory(&info2, sizeof(info2));
+    info2.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+    info2.header.size = sizeof(info2);
+    info2.header.adapterId = path->targetInfo.adapterId;
+    info2.header.id = path->targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&info2.header) == ERROR_SUCCESS) {
+        DISPLAYCONFIG_SET_WCG_STATE wcg;
+        DISPLAYCONFIG_SET_HDR_STATE hdr;
+        if (info2.activeColorMode == DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR) return NULL;
+        if (info2.activeColorMode == DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR) {
+            ZeroMemory(&hdr, sizeof(hdr));
+            hdr.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE;
+            hdr.header.size = sizeof(hdr);
+            hdr.header.adapterId = path->targetInfo.adapterId;
+            hdr.header.id = path->targetInfo.id;
+            DisplayConfigSetDeviceInfo(&hdr.header);
+        }
+        ZeroMemory(&wcg, sizeof(wcg));
+        wcg.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_WCG_STATE;
+        wcg.header.size = sizeof(wcg);
+        wcg.header.adapterId = path->targetInfo.adapterId;
+        wcg.header.id = path->targetInfo.id;
+        DisplayConfigSetDeviceInfo(&wcg.header);
+        if (DisplayConfigGetDeviceInfo(&info2.header) != ERROR_SUCCESS) return "colour: error";
+        return info2.activeColorMode == DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR
+            ? "colour: wide colour off" : "colour: still not SDR";
+    }
+    /* Before Windows 11 24H2: one advanced color switch. */
+    ZeroMemory(&info, sizeof(info));
+    info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    info.header.size = sizeof(info);
+    info.header.adapterId = path->targetInfo.adapterId;
+    info.header.id = path->targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&info.header) == ERROR_SUCCESS && info.advancedColorEnabled) {
+        DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE set;
+        ZeroMemory(&set, sizeof(set));
+        set.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+        set.header.size = sizeof(set);
+        set.header.adapterId = path->targetInfo.adapterId;
+        set.header.id = path->targetInfo.id;
+        return DisplayConfigSetDeviceInfo(&set.header) == ERROR_SUCCESS
+            ? "colour: advanced colour off" : "colour: error";
+    }
+    return NULL;
+}
+
 static int only_appsandbox(void)
 {
+    const char *colour;
     UINT32 np = 0, nm = 0, i, idx;
     DISPLAYCONFIG_PATH_INFO *paths;
     DISPLAYCONFIG_MODE_INFO *modes;
@@ -79,7 +136,11 @@ static int only_appsandbox(void)
             others++;
     }
     if (ours < 0) { printf("no appsandbox display"); free(paths); free(modes); return 0; }
-    if (!others)  { printf("unchanged"); free(paths); free(modes); return 0; }
+    colour = sdr_only(&paths[ours]);
+    if (!others) {
+        if (colour) printf("applied: %s", colour); else printf("unchanged");
+        free(paths); free(modes); return 0;
+    }
 
     for (i = 0; i < np; i++) {
         if ((int)i == ours) continue;
@@ -96,10 +157,39 @@ static int only_appsandbox(void)
     rc = SetDisplayConfig(np, paths, nm, modes,
                           SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
                           SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES);
-    if (rc == ERROR_SUCCESS) printf("applied: %d other display(s) off", others);
+    if (rc == ERROR_SUCCESS) printf("applied: %d other display(s) off%s%s", others,
+                                    colour ? "; " : "", colour ? colour : "");
     else printf("error %ld", rc);
     free(paths); free(modes);
     return rc == ERROR_SUCCESS ? 0 : 1;
+}
+
+/* sdr_only for the AppSandbox display, wherever it is now. */
+static void sdr_ours(void)
+{
+    UINT32 np = 0, nm = 0, i;
+    DISPLAYCONFIG_PATH_INFO *paths;
+    DISPLAYCONFIG_MODE_INFO *modes;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return;
+    paths = (DISPLAYCONFIG_PATH_INFO *)calloc(np, sizeof(*paths));
+    modes = (DISPLAYCONFIG_MODE_INFO *)calloc(nm ? nm : 1, sizeof(*modes));
+    if (paths && modes &&
+        QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+        for (i = 0; i < np; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+            ZeroMemory(&src, sizeof(src));
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = sizeof(src);
+            src.header.adapterId = paths[i].sourceInfo.adapterId;
+            src.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS &&
+                is_appsandbox_display(src.viewGdiDeviceName)) {
+                sdr_only(&paths[i]);
+                break;
+            }
+        }
+    }
+    free(paths); free(modes);
 }
 
 static int stream_prep(void)
@@ -142,6 +232,8 @@ static int stream_prep(void)
         }
         Sleep(200);
     }
+    /* A monitor that just arrived can come up in wide colour: capture must start in SDR. */
+    sdr_ours();
     return 0;
 }
 
