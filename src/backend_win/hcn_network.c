@@ -843,6 +843,9 @@ HRESULT hcn_delete_network(const GUID *network_id)
 
     if (!g_hcn_dll || !pfnDeleteNet)
         return E_NOT_VALID_STATE;
+    /* A VM that hasn't run since the app started has no network to delete. */
+    if (IsEqualGUID(network_id, &GUID_NULL))
+        return S_FALSE;
 
     StringFromGUID2(network_id, guid_str, 64);
     ui_log(L"HCN: Deleting network %s...", guid_str);
@@ -868,6 +871,9 @@ HRESULT hcn_delete_endpoint(const GUID *endpoint_id)
 
     if (!g_hcn_dll || !pfnDeleteEp)
         return E_NOT_VALID_STATE;
+    /* A VM that hasn't run since the app started has no endpoint to delete. */
+    if (IsEqualGUID(endpoint_id, &GUID_NULL))
+        return S_FALSE;
 
     StringFromGUID2(endpoint_id, guid_str, 64);
     ui_log(L"HCN: Deleting endpoint %s...", guid_str);
