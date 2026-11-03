@@ -45,7 +45,11 @@ def main() -> None:
     assert "-ValueName 'SyncForegroundPolicy'" in ensure
     assert "-ValueName 'DisablePasswordChange'" in ensure
     # Programs on the appliance's shares run without a security warning: its hosts are intranet.
-    assert "Internet Settings\\\\ZoneMapKey' -ValueName ('*.'+$d.DNSRoot) -Type String -Value '1'" in ensure
+    # It's the ZoneMap\Domains list Windows reads, not the editor's ZoneMapKey, which
+    # needs a client extension Set-GPRegistryValue doesn't enable; the old value is removed.
+    assert "-Key ($ie+'\\\\ZoneMap\\\\Domains\\\\'+$d.DNSRoot) -ValueName '*' -Type DWord -Value 1" in ensure
+    assert "Remove-GPRegistryValue -Name $name -Key ($ie+'\\\\ZoneMapKey')" in ensure
+    assert "Set-GPRegistryValue -Name $name -Key ($ie+'\\\\ZoneMapKey')" not in ensure
     assert "Set-ADUser -Identity $sam -HomeDirectory $unc -HomeDrive 'H:'" in agent
     assert agent.count("function AsbHome($sam){") == 2      # ensure + user_set
     assert " try{ AsbHome $n }" in agent
