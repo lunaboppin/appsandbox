@@ -756,7 +756,7 @@ HRESULT vm_stream_pair(VmInstance *vm, const char *pin, const char *client_name,
     if (!pin || strlen(pin) != 4) return E_INVALIDARG;
     for (p = pin; *p; p++) if (*p < '0' || *p > '9') return E_INVALIDARG;
     sprintf_s(cmd, sizeof(cmd), "stream_pin:%s:%.40s", pin, client_name && *client_name ? client_name : "Moonlight");
-    if (vm_agent_send(vm, cmd, reply, sizeof(reply), 35000)) return S_OK;
+    if (vm_agent_send(vm, cmd, reply, sizeof(reply), 70000)) return S_OK;
     if (message) strncpy_s(message, message_cap, strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply, _TRUNCATE);
     return E_FAIL;
 }
