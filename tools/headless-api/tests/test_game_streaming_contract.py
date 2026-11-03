@@ -143,6 +143,11 @@ def main() -> None:
     assert re.search(r'identity_file\(const char \*leaf.*?"state".*?"cert".*?"key"', agent, re.S)
     assert "SecureZeroMemory(vm->session_identity" in link
 
+    # Duplicates don't become the folder suggested for the user's next VM, and a setting
+    # that older versions saved that way is ignored.
+    assert "if (!inst || inst->session_clone || !inst->storage_root[0]) return;" in core
+    assert r'if (!wcsstr(line + 18, L"\\GameStreaming\\sessions"))' in core
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")

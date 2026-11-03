@@ -1561,6 +1561,9 @@ function renderVmTable() {
         updateStatusCell(statusTd, vm);
 
         var sig = [
+            /* The row's buttons act on index i, so a VM that moves (another was
+               deleted above it) needs them rebuilt. */
+            i,
             i === selectedVm, editModeRow === i,
             vm.running, vm.buildingVhdx, vm.managementBusy, vm.shuttingDown, vm.agentOnline,
             vm.installComplete, vm.isTemplate,
