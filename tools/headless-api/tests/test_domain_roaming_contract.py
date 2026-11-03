@@ -44,6 +44,8 @@ def main() -> None:
     assert "$want='%HOMESHARE%\\\\'+$map[$v]" in ensure
     assert "-ValueName 'SyncForegroundPolicy'" in ensure
     assert "-ValueName 'DisablePasswordChange'" in ensure
+    # Programs on the appliance's shares run without a security warning: its hosts are intranet.
+    assert "Internet Settings\\\\ZoneMapKey' -ValueName ('*.'+$d.DNSRoot) -Type String -Value '1'" in ensure
     assert "Set-ADUser -Identity $sam -HomeDirectory $unc -HomeDrive 'H:'" in agent
     assert agent.count("function AsbHome($sam){") == 2      # ensure + user_set
     assert " try{ AsbHome $n }" in agent
