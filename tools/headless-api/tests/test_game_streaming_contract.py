@@ -75,6 +75,14 @@ def main() -> None:
     assert "InterlockedDecrement(&inst->stopping)" in stop
     assert "while (InterlockedCompareExchange(&inst->stopping, 0, 0)" in core
 
+    # Sunshine is never left stopped: a loaded encoder library isn't copied over, and a
+    # setup that fails starts the installed service again.
+    setup_ps = agent[agent.index("stream_setup_ps[]"):agent.index("stream_status_ps[]")]
+    assert "(Get-FileHash $dst).Hash -eq (Get-FileHash $lib.FullName).Hash" in setup_ps
+    assert "try { Copy-Item $lib.FullName $dst -Force } catch {" in setup_ps
+    catch = setup_ps[setup_ps.rindex("} catch {"):]
+    assert "Start-Service SunshineService -ErrorAction SilentlyContinue" in catch
+
     # The password: checked on the appliance, encrypted while kept, and gone after use.
     assert "ValidateCredentials" in agent
     assert "CryptProtectMemory" in gs and "GS_PASSWORD_KEEP_MS" in gs
