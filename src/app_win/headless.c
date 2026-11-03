@@ -870,6 +870,30 @@ static int handle_request(PHTTP_REQUEST req)
         return 0;
     }
 
+    /* ---- /v1/domain/region ----
+         POST /v1/domain/region   {timeZone: Windows id or "", ukFormats} */
+    if (wcscmp(path, L"/v1/domain/region") == 0) {
+        wchar_t body[512] = L"", tz[128] = L"", message[512] = L"";
+        BOOL uk = FALSE;
+        HRESULT hr;
+        if (verb != HttpVerbPOST) {
+            send_err(req->RequestId, 404, "Not Found", "not_found", "no such route");
+            return 0;
+        }
+        body_to_wide(req, body, _countof(body));
+        json_get_string(body, L"timeZone", tz, _countof(tz));
+        json_get_bool(body, L"ukFormats", &uk);
+        hr = asb_domain_region_set(tz, uk, message, _countof(message));
+        if (FAILED(hr)) {
+            char m[600] = "the request could not be done";
+            if (message[0]) WideCharToMultiByte(CP_UTF8, 0, message, -1, m, sizeof(m), NULL, NULL);
+            send_err(req->RequestId, 409, "Conflict", "domain_refused", m);
+            return 0;
+        }
+        send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+        return 0;
+    }
+
     /* ---- /v1/game-streaming ----
          GET  /v1/game-streaming
          POST /v1/game-streaming        {vm, maxSessions, idleMinutes, group, lan, vpn, drivesOff}

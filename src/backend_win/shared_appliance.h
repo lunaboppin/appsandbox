@@ -41,6 +41,8 @@ typedef struct {
     BOOL update_available;
     BOOL domain_enabled;  /* the appliance is the AppSandbox domain controller */
     BOOL domain_busy;     /* promotion in progress */
+    BOOL domain_uk_formats;            /* the domain's policy sets English (UK) formats */
+    wchar_t domain_time_zone[128];     /* the domain's policy time zone (Windows id), or empty */
     DWORD data_size_gb;
     DWORD ram_mb;
     DWORD cpu_cores;
@@ -129,6 +131,8 @@ HRESULT shared_appliance_domain_user_delete(const wchar_t *name,
                                             wchar_t *message, size_t message_chars);
 HRESULT shared_appliance_domain_group_add(const wchar_t *name,
                                           wchar_t *message, size_t message_chars);
+HRESULT shared_appliance_domain_region_set(const wchar_t *time_zone, BOOL uk_formats,
+                                           wchar_t *message, size_t message_chars);
 HRESULT shared_appliance_domain_group_delete(const wchar_t *name,
                                              wchar_t *message, size_t message_chars);
 /* The credential-bearing domain_join command for a managed VM whose link to

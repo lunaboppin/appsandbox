@@ -121,6 +121,7 @@ window.onHostMessage = function(msg) {
         case 'applianceBrowseResult': document.getElementById(msg.kind === 'iso' ? 'appliance-server-iso' : 'appliance-storage-parent').value = msg.path || ''; break;
         case 'sharedApplianceResult': onSharedApplianceResult(msg); break;
         case 'domainResult': onDomainResult(msg); break;
+        case 'timeZones': timeZones = msg.zones || []; renderDomainRegion(); break;
         case 'gameStreamingResult': onGameStreamingResult(msg); break;
         case 'labResult': onLabResult(msg); break;
         case 'vpnConfigResult': onVpnConfigResult(msg); break;
@@ -702,8 +703,42 @@ function domainState() {
     return s.domainEnabled ? 'ready' : 'off';
 }
 
+var timeZones = null;
+
+/* The policy's current values, when the dialog opens and after a save. */
+function renderDomainRegion() {
+    var s = sharedAppliance || {}, select = document.getElementById('domain-tz');
+    select.innerHTML = '';
+    var none = document.createElement('option');
+    none.value = ''; none.textContent = 'Not set (each VM keeps its own)';
+    select.appendChild(none);
+    (timeZones || []).slice().sort(function(a, b) {
+        return a.bias - b.bias || (a.id < b.id ? -1 : 1);
+    }).forEach(function(z) {
+        var o = document.createElement('option');
+        o.value = z.id; o.textContent = z.name;
+        select.appendChild(o);
+    });
+    if (s.domainTimeZone && !(timeZones || []).some(function(z) { return z.id === s.domainTimeZone; })) {
+        var kept = document.createElement('option');
+        kept.value = kept.textContent = s.domainTimeZone;
+        select.appendChild(kept);
+    }
+    select.value = s.domainTimeZone || '';
+    document.getElementById('domain-uk').checked = !!s.domainUkFormats;
+}
+
+function saveDomainRegion() {
+    domainSend('domainRegionSet', {
+        name: document.getElementById('domain-tz').value,
+        enabled: document.getElementById('domain-uk').checked
+    });
+}
+
 function openDomainModal() {
     domainLoaded = false;
+    renderDomainRegion();
+    if (!timeZones) sendCmd('timeZoneList');
     document.getElementById('domain-overlay').classList.add('active');
     clearDomainUser();
     renderDomain();
@@ -943,6 +978,11 @@ function onDomainResult(msg) {
     if (msg.action === 'domainSetup') { renderDomain(); return; }
     if (msg.action === 'domainUserSet') clearDomainUser();
     if (msg.action === 'domainGroupAdd') document.getElementById('domain-group-name').value = '';
+    if (msg.action === 'domainRegionSet') {
+        /* What was saved, before the state refresh brings it back. */
+        sharedAppliance.domainTimeZone = document.getElementById('domain-tz').value;
+        sharedAppliance.domainUkFormats = document.getElementById('domain-uk').checked;
+    }
     refreshDomain();
 }
 

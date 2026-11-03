@@ -705,6 +705,8 @@ static void send_full_state(void)
         jb_bool(&jb, L"domainEnabled", s.domain_enabled);
         jb_bool(&jb, L"domainBusy", s.domain_busy);
         jb_string(&jb, L"domainName", L"" ASB_DOMAIN_FQDN);
+        jb_string(&jb, L"domainTimeZone", s.domain_time_zone);
+        jb_bool(&jb, L"domainUkFormats", s.domain_uk_formats);
         jb_object_end(&jb);
     }
 
@@ -1377,6 +1379,38 @@ static HRESULT domain_ensure_appliance(wchar_t *message, size_t message_chars)
     return (HRESULT)code;
 }
 
+/* Windows' time zones, for the Domain dialog's regional policy. */
+static void post_time_zones(void)
+{
+    DYNAMIC_TIME_ZONE_INFORMATION tz;
+    TIME_ZONE_INFORMATION detail;
+    size_t chars = 64 * 1024;
+    wchar_t *out = (wchar_t *)malloc(chars * sizeof(wchar_t)), label[200];
+    JsonBuilder jb;
+    DWORD i;
+    if (!out) return;
+    jb_init(&jb, out, chars);
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"timeZones");
+    jb_array_begin(&jb, L"zones");
+    for (i = 0; EnumDynamicTimeZoneInformation(i, &tz) == ERROR_SUCCESS; i++) {
+        LONG bias = 0;
+        if (GetTimeZoneInformationForYear(0, &tz, &detail)) bias = -detail.Bias;
+        swprintf_s(label, _countof(label), L"(UTC%c%02ld:%02ld) %s", bias < 0 ? L'-' : L'+',
+                   labs(bias) / 60, labs(bias) % 60, tz.TimeZoneKeyName);
+        if (i > 0) jb_append(&jb, L",");
+        jb_object_begin(&jb);
+        jb_string(&jb, L"id", tz.TimeZoneKeyName);
+        jb_string(&jb, L"name", label);
+        jb_int(&jb, L"bias", (int)bias);
+        jb_object_end(&jb);
+    }
+    jb_array_end(&jb);
+    jb_object_end(&jb);
+    webview2_post(out);
+    free(out);
+}
+
 static DWORD WINAPI domain_work_thread(LPVOID param)
 {
     DomainWork *w = (DomainWork *)param;
@@ -1414,6 +1448,9 @@ static DWORD WINAPI domain_work_thread(LPVOID param)
         w->result = asb_domain_group_add(w->name, w->message, _countof(w->message));
     } else if (wcscmp(w->action, L"domainGroupDelete") == 0) {
         w->result = asb_domain_group_delete(w->name, w->message, _countof(w->message));
+    } else if (wcscmp(w->action, L"domainRegionSet") == 0) {
+        /* name: the time zone id; enabled: English (UK) formats */
+        w->result = asb_domain_region_set(w->name, w->enabled, w->message, _countof(w->message));
     } else {
         w->result = E_INVALIDARG;
     }
@@ -2051,6 +2088,8 @@ static void on_webview2_message(const wchar_t *json)
         send_full_state();
     } else if (wcsncmp(action, L"gameStreaming", 13) == 0) {
         game_streaming_command(action, json);
+    } else if (wcscmp(action, L"timeZoneList") == 0) {
+        post_time_zones();
     } else if (wcsncmp(action, L"domain", 6) == 0) {
         DomainWork *work = (DomainWork *)calloc(1, sizeof(*work));
         HANDLE thread = NULL;

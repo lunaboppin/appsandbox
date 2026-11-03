@@ -2524,10 +2524,43 @@ static const char DOMAIN_ENSURE_PS[] =
         " Write-Output 'result:ok'; exit 0\r\n"
         "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
 
+/* domain_region:<b64 time zone id, or empty>:<0|1>. Its own GPO, linked to the domain.
+   Windows has no policy for the time zone, so the value is the agent's: every managed VM
+   sets it (policy_time_zone_thread). English (UK) formats are the user's own locale
+   values, written at each sign-in, with overrides locked. Turning one off takes it out
+   of the policy; Windows keeps what it had last. */
+static const char DOMAIN_REGION_PS[] =
+        "$ErrorActionPreference='Stop'\r\n"
+        "try{\r\n"
+        " Import-Module GroupPolicy\r\n"
+        " $d=Get-ADDomain\r\n"
+        " $name='AppSandbox Regional Settings'\r\n"
+        " if(-not (Get-GPO -Name $name -ErrorAction SilentlyContinue)){ New-GPO -Name $name -Comment 'Time zone and English (UK) formats on managed AppSandbox VMs' | Out-Null }\r\n"
+        " if(-not ((Get-GPInheritance -Target $d.DistinguishedName).GpoLinks | Where-Object { $_.DisplayName -eq $name })){ New-GPLink -Name $name -Target $d.DistinguishedName | Out-Null }\r\n"
+        " $tz=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:ASB_DOM_TZ))\r\n"
+        " $pk='HKLM\\Software\\Policies\\AppSandbox'\r\n"
+        " if($tz){ Set-GPRegistryValue -Name $name -Key $pk -ValueName 'TimeZone' -Type String -Value $tz | Out-Null }\r\n"
+        " else{ Remove-GPRegistryValue -Name $name -Key $pk -ValueName 'TimeZone' -ErrorAction SilentlyContinue | Out-Null }\r\n"
+        " $intl='HKCU\\Control Panel\\International'\r\n"
+        " $uk=[ordered]@{ LocaleName='en-GB'; Locale='00000809'; sCountry='United Kingdom'; sShortDate='dd/MM/yyyy'; sLongDate='dd MMMM yyyy'; sYearMonth='MMMM yyyy'; iDate='1'; sDate='/'; sShortTime='HH:mm'; sTimeFormat='HH:mm:ss'; iTime='1'; iTLZero='1'; iFirstDayOfWeek='0'; sCurrency=[string][char]0xA3; sDecimal='.'; sThousand=','; sList=','; iMeasure='0'; iPaperSize='9' }\r\n"
+        " $lock=@('HKCU\\Software\\Policies\\Microsoft\\Control Panel\\International','PreventUserOverrides')\r\n"
+        " if($env:ASB_DOM_UK -eq '1'){\r\n"
+        "  foreach($v in $uk.Keys){ Set-GPRegistryValue -Name $name -Key $intl -ValueName $v -Type String -Value $uk[$v] | Out-Null }\r\n"
+        "  Set-GPRegistryValue -Name $name -Key ($intl+'\\Geo') -ValueName 'Nation' -Type String -Value '242' | Out-Null\r\n"
+        "  Set-GPRegistryValue -Name $name -Key ($intl+'\\Geo') -ValueName 'Name' -Type String -Value 'GB' | Out-Null\r\n"
+        "  Set-GPRegistryValue -Name $name -Key $lock[0] -ValueName $lock[1] -Type DWord -Value 1 | Out-Null\r\n"
+        " }else{\r\n"
+        "  foreach($v in $uk.Keys){ Remove-GPRegistryValue -Name $name -Key $intl -ValueName $v -ErrorAction SilentlyContinue | Out-Null }\r\n"
+        "  foreach($v in 'Nation','Name'){ Remove-GPRegistryValue -Name $name -Key ($intl+'\\Geo') -ValueName $v -ErrorAction SilentlyContinue | Out-Null }\r\n"
+        "  Remove-GPRegistryValue -Name $name -Key $lock[0] -ValueName $lock[1] -ErrorAction SilentlyContinue | Out-Null\r\n"
+        " }\r\n"
+        " Write-Output 'result:ok'; exit 0\r\n"
+        "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
+
 static const char *const DOMAIN_ENV[] = {
     "ASB_DOM_NB", "ASB_DOM_FQDN", "ASB_DOM_PW", "ASB_DOM_USER", "ASB_DOM_PWSET",
     "ASB_DOM_ENABLED", "ASB_DOM_GROUPS", "ASB_DOM_GROUP", "ASB_DOM_DC",
-    "ASB_MANAGEMENT_HOST", NULL
+    "ASB_MANAGEMENT_HOST", "ASB_DOM_TZ", "ASB_DOM_UK", NULL
 };
 
 /* Run a domain script; reply gets "ok", "ok:<data>" or "error:<message>". */
@@ -2965,6 +2998,75 @@ static void session_hide_setup_disc(void)
         else
             agent_log("Session: could not remove drive %lc: (%lu).", root[0], GetLastError());
     }
+}
+
+/* The domain's time zone (DOMAIN_REGION_PS) on this machine: at start, and whenever
+   policy changes. Automatic time zone is turned off while it's set, or it would move. */
+static void policy_time_zone_apply(void)
+{
+    wchar_t want[128] = L"";
+    DWORD size = sizeof(want), i;
+    DYNAMIC_TIME_ZONE_INFORMATION cur, tz;
+    HANDLE token;
+
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\AppSandbox", L"TimeZone",
+                     RRF_RT_REG_SZ, NULL, want, &size) != ERROR_SUCCESS || !want[0])
+        return;
+    if (GetDynamicTimeZoneInformation(&cur) != TIME_ZONE_ID_INVALID &&
+        _wcsicmp(cur.TimeZoneKeyName, want) == 0)
+        return;
+    for (i = 0; EnumDynamicTimeZoneInformation(i, &tz) == ERROR_SUCCESS; i++) {
+        DWORD off = 4;
+        if (_wcsicmp(tz.TimeZoneKeyName, want) != 0) continue;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+            TOKEN_PRIVILEGES tp;
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (LookupPrivilegeValueW(NULL, SE_TIME_ZONE_NAME, &tp.Privileges[0].Luid))
+                AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+            CloseHandle(token);
+        }
+        RegSetKeyValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\tzautoupdate",
+                        L"Start", REG_DWORD, &off, sizeof(off));
+        if (SetDynamicTimeZoneInformation(&tz))
+            agent_log("Time zone set to %S by domain policy.", want);
+        else
+            agent_log("Could not set the time zone to %S (%lu).", want, GetLastError());
+        return;
+    }
+    agent_log("Domain policy names a time zone this Windows doesn't have: %S", want);
+}
+
+static DWORD WINAPI policy_time_zone_thread(LPVOID param)
+{
+    HANDLE changed = CreateEventW(NULL, FALSE, FALSE, NULL);
+    (void)param;
+    for (;;) {
+        HKEY key = NULL;
+        HANDLE waits[2];
+        policy_time_zone_apply();
+        /* Policies may not exist until the first policy refresh writes it. */
+        if (!changed ||
+            RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies", 0, NULL, 0, KEY_NOTIFY,
+                            NULL, &key, NULL) != ERROR_SUCCESS ||
+            RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                                    changed, TRUE) != ERROR_SUCCESS) {
+            if (key) RegCloseKey(key);
+            if (WaitForSingleObject(g_stop_event, 15 * 60 * 1000) == WAIT_OBJECT_0) break;
+            continue;
+        }
+        waits[0] = g_stop_event;
+        waits[1] = changed;
+        /* Hourly as well, in case someone changes the time zone by hand. */
+        if (WaitForMultipleObjects(2, waits, FALSE, 60 * 60 * 1000) == WAIT_OBJECT_0) {
+            RegCloseKey(key);
+            break;
+        }
+        RegCloseKey(key);
+        Sleep(2000);   /* a refresh writes several values */
+    }
+    if (changed) CloseHandle(changed);
+    return 0;
 }
 
 /* Is Windows setup's temporary account signed in? */
@@ -3454,6 +3556,13 @@ static void handle_domain_command(char *cmd, char *reply, size_t reply_size)
                           reply, reply_size);
     } else if (strcmp(cmd, "domain_ensure") == 0) {
         run_domain_script(DOMAIN_ENSURE_PS, 10 * 60 * 1000, reply, reply_size);
+    } else if (strncmp(cmd, "domain_region:", 14) == 0) {
+        n = domain_split(cmd + 14, f, 8);       /* time zone (base64, may be empty), 0|1 */
+        if (n != 2 || (f[0][0] && !domain_field_ok(f[0], "+/=", 200)) ||
+            (strcmp(f[1], "0") != 0 && strcmp(f[1], "1") != 0)) goto invalid;
+        SetEnvironmentVariableA("ASB_DOM_TZ", f[0]);
+        SetEnvironmentVariableA("ASB_DOM_UK", f[1]);
+        run_domain_script(DOMAIN_REGION_PS, 5 * 60 * 1000, reply, reply_size);
     } else if (strncmp(cmd, "domain_validate:", 16) == 0) {
         n = domain_split(cmd + 16, f, 8);       /* user, pw, group or empty */
         if (n != 3 || !domain_field_ok(f[0], "._-", 20) || !domain_field_ok(f[1], "+/=", 600) ||
@@ -5359,6 +5468,12 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Start audio capture monitor (SYSTEM, :0004) */
     start_audio_monitor();
+
+    /* The domain's time zone, on VMs that are members. */
+    {
+        HANDLE tz = CreateThread(NULL, 0, policy_time_zone_thread, NULL, 0, NULL);
+        if (tz) CloseHandle(tz);
+    }
 
     /* Run in Sandbox: files the host copies in (:0010) */
     file_drop_start(p9copy_log, g_stop_event);

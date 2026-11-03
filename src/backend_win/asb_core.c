@@ -6576,6 +6576,9 @@ ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size
 { return shared_appliance_domain_group_add(name, message, message_chars); }
 ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars)
 { return shared_appliance_domain_group_delete(name, message, message_chars); }
+ASB_API HRESULT asb_domain_region_set(const wchar_t *time_zone, BOOL uk_formats,
+                                      wchar_t *message, size_t message_chars)
+{ return shared_appliance_domain_region_set(time_zone, uk_formats, message, message_chars); }
 /* ---- WireGuard VPN ---- */
 
 ASB_API int asb_vpn_config_count(void) { return vpn_configs_count(); }
