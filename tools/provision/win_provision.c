@@ -250,8 +250,10 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name) {
         "echo === SetupComplete.cmd started === >> \"%LOG%\"\r\n"
         "\r\n"
         "REM ---- Taskbar: pin only Edge and File Explorer; hide search, Task View,\r\n"
-        "REM widgets, chat and Copilot. Applies to every account's first sign-in. ----\r\n"
+        "REM widgets, chat and Copilot. Applies to every account's first sign-in.\r\n"
+        "REM An ISO that came with its own setup (custom-iso.txt) keeps its own pins. ----\r\n"
         "echo [UI] Configuring the taskbar... >> \"%LOG%\"\r\n"
+        "if exist \"%SystemRoot%\\AppSandbox\\custom-iso.txt\" goto :pins_done\r\n"
         "mkdir \"%SystemRoot%\\OEM\" 2>nul\r\n"
         "> \"%SystemRoot%\\OEM\\TaskbarLayoutModification.xml\" (\r\n"
         "echo ^<?xml version=\"1.0\" encoding=\"utf-8\"?^>\r\n"
@@ -267,6 +269,7 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name) {
         "echo ^</LayoutModificationTemplate^>\r\n"
         ")\r\n"
         "reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\" /v LayoutXMLPath /t REG_SZ /d \"%SystemRoot%\\OEM\\TaskbarLayoutModification.xml\" /f >> \"%LOG%\" 2>&1\r\n"
+        ":pins_done\r\n"
         "reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Dsh\" /v AllowNewsAndInterests /t REG_DWORD /d 0 /f >> \"%LOG%\" 2>&1\r\n"
         "reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Chat\" /v ChatIcon /t REG_DWORD /d 3 /f >> \"%LOG%\" 2>&1\r\n"
         "reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search\" /v SearchOnTaskbarMode /t REG_DWORD /d 0 /f >> \"%LOG%\" 2>&1\r\n"
@@ -356,6 +359,11 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name) {
 
     fputs(
         ":done\r\n"
+        "REM An ISO's own SetupComplete.cmd (from its $OEM$ folder) runs after ours.\r\n"
+        "if exist \"%SystemRoot%\\Setup\\Scripts\\SetupComplete.iso.cmd\" (\r\n"
+        "    echo [ISO] Running the ISO's SetupComplete.cmd... >> \"%LOG%\"\r\n"
+        "    call \"%SystemRoot%\\Setup\\Scripts\\SetupComplete.iso.cmd\" >> \"%LOG%\" 2>&1\r\n"
+        ")\r\n"
         "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
         f);
     return 0;
