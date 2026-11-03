@@ -2642,7 +2642,70 @@ static const char stream_common_ps[] =
     " Invoke-RestMethod @a\r\n"
     "}\r\n";
 
+/* Sunshine adds an entry each time a device pairs, even one already paired, then refuses
+   a certificate that matches more than one entry ("Client certificate identity is not
+   enabled", error 401 in Moonlight). Keep the latest entry for each certificate. With
+   $restart, a running Sunshine is stopped for the change and started again, since it
+   would otherwise write its own list back. */
+#define PAIRING_REPAIR_PS \
+    "function Get-UniquePairings($s){\r\n" \
+    " $devs=@($s.root.named_devices | Where-Object { $_ }); $seen=@{}; $keep=@()\r\n" \
+    " for($i=$devs.Count-1;$i -ge 0;$i--){ $c=[string]$devs[$i].cert; if(-not $seen.ContainsKey($c)){ $seen[$c]=1; $keep=@($devs[$i])+$keep } }\r\n" \
+    " return ,$keep\r\n" \
+    "}\r\n" \
+    "function Repair-Pairings($state,$log,$restart){\r\n" \
+    " if(-not (Test-Path $state)){ return }\r\n" \
+    " $running=$false\r\n" \
+    " try {\r\n" \
+    "  $s=Get-Content $state -Raw | ConvertFrom-Json\r\n" \
+    "  if((Get-UniquePairings $s).Count -eq @($s.root.named_devices | Where-Object { $_ }).Count){ return }\r\n" \
+    "  $running=$restart -and ((Get-Service SunshineService -ErrorAction SilentlyContinue).Status -eq 'Running')\r\n" \
+    "  if($running){ Stop-Service SunshineService -Force; $s=Get-Content $state -Raw | ConvertFrom-Json }\r\n" \
+    "  $before=@($s.root.named_devices | Where-Object { $_ }).Count\r\n" \
+    "  $keep=Get-UniquePairings $s\r\n" \
+    "  $s.root.named_devices=$keep\r\n" \
+    "  [IO.File]::WriteAllText($state,($s | ConvertTo-Json -Depth 8),(New-Object Text.UTF8Encoding $false))\r\n" \
+    "  Add-Content $log ((Get-Date -Format s)+' removed '+($before-$keep.Count)+' duplicate paired device(s)')\r\n" \
+    " } catch { Add-Content $log ((Get-Date -Format s)+' '+$_.Exception.Message) }\r\n" \
+    " if($running){ Start-Service SunshineService -ErrorAction SilentlyContinue }\r\n" \
+    "}\r\n"
+
+/* Run by the pairing watcher when Sunshine's state changes. */
+static const char pairing_watch_ps[] =
+    PAIRING_REPAIR_PS
+    "Repair-Pairings (Join-Path $env:ProgramFiles 'Sunshine\\config\\sunshine_state.json') 'C:\\ProgramData\\AppSandbox\\stream\\pairing.log' $true\r\n";
+
+/* A device paired again during a session is locked out until the list is repaired, so
+   repair it whenever Sunshine saves its state, which it does after each pairing. */
+static DWORD WINAPI pairing_watch_thread(LPVOID param)
+{
+    wchar_t state[MAX_PATH], root[MAX_PATH];
+    const wchar_t *script = L"C:\\ProgramData\\AppSandbox\\pairing-watch.ps1";
+    FILETIME seen = { 0, 0 };
+    (void)param;
+    if (!GetEnvironmentVariableW(L"ProgramFiles", root, MAX_PATH)) return 0;
+    swprintf_s(state, MAX_PATH, L"%s\\Sunshine\\config\\sunshine_state.json", root);
+    while (WaitForSingleObject(g_stop_event, 3000) != WAIT_OBJECT_0) {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        char out[512];
+        if (!GetFileAttributesExW(state, GetFileExInfoStandard, &a) ||
+            CompareFileTime(&a.ftLastWriteTime, &seen) == 0) continue;
+        /* The first look only notes the time: setup repairs the list it starts with. */
+        if (seen.dwLowDateTime || seen.dwHighDateTime) {
+            Sleep(1000);   /* let the writer finish */
+            out[0] = '\0';
+            if (write_agent_script(script, pairing_watch_ps) == 0)
+                run_agent_powershell_out(script, 120000, out, sizeof(out));
+            DeleteFileW(script);
+            if (!GetFileAttributesExW(state, GetFileExInfoStandard, &a)) continue;
+        }
+        seen = a.ftLastWriteTime;
+    }
+    return 0;
+}
+
 static const char stream_setup_ps[] =
+    PAIRING_REPAIR_PS
     "New-Item -ItemType Directory -Force $dir | Out-Null\r\n"
     "& icacls $dir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\\Administrators:(OI)(CI)F' | Out-Null\r\n"
     /* stream_status can be reading it at that moment. */
@@ -2727,22 +2790,8 @@ static const char stream_setup_ps[] =
     " Get-NetFirewallRule -DisplayName 'Sunshine*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
     " Get-NetFirewallRule -Group 'AppSandboxStream' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\r\n"
     " New-NetFirewallRule -DisplayName 'App Sandbox streaming' -Group 'AppSandboxStream' -Direction Inbound -Action Allow -Program $exe -RemoteAddress $allowed | Out-Null\r\n"
-    /* Pairing the same Moonlight device again adds another entry with the same
-       certificate, and Sunshine refuses a certificate that matches more than one
-       ("Client certificate identity is not enabled", error 401 in Moonlight). A
-       user's pairings follow them from session to session, so keep the latest one. */
-    " $state=Join-Path $root 'config\\sunshine_state.json'\r\n"
-    " if(Test-Path $state){ try {\r\n"
-    "  $s=Get-Content $state -Raw | ConvertFrom-Json\r\n"
-    "  $devs=@($s.root.named_devices | Where-Object { $_ })\r\n"
-    "  $seen=@{}; $keep=@()\r\n"
-    "  for($i=$devs.Count-1;$i -ge 0;$i--){ if(-not $seen.ContainsKey([string]$devs[$i].cert)){ $seen[[string]$devs[$i].cert]=1; $keep=@($devs[$i])+$keep } }\r\n"
-    "  if($keep.Count -ne $devs.Count){\r\n"
-    "   $s.root.named_devices=$keep\r\n"
-    "   [IO.File]::WriteAllText($state,($s | ConvertTo-Json -Depth 8),(New-Object Text.UTF8Encoding $false))\r\n"
-    "   Add-Content (Join-Path $dir 'pairing.log') ((Get-Date -Format s)+' removed '+($devs.Count-$keep.Count)+' duplicate paired device(s)')\r\n"
-    "  }\r\n"
-    " } catch { Add-Content (Join-Path $dir 'pairing.log') ((Get-Date -Format s)+' '+$_.Exception.Message) } }\r\n"
+    /* A user's pairings follow them from session to session: see PAIRING_REPAIR_PS. */
+    " Repair-Pairings (Join-Path $root 'config\\sunshine_state.json') (Join-Path $dir 'pairing.log') $false\r\n"
     " Set-Service SunshineService -StartupType Automatic\r\n"
     " Start-Service SunshineService\r\n"
     " Status 'ready' ''\r\n"
@@ -5498,6 +5547,12 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     {
         HANDLE tz = CreateThread(NULL, 0, policy_time_zone_thread, NULL, 0, NULL);
         if (tz) CloseHandle(tz);
+    }
+
+    /* Moonlight pairings that would lock a device out (Game Streaming). */
+    {
+        HANDLE pw = CreateThread(NULL, 0, pairing_watch_thread, NULL, 0, NULL);
+        if (pw) CloseHandle(pw);
     }
 
     /* Run in Sandbox: files the host copies in (:0010) */
