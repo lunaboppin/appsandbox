@@ -189,8 +189,18 @@ def main() -> None:
     # setup keeps the latest pairing of each device before Sunshine starts.
     setup = agent[agent.index("static const char stream_setup_ps[]"):]
     setup = setup[:setup.index("static DWORD WINAPI stream_setup_thread")]
-    assert setup.index("named_devices=$keep") < setup.index(r" Start-Service SunshineService\r\n")
-    assert "$seen.ContainsKey([string]$devs[$i].cert)" in setup
+    assert setup.startswith("static const char stream_setup_ps[] =\n    PAIRING_REPAIR_PS") or \
+        setup.startswith("static const char stream_setup_ps[] =\r\n    PAIRING_REPAIR_PS")
+    assert setup.index("Repair-Pairings (Join-Path $root") < setup.index(r" Start-Service SunshineService\r\n")
+    repair = agent[agent.index("#define PAIRING_REPAIR_PS"):agent.index("static const char pairing_watch_ps[]")]
+    assert "$seen.ContainsKey($c)" in repair and "$s.root.named_devices=$keep" in repair
+    assert "Stop-Service SunshineService -Force" in repair and "Start-Service SunshineService" in repair
+    # Pairing again during a session adds a duplicate at once: a watcher repairs it then.
+    watch = agent[agent.index("static DWORD WINAPI pairing_watch_thread"):]
+    watch = watch[:watch.index("\n}") + 2]
+    assert "GetFileAttributesExW(state" in watch and "write_agent_script(script, pairing_watch_ps)" in watch
+    assert "' $true\\r\\n\";" in agent[agent.index("static const char pairing_watch_ps[]"):][:400]
+    assert "CreateThread(NULL, 0, pairing_watch_thread" in agent
     # Streams aren't washed out: the AppSandbox display is kept out of wide colour (FP16).
     displays = read("tools/agent/appsandbox-displays.c")
     assert "DISPLAYCONFIG_DEVICE_INFO_SET_WCG_STATE" in displays and "DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR" in displays
