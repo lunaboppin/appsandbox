@@ -13,6 +13,7 @@
 #include "gpu_enum.h"
 #include "hcn_network.h"
 #include "disk_util.h"
+#include "iso_custom.h"
 #include "fedora_install.h"
 #include "d3dlayers.h"
 #include "snapshot.h"
@@ -1881,19 +1882,31 @@ typedef struct {
 /* Index of the plain "Windows 11 Pro" (or 10 Pro) image in a Windows ISO,
    1 when there is none or the ISO can't be read. Index 1 on consumer ISOs is
    Home, which can't join a domain (managed VMs) and lacks Pro features; the
-   N, Education and Workstations variants are skipped on purpose. */
-static int windows_pro_image_index(const wchar_t *iso_path)
+   N, Education and Workstations variants are skipped on purpose.
+   With custom_dir, the same mount also copies the ISO's own setup customisation
+   (autounattend.xml at its root, sources\$OEM$) there; custom_dir ends up empty
+   when the ISO has none. *custom_failed is set when that copy failed. */
+static int windows_pro_image_index(const wchar_t *iso_path, const wchar_t *custom_dir,
+                                   BOOL *custom_failed)
 {
     static const wchar_t script[] =
-        L"$i=1; $m=$null; try{ "
+        L"$ProgressPreference='SilentlyContinue'; $i=1; $f=''; $m=$null; try{ "
         L"$m=Mount-DiskImage -ImagePath $env:ASB_ISO -StorageType ISO -PassThru -ErrorAction Stop; "
-        L"$l=($m | Get-Volume).DriveLetter; $w=$l+':\\sources\\install.wim'; "
+        L"$l=($m | Get-Volume).DriveLetter; "
+        L"if($env:ASB_CUSTOM){ $c=$env:ASB_CUSTOM; try{ "
+        L"Remove-Item -LiteralPath $c -Recurse -Force -ErrorAction SilentlyContinue; "
+        L"New-Item -ItemType Directory -Path $c -Force | Out-Null; "
+        L"$u=$l+':\\autounattend.xml'; if(Test-Path -LiteralPath $u){ Copy-Item -LiteralPath $u -Destination $c -Force -ErrorAction Stop }; "
+        L"$o=$l+':\\sources\\$OEM$'; if(Test-Path -LiteralPath $o){ Copy-Item -LiteralPath $o -Destination $c -Recurse -Force -ErrorAction Stop }; "
+        L"Get-ChildItem -LiteralPath $c -Recurse -File -Force | ForEach-Object { $_.IsReadOnly=$false } "
+        L"}catch{ $f='custom-copy-failed'; Remove-Item -LiteralPath $c -Recurse -Force -ErrorAction SilentlyContinue } }; "
+        L"$w=$l+':\\sources\\install.wim'; "
         L"if(-not (Test-Path $w)){ $w=$l+':\\sources\\install.esd' }; "
         L"$p=Get-WindowsImage -ImagePath $w -ErrorAction Stop | Where-Object { $_.ImageName -match '^Windows \\d+ Pro$' } | Select-Object -First 1; "
         L"if($p){ $i=$p.ImageIndex } "
         L"}catch{} finally{ if($m){ Dismount-DiskImage -ImagePath $env:ASB_ISO | Out-Null } }; "
-        L"Write-Output $i";
-    wchar_t cmd[2048];
+        L"Write-Output ([string]$i + ' ' + $f)";
+    wchar_t cmd[4096];
     const wchar_t *ext = wcsrchr(iso_path, L'.');
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -1915,6 +1928,7 @@ static int windows_pro_image_index(const wchar_t *iso_path)
     si.hStdError = wr;
     ZeroMemory(&pi, sizeof(pi));
     SetEnvironmentVariableW(L"ASB_ISO", iso_path);
+    SetEnvironmentVariableW(L"ASB_CUSTOM", custom_dir);
     if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(wr);
         wr = NULL;
@@ -1926,17 +1940,40 @@ static int windows_pro_image_index(const wchar_t *iso_path)
         CloseHandle(pi.hProcess);
     }
     SetEnvironmentVariableW(L"ASB_ISO", NULL);
+    SetEnvironmentVariableW(L"ASB_CUSTOM", NULL);
     out[total] = '\0';
     if (wr) CloseHandle(wr);
     CloseHandle(rd);
+    if (custom_failed) *custom_failed = strstr(out, "custom-copy-failed") != NULL;
     index = atoi(out);
     return index >= 1 && index <= 64 ? index : 1;
+}
+
+/* Our answer file, with the ISO's own merged in when it brought one
+   (custom_unattend NULL otherwise). */
+static BOOL write_vm_unattend(VhdxCreateArgs *args, const wchar_t *path, const wchar_t *lang,
+                              const wchar_t *custom_unattend)
+{
+    wchar_t summary[512];
+    if (!generate_unattend_vhdx(path, args->config.name, args->config.admin_user,
+                                args->config.admin_pass, lang))
+        return FALSE;
+    if (!custom_unattend) return TRUE;
+    if (!iso_custom_merge_unattend(path, custom_unattend, summary, _countof(summary))) {
+        asb_log(L"Warning: couldn't merge the ISO's autounattend.xml; its answer file is not used.");
+        return TRUE;
+    }
+    asb_log(L"Merged the ISO's autounattend.xml: %s.", summary);
+    return TRUE;
 }
 
 static DWORD WINAPI vhdx_create_thread(LPVOID param)
 {
     VhdxCreateArgs *args = (VhdxCreateArgs *)param;
     wchar_t staging[MAX_PATH], file_path[MAX_PATH];
+    wchar_t custom_dir[MAX_PATH], custom_unattend[MAX_PATH];
+    BOOL has_custom_unattend = FALSE, has_custom_oem = FALSE;
+    int image_index;
     wchar_t manifest[MAX_PATH];
     wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
     wchar_t cmdline[2048];
@@ -1955,6 +1992,34 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
     swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
     CreateDirectoryW(staging, NULL);
 
+    /* The edition to install: the Pro one, not index 1 (Home). For a normal VM the
+       same ISO mount picks up the ISO's own setup customisation (a debloated or
+       otherwise customised ISO), which Windows Setup would have used. */
+    swprintf_s(custom_dir, MAX_PATH, L"%s\\iso-custom", staging);
+    {
+        BOOL custom_failed = FALSE;
+        image_index = windows_pro_image_index(args->config.image_path,
+                                              args->config.is_template ? NULL : custom_dir,
+                                              &custom_failed);
+        asb_log(L"Windows image: using index %d of the ISO%s.", image_index,
+                image_index == 1 ? L" (no plain Pro edition found, or not an ISO)" : L" (Pro)");
+        if (custom_failed)
+            asb_log(L"Warning: couldn't copy the ISO's own setup files; installing without them.");
+    }
+    if (!args->config.is_template) {
+        wchar_t oem[MAX_PATH];
+        DWORD attrs;
+        swprintf_s(custom_unattend, MAX_PATH, L"%s\\" ISO_CUSTOM_UNATTEND, custom_dir);
+        swprintf_s(oem, MAX_PATH, L"%s\\" ISO_CUSTOM_OEM, custom_dir);
+        has_custom_unattend = GetFileAttributesW(custom_unattend) != INVALID_FILE_ATTRIBUTES;
+        attrs = GetFileAttributesW(oem);
+        has_custom_oem = attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+        if (has_custom_unattend || has_custom_oem)
+            asb_log(L"The ISO has its own setup:%s%s.",
+                    has_custom_unattend ? L" autounattend.xml" : L"",
+                    has_custom_oem ? L" sources\\$OEM$" : L"");
+    }
+
     /* Generate unattend.xml */
     swprintf_s(file_path, MAX_PATH, L"%s\\unattend.xml", staging);
     if (args->config.is_template) {
@@ -1964,8 +2029,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             goto done;
         }
     } else {
-        if (!generate_unattend_vhdx(file_path, args->config.name, args->config.admin_user,
-                                     args->config.admin_pass, L"en-US")) {
+        if (!write_vm_unattend(args, file_path, L"en-US",
+                               has_custom_unattend ? custom_unattend : NULL)) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, 512, L"Failed to generate unattend.xml");
             goto done;
@@ -1995,12 +2060,18 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         wcscpy_s(args->error_msg, 512, L"Failed to generate staging manifest");
         goto done;
     }
+    if (has_custom_unattend || has_custom_oem) {
+        int n = iso_custom_append_manifest(manifest, custom_dir, args->config.image_path);
+        if (n < 0) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, 512, L"Failed to stage the ISO's own setup files");
+            goto done;
+        }
+        asb_log(L"Staging %d file(s) from the ISO's $OEM$ folder.", n - 1);
+    }
 
-    /* Build iso-patch command line: the Pro edition, not index 1 (Home). */
+    /* Build iso-patch command line */
     {
-        int image_index = windows_pro_image_index(args->config.image_path);
-        asb_log(L"Windows image: using index %d of the ISO%s.", image_index,
-                image_index == 1 ? L" (no plain Pro edition found, or not an ISO)" : L" (Pro)");
         swprintf_s(cmdline, 2048,
             L"\"%s\\iso-patch.exe\" --to-vhdx \"%s\" %d %lu --output \"%s\" --stage \"%s\"",
             exe_dir, args->config.image_path, image_index, args->config.hdd_gb,
@@ -2084,9 +2155,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                 wchar_t stg[MAX_PATH];
                                 swprintf_s(stg, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
                                 swprintf_s(unattend_path, MAX_PATH, L"%s\\unattend.xml", stg);
-                                generate_unattend_vhdx(unattend_path, args->config.name,
-                                                        args->config.admin_user, args->config.admin_pass,
-                                                        args->language);
+                                write_vm_unattend(args, unattend_path, args->language,
+                                                  has_custom_unattend ? custom_unattend : NULL);
                             }
                         } else if (strncmp(line, "DONE:", 5) == 0) {
                             args->result = S_OK;
