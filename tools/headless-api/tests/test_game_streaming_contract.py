@@ -59,6 +59,11 @@ def main() -> None:
     for leftover in ("sunshine_state.json", "credentials", "webui.txt"):
         assert leftover in agent
     assert "/generalize" in agent
+    # Sysprep never stops at a dialog nobody can see, and apps it would refuse are removed first.
+    assert "'/generalize','/oobe','/shutdown','/quiet','/mode:vm'" in agent
+    image_ps = agent[agent.index("SESSION_IMAGE_PS[]"):agent.index("session_image_thread")]
+    assert image_ps.index("Remove-AppxPackage -Package $a.PackageFullName -AllUsers") < image_ps.index("St 'sysprep'")
+    assert "$prov -notcontains $_.Name" in image_ps and "if($prov.Count){" in image_ps
     # A failed refresh leaves the working image in place.
     assert "wcscpy_s(g_image, MAX_PATH, base)" in gs
     # A build VM that stops is noticed at once, not after the waits time out.
