@@ -685,8 +685,11 @@ static void load_vm_list(void)
         if (in_settings) {
             if (wcsncmp(line, L"LastIsoPath=", 12) == 0)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
-            else if (wcsncmp(line, L"LastStorageParent=", 18) == 0)
-                wcscpy_s(g_last_storage_parent, MAX_PATH, line + 18);
+            else if (wcsncmp(line, L"LastStorageParent=", 18) == 0) {
+                /* 0.1.7.14 and earlier saved Game Streaming's own folder here. */
+                if (!wcsstr(line + 18, L"\\GameStreaming\\sessions"))
+                    wcscpy_s(g_last_storage_parent, MAX_PATH, line + 18);
+            }
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
             else if (wcsncmp(line, L"LastSandboxVm=", 14) == 0)
@@ -975,11 +978,13 @@ static HRESULT validate_storage_parent(const wchar_t *parent, DWORD hdd_gb,
     return S_OK;
 }
 
-static void remember_storage_parent(const wchar_t *root)
+/* Game Streaming's duplicates live in its own folder, which isn't a place to suggest
+   for the user's next VM. */
+static void remember_storage_parent(const VmInstance *inst)
 {
     wchar_t parent[MAX_PATH], *slash;
-    if (!root || !root[0]) return;
-    wcscpy_s(parent, MAX_PATH, root);
+    if (!inst || inst->session_clone || !inst->storage_root[0]) return;
+    wcscpy_s(parent, MAX_PATH, inst->storage_root);
     slash = wcsrchr(parent, L'\\');
     if (slash) { *slash = L'\0'; wcscpy_s(g_last_storage_parent, MAX_PATH, parent); }
 }
@@ -2298,7 +2303,7 @@ done:
                 }
                 LeaveCriticalSection(&g_cs);
 
-                if (!inst->is_template) remember_storage_parent(inst->storage_root);
+                if (!inst->is_template) remember_storage_parent(inst);
                 hcs_start_monitor(inst);
                 if (inst->is_template) {
                     asb_log(L"Template \"%s\" building (sysprep will shut down when ready).", inst->name);
@@ -2310,7 +2315,7 @@ done:
                 save_vm_list();
             } else if (args->vhdx_created) {
                 LeaveCriticalSection(&g_cs);
-                if (!inst->is_template) remember_storage_parent(inst->storage_root);
+                if (!inst->is_template) remember_storage_parent(inst);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
                 if (args->result == (HRESULT)0x800705AF)
@@ -3920,7 +3925,7 @@ done:
                 }
                 LeaveCriticalSection(&g_cs);
 
-                remember_storage_parent(inst->storage_root);
+                remember_storage_parent(inst);
                 hcs_start_monitor(inst);
                 vm_agent_start(inst);
                 idd_probe_start(inst);
@@ -3929,7 +3934,7 @@ done:
                 save_vm_list();
             } else if (args->vhdx_created) {
                 LeaveCriticalSection(&g_cs);
-                remember_storage_parent(inst->storage_root);
+                remember_storage_parent(inst);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
                 if (args->result == (HRESULT)0x800705AF)
@@ -4702,7 +4707,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     g_vm_count++;
 
     if (!is_template_create)
-        remember_storage_parent(inst->storage_root);
+        remember_storage_parent(inst);
 
     if (!is_template_create)
         vm_save_state_json(cfg.vhdx_path, FALSE);
