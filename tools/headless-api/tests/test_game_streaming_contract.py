@@ -218,6 +218,22 @@ def main() -> None:
     assert "stream_run(vars, stream_pin_ps, 60000" in agent
     assert "vm_agent_send(vm, cmd, reply, sizeof(reply), 70000)" in read("src/backend_win/vm_stream.c")
 
+    # A duplicate shut down from inside is kept 30 minutes and can be started again from
+    # the dashboard; it's deleted after that, or on End session, as before.
+    gs = read("src/backend_win/game_stream.c")
+    assert "#define GS_KEEP_STOPPED_MIN  30" in gs
+    thread = gs[gs.index("static DWORD WINAPI session_thread"):gs.index("static int find_session")]
+    assert "if (!vm->running) goto stopped;" in thread
+    stopped = thread[thread.index("\nstopped:"):thread.index("\nwait_to_clean:")]
+    assert 'session_state(slot, "stopped"' in stopped and "goto cleanup;" in stopped
+    assert "asb_vm_start_ex(asb_vm_find(s->vm_name)" in stopped and "goto watch;" in stopped
+    assert "seen_user = FALSE;" in stopped and "(anyone || !seen_user) ? 0 : signed_out + 1" in thread
+    assert 'strcmp(g_sessions[slot].state, "stopped") == 0' in gs
+    web = read("src/backend_win/vm_web.c")
+    assert 'strcmp(path, "/api/app/session/resume") == 0' in web
+    assert web.index("/api/app/session/resume") > web.index("/api/app/session\"") if "/api/app/session\"" in web else True
+    assert 'id="btn-resume"' in read("web/dash.html") and "api('/api/app/session/resume'" in dash
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")

@@ -2064,6 +2064,12 @@ static void dashboard_api(WebConn *c, const char *path, BOOL post, const char *h
     } else if (post && strcmp(path, "/api/app/session/end") == 0) {
         game_stream_session_end(user);
         http_reply(c, "200 OK", "application/json", NULL, "{\"ok\":true}", 11);
+    } else if (post && strcmp(path, "/api/app/session/resume") == 0) {
+        if (FAILED(game_stream_session_resume(user))) {
+            http_text(c, "409 Conflict", "Your VM isn't waiting to be started again.");
+            return;
+        }
+        http_reply(c, "200 OK", "application/json", NULL, "{\"ok\":true}", 11);
     } else if (post && strcmp(path, "/api/app/session/pair") == 0) {
         if (FAILED(game_stream_session_pair(user, body, message, sizeof(message)))) {
             http_text(c, "409 Conflict", message[0] ? message : "Pairing failed. Check the PIN and try again from Moonlight.");

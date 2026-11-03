@@ -181,7 +181,9 @@ function renderSession(s) {
   $('session-error').textContent = s.state === 'failed' ? s.detail : '';
   $('session-detail').textContent = s.state === 'starting' ? s.detail + '...'
     : s.state === 'ending' ? 'Removing your VM...'
-    : ready ? 'Your VM is ready.' : '';
+    : s.state === 'stopped' ? s.detail
+    : ready ? (s.detail || 'Your VM is ready.') : '';
+  $('btn-resume').hidden = s.state !== 'stopped';
   $('btn-end').textContent = s.state === 'failed' ? 'Start over' : 'End session';
   $('btn-end').hidden = s.state === 'ending';
   renderMode(ready);
@@ -219,6 +221,12 @@ $('btn-switch').addEventListener('click', () => {
   sessionMode = sessionMode === 'browser' ? 'moonlight' : 'browser';
   autoOpened = true;
   renderMode(true);
+});
+$('btn-resume').addEventListener('click', async () => {
+  $('btn-resume').disabled = true;
+  await api('/api/app/session/resume', '').catch(() => {});
+  $('btn-resume').disabled = false;
+  poll();
 });
 $('btn-end').addEventListener('click', async () => {
   $('btn-end').disabled = true;

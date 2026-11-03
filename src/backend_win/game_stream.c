@@ -31,6 +31,7 @@
 #define GS_SIGNIN_MS         (6ull * 60ull * 1000ull)
 #define GS_SIGNED_OUT_POLLS  3        /* of GS_WATCH_MS each, before a session counts as over */
 #define GS_WATCH_MS          10000
+#define GS_KEEP_STOPPED_MIN  30       /* a duplicate shut down from inside waits this long to be started again */
 #define GS_CATALOG_MAX       (4u * 1024u * 1024u)
 #define GS_IDENTITY_MAX      (1024u * 1024u)
 #define GS_IDENTITY_PIECE    1000     /* bytes per command; base64 stays well under the agent's limit */
@@ -46,9 +47,10 @@ typedef struct {
     wchar_t   image[MAX_PATH];        /* the image dir this duplicate's disk depends on */
     char      item[128];
     char      mode[16];
-    char      state[16];              /* starting, ready, ending, failed */
+    char      state[16];              /* starting, ready, stopped, ending, failed */
     char      detail[300];
     volatile LONG stop;
+    volatile LONG resume;             /* the user asked to start a stopped duplicate again */
 } GsSession;
 
 typedef struct {
@@ -1033,6 +1035,7 @@ static DWORD WINAPI session_thread(LPVOID param)
 {
     GsStart *start = (GsStart *)param;
     int slot = start->slot, signed_out = 0;
+    BOOL seen_user = TRUE;            /* signed in when the session became ready */
     GsSession *s = &g_sessions[slot];
     AsbVmConfig config;
     VmInstance *vm, *source;
@@ -1170,13 +1173,16 @@ static DWORD WINAPI session_thread(LPVOID param)
     session_state(slot, "ready", "");
     ui_log(L"Game Streaming: \"%s\" is ready for %s.", s->vm_name, s->user);
 
+watch:
     idle_since = GetTickCount64();
+    signed_out = 0;
     for (;;) {
         ULONGLONG now;
         if (InterlockedCompareExchange(&s->stop, 0, 0) || g_shutting_down) break;
         Sleep(GS_WATCH_MS);
         vm = asb_find_vm_by_id(id);
-        if (!vm || !vm->running) break;
+        if (!vm) break;
+        if (!vm->running) goto stopped;
         now = GetTickCount64();
         if (vm_web_connected(id) || now - vm_stream_last_activity(id) < 30000)
             idle_since = now;
@@ -1186,12 +1192,54 @@ static DWORD WINAPI session_thread(LPVOID param)
         }
         /* The user's own sign-out ends the session. */
         if (vm->agent_online && !vm->agent_initializing) {
-            console_user(vm, s->user, &anyone);
-            signed_out = anyone ? 0 : signed_out + 1;
+            /* Started again, it waits at the sign-in screen until they sign in. */
+            if (console_user(vm, s->user, &anyone)) seen_user = TRUE;
+            signed_out = (anyone || !seen_user) ? 0 : signed_out + 1;
             if (signed_out >= GS_SIGNED_OUT_POLLS) break;
         }
     }
     goto cleanup;
+
+stopped:
+    /* Shut down from inside: kept a while in case they want it back. */
+    ui_log(L"Game Streaming: \"%s\" was shut down. It's kept for %d min in case %s starts it again.",
+           s->vm_name, GS_KEEP_STOPPED_MIN, s->user);
+    sprintf_s(reply, sizeof(reply), "Your VM was shut down. Start it again within %d minutes, or it's removed.",
+              GS_KEEP_STOPPED_MIN);
+    session_state(slot, "stopped", reply);
+    InterlockedExchange(&s->resume, 0);
+    deadline = GetTickCount64() + (ULONGLONG)GS_KEEP_STOPPED_MIN * 60000ull;
+    while (!InterlockedExchange(&s->resume, 0)) {
+        if (InterlockedCompareExchange(&s->stop, 0, 0) || g_shutting_down) goto cleanup;
+        if (GetTickCount64() > deadline) {
+            ui_log(L"Game Streaming: removing \"%s\": it was shut down %d min ago.", s->vm_name, GS_KEEP_STOPPED_MIN);
+            goto cleanup;
+        }
+        Sleep(1000);
+    }
+    session_state(slot, "starting", "Starting your VM");
+    hr = asb_vm_start_ex(asb_vm_find(s->vm_name), -1, -1, NULL, TRUE);
+    if (FAILED(hr)) {
+        sprintf_s(reply, sizeof(reply), "Your VM couldn't start again (0x%08X).", hr);
+        session_failed(slot, reply);
+        goto wait_to_clean;
+    }
+    ui_log(L"Game Streaming: started \"%s\" again for %s.", s->vm_name, s->user);
+    deadline = GetTickCount64() + GS_START_TIMEOUT_MS;
+    for (;;) {
+        if (InterlockedCompareExchange(&s->stop, 0, 0) || g_shutting_down) goto cleanup;
+        vm = asb_find_vm_by_id(id);
+        if (!vm) goto cleanup;
+        if (vm->agent_online && !vm->agent_initializing) break;
+        if (!vm->running || GetTickCount64() > deadline) {
+            session_failed(slot, "Your VM didn't start again.");
+            goto wait_to_clean;
+        }
+        Sleep(2000);
+    }
+    seen_user = FALSE;
+    session_state(slot, "ready", "Sign in to Windows again.");
+    goto watch;
 
 wait_to_clean:
     /* Keep the failure on the dashboard until they've seen it. */
@@ -1356,6 +1404,20 @@ HRESULT game_stream_session_end(const wchar_t *user)
     if (slot >= 0) InterlockedExchange(&g_sessions[slot].stop, 1);
     ReleaseSRWLockShared(&g_lock);
     return slot >= 0 ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+HRESULT game_stream_session_resume(const wchar_t *user)
+{
+    int slot;
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    AcquireSRWLockShared(&g_lock);
+    slot = find_session(user);
+    if (slot >= 0 && strcmp(g_sessions[slot].state, "stopped") == 0) {
+        InterlockedExchange(&g_sessions[slot].resume, 1);
+        hr = S_OK;
+    }
+    ReleaseSRWLockShared(&g_lock);
+    return hr;
 }
 
 HRESULT game_stream_end_session_of_vm(const wchar_t *vm_name)

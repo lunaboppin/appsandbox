@@ -79,6 +79,8 @@ int game_stream_session_json(const wchar_t *user, char *out, int cap);
 HRESULT game_stream_session_start(const char *token, const wchar_t *user, const char *mode, const char *item,
                                   const wchar_t *password, char *message, int message_cap);
 HRESULT game_stream_session_end(const wchar_t *user);
+/* Starts a session's VM again after it was shut down (state "stopped"). */
+HRESULT game_stream_session_resume(const wchar_t *user);
 HRESULT game_stream_session_pair(const wchar_t *user, const char *pin, char *message, int message_cap);
 /* The VM of this user's ready session, or 0. */
 UINT64 game_stream_session_vm(const wchar_t *user, char *name, size_t name_chars);
