@@ -161,6 +161,24 @@ def main() -> None:
     assert "if (!inst || inst->session_clone || !inst->storage_root[0]) return;" in core
     assert r'if (!wcsstr(line + 18, L"\\GameStreaming\\sessions"))' in core
 
+    # Sessions get the network and drives chosen for Game Streaming, not the nominated
+    # VM's: a VPN routes their traffic, and the relay reaches them on the host's
+    # address on the VPN network. A VPN deleted since falls back to NAT.
+    stream = read("src/backend_win/vm_stream.c")
+    assert "config.network_mode = vpn[0] ? ASB_NET_VPN : ASB_NET_NAT;" in gs
+    assert "config.shared_resource_exclusions = drives_off;" in gs
+    assert "if (vpn[0] && !vpn_configs_find(vpn, NULL))" in gs
+    assert 'wcsspn(drives_off, L"0123456789abcdefABCDEF-{},")' in gs
+    assert 'L"GameStreamVpn=%s' in gs and 'L"GameStreamDrivesOff=%s' in gs
+    assert "vm->network_mode == NET_VPN ? vm->vpn_ip" in stream
+    assert 'sprintf_s(allowed, sizeof(allowed), "%s.1", hcn_vpn_subnet_base());' in stream
+    assert 'json_get_string(json, L"drivesOff"' in ui and 'json_get_string(body, L"drivesOff"' in headless
+    assert 'id="gs-vpn"' in html and 'id="gs-drives"' in html and "drivesOff:" in js
+    # The disc that set a duplicate up leaves This PC once its user is signed in.
+    signed_in = agent[agent.index('strcmp(cmd, "session_signed_in") == 0'):]
+    assert "session_hide_setup_disc();" in signed_in[:300]
+    assert '_wcsicmp(label, L"APPSETUP") != 0' in agent and "DeleteVolumeMountPointW(root)" in agent
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")

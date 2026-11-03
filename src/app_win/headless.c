@@ -872,14 +872,14 @@ static int handle_request(PHTTP_REQUEST req)
 
     /* ---- /v1/game-streaming ----
          GET  /v1/game-streaming
-         POST /v1/game-streaming        {vm, maxSessions, idleMinutes, group, lan}
+         POST /v1/game-streaming        {vm, maxSessions, idleMinutes, group, lan, vpn, drivesOff}
          POST /v1/game-streaming/image  build or refresh the image
          POST /v1/game-streaming/off    end every session and delete the image */
     if (wcscmp(path, L"/v1/game-streaming") == 0 || wcsncmp(path, L"/v1/game-streaming/", 19) == 0) {
         wchar_t message[512] = L"";
         HRESULT hr = S_OK;
         if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming") == 0) {
-            wchar_t body[1024] = L"", vm[256] = L"", group[65] = L"";
+            wchar_t body[4096] = L"", vm[256] = L"", group[65] = L"", vpn[40] = L"", drives_off[1024] = L"";
             int max_sessions = 2, idle = 30;
             BOOL lan = FALSE;
             body_to_wide(req, body, _countof(body));
@@ -888,7 +888,9 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_int(body, L"maxSessions", &max_sessions);
             json_get_int(body, L"idleMinutes", &idle);
             json_get_bool(body, L"lan", &lan);
-            hr = game_stream_configure(vm, max_sessions, idle, group, lan, message, _countof(message));
+            json_get_string(body, L"vpn", vpn, _countof(vpn));
+            json_get_string(body, L"drivesOff", drives_off, _countof(drives_off));
+            hr = game_stream_configure(vm, max_sessions, idle, group, lan, vpn, drives_off, message, _countof(message));
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/image") == 0) {
             hr = game_stream_build_image(message, _countof(message));
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/off") == 0) {

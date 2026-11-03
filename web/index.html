@@ -446,6 +446,12 @@
                     <input id="gs-idle" type="number" min="0" max="1440" value="30">
                     <label for="gs-group">Only this domain group:</label>
                     <input id="gs-group" maxlength="64" spellcheck="false" placeholder="Any domain user">
+                    <label for="gs-vpn">Network:</label>
+                    <select id="gs-vpn"></select>
+                </div>
+                <div id="gs-drives-row" style="margin:8px 0 10px">
+                    <span>Drives on each session:</span>
+                    <div id="gs-drives"></div>
                 </div>
                 <label class="manage-check"><input type="checkbox" id="gs-lan"> Allow other devices (private and domain networks, over HTTPS)</label>
                 <small>Each session is a new copy of the nominated VM's saved image. Whoever signs in gets full control of their copy, including everything installed in the image, and anything signed in there, like a launcher account. Sessions run on this PC's memory, CPU and GPU.</small>
