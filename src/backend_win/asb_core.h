@@ -329,6 +329,9 @@ ASB_API HRESULT asb_domain_user_set(const wchar_t *name, const wchar_t *password
 ASB_API HRESULT asb_domain_user_delete(const wchar_t *name, wchar_t *message, size_t message_chars);
 ASB_API HRESULT asb_domain_group_add(const wchar_t *name, wchar_t *message, size_t message_chars);
 ASB_API HRESULT asb_domain_group_delete(const wchar_t *name, wchar_t *message, size_t message_chars);
+/* The domain policy's time zone (Windows id, or empty) and English (UK) formats. */
+ASB_API HRESULT asb_domain_region_set(const wchar_t *time_zone, BOOL uk_formats,
+                                      wchar_t *message, size_t message_chars);
 /* ---- WireGuard VPN configs ---- */
 ASB_API int asb_vpn_config_count(void);
 ASB_API BOOL asb_vpn_config_get(int index, AsbVpnConfigInfo *out);

@@ -365,6 +365,10 @@ static HRESULT save_config_locked(void)
     fwprintf(file, L"RamMB=%lu\n", g_appliance.status.ram_mb);
     fwprintf(file, L"CpuCores=%lu\n", g_appliance.status.cpu_cores);
     fwprintf(file, L"DomainEnabled=%d\n", g_appliance.status.domain_enabled ? 1 : 0);
+    if (g_appliance.status.domain_time_zone[0])
+        fwprintf(file, L"DomainTimeZone=%s\n", g_appliance.status.domain_time_zone);
+    if (g_appliance.status.domain_uk_formats)
+        fwprintf(file, L"DomainUkFormats=1\n");
     fflush(file);
     FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(file)));
     fclose(file);
@@ -550,6 +554,9 @@ static void load_config(void)
         else if (wcsncmp(line, L"RamMB=", 6) == 0) g_appliance.status.ram_mb = _wtoi(line + 6);
         else if (wcsncmp(line, L"CpuCores=", 9) == 0) g_appliance.status.cpu_cores = _wtoi(line + 9);
         else if (wcsncmp(line, L"DomainEnabled=", 14) == 0) g_appliance.status.domain_enabled = _wtoi(line + 14) != 0;
+        else if (wcsncmp(line, L"DomainTimeZone=", 15) == 0)
+            wcsncpy_s(g_appliance.status.domain_time_zone, _countof(g_appliance.status.domain_time_zone), line + 15, _TRUNCATE);
+        else if (wcsncmp(line, L"DomainUkFormats=", 16) == 0) g_appliance.status.domain_uk_formats = _wtoi(line + 16) != 0;
     }
     fclose(file);
     if (g_appliance.status.configured) {
@@ -2974,6 +2981,35 @@ HRESULT shared_appliance_domain_group_delete(const wchar_t *name,
     b64_utf8(name, group_b64, sizeof(group_b64));
     sprintf_s(command, sizeof(command), "domain_group_delete:%s", group_b64);
     return domain_send(command, reply, sizeof(reply), 60000, message, message_chars);
+}
+
+/* The domain's time zone (a Windows id, or empty to leave each VM's alone) and English
+   (UK) formats, as the appliance's "AppSandbox Regional Settings" policy. */
+HRESULT shared_appliance_domain_region_set(const wchar_t *time_zone, BOOL uk_formats,
+                                           wchar_t *message, size_t message_chars)
+{
+    DYNAMIC_TIME_ZONE_INFORMATION tz;
+    char command[256], tz_b64[192], reply[1024];
+    BOOL known = !time_zone || !time_zone[0];
+    DWORD i;
+    HRESULT hr;
+    for (i = 0; !known && EnumDynamicTimeZoneInformation(i, &tz) == ERROR_SUCCESS; i++)
+        known = wcscmp(tz.TimeZoneKeyName, time_zone) == 0;
+    if (!known) {
+        domain_message(message, message_chars, "Choose a time zone from the list.");
+        return E_INVALIDARG;
+    }
+    b64_utf8(time_zone ? time_zone : L"", tz_b64, sizeof(tz_b64));
+    sprintf_s(command, sizeof(command), "domain_region:%s:%d", tz_b64, uk_formats ? 1 : 0);
+    hr = domain_send(command, reply, sizeof(reply), 5ul * 60ul * 1000ul, message, message_chars);
+    if (FAILED(hr)) return hr;
+    EnterCriticalSection(&g_appliance.cs);
+    wcsncpy_s(g_appliance.status.domain_time_zone, _countof(g_appliance.status.domain_time_zone),
+              time_zone ? time_zone : L"", _TRUNCATE);
+    g_appliance.status.domain_uk_formats = uk_formats;
+    save_config_locked();
+    LeaveCriticalSection(&g_appliance.cs);
+    return S_OK;
 }
 
 BOOL shared_appliance_domain_join_command(const char *dc_ip, char *command, size_t chars)

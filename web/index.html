@@ -418,6 +418,18 @@
                     <button type="button" onclick="addDomainGroup()">Add Group</button>
                 </div>
             </fieldset>
+            <fieldset>
+                <legend>Regional settings</legend>
+                <div class="form-grid">
+                    <label for="domain-tz">Time zone:</label>
+                    <select id="domain-tz"></select>
+                </div>
+                <label class="manage-check"><input type="checkbox" id="domain-uk"> English (UK) formats: day/month/year dates and 24-hour time</label>
+                <small>A domain policy applies these to every managed VM, including Game Streaming sessions. Users can't change them. Turning one off leaves VMs as they are.</small>
+                <div class="modal-buttons">
+                    <button type="button" class="primary" onclick="saveDomainRegion()">Save Regional Settings</button>
+                </div>
+            </fieldset>
         </div>
         <div class="modal-buttons">
             <button type="button" onclick="refreshDomain()">Refresh</button>

@@ -11,6 +11,9 @@ Per-group drives: a shared resource may name domain groups. The appliance
 then admits only them (plus the host's service account); managed VMs map it
 per user at sign-in with the user's own credentials, local VMs skip it.
 
+Regional settings: an "AppSandbox Regional Settings" GPO sets the time zone (applied
+by the agent on each VM) and English (UK) formats.
+
 Disposable VMs: turning it on checkpoints the stopped VM; every normal start
 boots a new branch of that checkpoint and deletes the last session's branch.
 """
@@ -56,6 +59,24 @@ def main() -> None:
     assert 'strcmp(cmd, "domain_ensure") == 0' in agent
     assert app.count('"domain_ensure"') == 2                  # after promotion + once per session
     assert "if (!g_domain_ensured) {" in app
+
+    # Regional settings: their own GPO, linked to the domain. The time zone is a value only
+    # the agent reads (Windows has no policy for it), applied when policy changes; English
+    # (UK) formats are the user's locale values with overrides locked.
+    region = agent[agent.index("static const char DOMAIN_REGION_PS[]"):agent.index("static const char *const DOMAIN_ENV[]")]
+    assert "$name='AppSandbox Regional Settings'" in region and "New-GPLink -Name $name" in region
+    assert "-Key $pk -ValueName 'TimeZone' -Type String -Value $tz" in region
+    assert "LocaleName='en-GB'" in region and "sShortDate='dd/MM/yyyy'" in region and "sShortTime='HH:mm'" in region
+    assert "'PreventUserOverrides'" in region
+    assert 'strncmp(cmd, "domain_region:", 14) == 0' in agent
+    assert '"ASB_DOM_TZ", "ASB_DOM_UK"' in agent
+    assert "SetDynamicTimeZoneInformation(&tz)" in agent and "RegNotifyChangeKeyValue(key, TRUE" in agent
+    assert "CreateThread(NULL, 0, policy_time_zone_thread" in agent
+    assert '"domain_region:%s:%d"' in app and "EnumDynamicTimeZoneInformation" in app
+    assert 'L"DomainTimeZone=%s\\n"' in app and 'L"DomainUkFormats=1\\n"' in app
+    assert 'wcscmp(w->action, L"domainRegionSet") == 0' in ui and 'jb_string(&jb, L"domainTimeZone"' in ui
+    assert 'id="domain-tz"' in html and 'id="domain-uk"' in html and "domainSend('domainRegionSet'" in js
+    assert 'L"/v1/domain/region"' in read("src/app_win/headless.c")
 
     # Per-group drives
     assert 'L"Groups=", 7' in res and "out[n].groups" in res
