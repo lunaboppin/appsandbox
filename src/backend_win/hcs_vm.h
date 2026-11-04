@@ -169,6 +169,7 @@ typedef struct {
     DWORD       stream_port;             /* Sunshine base port (47989 + 100 * n) */
     BOOL        stream_software;         /* TRUE = never use the guest GPU to encode */
     BOOL        session_clone;           /* TRUE = Game Streaming duplicate: never saved, deleted when its session ends */
+    BOOL        session_reuse;           /* a kept duplicate: no setup or join, its sign-in takes one restart */
     char        session_logon[1024];     /* the sign-in to set up in the guest; wiped once sent */
     char       *session_identity;        /* commands restoring the user's Sunshine identity, one per line; wiped and freed once sent */
     char        stream_name[32];         /* the name Moonlight shows, when not the VM's */

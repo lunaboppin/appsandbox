@@ -180,10 +180,13 @@ function renderSession(s) {
   $('session-wait').hidden = s.state !== 'starting';
   $('session-error').textContent = s.state === 'failed' ? s.detail : '';
   $('session-detail').textContent = s.state === 'starting' ? s.detail + '...'
-    : s.state === 'ending' ? 'Removing your VM...'
+    : s.state === 'ending' ? (s.detail || 'Removing your VM...')
     : s.state === 'stopped' ? s.detail
     : ready ? (s.detail || 'Your VM is ready.') : '';
   $('btn-resume').hidden = s.state !== 'stopped';
+  $('session-keep').textContent = s.keepDays > 0
+    ? 'Ending the session shuts this VM down and keeps it for your next one. It starts over when the games image is updated, or after ' + s.keepDays + ' days unused. Your Desktop, Documents, Downloads and Pictures are always on your H: drive.'
+    : 'Ending the session deletes this VM. Your Desktop, Documents, Downloads and Pictures stay on your H: drive; anything else you saved in it is lost.';
   $('btn-end').textContent = s.state === 'failed' ? 'Start over' : 'End session';
   $('btn-end').hidden = s.state === 'ending';
   renderMode(ready);
