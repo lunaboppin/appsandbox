@@ -266,6 +266,30 @@ static void vm_agent_send_deploy_key(SOCKET s, VmInstance *vm)
     ui_log(L"Requested SSH key deploy for \"%s\".", vm->name);
 }
 
+/* "disk:<free MB>:<total MB>" from the agent, every few minutes. A full disk breaks
+   a guest in odd ways (the VPN gateway's logging filled its disk unnoticed), so the
+   log and the VM list say so before it gets there: under 10% and under 10 GB free,
+   or under 1 GB free whatever the size. */
+static void disk_report(VmInstance *vm, const char *args)
+{
+    unsigned long long free_mb = 0, total_mb = 0;
+    BOOL low;
+    if (sscanf_s(args, "%llu:%llu", &free_mb, &total_mb) != 2 || !total_mb || free_mb > total_mb)
+        return;
+    low = free_mb < 1024 || (free_mb * 10 < total_mb && free_mb < 10240);
+    vm->disk_free_mb = (DWORD)free_mb;
+    vm->disk_total_mb = (DWORD)total_mb;
+    if (low == vm->disk_low) return;
+    vm->disk_low = low;
+    if (low)
+        ui_log(L"Warning: \"%s\" is running out of disk space: %.1f GB free of %.1f GB. "
+               L"Free some space in it, or make its disk bigger in Manage.",
+               vm->name, free_mb / 1024.0, total_mb / 1024.0);
+    else
+        ui_log(L"\"%s\" has enough disk space again (%.1f GB free).", vm->name, free_mb / 1024.0);
+    notify_agent_status(vm);
+}
+
 /* Process an untagged (async) message from the agent.
    Returns: 0 = handled, 1 = os_shutdown (caller should break),
             2 = service_stopping (caller should break and let the reconnect
@@ -321,6 +345,8 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
     } else if (strncmp(buf, "log:", 4) == 0) {
         ui_log(L"[%s] %S", vm->name, buf + 4);
+    } else if (strncmp(buf, "disk:", 5) == 0) {
+        disk_report(vm, buf + 5);
     } else if (strcmp(buf, "gpu_query") == 0) {
         if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
             char header[64];
@@ -559,6 +585,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         vm->agent_initializing = TRUE;
         vm->agent_online = TRUE;
         vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
+        vm->disk_low = FALSE;    /* the agent's first disk: report warns again if it still is */
         vm->shutdown_requested = FALSE;
         vm->last_heartbeat = GetTickCount64();
         ui_log(L"Agent online for \"%s\".", vm->name);

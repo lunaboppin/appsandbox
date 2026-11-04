@@ -153,6 +153,9 @@ typedef struct {
     volatile BOOL  shutdown_requested;   /* TRUE after graceful shutdown sent */
     ULONGLONG      shutdown_time;        /* GetTickCount64() when shutdown requested */
     volatile ULONGLONG last_heartbeat;   /* GetTickCount64() of last agent heartbeat */
+    DWORD       disk_free_mb;            /* Guest system disk, from the agent's "disk:" report (0 = none yet) */
+    DWORD       disk_total_mb;
+    BOOL        disk_low;                /* Free space is under the warning line */
     HANDLE      idd_probe_thread;        /* Background VDD availability probe */
     volatile BOOL idd_probe_stop;
     char        nat_ip[32];              /* Allocated NAT IP (e.g. "172.20.0.2"), empty if not NAT */

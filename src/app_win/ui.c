@@ -258,6 +258,9 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"running", v->running);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
     jb_bool(jb, L"agentOnline", v->agent_online);
+    jb_bool(jb, L"diskLow", v->running && v->disk_low);
+    jb_int(jb, L"diskFreeMb", (int)v->disk_free_mb);
+    jb_int(jb, L"diskTotalMb", (int)v->disk_total_mb);
     jb_int(jb, L"ramMb", (int)v->ram_mb);
     jb_int(jb, L"hddGb", (int)v->hdd_gb);
     jb_int(jb, L"cpuCores", (int)v->cpu_cores);

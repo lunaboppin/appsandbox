@@ -4776,14 +4776,31 @@ static DWORD appliance_remove_share(const char *share_arg)
     return run_powershell_wait(script, 30000);
 }
 
+/* The system drive's free and total space in MB, for the host's low-disk warning. */
+static void report_disk_space(AsbConn *client)
+{
+    ULARGE_INTEGER free_bytes, total_bytes;
+    wchar_t root[MAX_PATH];
+    char line[96];
+    if (!GetWindowsDirectoryW(root, MAX_PATH) || root[1] != L':') wcscpy_s(root, MAX_PATH, L"C:");
+    root[2] = L'\\';
+    root[3] = 0;
+    if (!GetDiskFreeSpaceExW(root, &free_bytes, &total_bytes, NULL)) return;
+    sprintf_s(line, sizeof(line), "disk:%llu:%llu",
+              free_bytes.QuadPart >> 20, total_bytes.QuadPart >> 20);
+    send_line(client, line);
+}
+
 static void handle_client(AsbConn *client)
 {
     char buf[2048];
     int n;
     DWORD heartbeat_interval = 5000;     /* ms between heartbeats */
     DWORD device_check_interval = 20000; /* ms between VDD/Hyper-V device checks */
+    DWORD disk_check_interval = 5 * 60 * 1000;
     DWORD last_heartbeat;
     DWORD last_device_check;
+    DWORD last_disk_check;
 
     agent_log("Client connected.");
     g_client_sock = client;
@@ -4809,6 +4826,8 @@ static void handle_client(AsbConn *client)
 
     last_heartbeat = GetTickCount();
     last_device_check = last_heartbeat;
+    report_disk_space(client);
+    last_disk_check = last_heartbeat;
 
     /* Persistent connection loop */
     while (WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {
@@ -4835,6 +4854,10 @@ static void handle_client(AsbConn *client)
             ensure_hyperv_video_disabled(client);
             keep_only_appsandbox_display();
             report_idd_status(client, 0);   /* re-report the (possibly self-healed) VDD state; on-change only */
+        }
+        if (now - last_disk_check >= disk_check_interval) {
+            last_disk_check = now;
+            report_disk_space(client);
         }
 
 

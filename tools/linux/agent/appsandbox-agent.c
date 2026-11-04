@@ -454,6 +454,7 @@ static void *heartbeat_thread(void *arg)
 {
     (void)arg;
     int idd_last = 0;   /* last reported display-driver readiness (so we only send on change) */
+    unsigned disk_beats = 0;
     while (!g_stop) {
         /* Sleep first so the very first heartbeat is at +5s, after hello. */
         for (int s = 0; s < HEARTBEAT_INTERVAL_SEC && !g_stop; s++)
@@ -477,6 +478,18 @@ static void *heartbeat_thread(void *arg)
             if (ready != idd_last) {
                 send_line(fd, ready ? "idd_status:ok" : "idd_status:not_found");
                 idd_last = ready;
+            }
+        }
+        /* The root filesystem's free and total MB, for the host's low-disk warning:
+         * after the first beat, then every 5 minutes. */
+        if (disk_beats++ % 60 == 0) {
+            struct statvfs vfs;
+            if (statvfs("/", &vfs) == 0) {
+                char line[96];
+                snprintf(line, sizeof(line), "disk:%llu:%llu",
+                         ((unsigned long long)vfs.f_bavail * vfs.f_frsize) >> 20,
+                         ((unsigned long long)vfs.f_blocks * vfs.f_frsize) >> 20);
+                send_line(fd, line);
             }
         }
     }

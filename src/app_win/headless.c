@@ -286,6 +286,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->install_error);
     pos += sprintf_s(out + pos, cap - pos, ",\"installStatus\":");
     pos = append_wstr(out, cap, pos, v->install_status);
+    pos += sprintf_s(out + pos, cap - pos, ",\"diskLow\":%s,\"diskFreeMb\":%lu,\"diskTotalMb\":%lu",
+                     v->running && v->disk_low ? "true" : "false",
+                     (unsigned long)v->disk_free_mb, (unsigned long)v->disk_total_mb);
     pos += sprintf_s(out + pos, cap - pos, ",\"storageRoot\":");
     pos = append_wstr(out, cap, pos, v->storage_root);
     /* null when nothing is going on, so a client can test it plainly. */
