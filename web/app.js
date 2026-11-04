@@ -1457,6 +1457,9 @@ function updateStatusCell(td, vm) {
     } else if (vm.running) {
         className = 'status-running';
         label = 'Running';
+        if (vm.diskLow)
+            detail = 'Low disk space: ' + (vm.diskFreeMb / 1024).toFixed(1) + ' GB free of ' +
+                     Math.round(vm.diskTotalMb / 1024) + ' GB';
     } else {
         className = 'status-stopped';
         label = 'Stopped';
