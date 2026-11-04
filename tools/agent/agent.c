@@ -2613,9 +2613,10 @@ static void run_domain_script(const char *script, DWORD timeout_ms,
    found. The host sends setup at every agent start, so a port change or a new GPU
    driver takes effect and an install cut short by a reboot finishes. The web UI
    stays on localhost with a random password that only these scripts use. */
-#define STREAM_SUNSHINE_VER  "2026.914.233613"
-#define STREAM_SUNSHINE_URL  "https://github.com/LizardByte/Sunshine/releases/download/v2026.914.233613/Sunshine-Windows-AMD64-installer.msi"
-#define STREAM_SUNSHINE_SHA  "1D7FED8BEECD5889DC7FF14CF9F42D6D38F37C3066C13C6C2A5F4E91847E0CCF"
+/* A pre-release: the first with fp16_sdr_gamma_encoded (see stream_setup_ps). */
+#define STREAM_SUNSHINE_VER  "2026.1103.23515"
+#define STREAM_SUNSHINE_URL  "https://github.com/LizardByte/Sunshine/releases/download/v2026.1103.23515/Sunshine-Windows-AMD64-installer.msi"
+#define STREAM_SUNSHINE_SHA  "40F27770E1C6D5438536CC9AFFCA70599C9235B5BB7A1D312A9760C273DE2984"
 #define STREAM_VIGEM_URL     "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe"
 #define STREAM_VIGEM_SHA     "89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A"
 #define STREAM_SETUP         L"C:\\ProgramData\\AppSandbox\\stream-setup.ps1"
@@ -2773,7 +2774,11 @@ static const char stream_setup_ps[] =
     "  'capture = ddx',\r\n"
     "  'lan_encryption_mode = 1',\r\n"
     "  'wan_encryption_mode = 1',\r\n"
-    "  'dd_configuration_option = disabled'\r\n"
+    "  'dd_configuration_option = disabled',\r\n"
+    /* With a GPU, Windows composes the AppSandbox display's SDR desktop in FP16 that
+       is already sRGB-encoded; Sunshine's default shader encodes it again and the
+       stream looks washed out. The display is never HDR, where this is ignored. */
+    "  'fp16_sdr_gamma_encoded = enabled'\r\n"
     " )\r\n"
     " if($encoder -eq 'software'){ $lines+='encoder = software' }\r\n"
     " Set-Content -Path $cfg -Value $lines -Encoding ascii\r\n"
