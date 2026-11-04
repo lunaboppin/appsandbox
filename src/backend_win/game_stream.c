@@ -18,6 +18,7 @@
 #include <sddl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -51,6 +52,7 @@ typedef struct {
     char      detail[300];
     volatile LONG stop;
     volatile LONG resume;             /* the user asked to start a stopped duplicate again */
+    volatile LONG discard;            /* their data is being deleted: don't keep the VM */
 } GsSession;
 
 typedef struct {
@@ -72,6 +74,7 @@ static BOOL      g_enabled;
 static wchar_t   g_nominated[256];
 static int       g_max_sessions = 2;
 static int       g_idle_minutes = 30;
+static int       g_keep_days = 14;    /* how long a user's VM is kept unused between sessions; 0 = deleted each time */
 static wchar_t   g_group[65];
 static BOOL      g_lan;
 static wchar_t   g_vpn[40];           /* a VPN config's id, or empty for NAT */
@@ -83,6 +86,8 @@ static GsSession g_sessions[GS_MAX_SESSIONS];
 static GsLogin   g_logins[GS_MAX_LOGINS];
 static volatile LONG g_threads;
 static volatile LONG g_shutting_down;
+
+static void kept_sweep(void (*keep)(const wchar_t *name, void *ctx), void *ctx);
 
 static struct {
     volatile LONG busy;
@@ -239,8 +244,8 @@ BOOL game_stream_has_settings(void) { return g_enabled; }
 void game_stream_write_settings(FILE *f)
 {
     if (!g_enabled) return;
-    fwprintf(f, L"GameStreamEnabled=1\nGameStreamVm=%s\nGameStreamMax=%d\nGameStreamIdle=%d\n",
-             g_nominated, g_max_sessions, g_idle_minutes);
+    fwprintf(f, L"GameStreamEnabled=1\nGameStreamVm=%s\nGameStreamMax=%d\nGameStreamIdle=%d\nGameStreamKeepDays=%d\n",
+             g_nominated, g_max_sessions, g_idle_minutes, g_keep_days);
     if (g_group[0]) fwprintf(f, L"GameStreamGroup=%s\n", g_group);
     if (g_lan) fwprintf(f, L"GameStreamLan=1\n");
     if (g_vpn[0]) fwprintf(f, L"GameStreamVpn=%s\n", g_vpn);
@@ -255,6 +260,7 @@ BOOL game_stream_read_setting(const wchar_t *line)
     else if (wcsncmp(line, L"GameStreamVm=", 13) == 0) wcscpy_s(g_nominated, _countof(g_nominated), line + 13);
     else if (wcsncmp(line, L"GameStreamMax=", 14) == 0) g_max_sessions = _wtoi(line + 14);
     else if (wcsncmp(line, L"GameStreamIdle=", 15) == 0) g_idle_minutes = _wtoi(line + 15);
+    else if (wcsncmp(line, L"GameStreamKeepDays=", 19) == 0) g_keep_days = _wtoi(line + 19);
     else if (wcsncmp(line, L"GameStreamGroup=", 16) == 0) wcscpy_s(g_group, _countof(g_group), line + 16);
     else if (wcsncmp(line, L"GameStreamLan=", 14) == 0) g_lan = _wtoi(line + 14) != 0;
     else if (wcsncmp(line, L"GameStreamVpn=", 14) == 0) wcsncpy_s(g_vpn, _countof(g_vpn), line + 14, _TRUNCATE);
@@ -695,6 +701,7 @@ static DWORD WINAPI build_thread(LPVOID param)
         ReleaseSRWLockExclusive(&g_lock);
         asb_save();
         ui_log(L"Game Streaming: the image is ready.");
+        kept_sweep(NULL, NULL);   /* VMs from the old image start over */
     } else {
         /* The old image, if there is one, stays in use. */
         if (image_dir[0]) asb_session_clone_remove_leftover(NULL, image_dir);
@@ -989,10 +996,138 @@ static void user_stream_name(const wchar_t *user, char *out, size_t chars)
     out[pos] = 0;
 }
 
-void game_stream_forget_user(const wchar_t *user)
+/* ---- A user's kept VM ----
+   Each user's duplicate is kept between sessions, stopped, so the next one only boots it.
+   identities\<user>\vm: "<VM name>|<image folder>|<last used, seconds since 1970>". It is
+   deleted when the image changes, after g_keep_days unused, or when it fails to set up. */
+
+static BOOL kept_read(const wchar_t *user, wchar_t *name, size_t name_chars,
+                      wchar_t *image, size_t image_chars, ULONGLONG *last)
+{
+    wchar_t path[MAX_PATH], line[MAX_PATH + 64], *a, *b;
+    FILE *f = NULL;
+    if (!identity_path(user, L"vm", path, MAX_PATH) || _wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f)
+        return FALSE;
+    line[0] = 0;
+    if (!fgetws(line, _countof(line), f)) line[0] = 0;
+    fclose(f);
+    line[wcscspn(line, L"\r\n")] = 0;
+    a = wcschr(line, L'|');
+    b = a ? wcschr(a + 1, L'|') : NULL;
+    if (!a || !b) return FALSE;
+    *a++ = 0;
+    *b++ = 0;
+    if (wcsncmp(line, L"GS-", 3) != 0 || wcslen(line) > 15 || wcspbrk(line, L"\\/.")) return FALSE;
+    wcscpy_s(name, name_chars, line);
+    wcscpy_s(image, image_chars, a);
+    *last = _wcstoui64(b, NULL, 10);
+    return TRUE;
+}
+
+static void kept_write(const wchar_t *user, const wchar_t *name, const wchar_t *image)
 {
     wchar_t path[MAX_PATH];
+    FILE *f = NULL;
+    if (!identity_dirs(user) || !identity_path(user, L"vm", path, MAX_PATH)) return;
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
+    fwprintf(f, L"%s|%s|%llu\n", name, image, (unsigned long long)_time64(NULL));
+    fclose(f);
+}
+
+static void kept_forget(const wchar_t *user)
+{
+    wchar_t path[MAX_PATH];
+    if (identity_path(user, L"vm", path, MAX_PATH)) DeleteFileW(path);
+}
+
+/* Its folder, its computer account and the record. */
+static void kept_remove(const wchar_t *user, const wchar_t *name, const wchar_t *why)
+{
+    wchar_t dir[MAX_PATH];
+    AcquireSRWLockShared(&g_lock);
+    swprintf_s(dir, MAX_PATH, L"%s\\sessions\\%s", g_root, name);
+    ReleaseSRWLockShared(&g_lock);
+    asb_session_clone_remove_leftover(name, dir);
+    shared_appliance_domain_computer_remove(name);
+    kept_forget(user);
+    ui_log(L"Game Streaming: deleted %s's VM \"%s\" (%s).", user, name, why);
+}
+
+/* NULL when the kept VM can start the user's next session, otherwise why not. */
+static const wchar_t *kept_unusable(const wchar_t *name, const wchar_t *image, ULONGLONG last)
+{
+    wchar_t current[MAX_PATH] = L"", disk[MAX_PATH];
+    int days;
+    AcquireSRWLockShared(&g_lock);
+    if (g_image[0]) image_dir_of(g_image, current, MAX_PATH);
+    days = g_keep_days;
+    swprintf_s(disk, MAX_PATH, L"%s\\sessions\\%s\\disk.vhdx", g_root, name);
+    ReleaseSRWLockShared(&g_lock);
+    if (days <= 0) return L"VMs aren't kept between sessions";
+    if (!current[0] || _wcsicmp(image, current) != 0) return L"the games image was refreshed";
+    if ((ULONGLONG)_time64(NULL) > last + (ULONGLONG)days * 86400ull) return L"unused for too long";
+    if (GetFileAttributesW(disk) == INVALID_FILE_ATTRIBUTES) return L"its disk is missing";
+    return NULL;
+}
+
+static BOOL session_active(const wchar_t *user);
+static int find_session(const wchar_t *user);
+
+/* Delete kept VMs that can't be used again; for each one kept, call keep(name). */
+static void kept_sweep(void (*keep)(const wchar_t *name, void *ctx), void *ctx)
+{
+    wchar_t pattern[MAX_PATH], name[32], image[MAX_PATH];
+    WIN32_FIND_DATAW d;
+    HANDLE h;
+    ULONGLONG last;
+    if (!identity_path(NULL, NULL, pattern, MAX_PATH)) return;
+    wcscat_s(pattern, MAX_PATH, L"\\*");
+    h = FindFirstFileW(pattern, &d);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const wchar_t *why;
+        if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || d.cFileName[0] == L'.') continue;
+        if (!kept_read(d.cFileName, name, _countof(name), image, _countof(image), &last)) continue;
+        if (session_active(d.cFileName) || asb_vm_find(name)) { if (keep) keep(name, ctx); continue; }
+        why = kept_unusable(name, image, last);
+        if (why) kept_remove(d.cFileName, name, why);
+        else if (keep) keep(name, ctx);
+    } while (FindNextFileW(h, &d) && !g_shutting_down);
+    FindClose(h);
+}
+
+static DWORD WINAPI kept_sweep_thread(LPVOID param)
+{
+    (void)param;
+    kept_sweep(NULL, NULL);
+    prune_images();
+    InterlockedDecrement(&g_threads);
+    return 0;
+}
+
+/* Deleting can wait on the domain controller: not on the caller's thread. */
+static void kept_sweep_later(void)
+{
+    HANDLE t;
+    InterlockedIncrement(&g_threads);
+    t = CreateThread(NULL, 0, kept_sweep_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    else InterlockedDecrement(&g_threads);
+}
+
+void game_stream_forget_user(const wchar_t *user)
+{
+    wchar_t path[MAX_PATH], name[32], image[MAX_PATH];
+    ULONGLONG last;
+    int slot;
+    /* Its session ends without keeping the VM. */
+    AcquireSRWLockShared(&g_lock);
+    slot = find_session(user);
+    if (slot >= 0) InterlockedExchange(&g_sessions[slot].discard, 1);
+    ReleaseSRWLockShared(&g_lock);
     game_stream_session_end(user);
+    if (kept_read(user, name, _countof(name), image, _countof(image), &last))
+        kept_remove(user, name, L"the user's Game Streaming data was deleted");
     if (identity_path(user, NULL, path, MAX_PATH) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
         asb_session_clone_remove_leftover(NULL, path);
         ui_log(L"Game Streaming: deleted %s's Moonlight identity.", user);
@@ -1036,6 +1171,10 @@ static DWORD WINAPI session_thread(LPVOID param)
     GsStart *start = (GsStart *)param;
     int slot = start->slot, signed_out = 0;
     BOOL seen_user = TRUE;            /* signed in when the session became ready */
+    BOOL reuse = FALSE, ready_once = FALSE, keep;
+    int keep_days;
+    wchar_t image_dir[MAX_PATH], kept_name[32], kept_image[MAX_PATH];
+    ULONGLONG kept_last;
     GsSession *s = &g_sessions[slot];
     AsbVmConfig config;
     VmInstance *vm, *source;
@@ -1055,6 +1194,7 @@ static DWORD WINAPI session_thread(LPVOID param)
     wcscpy_s(nominated, _countof(nominated), g_nominated);
     lan = g_lan;
     idle_minutes = g_idle_minutes;
+    keep_days = g_keep_days;
     wcscpy_s(vpn, _countof(vpn), g_vpn);
     wcscpy_s(drives_off, _countof(drives_off), g_drives_off);
     ReleaseSRWLockShared(&g_lock);
@@ -1072,7 +1212,20 @@ static DWORD WINAPI session_thread(LPVOID param)
         software = source->stream_software;
     }
 
-    session_state(slot, "starting", "Creating your VM");
+    image_dir_of(base, image_dir, MAX_PATH);
+    /* Their VM from last time, if it can still be used; otherwise a new one. */
+    if (kept_read(s->user, kept_name, _countof(kept_name), kept_image, _countof(kept_image), &kept_last)) {
+        const wchar_t *why = kept_unusable(kept_name, kept_image, kept_last);
+        if (!why && !asb_vm_find(kept_name)) {
+            reuse = TRUE;
+            AcquireSRWLockExclusive(&g_lock);
+            wcscpy_s(s->vm_name, _countof(s->vm_name), kept_name);
+            ReleaseSRWLockExclusive(&g_lock);
+        } else {
+            kept_remove(s->user, kept_name, why ? why : L"it's in use");
+        }
+    }
+    session_state(slot, "starting", reuse ? "Starting your VM" : "Creating your VM");
     CreateDirectoryW(sessions, NULL);
     if (!shared_appliance_domain_autologon_command(s->user, start->password, logon, sizeof(logon))) {
         session_failed(slot, "Your sign-in can't be used to start a VM.");
@@ -1095,7 +1248,9 @@ static DWORD WINAPI session_thread(LPVOID param)
     config.domain_member = TRUE;
     config.session_clone = TRUE;
     config.session_logon = logon;
-    identity = identity_commands(s->user);
+    config.session_reuse = reuse;
+    /* A kept VM still has the user's Sunshine identity. */
+    identity = reuse ? NULL : identity_commands(s->user);
     user_stream_name(s->user, stream_name, sizeof(stream_name));
     config.session_identity = identity;
     config.stream_name = stream_name;
@@ -1110,8 +1265,11 @@ static DWORD WINAPI session_thread(LPVOID param)
     if (FAILED(hr)) {
         sprintf_s(reply, sizeof(reply), "The VM couldn't be created (0x%08X).", hr);
         session_failed(slot, reply);
+        if (reuse) kept_remove(s->user, s->vm_name, L"it couldn't start");
+        reuse = FALSE;
         goto cleanup;
     }
+    if (keep_days > 0) kept_write(s->user, s->vm_name, image_dir);
     vm = asb_vm_instance(asb_vm_find(s->vm_name));
     if (!vm) { session_failed(slot, "The VM couldn't be created."); goto cleanup; }
     id = vm->unique_id;
@@ -1124,7 +1282,7 @@ static DWORD WINAPI session_thread(LPVOID param)
         ui_log(L"Game Streaming: browser view isn't available for \"%s\": %s", s->vm_name, err);
 
     /* Setup, the domain join and its restart, then the sign-in. */
-    session_state(slot, "starting", "Setting up Windows");
+    session_state(slot, "starting", reuse ? "Starting Windows" : "Setting up Windows");
     deadline = GetTickCount64() + GS_START_TIMEOUT_MS;
     signin_since = 0;
     for (;;) {
@@ -1145,7 +1303,7 @@ static DWORD WINAPI session_thread(LPVOID param)
         }
         if (vm->agent_online && !vm->agent_initializing) {
             if (console_user(vm, s->user, &anyone)) break;
-            session_state(slot, "starting", vm->session_logon[0] ? "Setting up Windows" : "Joining the domain and signing you in");
+            session_state(slot, "starting", reuse ? "Signing you in" : vm->session_logon[0] ? "Setting up Windows" : "Joining the domain and signing you in");
             /* The boot's sign-in is long over by now if it was going to happen. */
             if (!vm->session_logon[0]) {
                 if (!signin_since) signin_since = GetTickCount64();
@@ -1171,6 +1329,7 @@ static DWORD WINAPI session_thread(LPVOID param)
         if (vm) vm_agent_send(vm, cmd, reply, sizeof(reply), 15000);
     }
     session_state(slot, "ready", "");
+    ready_once = TRUE;
     ui_log(L"Game Streaming: \"%s\" is ready for %s.", s->vm_name, s->user);
 
 watch:
@@ -1204,7 +1363,9 @@ stopped:
     /* Shut down from inside: kept a while in case they want it back. */
     ui_log(L"Game Streaming: \"%s\" was shut down. It's kept for %d min in case %s starts it again.",
            s->vm_name, GS_KEEP_STOPPED_MIN, s->user);
-    sprintf_s(reply, sizeof(reply), "Your VM was shut down. Start it again within %d minutes, or it's removed.",
+    sprintf_s(reply, sizeof(reply), keep_days > 0
+              ? "Your VM was shut down. Start it again within %d minutes, or the session ends and it's kept for next time."
+              : "Your VM was shut down. Start it again within %d minutes, or it's removed.",
               GS_KEEP_STOPPED_MIN);
     session_state(slot, "stopped", reply);
     InterlockedExchange(&s->resume, 0);
@@ -1252,14 +1413,34 @@ cleanup:
     SecureZeroMemory(start->password, sizeof(start->password));
     SecureZeroMemory(logon, sizeof(logon));
     free(start);
-    session_state(slot, "ending", "");
+    /* Kept for next time once it has worked: a new VM that never got ready is deleted. */
+    keep = id && keep_days > 0 && (reuse || ready_once) && !InterlockedCompareExchange(&s->discard, 0, 0);
+    session_state(slot, "ending", keep ? "Shutting down your VM. It's kept for your next session." : "");
     if (id) {
         vm = asb_find_vm_by_id(id);
         if (vm) vm_web_set(vm, FALSE, FALSE, NULL, 0);
-        asb_session_clone_delete(id);
+        if (keep && vm && vm->running) {
+            AsbVm handle = asb_vm_find(s->vm_name);
+            asb_vm_shutdown(handle);
+            if (FAILED(asb_vm_wait_stopped(handle, g_shutting_down ? 45000 : 180000))) {
+                ui_log(L"Game Streaming: \"%s\" didn't shut down, so it's turned off.", s->vm_name);
+                asb_vm_stop(handle);
+                asb_vm_wait_stopped(handle, 30000);
+            }
+        }
+        if (keep && SUCCEEDED(asb_session_clone_release(id))) {
+            kept_write(s->user, s->vm_name, image_dir);
+            ui_log(L"Game Streaming: kept \"%s\" for %s's next session.", s->vm_name, s->user);
+        } else {
+            keep = FALSE;
+            asb_session_clone_delete(id);
+        }
     }
-    if (SUCCEEDED(shared_appliance_domain_computer_remove(s->vm_name)))
-        ui_log(L"Game Streaming: removed \"%s\" and its computer account.", s->vm_name);
+    if (!keep) {
+        kept_forget(s->user);
+        if (SUCCEEDED(shared_appliance_domain_computer_remove(s->vm_name)))
+            ui_log(L"Game Streaming: removed \"%s\" and its computer account.", s->vm_name);
+    }
     AcquireSRWLockExclusive(&g_lock);
     ZeroMemory(s, sizeof(*s));
     ReleaseSRWLockExclusive(&g_lock);
@@ -1274,6 +1455,15 @@ static int find_session(const wchar_t *user)
     for (i = 0; i < GS_MAX_SESSIONS; i++)
         if (g_sessions[i].used && _wcsicmp(g_sessions[i].user, user) == 0) return i;
     return -1;
+}
+
+static BOOL session_active(const wchar_t *user)
+{
+    int slot;
+    AcquireSRWLockShared(&g_lock);
+    slot = find_session(user);
+    ReleaseSRWLockShared(&g_lock);
+    return slot >= 0;
 }
 
 static void utf8_message(char *message, int cap, const char *text)
@@ -1491,6 +1681,9 @@ int game_stream_session_json(const wchar_t *user, char *out, int cap)
     pos = json_append_utf8(out, cap, pos, "mode", copy.mode);
     pos += sprintf_s(out + pos, cap - pos, ",");
     pos = json_append_wide(out, cap, pos, "vm", copy.vm_name);
+    AcquireSRWLockShared(&g_lock);
+    pos += sprintf_s(out + pos, cap - pos, ",\"keepDays\":%d", g_keep_days);
+    ReleaseSRWLockShared(&g_lock);
     vm = copy.vm_id ? asb_find_vm_by_id(copy.vm_id) : NULL;
     if (vm && strcmp(copy.state, "ready") == 0) {
         pos += sprintf_s(out + pos, cap - pos, ",\"moonlightKnown\":%s,\"moonlightPort\":%lu,\"moonlightAddresses\":[",
@@ -1507,7 +1700,7 @@ int game_stream_session_json(const wchar_t *user, char *out, int cap)
 
 /* ---- Admin ---- */
 
-HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle_minutes,
+HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle_minutes, int keep_days,
                               const wchar_t *group, BOOL lan, const wchar_t *vpn_id,
                               const wchar_t *drives_off, wchar_t *err, size_t err_chars)
 {
@@ -1531,6 +1724,10 @@ HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle
     if (max_sessions < 1 || max_sessions > GS_MAX_SESSIONS || idle_minutes < 0 || idle_minutes > 24 * 60 ||
         (group && wcslen(group) > 64)) {
         if (err) swprintf_s(err, err_chars, L"Sessions must be 1 to %d, and the idle time 0 to 1440 minutes.", GS_MAX_SESSIONS);
+        return E_INVALIDARG;
+    }
+    if (keep_days < 0 || keep_days > 365) {
+        if (err) wcsncpy_s(err, err_chars, L"Keep VMs for 0 to 365 days.", _TRUNCATE);
         return E_INVALIDARG;
     }
     if (vpn_id && vpn_id[0] && !vpn_configs_find(vpn_id, NULL)) {
@@ -1560,6 +1757,7 @@ HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle
     wcscpy_s(g_nominated, _countof(g_nominated), vm_name);
     g_max_sessions = max_sessions;
     g_idle_minutes = idle_minutes;
+    g_keep_days = keep_days;
     wcsncpy_s(g_group, _countof(g_group), group ? group : L"", _TRUNCATE);
     g_lan = lan;
     wcsncpy_s(g_vpn, _countof(g_vpn), vpn_id ? vpn_id : L"", _TRUNCATE);
@@ -1572,6 +1770,7 @@ HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle
     hr = vm_web_dashboard_set(TRUE, lan, message, _countof(message));
     if (FAILED(hr) && err) wcsncpy_s(err, err_chars, message, _TRUNCATE);
     asb_save();
+    kept_sweep_later();   /* the new limit may end some */
     if (changed_vm) prune_images();
     return hr;
 }
@@ -1637,7 +1836,7 @@ int game_stream_status_json(char *out, int cap)
     GsSession copy[GS_MAX_SESSIONS];
     wchar_t nominated[256], group[65], phase[160], error[400], vpn[40], drives_off[1024];
     BOOL enabled, lan, image;
-    int max_sessions, idle;
+    int max_sessions, idle, keep_days;
 
     if (catalog) {
         for (p = catalog; (p = strstr(p, "\"id\":\"")) != NULL; p += 6) games++;
@@ -1649,6 +1848,7 @@ int game_stream_status_json(char *out, int cap)
     image = g_image[0] != 0;
     max_sessions = g_max_sessions;
     idle = g_idle_minutes;
+    keep_days = g_keep_days;
     wcscpy_s(nominated, _countof(nominated), g_nominated);
     wcscpy_s(group, _countof(group), g_group);
     wcscpy_s(vpn, _countof(vpn), g_vpn);
@@ -1658,8 +1858,8 @@ int game_stream_status_json(char *out, int cap)
     memcpy(copy, g_sessions, sizeof(copy));
     ReleaseSRWLockShared(&g_lock);
 
-    pos += sprintf_s(out + pos, cap - pos, "{\"enabled\":%s,\"lan\":%s,\"maxSessions\":%d,\"idleMinutes\":%d,\"imageReady\":%s,\"games\":%d,\"building\":%s,\"buildPct\":%ld,",
-                     enabled ? "true" : "false", lan ? "true" : "false", max_sessions, idle,
+    pos += sprintf_s(out + pos, cap - pos, "{\"enabled\":%s,\"lan\":%s,\"maxSessions\":%d,\"idleMinutes\":%d,\"keepDays\":%d,\"imageReady\":%s,\"games\":%d,\"building\":%s,\"buildPct\":%ld,",
+                     enabled ? "true" : "false", lan ? "true" : "false", max_sessions, idle, keep_days,
                      image ? "true" : "false", games,
                      InterlockedCompareExchange(&g_build.busy, 0, 0) ? "true" : "false",
                      InterlockedCompareExchange(&g_build.pct, 0, 0));
@@ -1697,13 +1897,24 @@ int game_stream_status_json(char *out, int cap)
 
 /* ---- Lifecycle ---- */
 
-/* Sessions end with the app, so any duplicate still on disk was left by a crash. */
+typedef struct { wchar_t names[64][32]; int count; } KeptNames;
+
+static void kept_note(const wchar_t *name, void *ctx)
+{
+    KeptNames *k = (KeptNames *)ctx;
+    if (k->count < (int)_countof(k->names)) wcscpy_s(k->names[k->count++], 32, name);
+}
+
+/* Sessions end with the app, so a duplicate still on disk is a user's kept VM, or was
+   left by a crash. */
 static DWORD WINAPI sweep_thread(LPVOID param)
 {
     wchar_t sessions[MAX_PATH], pattern[MAX_PATH], dir[MAX_PATH];
     WIN32_FIND_DATAW d;
     HANDLE h;
+    KeptNames *kept = (KeptNames *)calloc(1, sizeof(KeptNames));
     (void)param;
+    if (kept) kept_sweep(kept_note, kept);
     AcquireSRWLockShared(&g_lock);
     swprintf_s(sessions, MAX_PATH, L"%s\\sessions", g_root);
     ReleaseSRWLockShared(&g_lock);
@@ -1711,7 +1922,13 @@ static DWORD WINAPI sweep_thread(LPVOID param)
     h = FindFirstFileW(pattern, &d);
     if (h != INVALID_HANDLE_VALUE) {
         do {
+            BOOL is_kept = FALSE;
+            int k;
             if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            /* If the list couldn't be made, nothing is deleted. */
+            if (!kept) continue;
+            for (k = 0; k < kept->count; k++) if (_wcsicmp(kept->names[k], d.cFileName) == 0) is_kept = TRUE;
+            if (is_kept) continue;
             swprintf_s(dir, MAX_PATH, L"%s\\%s", sessions, d.cFileName);
             ui_log(L"Game Streaming: removing \"%s\", left over from an earlier run.", d.cFileName);
             asb_session_clone_remove_leftover(d.cFileName, dir);
@@ -1719,6 +1936,7 @@ static DWORD WINAPI sweep_thread(LPVOID param)
         } while (FindNextFileW(h, &d) && !g_shutting_down);
         FindClose(h);
     }
+    free(kept);
     prune_images();
     InterlockedDecrement(&g_threads);
     return 0;

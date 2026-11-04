@@ -222,7 +222,8 @@ def main() -> None:
     # the dashboard; it's deleted after that, or on End session, as before.
     gs = read("src/backend_win/game_stream.c")
     assert "#define GS_KEEP_STOPPED_MIN  30" in gs
-    thread = gs[gs.index("static DWORD WINAPI session_thread"):gs.index("static int find_session")]
+    thread_at = gs.index("static DWORD WINAPI session_thread")
+    thread = gs[thread_at:gs.index("static int find_session(const wchar_t *user)\n{", thread_at) if "static int find_session(const wchar_t *user)\n{" in gs else gs.index("static int find_session(const wchar_t *user)\r\n{", thread_at)]
     assert "if (!vm->running) goto stopped;" in thread
     stopped = thread[thread.index("\nstopped:"):thread.index("\nwait_to_clean:")]
     assert 'session_state(slot, "stopped"' in stopped and "goto cleanup;" in stopped
@@ -233,6 +234,34 @@ def main() -> None:
     assert 'strcmp(path, "/api/app/session/resume") == 0' in web
     assert web.index("/api/app/session/resume") > web.index("/api/app/session\"") if "/api/app/session\"" in web else True
     assert 'id="btn-resume"' in read("web/dash.html") and "api('/api/app/session/resume'" in dash
+
+    # Each user's VM is kept between sessions: shut down, taken out of the list with its
+    # folder left, and booted again next time without setup, identity restore or a join.
+    assert "static int       g_keep_days = 14;" in gs and 'L"GameStreamKeepDays="' in gs
+    assert "keep = id && keep_days > 0 && (reuse || ready_once) && !InterlockedCompareExchange(&s->discard, 0, 0);" in thread
+    end = thread[thread.index("\ncleanup:"):]
+    assert end.index("asb_vm_shutdown(handle);") < end.index("asb_session_clone_release(id)")
+    assert "kept_forget(s->user);" in end and "shared_appliance_domain_computer_remove(s->vm_name)" in end
+    assert "config.session_reuse = reuse;" in thread and "identity = reuse ? NULL : identity_commands(s->user);" in thread
+    assert 'if (reuse) kept_remove(s->user, s->vm_name, L"it couldn\'t start");' in thread
+    unusable = gs[gs.index("static const wchar_t *kept_unusable"):gs.index("static BOOL session_active(const wchar_t *user);")]
+    assert "the games image was refreshed" in unusable and "unused for too long" in unusable
+    assert "kept_sweep(NULL, NULL);   /* VMs from the old image start over */" in gs
+    sweep = gs[gs.index("static DWORD WINAPI sweep_thread"):gs.index("void game_stream_init(void)")]
+    assert "kept_sweep(kept_note, kept);" in sweep and "if (is_kept) continue;" in sweep and "if (!kept) continue;" in sweep
+    forget = gs[gs.index("void game_stream_forget_user"):]
+    assert "InterlockedExchange(&g_sessions[slot].discard, 1);" in forget[:900] and "kept_remove(user, name" in forget[:900]
+    core = read("src/backend_win/asb_core.c")
+    assert "if (!keep_files) remove_dir_recursive(dir);" in core
+    assert "if (from_template && config->session_clone && config->session_reuse) {" in core
+    assert "cfg.admin_pass[0] != L'\\0' && !config->session_reuse" in core
+    agent_link = read("src/backend_win/vm_agent.c")
+    assert "vm->session_logon[0] && !vm->session_reuse" in agent_link
+    reuse_join = agent_link[agent_link.index('strcmp(buf, "ok:already") == 0'):][:1400]
+    assert '"restart"' in reuse_join and "vm->session_signing_in = TRUE;" in reuse_join
+    assert "SecureZeroMemory(vm->session_logon" in reuse_join
+    assert 'id="gs-keep"' in html and "keepDays:" in js and 'id="session-keep"' in read("web/dash.html")
+    assert 'json_get_int(body, L"keepDays", &keep_days)' in headless and 'json_get_int(json, L"keepDays", &keep_days)' in ui
 
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link

@@ -1049,6 +1049,7 @@ function renderGameStreaming() {
         if (s.vm) select.value = s.vm;
         document.getElementById('gs-max').value = s.maxSessions || 2;
         document.getElementById('gs-idle').value = s.idleMinutes === undefined ? 30 : s.idleMinutes;
+        document.getElementById('gs-keep').value = s.keepDays === undefined ? 14 : s.keepDays;
         document.getElementById('gs-group').value = s.group || '';
         document.getElementById('gs-lan').checked = !!s.lan;
         renderGsNetworkAndDrives(s);
@@ -1149,6 +1150,7 @@ function saveGameStreaming() {
             vm: document.getElementById('gs-vm').value,
             maxSessions: parseInt(document.getElementById('gs-max').value, 10) || 0,
             idleMinutes: parseInt(document.getElementById('gs-idle').value, 10) || 0,
+            keepDays: parseInt(document.getElementById('gs-keep').value, 10) || 0,
             group: document.getElementById('gs-group').value.trim(),
             lan: lan,
             vpn: document.getElementById('gs-vpn').value,

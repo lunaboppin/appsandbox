@@ -904,17 +904,18 @@ static int handle_request(PHTTP_REQUEST req)
         HRESULT hr = S_OK;
         if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming") == 0) {
             wchar_t body[4096] = L"", vm[256] = L"", group[65] = L"", vpn[40] = L"", drives_off[1024] = L"";
-            int max_sessions = 2, idle = 30;
+            int max_sessions = 2, idle = 30, keep_days = 14;
             BOOL lan = FALSE;
             body_to_wide(req, body, _countof(body));
             json_get_string(body, L"vm", vm, _countof(vm));
             json_get_string(body, L"group", group, _countof(group));
             json_get_int(body, L"maxSessions", &max_sessions);
             json_get_int(body, L"idleMinutes", &idle);
+            json_get_int(body, L"keepDays", &keep_days);
             json_get_bool(body, L"lan", &lan);
             json_get_string(body, L"vpn", vpn, _countof(vpn));
             json_get_string(body, L"drivesOff", drives_off, _countof(drives_off));
-            hr = game_stream_configure(vm, max_sessions, idle, group, lan, vpn, drives_off, message, _countof(message));
+            hr = game_stream_configure(vm, max_sessions, idle, keep_days, group, lan, vpn, drives_off, message, _countof(message));
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/image") == 0) {
             hr = game_stream_build_image(message, _countof(message));
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/off") == 0) {

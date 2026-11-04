@@ -625,7 +625,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         /* A Game Streaming duplicate's first boot: Windows setup has to finish
            before anything here can restart the guest. */
-        if (vm->session_clone && vm->session_logon[0]) {
+        if (vm->session_clone && vm->session_logon[0] && !vm->session_reuse) {
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, "session_setup_wait", buf, sizeof(buf), 25ul * 60ul * 1000ul);
             if (n <= 0) goto disconnected;
             if (strcmp(buf, "ok") != 0)
@@ -750,7 +750,25 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                             vm->session_signing_in = TRUE;
                         }
                     }
-                    else if (strcmp(buf, "ok:already") != 0) {
+                    else if (strcmp(buf, "ok:already") == 0) {
+                        /* A user's kept duplicate is joined already: its sign-in is set up
+                           now and takes a restart of its own. */
+                        if (vm->session_reuse && vm->session_logon[0]) {
+                            n = send_tagged_cmd(s, vm, &conn->cmd_seq, vm->session_logon, buf, sizeof(buf), 10000);
+                            SecureZeroMemory(vm->session_logon, sizeof(vm->session_logon));
+                            if (n <= 0) goto disconnected;
+                            if (strcmp(buf, "ok") != 0) {
+                                ui_log(L"Setting up the sign-in on \"%s\" failed (%S).", vm->name, buf);
+                                InterlockedExchange(&vm->session_signin_failed, 1);
+                            } else {
+                                vm->session_signing_in = TRUE;
+                                ui_log(L"\"%s\" restarts to sign its user in.", vm->name);
+                                n = send_tagged_cmd(s, vm, &conn->cmd_seq, "restart", buf, sizeof(buf), 15000);
+                                if (n <= 0) goto disconnected;
+                            }
+                        }
+                    }
+                    else {
                         ui_log(L"Joining \"%s\" to the domain failed (%S).", vm->name, buf);
                         if (vm->session_clone) InterlockedExchange(&vm->session_signin_failed, 1);
                     }

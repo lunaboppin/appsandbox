@@ -4381,6 +4381,7 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     inst->domain_member = cfg.domain_member;
     if (config->session_clone) {
         inst->session_clone = TRUE;
+        inst->session_reuse = config->session_reuse;
         inst->install_complete = TRUE;   /* Windows is already installed on its image */
         if (config->session_logon)
             strcpy_s(inst->session_logon, sizeof(inst->session_logon), config->session_logon);
@@ -4452,10 +4453,16 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
            root; accepting a root that only fits disk.vhdx would fail later. */
         if (wcslen(vhdx_dir) > MAX_PATH - 96)
             return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
-        if (GetFileAttributesW(vhdx_dir) != INVALID_FILE_ATTRIBUTES)
-            return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
-        if (!CreateDirectoryW(vhdx_dir, NULL))
-            return HRESULT_FROM_WIN32(GetLastError());
+        if (config->session_clone && config->session_reuse) {
+            /* A user's duplicate kept from their last session: its folder is the VM. */
+            if (GetFileAttributesW(vhdx_dir) == INVALID_FILE_ATTRIBUTES)
+                return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+        } else {
+            if (GetFileAttributesW(vhdx_dir) != INVALID_FILE_ATTRIBUTES)
+                return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+            if (!CreateDirectoryW(vhdx_dir, NULL))
+                return HRESULT_FROM_WIN32(GetLastError());
+        }
         wcscpy_s(cfg.storage_root, MAX_PATH, vhdx_dir);
     }
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
@@ -4637,7 +4644,11 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     /* Create disk (synchronous path: from-template only — Linux ISO
        creates go through the use_linux_cloud branch above; Windows ISO
        installs go through use_vhdx_first above). */
-    if (from_template) {
+    if (from_template && config->session_clone && config->session_reuse) {
+        asb_log(L"Starting \"%s\" from the disk kept from its last session.", cfg.name);
+        hr = upgrade_windows_agent_offline(cfg.vhdx_path);
+        if (FAILED(hr)) asb_log(L"Warning: could not update the agent on \"%s\" (0x%08X).", cfg.name, hr);
+    } else if (from_template) {
         const wchar_t *base_path = template_idx >= 0 ? g_templates[template_idx].vhdx_path : config->base_vhdx;
         asb_log(L"Creating differencing VHDX over \"%s\"...",
                 template_idx >= 0 ? g_templates[template_idx].name : config->base_vhdx);
@@ -4677,7 +4688,8 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
                 else asb_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
             }
         } else if (from_template) {
-            if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.admin_pass[0] != L'\0') {
+            /* A kept duplicate was set up in its first session. */
+            if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.admin_pass[0] != L'\0' && !config->session_reuse) {
                 wchar_t template_lang[32] = L"en-US";
                 vm_load_language_json(template_idx >= 0 ? g_templates[template_idx].vhdx_path : config->base_vhdx,
                                       template_lang, 32);
@@ -5136,7 +5148,15 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
 /* ---- VM Delete ---- */
 
+static HRESULT vm_remove(AsbVm vm, BOOL keep_files);
+
 ASB_API HRESULT asb_vm_delete(AsbVm vm)
+{
+    return vm_remove(vm, FALSE);
+}
+
+/* keep_files: take it out of the list only (a Game Streaming user's kept duplicate). */
+static HRESULT vm_remove(AsbVm vm, BOOL keep_files)
 {
     int idx, i;
     wchar_t dir[MAX_PATH];
@@ -5184,7 +5204,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     /* Recursively remove the whole VM folder, including subdirectories
        (snapshots\ and the build's _vhdx_staging\); a file-only delete would
        leave those and orphan the dir. */
-    remove_dir_recursive(dir);
+    if (!keep_files) remove_dir_recursive(dir);
 
     /* Compact arrays */
     EnterCriticalSection(&g_cs);
@@ -5200,7 +5220,21 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     return S_OK;
 }
 
+static HRESULT session_clone_drop(UINT64 vm_id, BOOL keep_files);
+
 HRESULT asb_session_clone_delete(UINT64 vm_id)
+{
+    return session_clone_drop(vm_id, FALSE);
+}
+
+HRESULT asb_session_clone_release(UINT64 vm_id)
+{
+    VmInstance *inst = asb_find_vm_by_id(vm_id);
+    if (inst && inst->running) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    return session_clone_drop(vm_id, TRUE);
+}
+
+static HRESULT session_clone_drop(UINT64 vm_id, BOOL keep_files)
 {
     VmInstance *inst = asb_find_vm_by_id(vm_id);
     int idx;
@@ -5222,7 +5256,7 @@ HRESULT asb_session_clone_delete(UINT64 vm_id)
         free(inst->session_identity);
         inst->session_identity = NULL;
     }
-    hr = asb_vm_delete(vm_handle(inst));
+    hr = vm_remove(vm_handle(inst), keep_files);
     if (SUCCEEDED(hr) && g_removed_cb) g_removed_cb(idx, g_removed_ud);
     return hr;
 }

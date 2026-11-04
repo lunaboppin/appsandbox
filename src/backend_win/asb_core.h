@@ -75,6 +75,7 @@ typedef struct {
                                       otherwise the ISO says which distribution it is */
     const wchar_t *base_vhdx;      /* Windows: start as a differencing disk over this disk */
     BOOL   session_clone;          /* Game Streaming duplicate: never saved, deleted with its session */
+    BOOL   session_reuse;          /* for a duplicate: boot the disk already in its folder, kept from the user's last session */
     const char *session_logon;     /* for a duplicate: the sign-in to set up in the guest */
     const char *session_identity;  /* for a duplicate: commands restoring the user's Sunshine identity */
     const char *stream_name;       /* for a duplicate: the name Moonlight shows */
@@ -164,6 +165,8 @@ HRESULT asb_disposable_new_session(AsbVm vm);
 /* Internal: delete a Game Streaming duplicate from a worker thread, telling the
    UI it is gone; and remove what a crash left behind of one. */
 HRESULT asb_session_clone_delete(UINT64 vm_id);
+/* Takes a stopped duplicate out of the VM list but keeps its folder, for its user's next session. */
+HRESULT asb_session_clone_release(UINT64 vm_id);
 void asb_session_clone_remove_leftover(const wchar_t *name, const wchar_t *dir);
 
 /* Graceful shutdown (sends ACPI shutdown signal). */
