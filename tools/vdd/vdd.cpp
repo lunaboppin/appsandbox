@@ -44,6 +44,12 @@ Environment:
 
 #define VDD_LOG_PATH L"C:\\ProgramData\\AppSandboxVDD.log"
 
+/* Register the IddCx 1.10 (HDR-aware) callbacks. Off: with them Windows composes
+   this SDR display's desktop in FP16 with sRGB-encoded values, so Desktop
+   Duplication (Sunshine, Parsec) applies gamma a second time and streams look
+   washed out. The v1 callbacks give an ordinary 8-bit desktop. */
+#define VDD_IDDCX_V2 0
+
 static void VddLog(const char* fmt, ...)
 {
     HANDLE hFile = CreateFileW(VDD_LOG_PATH, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -785,9 +791,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
         }
 
 
-        /* Use v2 acquire when available */
+        /* The v2 acquire goes with the v2 (HDR-aware) callbacks. */
 #pragma warning(suppress: 4127)
-        if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
+        if (VDD_IDDCX_V2 && IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
             IDARG_IN_RELEASEANDACQUIREBUFFER2 bufferInArgs = { 0 };
             IDARG_OUT_RELEASEANDACQUIREBUFFER2 buffer = { 0 };
             bufferInArgs.Size = sizeof(bufferInArgs);
@@ -2040,8 +2046,9 @@ NTSTATUS VddDeviceAdd(
     iddConfig.EvtIddCxMonitorAssignSwapChain             = VddMonitorAssignSwapChain;
     iddConfig.EvtIddCxMonitorUnassignSwapChain           = VddMonitorUnassignSwapChain;
 
-    /* Use v2 callbacks when compiled with IddCx 1.10+ */
-    if (IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo)) {
+    /* The v1 callbacks: see VDD_IDDCX_V2. */
+#pragma warning(suppress: 4127)
+    if (VDD_IDDCX_V2 && IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo)) {
         VddLog("DeviceAdd: registering v2 callbacks (IddCx 1.10+)");
         iddConfig.EvtIddCxAdapterQueryTargetInfo            = VddAdapterQueryTargetInfo;
         iddConfig.EvtIddCxMonitorSetDefaultHdrMetaData      = VddMonitorSetDefaultHdrMetadata;
