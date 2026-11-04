@@ -45,6 +45,12 @@ def main() -> None:
     assert "vpn_gateway_uses_nat_network()" in core, "the gateway's uplink must outlive the last NAT VM"
     assert "lookup main priority 31000" in linux_agent, "the gateway's own address is exempt from table 99"
     assert "#define GATEWAY_LAYOUT" in gateway and "Layout=" in gateway
+    # The bare Ubuntu cloud image (3.5 GiB) fills up with its own updates.
+    build = gateway[gateway.index("static HRESULT build_os_disk(void)"):]
+    build = build[:build.index("\n}\n")]
+    assert "vhdx_resize_grow(g_gw.os_vhdx, GATEWAY_DISK_GB" in build, "the gateway disk is grown before its first boot"
+    assert build.index("--qcow2-to-vhdx") < build.index("vhdx_resize_grow(")
+    assert int(gateway.split("#define GATEWAY_LAYOUT")[1].split()[0]) >= 3, "existing small gateways are rebuilt"
 
     # ---- Configs: keys protected, IPv4 only, validated ----
     assert "CryptProtectData(" in configs and "CRYPTPROTECT_LOCAL_MACHINE" in configs

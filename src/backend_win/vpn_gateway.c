@@ -25,13 +25,15 @@
 #define GATEWAY_LAN_MAC_COLON "02:15:5d:a5:b1:02"
 /* 512 MB OOM-killed cloud-init during setup (apt + locale generation). */
 #define GATEWAY_RAM_MB      1024
+/* The Ubuntu cloud image is 3.5 GiB, which its own daily updates fill. */
+#define GATEWAY_DISK_GB     8
 #define GATEWAY_IDLE_MS     (5ull * 60ull * 1000ull)
 #define GATEWAY_SETUP_TIMEOUT_MS  (20ull * 60ull * 1000ull)
 #define GATEWAY_START_TIMEOUT_MS  (3ull * 60ull * 1000ull)
 #define GATEWAY_SLOTS       16
 /* Bump when the gateway's seed or agent changes in a way an existing gateway
    must pick up: a gateway set up under an older layout is rebuilt. */
-#define GATEWAY_LAYOUT      2
+#define GATEWAY_LAYOUT      3   /* 3: an 8 GiB disk, not the cloud image's 3.5 */
 /* Used when a config names no DNS server. Reached through the tunnel. */
 #define GATEWAY_FALLBACK_DNS "1.1.1.1,1.0.0.1"
 
@@ -161,6 +163,9 @@ static HRESULT build_os_disk(void)
         exe, image, g_gw.os_vhdx);
     hr = appliance_run_hidden_process(command, 30 * 60 * 1000);
     if (FAILED(hr)) return hr;
+    /* cloud-init grows the root partition into this on the first boot. */
+    hr = vhdx_resize_grow(g_gw.os_vhdx, GATEWAY_DISK_GB, NULL, NULL);
+    if (FAILED(hr) && hr != E_INVALIDARG) return hr;
     if (!asb_ensure_ssh_key(ssh_public_key, _countof(ssh_public_key))) return E_FAIL;
     swprintf_s(resource_dir, _countof(resource_dir), L"%s\\resources", exe);
     sprintf_s(uplink_ip, sizeof(uplink_ip), "%s.253", hcn_nat_subnet_base());
@@ -242,7 +247,7 @@ static HRESULT start_vm(BOOL provisioning)
     wcscpy_s(config->vhdx_path, MAX_PATH, g_gw.os_vhdx);
     wcscpy_s(config->storage_root, MAX_PATH, g_gw.root);
     config->ram_mb = GATEWAY_RAM_MB;
-    config->hdd_gb = 8;
+    config->hdd_gb = GATEWAY_DISK_GB;
     config->cpu_cores = 1;
     config->gpu_mode = GPU_NONE;
     config->network_mode = NET_NONE;
