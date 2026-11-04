@@ -1318,6 +1318,17 @@ static DWORD WINAPI session_thread(LPVOID param)
         Sleep(3000);
     }
     vm_agent_send(vm, "session_signed_in", reply, sizeof(reply), 15000);
+    {
+        /* This PC's time zone, unless the domain sets one. A VM kept from before the
+           answer file carried it is still on Windows' default (Pacific). */
+        DYNAMIC_TIME_ZONE_INFORMATION tz;
+        char cmd[200];
+        if (GetDynamicTimeZoneInformation(&tz) != TIME_ZONE_ID_INVALID && tz.TimeZoneKeyName[0]) {
+            sprintf_s(cmd, sizeof(cmd), "session_time_zone:%S", tz.TimeZoneKeyName);
+            if (vm_agent_send(vm, cmd, reply, sizeof(reply), 15000) && strncmp(reply, "ok", 2) != 0)
+                ui_log(L"Game Streaming: couldn't set the time zone on \"%s\": %S", s->vm_name, reply);
+        }
+    }
 
     if (strcmp(s->item, "desktop") != 0) {
         char cmd[160];

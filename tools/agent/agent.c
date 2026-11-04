@@ -3112,21 +3112,17 @@ static void session_hide_setup_disc(void)
     }
 }
 
-/* The domain's time zone (DOMAIN_REGION_PS) on this machine: at start, and whenever
-   policy changes. Automatic time zone is turned off while it's set, or it would move. */
-static void policy_time_zone_apply(void)
+/* Switches this machine to a Windows time zone id, such as "GMT Standard Time".
+   Automatic time zone is turned off, or it would move it again. */
+static BOOL time_zone_set(const wchar_t *want, const char *why)
 {
-    wchar_t want[128] = L"";
-    DWORD size = sizeof(want), i;
+    DWORD i;
     DYNAMIC_TIME_ZONE_INFORMATION cur, tz;
     HANDLE token;
 
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\AppSandbox", L"TimeZone",
-                     RRF_RT_REG_SZ, NULL, want, &size) != ERROR_SUCCESS || !want[0])
-        return;
     if (GetDynamicTimeZoneInformation(&cur) != TIME_ZONE_ID_INVALID &&
         _wcsicmp(cur.TimeZoneKeyName, want) == 0)
-        return;
+        return TRUE;
     for (i = 0; EnumDynamicTimeZoneInformation(i, &tz) == ERROR_SUCCESS; i++) {
         DWORD off = 4;
         if (_wcsicmp(tz.TimeZoneKeyName, want) != 0) continue;
@@ -3140,13 +3136,32 @@ static void policy_time_zone_apply(void)
         }
         RegSetKeyValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\tzautoupdate",
                         L"Start", REG_DWORD, &off, sizeof(off));
-        if (SetDynamicTimeZoneInformation(&tz))
-            agent_log("Time zone set to %S by domain policy.", want);
-        else
-            agent_log("Could not set the time zone to %S (%lu).", want, GetLastError());
-        return;
+        if (SetDynamicTimeZoneInformation(&tz)) {
+            agent_log("Time zone set to %S by %s.", want, why);
+            return TRUE;
+        }
+        agent_log("Could not set the time zone to %S (%lu).", want, GetLastError());
+        return FALSE;
     }
-    agent_log("Domain policy names a time zone this Windows doesn't have: %S", want);
+    agent_log("This Windows doesn't have the time zone from %s: %S", why, want);
+    return FALSE;
+}
+
+/* The time zone the domain sets (DOMAIN_REGION_PS), or none. */
+static BOOL policy_time_zone(wchar_t *want, DWORD chars)
+{
+    DWORD size = chars * sizeof(wchar_t);
+    want[0] = 0;
+    return RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\AppSandbox", L"TimeZone",
+                        RRF_RT_REG_SZ, NULL, want, &size) == ERROR_SUCCESS && want[0];
+}
+
+/* The domain's time zone on this machine: at start, and whenever policy changes. */
+static void policy_time_zone_apply(void)
+{
+    wchar_t want[128];
+    if (policy_time_zone(want, _countof(want)))
+        time_zone_set(want, "domain policy");
 }
 
 static DWORD WINAPI policy_time_zone_thread(LPVOID param)
@@ -3588,6 +3603,20 @@ static void session_command(char *cmd, char *reply, size_t reply_size)
         session_wait_signin(reply, reply_size);
     } else if (strcmp(cmd, "session_signin_why") == 0) {
         run_domain_script(SESSION_SIGNIN_WHY_PS, 60000, reply, reply_size);
+    } else if (strncmp(cmd, "session_time_zone:", 18) == 0) {
+        /* The host's time zone, for a duplicate whose setup left Windows' default. The
+           domain's own time zone wins when it sets one. */
+        wchar_t want[128], policy[128];
+        const char *p = cmd + 18;
+        int n = 0;
+        for (; *p && n < 127; p++) {
+            if (!isalnum((unsigned char)*p) && !strchr(" ().+-", *p)) break;
+            want[n++] = (wchar_t)*p;
+        }
+        want[n] = 0;
+        if (*p || !n) strcpy_s(reply, reply_size, "error:invalid arguments");
+        else if (policy_time_zone(policy, _countof(policy))) strcpy_s(reply, reply_size, "ok:domain");
+        else strcpy_s(reply, reply_size, time_zone_set(want, "the host") ? "ok" : "error:not set");
     } else if (strcmp(cmd, "session_signed_in") == 0) {
         session_autologon_clear();
         session_hide_setup_disc();
