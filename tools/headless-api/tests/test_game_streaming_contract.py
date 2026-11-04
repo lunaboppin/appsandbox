@@ -192,6 +192,11 @@ def main() -> None:
     assert setup.startswith("static const char stream_setup_ps[] =\n    PAIRING_REPAIR_PS") or \
         setup.startswith("static const char stream_setup_ps[] =\r\n    PAIRING_REPAIR_PS")
     assert setup.index("Repair-Pairings (Join-Path $root") < setup.index(r" Start-Service SunshineService\r\n")
+    # Windows hands Sunshine the SDR desktop as sRGB-encoded FP16: without this Sunshine
+    # applies gamma again and streams look washed out. Needs Sunshine 2026.1103 or newer.
+    assert r"'fp16_sdr_gamma_encoded = enabled'\r\n" in setup
+    ver = re.search(r'#define STREAM_SUNSHINE_VER\s+"(\d+)\.(\d+)\.(\d+)"', agent)
+    assert ver and (int(ver.group(1)), int(ver.group(2))) >= (2026, 1103), "the option is ignored by older Sunshine"
     repair = agent[agent.index("#define PAIRING_REPAIR_PS"):agent.index("static const char pairing_watch_ps[]")]
     assert "$seen.ContainsKey($c)" in repair and "$s.root.named_devices=$keep" in repair
     assert "Stop-Service SunshineService -Force" in repair and "Start-Service SunshineService" in repair
