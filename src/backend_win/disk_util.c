@@ -1009,6 +1009,20 @@ static HRESULT iso_create_resources_ex(const wchar_t *iso_path,
 /* ---- Template VM resources ---- */
 
 
+/* This PC's time zone as an answer-file line, or "". Without one, a generalized copy
+   starts on Windows' default (Pacific), hours off from the host. */
+static void host_time_zone_xml(wchar_t *out, size_t chars)
+{
+    DYNAMIC_TIME_ZONE_INFORMATION tz;
+    const wchar_t *c;
+    out[0] = 0;
+    if (GetDynamicTimeZoneInformation(&tz) == TIME_ZONE_ID_INVALID || !tz.TimeZoneKeyName[0])
+        return;
+    for (c = tz.TimeZoneKeyName; *c; c++)
+        if (!iswalnum(*c) && !wcschr(L" ().+-", *c)) return;
+    swprintf_s(out, chars, L"            <TimeZone>%s</TimeZone>\n", tz.TimeZoneKeyName);
+}
+
 /* Generate unattend.xml for instances created from templates.
    Post-sysprep mini-setup uses "unattend.xml" (not "autounattend.xml")
    when searching removable media. Contains specialize + oobeSystem passes. */
@@ -1020,8 +1034,9 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
                                         BOOL session)
 {
     FILE *f;
-    wchar_t comp_name[16];
+    wchar_t comp_name[16], time_zone[160];
     wcsncpy_s(comp_name, 16, vm_name, 15);
+    host_time_zone_xml(time_zone, _countof(time_zone));
 
     if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
         return FALSE;
@@ -1111,6 +1126,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                <ProtectYourPC>3</ProtectYourPC>\n"
         L"%s"
         L"            </OOBE>\n"
+        L"%s"
         L"            <UserAccounts><LocalAccounts>\n"
         L"                <LocalAccount wcm:action=\"add\">\n"
         L"                    <Name>%s</Name>\n"
@@ -1124,7 +1140,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
            check that can take minutes, and can stop at an error page wanting a click. */
         session ? L"                <SkipMachineOOBE>true</SkipMachineOOBE>\n"
                   L"                <SkipUserOOBE>true</SkipUserOOBE>\n" : L"",
-        admin_user, b64_password);
+        time_zone, admin_user, b64_password);
 
     /* A Game Streaming duplicate already has the agent, and its first sign-in
        belongs to the user the host signs in, so it skips the local account's. */

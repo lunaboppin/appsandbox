@@ -268,6 +268,20 @@ def main() -> None:
     assert 'id="gs-keep"' in html and "keepDays:" in js and 'id="session-keep"' in read("web/dash.html")
     assert 'json_get_int(body, L"keepDays", &keep_days)' in headless and 'json_get_int(json, L"keepDays", &keep_days)' in ui
 
+    # Time zone: a generalized duplicate would start on Windows' default (Pacific). The
+    # answer file carries this PC's zone, and each session sends it for VMs kept from
+    # before; the domain's own zone wins.
+    disk = read("src/backend_win/disk_util.c")
+    assert "static void host_time_zone_xml" in disk and "<TimeZone>%s</TimeZone>" in disk
+    assert "host_time_zone_xml(time_zone, _countof(time_zone));" in disk
+    assert "time_zone, admin_user, b64_password);" in disk
+    assert '"session_time_zone:%S", tz.TimeZoneKeyName' in gs
+    assert gs.index('"session_signed_in"') < gs.index('"session_time_zone:%S"')
+    tzcmd = agent[agent.index('strncmp(cmd, "session_time_zone:", 18) == 0'):][:900]
+    assert "policy_time_zone(policy, _countof(policy))" in tzcmd and '"ok:domain"' in tzcmd
+    assert 'strchr(" ().+-", *p)' in tzcmd and 'time_zone_set(want, "the host")' in tzcmd
+    assert 'time_zone_set(want, "domain policy");' in agent
+
     # Callers for one VM take turns on its command slot.
     assert "g_conn_send_locks" in link
     print("Game Streaming contract verified.")
