@@ -482,7 +482,7 @@ static DWORD WINAPI bs_window_thread(LPVOID param)
     {
         BOOL dark = TRUE;
         typedef HRESULT (WINAPI *DwmSetAttr)(HWND, DWORD, LPCVOID, DWORD);
-        HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+        HMODULE dwm = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         DwmSetAttr set = dwm ? (DwmSetAttr)GetProcAddress(dwm, "DwmSetWindowAttribute") : NULL;
         if (set) set(v->hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
     }

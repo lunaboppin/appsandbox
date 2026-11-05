@@ -340,7 +340,11 @@ static void hcs_cb_log(const wchar_t *fmt, ...)
 {
     FILE *lf = NULL;
     va_list ap;
-    if (_wfopen_s(&lf, L"appsandbox.log", L"a") == 0 && lf) {
+    wchar_t log_path[MAX_PATH], base[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(log_path, MAX_PATH, L"%s\\AppSandbox\\appsandbox.log", base);
+    if (_wfopen_s(&lf, log_path, L"a") == 0 && lf) {
         va_start(ap, fmt);
         vfwprintf(lf, fmt, ap);
         va_end(ap);
@@ -667,7 +671,7 @@ BOOL hcs_init(void)
 {
     g_ui_thread_id = GetCurrentThreadId();
 
-    g_hcs_dll = LoadLibraryW(L"computecore.dll");
+    g_hcs_dll = LoadLibraryExW(L"computecore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_hcs_dll)
         return FALSE;
 
@@ -1200,6 +1204,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         }
     }
 
+#define HV_SERVICE_SDDL L"D:P(A;;FA;;;SY)(A;;FA;;;BA)"
     /* ServiceTable: list the AppSandbox service GUIDs the guest is
        permitted to bind on. Windows guests get the a5b0cafe-XXXX-...
        form (reached via AF_HYPERV from the in-VM agent and helpers).
@@ -1207,7 +1212,10 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        bind(AF_VSOCK, port=N) ends up registered as the corresponding
        <N>-FACB-... GUID on the host side. Same security descriptors
        for both. Ports 1–6 cover agent + frame + input + audio + the
-       two clipboard channels; 8 is the Backstage session's screen. */
+       two clipboard channels; 8 is the Backstage session's screen.
+       Only SYSTEM and Administrators may bind or connect on the host side:
+       the agent runs commands as SYSTEM in the guest, and the other channels
+       carry the screen, input and clipboard. App Sandbox runs elevated. */
     {
         wchar_t entry[256];
         wchar_t guid_str[64];
@@ -1218,8 +1226,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"
-                    L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                    L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                    L"\"BindSecurityDescriptor\":\"" HV_SERVICE_SDDL L"\","
+                    L"\"ConnectSecurityDescriptor\":\"" HV_SERVICE_SDDL L"\","
                     L"\"AllowWildcardBinds\":true"
                 L"}",
                 (port > 1) ? L"," : L"", guid_str);
@@ -1229,8 +1237,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         hcs_service_guid_str(config->os_type, ASB_FILE_DROP_CHANNEL, guid_str, 64);
         swprintf_s(entry, 256,
             L",\"%s\":{"
-                L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                L"\"BindSecurityDescriptor\":\"" HV_SERVICE_SDDL L"\","
+                L"\"ConnectSecurityDescriptor\":\"" HV_SERVICE_SDDL L"\","
                 L"\"AllowWildcardBinds\":true"
             L"}", guid_str);
         wcscat_s(service_table, 2048, entry);

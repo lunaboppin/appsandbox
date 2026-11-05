@@ -291,6 +291,15 @@ ASB_API const wchar_t *asb_get_last_storage_parent(void);
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress);
 ASB_API BOOL asb_get_suppress_tray_warn(void);
 ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int capacity);
+/* Owns %ProgramData%\AppSandbox for Administrators and resets its ACL (SYSTEM and
+   Administrators full, Users read); the settings file and SSH folder are admin-only.
+   asb_init calls it; once per process. */
+ASB_API BOOL asb_secure_data_dir(void);
+/* Names that are safe in folder names, unattend XML and command lines. */
+ASB_API BOOL asb_vm_name_ok(const wchar_t *name);
+ASB_API BOOL asb_user_name_ok(const wchar_t *name);
+/* A report.html under the LabReports folder, safe to open with ShellExecute. */
+ASB_API BOOL asb_lab_report_path_ok(const wchar_t *path);
 
 /* ---- Global shared resources (Windows guests) ---- */
 /* Linux guest source this build ships (resources\linux\guest-src): a stamp to

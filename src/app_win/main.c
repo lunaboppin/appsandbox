@@ -12,6 +12,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     (void)hPrevInstance;
     (void)pCmdLine;
 
+    /* DLLs load from this app's folder and System32 only: never the working
+       directory or PATH, where another user or a download could plant one. */
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+
     /* Per-monitor DPI awareness (Windows 10 1703+) */
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 

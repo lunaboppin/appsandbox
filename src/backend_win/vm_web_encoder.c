@@ -54,7 +54,7 @@ static BOOL mf_load(void)
 {
     static LONG state;   /* 0 = not tried, 1 = loaded, 2 = unavailable */
     if (state == 0) {
-        HMODULE dll = LoadLibraryW(L"mfplat.dll");
+        HMODULE dll = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         LONG result = 2;
         if (dll) {
             PFN_MFStartup startup = (PFN_MFStartup)GetProcAddress(dll, "MFStartup");

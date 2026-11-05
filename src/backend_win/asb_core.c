@@ -39,6 +39,9 @@
 #include <io.h>
 #include <bcrypt.h>
 #include <virtdisk.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <wctype.h>
 
 /* This build's version as a wide string (ASB_VERSION_FULL comes from
    Directory.Build.props, unquoted). */
@@ -182,6 +185,16 @@ static void                *g_removed_ud   = NULL;
 
 /* ---- Internal logging (writes to appsandbox.log and the registered log callback) ---- */
 
+/* %ProgramData%\AppSandbox\appsandbox.log: an absolute path in the folder
+   asb_secure_data_dir() locks down, never the working directory. */
+static void log_file_path(wchar_t *out, size_t chars)
+{
+    wchar_t base[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(out, chars, L"%s\\AppSandbox\\appsandbox.log", base);
+}
+
 static void preinstall_apps_normalize(const wchar_t *in, wchar_t *out, size_t chars);
 
 static void asb_log(const wchar_t *fmt, ...)
@@ -195,7 +208,9 @@ static void asb_log(const wchar_t *fmt, ...)
     /* Write to log file */
     {
         FILE *lf = NULL;
-        if (_wfopen_s(&lf, L"appsandbox.log", L"a") == 0 && lf) {
+        wchar_t log_path[MAX_PATH];
+        log_file_path(log_path, MAX_PATH);
+        if (_wfopen_s(&lf, log_path, L"a") == 0 && lf) {
             fwprintf(lf, L"%s\n", buf);
             fclose(lf);
         }
@@ -222,7 +237,9 @@ ASB_API void ui_log(const wchar_t *fmt, ...)
     /* Write to log file */
     {
         FILE *lf = NULL;
-        if (_wfopen_s(&lf, L"appsandbox.log", L"a") == 0 && lf) {
+        wchar_t log_path[MAX_PATH];
+        log_file_path(log_path, MAX_PATH);
+        if (_wfopen_s(&lf, log_path, L"a") == 0 && lf) {
             fwprintf(lf, L"%s\n", buf);
             fclose(lf);
         }
@@ -446,6 +463,186 @@ static void get_config_path(wchar_t *out, size_t out_len)
     swprintf_s(out, out_len, L"%s\\AppSandbox\\vms.cfg", base);
 }
 
+/* ---- Data folder access ----
+   %ProgramData% lets every user create folders, so %ProgramData%\AppSandbox may
+   already exist and belong to someone else. It is given to Administrators with a
+   fixed ACL: SYSTEM and Administrators full, Users read (the Hyper-V worker reads
+   Game Streaming's base disk, and the unelevated browser opens lab reports, through
+   that). Users can no longer create or change anything in it. The settings file and
+   the SSH folder get no Users access at all. */
+
+#define DATA_DIR_SDDL     L"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+#define PRIVATE_DIR_SDDL  L"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+#define PRIVATE_FILE_SDDL L"O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+
+static void enable_privilege(const wchar_t *name)
+{
+    HANDLE token;
+    TOKEN_PRIVILEGES tp;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (LookupPrivilegeValueW(NULL, name, &tp.Privileges[0].Luid))
+        AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+    CloseHandle(token);
+}
+
+/* TRUE when path already has want's owner and exactly its protected DACL, so a
+   start-up doesn't rewrite (and re-propagate) an ACL that is already right. */
+static BOOL security_matches(const wchar_t *path, PSECURITY_DESCRIPTOR want)
+{
+    PSECURITY_DESCRIPTOR have = NULL;
+    PSID have_owner = NULL, want_owner = NULL;
+    PACL have_dacl = NULL, want_dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE, same = FALSE;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    WORD i;
+
+    if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                              &have_owner, NULL, &have_dacl, NULL, &have) != ERROR_SUCCESS)
+        return FALSE;
+    if (GetSecurityDescriptorOwner(want, &want_owner, &defaulted) &&
+        GetSecurityDescriptorDacl(want, &present, &want_dacl, &defaulted) &&
+        GetSecurityDescriptorControl(have, &control, &revision) &&
+        (control & SE_DACL_PROTECTED) && have_owner && want_owner && have_dacl && want_dacl &&
+        EqualSid(have_owner, want_owner) && have_dacl->AceCount == want_dacl->AceCount) {
+        same = TRUE;
+        for (i = 0; same && i < want_dacl->AceCount; i++) {
+            ACE_HEADER *a = NULL, *b = NULL;
+            if (!GetAce(have_dacl, i, (void **)&a) || !GetAce(want_dacl, i, (void **)&b) ||
+                a->AceSize != b->AceSize || memcmp(a, b, a->AceSize) != 0)
+                same = FALSE;
+        }
+    }
+    LocalFree(have);
+    return same;
+}
+
+/* Give path the owner and protected DACL in sddl. A folder someone else made may
+   shut Administrators out, so on failure take ownership first and try again. */
+static BOOL apply_security(const wchar_t *path, const wchar_t *sddl)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE, ok = FALSE;
+    const SECURITY_INFORMATION all = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                     PROTECTED_DACL_SECURITY_INFORMATION;
+    DWORD rc = ERROR_INVALID_PARAMETER;
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL))
+        return FALSE;
+    if (security_matches(path, sd)) {
+        LocalFree(sd);
+        return TRUE;
+    }
+    if (GetSecurityDescriptorOwner(sd, &owner, &defaulted) &&
+        GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted)) {
+        rc = SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, all, owner, NULL, dacl, NULL);
+        if (rc != ERROR_SUCCESS) {
+            enable_privilege(L"SeTakeOwnershipPrivilege");
+            enable_privilege(L"SeRestorePrivilege");
+            if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                      owner, NULL, NULL, NULL) == ERROR_SUCCESS)
+                rc = SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, all, owner, NULL, dacl, NULL);
+        }
+        ok = rc == ERROR_SUCCESS;
+    }
+    if (!ok) asb_log(L"Data folder: could not secure %s (%lu).", path, rc);
+    LocalFree(sd);
+    return ok;
+}
+
+ASB_API BOOL asb_secure_data_dir(void)
+{
+    static LONG done = 0;
+    wchar_t base[MAX_PATH], root[MAX_PATH], path[MAX_PATH];
+    PSECURITY_DESCRIPTOR sd = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+    BOOL ok;
+
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return TRUE;
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(root, MAX_PATH, L"%s\\AppSandbox", base);
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(DATA_DIR_SDDL, SDDL_REVISION_1, &sd, NULL))
+        sa.lpSecurityDescriptor = sd;
+    CreateDirectoryW(root, sd ? &sa : NULL);
+    if (sd) LocalFree(sd);
+    /* A link here would point the whole data folder somewhere else. */
+    if (GetFileAttributesW(root) & FILE_ATTRIBUTE_REPARSE_POINT) {
+        asb_log(L"Data folder: %s is a link, not a folder. Remove it and restart App Sandbox.", root);
+        return FALSE;
+    }
+    ok = apply_security(root, DATA_DIR_SDDL);
+
+    swprintf_s(path, MAX_PATH, L"%s\\ssh", root);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+        ok = apply_security(path, PRIVATE_DIR_SDDL) && ok;
+    get_config_path(path, MAX_PATH);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+        ok = apply_security(path, PRIVATE_FILE_SDDL) && ok;
+    return ok;
+}
+
+/* TRUE when path's owner is SYSTEM, Administrators or the user running this app:
+   anyone else could have planted it. */
+static BOOL owner_trusted(const wchar_t *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PSID owner = NULL;
+    BOOL trusted = FALSE;
+    if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                              &owner, NULL, NULL, NULL, &sd) != ERROR_SUCCESS)
+        return FALSE;
+    if (owner && (IsWellKnownSid(owner, WinLocalSystemSid) ||
+                  IsWellKnownSid(owner, WinBuiltinAdministratorsSid))) {
+        trusted = TRUE;
+    } else if (owner) {
+        HANDLE token;
+        BYTE buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+        DWORD got = 0;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            if (GetTokenInformation(token, TokenUser, buf, sizeof(buf), &got))
+                trusted = EqualSid(owner, ((TOKEN_USER *)buf)->User.Sid);
+            CloseHandle(token);
+        }
+    }
+    LocalFree(sd);
+    return trusted;
+}
+
+/* VM and account names end up in folder names, unattend XML and command lines.
+   Letters (any language), digits, space, '_', '-' and '.'; no leading or
+   trailing dot or space, and no DOS device name. */
+static BOOL name_ok(const wchar_t *s, size_t max_chars)
+{
+    static const wchar_t *const reserved[] = {
+        L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5",
+        L"COM6", L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2", L"LPT3", L"LPT4",
+        L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+    };
+    size_t n = s ? wcslen(s) : 0, i, stem;
+    if (n == 0 || n > max_chars) return FALSE;
+    if (s[0] == L'.' || s[0] == L' ' || s[n - 1] == L'.' || s[n - 1] == L' ') return FALSE;
+    for (i = 0; i < n; i++) {
+        wchar_t ch = s[i];
+        if (ch < 0x20) return FALSE;
+        if (iswalnum(ch) || ch == L' ' || ch == L'_' || ch == L'-' || ch == L'.') continue;
+        return FALSE;
+    }
+    stem = wcscspn(s, L".");
+    for (i = 0; i < _countof(reserved); i++)
+        if (wcslen(reserved[i]) == stem && _wcsnicmp(s, reserved[i], stem) == 0) return FALSE;
+    return TRUE;
+}
+
+ASB_API BOOL asb_vm_name_ok(const wchar_t *name) { return name_ok(name, 64); }
+ASB_API BOOL asb_user_name_ok(const wchar_t *name) { return name_ok(name, 32); }
+
 /* Ensure the AppSandbox SSH keypair exists under %ProgramData%\AppSandbox\ssh\,
    creating an ed25519 pair (via the system ssh-keygen) if absent, and return its
    public-key line in pubkey_out (newline-trimmed). ed25519 keeps the public key
@@ -464,12 +661,23 @@ ASB_API BOOL asb_ensure_ssh_key(wchar_t *pubkey_out, int cap)
     swprintf_s(priv, MAX_PATH, L"%s\\id_appsandbox", ssh_dir);
     swprintf_s(pub,  MAX_PATH, L"%s\\id_appsandbox.pub", ssh_dir);
 
+    /* A key pair someone else left here is not ours: make a new one. */
+    if (GetFileAttributesW(pub) != INVALID_FILE_ATTRIBUTES &&
+        (!owner_trusted(pub) || !owner_trusted(priv))) {
+        asb_log(L"ssh key: %s was not created by App Sandbox; making a new key pair.", pub);
+        if ((!DeleteFileW(pub) && GetLastError() != ERROR_FILE_NOT_FOUND) ||
+            (!DeleteFileW(priv) && GetLastError() != ERROR_FILE_NOT_FOUND)) {
+            asb_log(L"ssh key: could not remove the old key (%lu).", GetLastError());
+            return FALSE;
+        }
+    }
     if (GetFileAttributesW(pub) == INVALID_FILE_ATTRIBUTES) {
         wchar_t dir1[MAX_PATH], sysdir[MAX_PATH], keygen[MAX_PATH], cmdline[1280];
         STARTUPINFOW si; PROCESS_INFORMATION pi;
         swprintf_s(dir1, MAX_PATH, L"%s\\AppSandbox", base);
         CreateDirectoryW(dir1, NULL);
         CreateDirectoryW(ssh_dir, NULL);
+        apply_security(ssh_dir, PRIVATE_DIR_SDDL);
         DeleteFileW(priv);   /* avoid ssh-keygen's interactive overwrite prompt on a partial key */
         GetSystemDirectoryW(sysdir, MAX_PATH);
         swprintf_s(keygen, MAX_PATH, L"%s\\OpenSSH\\ssh-keygen.exe", sysdir);
@@ -649,6 +857,7 @@ static BOOL save_vm_list(void)
         ReleaseSRWLockExclusive(&g_save_lock);
         return FALSE;
     }
+    apply_security(temp_path, PRIVATE_FILE_SDDL);
     if (!MoveFileExW(temp_path, path,
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(temp_path);
@@ -797,8 +1006,10 @@ static void load_vm_list(void)
             asb_run_decode_name(line + 15, vm->sandbox_run_file, _countof(vm->sandbox_run_file));
         else if (wcsncmp(line, L"LabMode=", 8) == 0)
             vm->lab_mode = (_wtoi(line + 8) != 0);
-        else if (wcsncmp(line, L"LabReport=", 10) == 0)
-            wcsncpy_s(vm->lab_report, _countof(vm->lab_report), line + 10, _TRUNCATE);
+        else if (wcsncmp(line, L"LabReport=", 10) == 0) {
+            if (asb_lab_report_path_ok(line + 10))
+                wcsncpy_s(vm->lab_report, _countof(vm->lab_report), line + 10, _TRUNCATE);
+        }
         else if (wcsncmp(line, L"GuestGrowTargetGB=", 18) == 0)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
@@ -4108,6 +4319,7 @@ ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
     _set_invalid_parameter_handler(core_invalid_parameter);
+    asb_secure_data_dir();
     InitializeCriticalSection(&g_cs);
 
     if (!hcs_init())
@@ -4245,6 +4457,17 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
 
     if (!config || !config->name || config->name[0] == L'\0') {
         asb_log(L"Error: VM name is required.");
+        return E_INVALIDARG;
+    }
+    if (!asb_vm_name_ok(config->name)) {
+        asb_log(L"Error: \"%s\" can't be used as a VM name. Use up to 64 letters, digits, "
+                L"spaces, dots, dashes or underscores, not starting or ending with a dot or space.",
+                config->name);
+        return E_INVALIDARG;
+    }
+    if (config->username && config->username[0] && !asb_user_name_ok(config->username)) {
+        asb_log(L"Error: \"%s\" can't be used as a user name. Use letters, digits, "
+                L"spaces, dots, dashes or underscores.", config->username);
         return E_INVALIDARG;
     }
 
@@ -5465,6 +5688,11 @@ ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name)
     inst = &g_vms[idx];
     if (inst->running || asb_vm_management_busy(vm)) return E_ACCESSDENIED;
     if (!name || name[0] == L'\0') return E_INVALIDARG;
+    if (!asb_vm_name_ok(name)) {
+        asb_log(L"\"%s\" can't be used as a VM name. Use up to 64 letters, digits, spaces, "
+                L"dots, dashes or underscores, not starting or ending with a dot or space.", name);
+        return E_INVALIDARG;
+    }
 
     for (i = 0; i < g_vm_count; i++) {
         if (i != idx && _wcsicmp(g_vms[i].name, name) == 0) {
@@ -5629,6 +5857,21 @@ ASB_API HRESULT asb_vm_set_domain_member(AsbVm vm, BOOL member)
    from the web\lab-report.html template. */
 
 #define LAB_REPORTS_ROOT L"C:\\ProgramData\\AppSandbox\\LabReports"
+
+/* Only ever a report.html App Sandbox wrote under LabReports: the path is opened
+   with ShellExecute, so anything else (a program, a share) is refused. */
+ASB_API BOOL asb_lab_report_path_ok(const wchar_t *path)
+{
+    static const wchar_t leaf[] = L"\\report.html";
+    size_t root = wcslen(LAB_REPORTS_ROOT), n = path ? wcslen(path) : 0, lc = wcslen(leaf);
+    if (n <= root + lc || n >= MAX_PATH) return FALSE;
+    if (_wcsnicmp(path, LAB_REPORTS_ROOT L"\\", root + 1) != 0) return FALSE;
+    if (_wcsicmp(path + n - lc, leaf) != 0) return FALSE;
+    if (wcsstr(path, L"\\..") || wcsstr(path, L"/") || wcschr(path + 2, L':') ||
+        wcsstr(path + 1, L"\\\\"))
+        return FALSE;
+    return TRUE;
+}
 
 ASB_API void asb_lab_reports_dir(AsbVm vm, wchar_t *out, size_t chars)
 {

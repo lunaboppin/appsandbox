@@ -98,7 +98,7 @@ Source: "..\..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "shell-menu.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; The working folder matters: the app writes appsandbox.log to its current directory.
+; The app writes appsandbox.log to %ProgramData%\AppSandbox; older builds wrote it here.
 Name: "{autoprograms}\App Sandbox"; Filename: "{app}\AppSandbox.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\App Sandbox"; Filename: "{app}\AppSandbox.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
