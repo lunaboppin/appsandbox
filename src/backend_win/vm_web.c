@@ -1544,7 +1544,8 @@ static void ws_read_loop(WebSession *ws)
         }
         memcpy(mask, rx + pos, 4);
         pos += 4;
-        if (msg_len + payload > WEB_MAX_MESSAGE) break;
+        /* No addition first: a 64-bit length near 2^64 would wrap past both checks. */
+        if (payload > WEB_MAX_MESSAGE || payload > (UINT64)(WEB_MAX_MESSAGE - msg_len)) break;
         if (msg_len + payload > msg_cap) {
             BYTE *bigger = (BYTE *)realloc(msg, (size_t)(msg_len + payload));
             if (!bigger) break;

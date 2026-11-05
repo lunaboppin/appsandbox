@@ -716,14 +716,14 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, net_cmd, buf, sizeof(buf), 120000);
             if (n <= 0) goto disconnected;
             if (strcmp(buf, "ok") != 0) {
-                swprintf_s(vm->shared_resource_error,
-                           _countof(vm->shared_resource_error),
+                _snwprintf_s(vm->shared_resource_error,
+                           _countof(vm->shared_resource_error), _TRUNCATE,
                            L"Private SMB adapter configuration failed: %S", buf);
                 for (ri = 0; ri < vm->shared_resource_count; ri++) {
                     wcscpy_s(vm->shared_resources[ri].mapping_result,
                              _countof(vm->shared_resources[ri].mapping_result), L"unavailable");
-                    swprintf_s(vm->shared_resources[ri].failure,
-                               _countof(vm->shared_resources[ri].failure), L"%S", buf);
+                    _snwprintf_s(vm->shared_resources[ri].failure,
+                               _countof(vm->shared_resources[ri].failure), _TRUNCATE, L"%S", buf);
                 }
                 ui_log(L"Shared-resource adapter failed for \"%s\" (%S).",
                        vm->name, buf);
@@ -857,9 +857,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 }
                 if (strcmp(buf, "ok") != 0) {
                     wcscpy_s(r->mapping_result, _countof(r->mapping_result), L"failed");
-                    swprintf_s(r->failure, _countof(r->failure), L"%S", buf);
-                    swprintf_s(vm->shared_resource_error,
-                        _countof(vm->shared_resource_error),
+                    _snwprintf_s(r->failure, _countof(r->failure), _TRUNCATE, L"%S", buf);
+                    _snwprintf_s(vm->shared_resource_error,
+                        _countof(vm->shared_resource_error), _TRUNCATE,
                         L"%c: %S", r->drive_letter, buf);
                     ui_log(L"Shared resource mapping failed for \"%s\" %c: (%S).",
                            vm->name, r->drive_letter, buf);
@@ -1243,10 +1243,10 @@ BOOL vm_agent_map_shared_resource(VmInstance *instance, HcsSharedResource *resou
                instance->name, resource->drive_letter);
     } else {
         wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"failed");
-        swprintf_s(resource->failure, _countof(resource->failure), L"%S",
+        _snwprintf_s(resource->failure, _countof(resource->failure), _TRUNCATE, L"%S",
                    response[0] ? response : "no reply");
-        swprintf_s(instance->shared_resource_error,
-                   _countof(instance->shared_resource_error), L"%c: %S",
+        _snwprintf_s(instance->shared_resource_error,
+                   _countof(instance->shared_resource_error), _TRUNCATE, L"%c: %S",
                    resource->drive_letter, response[0] ? response : "no reply");
         ui_log(L"Shared resource mapping failed for \"%s\" %c: (%S).",
                instance->name, resource->drive_letter,

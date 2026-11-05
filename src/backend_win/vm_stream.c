@@ -636,7 +636,7 @@ HRESULT vm_stream_configure(VmInstance *vm, BOOL enabled, int exposure, BOOL sof
             char cmd[300], reply[300] = "";
             vm_stream_setup_command(vm, cmd, sizeof(cmd));
             if (!vm_agent_send(vm, cmd, reply, sizeof(reply), 15000)) {
-                if (err) swprintf_s(err, err_chars, L"The VM's agent said: %S. Restart the VM to update it.", reply);
+                if (err) _snwprintf_s(err, err_chars, _TRUNCATE, L"The VM's agent said: %S. Restart the VM to update it.", reply);
                 return E_FAIL;
             }
         }

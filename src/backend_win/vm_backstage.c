@@ -189,7 +189,8 @@ static void bs_receive(BsView *v, SOCKET s)
                 v->height = (int)hdr.height;
             }
         }
-        if (v->pixels && (int)hdr.width == v->width)
+        /* Both sides: after a failed resize the old buffer may be shorter than the band's rows. */
+        if (v->pixels && (int)hdr.width == v->width && (int)hdr.height == v->height)
             memcpy(v->pixels + (size_t)hdr.y * hdr.width * 4, band, bytes);
         LeaveCriticalSection(&v->cs);
         if (first) {

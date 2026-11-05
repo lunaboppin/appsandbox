@@ -59,6 +59,10 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 
 #define CLIP_MAX_FORMATS    64
 #define CLIP_MAX_PAYLOAD    (64 * 1024 * 1024)
+/* Files copied in the guest, for one paste: the guest decides how much it sends. */
+#define CLIP_MAX_FILES      20000
+#define CLIP_MAX_FILE_BYTES (32ull * 1024ull * 1024ull * 1024ull)
+#define CLIP_DISK_SPARE     (2ull * 1024ull * 1024ull * 1024ull)
 #define CLIP_FILE_CHUNK     (1024 * 1024)
 
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
@@ -112,6 +116,8 @@ struct VmClipboardData {
     ClipFmtEntry     reader_fmts[CLIP_MAX_FORMATS];
     int              reader_fmt_count;
     int              reader_fetch_idx;
+    UINT32           reader_files;          /* files received for this copy */
+    UINT64           reader_file_bytes;     /* and their bytes */
 
     /* Temp directory for file transfers */
     wchar_t          temp_dir[MAX_PATH];
@@ -717,6 +723,20 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
     if (!clip_recv_exact(s, rel_path, (int)fi.path_len)) return FALSE;
     rel_path[fi.path_len / sizeof(wchar_t)] = L'\0';
 
+    /* Too many files, too many bytes, or not enough room on this PC: the copy stops
+       here (the channel reconnects) rather than fill the host's disk. */
+    {
+        ULARGE_INTEGER free_bytes;
+        if (++clip->reader_files > CLIP_MAX_FILES ||
+            fi.file_size > CLIP_MAX_FILE_BYTES - clip->reader_file_bytes ||
+            (GetDiskFreeSpaceExW(clip->temp_dir, &free_bytes, NULL, NULL) &&
+             free_bytes.QuadPart < fi.file_size + CLIP_DISK_SPARE)) {
+            clip_log(clip, L"CLIP-R: files copied in the VM are too many or too large to paste here; stopped.");
+            return FALSE;
+        }
+        clip->reader_file_bytes += fi.file_size;
+    }
+
     if (!clip_path_is_safe(rel_path)) {
         BYTE skip[4096];
         UINT64 rem = fi.file_size;
@@ -802,6 +822,35 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
 
 /* ---- Reader channel: handle messages ---- */
 
+/* Standard formats taken from the guest: text, pictures, and files (which go through
+   the temp folder). Handle-based ones (bitmaps, metafiles, palettes) and the rest are
+   left out. */
+static BOOL clip_standard_format_allowed(UINT32 fmt)
+{
+    return fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT || fmt == CF_LOCALE ||
+           fmt == CF_DIB || fmt == CF_DIBV5 || fmt == CF_HDROP;
+}
+
+static BOOL clip_named_format_allowed(const char *name)
+{
+    static const char *const ok[] = { "HTML Format", "PNG", "image/png", "Rich Text Format" };
+    int i;
+    for (i = 0; i < (int)(sizeof(ok) / sizeof(ok[0])); i++)
+        if (strcmp(name, ok[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+static BOOL clip_skip(SOCKET s, UINT32 bytes)
+{
+    BYTE skip[4096];
+    while (bytes > 0) {
+        int chunk = bytes > sizeof(skip) ? (int)sizeof(skip) : (int)bytes;
+        if (!clip_recv_exact(s, skip, chunk)) return FALSE;
+        bytes -= (UINT32)chunk;
+    }
+    return TRUE;
+}
+
 static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHeader *hdr)
 {
     switch (hdr->msg_type) {
@@ -853,7 +902,13 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
                 char name[256];
                 memcpy(name, buf + off, name_len);
                 name[name_len] = '\0';
+                /* Only formats that are plain data: anything else could carry
+                   handles, paths or structures host apps trust. */
+                if (!clip_named_format_allowed(name)) { off += (int)name_len; continue; }
                 local_id = RegisterClipboardFormatA(name);
+            } else if (name_len > 0 || !clip_standard_format_allowed(fmt_id)) {
+                off += (int)name_len;
+                continue;
             }
             off += (int)name_len;
 
@@ -865,6 +920,8 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
             clip->reader_fmt_count++;
         }
         clip->reader_fetch_idx = 0;
+        clip->reader_files = 0;
+        clip->reader_file_bytes = 0;
         LeaveCriticalSection(&clip->reader_cs);
 
         HeapFree(GetProcessHeap(), 0, buf);
@@ -882,8 +939,11 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         int idx = clip->reader_fetch_idx;
 
         if (idx >= 0 && idx < clip->reader_fmt_count) {
-            if (hdr->format == CF_HDROP && hdr->data_size == 0) {
-                clip->reader_fmts[idx].is_hdrop = TRUE;
+            if (clip->reader_fmts[idx].local_id == CF_HDROP) {
+                /* Files only ever come through the temp folder, never as the guest's own
+                   DROPFILES, whose paths could point anywhere (a UNC share, say). */
+                if (hdr->data_size == 0) clip->reader_fmts[idx].is_hdrop = TRUE;
+                else if (!clip_skip(s, hdr->data_size)) return FALSE;
             } else if (hdr->data_size > 0 && hdr->data_size <= CLIP_MAX_PAYLOAD) {
                 BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
                 if (data && clip_recv_exact(s, data, (int)hdr->data_size)) {

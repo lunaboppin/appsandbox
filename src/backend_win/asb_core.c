@@ -4084,9 +4084,19 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
 
 /* ---- Init / Cleanup ---- */
 
+/* A bad argument to a CRT _s function (most often text from a VM too long for its
+   buffer) would otherwise end the whole app and every VM in it. With this the
+   function fails instead, leaving an empty string. */
+static void core_invalid_parameter(const wchar_t *expression, const wchar_t *function,
+                                   const wchar_t *file, unsigned int line, uintptr_t reserved)
+{
+    (void)expression; (void)function; (void)file; (void)line; (void)reserved;
+}
+
 ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
+    _set_invalid_parameter_handler(core_invalid_parameter);
     InitializeCriticalSection(&g_cs);
 
     if (!hcs_init())
@@ -5640,8 +5650,9 @@ ASB_API HRESULT asb_lab_start(AsbVm vm, wchar_t *message, size_t message_chars)
     CreateDirectoryW(shots, NULL);
     asb_log(L"Lab: \"%s\" is taking its baseline (registry, processes, network)...", inst->name);
     if (!vm_agent_send(inst, "lab_start", reply, sizeof(reply), 5ul * 60ul * 1000ul)) {
-        swprintf_s(message, message_chars, L"The lab VM could not start recording: %S",
-                   strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
+        /* Guest text, so it's cut short: an overflow would end the whole app. */
+        _snwprintf_s(message, message_chars, _TRUNCATE, L"The lab VM could not start recording: %.200S",
+                     strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
         return E_FAIL;
     }
     wcscpy_s(inst->lab_dir, MAX_PATH, dir);
@@ -5653,13 +5664,19 @@ ASB_API HRESULT asb_lab_start(AsbVm vm, wchar_t *message, size_t message_chars)
     return S_OK;
 }
 
+/* The most report data a lab VM may send back. */
+#define LAB_REPORT_MAX (64u * 1024u * 1024u)
+
 /* report.json + screenshots -> report.html: the template's LAB_DATA marker
-   comment becomes the data. "</" is escaped so no string ends the script. */
+   comment becomes the data. The guest's JSON goes in as base64 and the page
+   parses it with JSON.parse, so whatever the guest sent can only ever be data,
+   never script; base64 also has no "</" or quote to end the string early. */
 static HRESULT lab_write_html(const wchar_t *dir, const char *json, size_t json_len,
                               const wchar_t *vm_name, wchar_t *out_path, size_t out_chars)
 {
     wchar_t module[MAX_PATH], tpl_path[MAX_PATH], find[MAX_PATH], *slash;
-    char *tpl = NULL, *marker, name8[512];
+    char *tpl = NULL, *marker, name8[512], *b64 = NULL;
+    DWORD b64_len = 0;
     FILE *f = NULL, *o = NULL;
     long tpl_len;
     WIN32_FIND_DATAW fd;
@@ -5679,17 +5696,33 @@ static HRESULT lab_write_html(const wchar_t *dir, const char *json, size_t json_
     tpl[fread(tpl, 1, (size_t)tpl_len, f)] = '\0';
     fclose(f);
     marker = strstr(tpl, "/*LAB_DATA*/");
-    swprintf_s(out_path, out_chars, L"%s\\report.html", dir);
-    if (!marker || _wfopen_s(&o, out_path, L"wb") != 0 || !o) { free(tpl); return E_FAIL; }
-    fwrite(tpl, 1, (size_t)(marker - tpl), o);
-    fputs("window.LAB_REPORT=", o);
-    for (i = 0; i < json_len; i++) {
-        if (json[i] == '<' && i + 1 < json_len && json[i + 1] == '/') fputs("<\\", o);
-        else fputc(json[i], o);
+    if (json_len > LAB_REPORT_MAX ||
+        !CryptBinaryToStringA((const BYTE *)json, (DWORD)json_len,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64_len) ||
+        !(b64 = (char *)malloc(b64_len)) ||
+        !CryptBinaryToStringA((const BYTE *)json, (DWORD)json_len,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64, &b64_len)) {
+        free(b64); free(tpl);
+        return E_FAIL;
     }
+    swprintf_s(out_path, out_chars, L"%s\\report.html", dir);
+    if (!marker || _wfopen_s(&o, out_path, L"wb") != 0 || !o) { free(b64); free(tpl); return E_FAIL; }
+    fwrite(tpl, 1, (size_t)(marker - tpl), o);
+    fputs("window.LAB_REPORT=(function(b){try{var s=atob(b),u=new Uint8Array(s.length),i;"
+          "for(i=0;i<s.length;i++)u[i]=s.charCodeAt(i);"
+          "var r=JSON.parse(new TextDecoder().decode(u));return r&&typeof r==='object'?r:{};}"
+          "catch(e){return {};}})(\"", o);
+    fwrite(b64, 1, b64_len, o);
+    fputs("\")", o);
+    free(b64);
     WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, name8, sizeof(name8), NULL, NULL);
     fputs(";\nwindow.LAB_META={\"vm\":\"", o);
-    for (i = 0; name8[i]; i++) { if (name8[i] == '"' || name8[i] == '\\' || name8[i] == '<') fputc('\\', o); fputc(name8[i], o); }
+    for (i = 0; name8[i]; i++) {
+        unsigned char ch = (unsigned char)name8[i];
+        if (ch < 0x20) continue;
+        if (ch == '"' || ch == '\\' || ch == '<') fputc('\\', o);
+        fputc(ch, o);
+    }
     fputs("\"};\nwindow.LAB_SHOTS=[", o);
     swprintf_s(find, MAX_PATH, L"%s\\screenshots\\shot_*.jpg", dir);
     h = FindFirstFileW(find, &fd);
@@ -5727,8 +5760,8 @@ ASB_API HRESULT asb_lab_stop(AsbVm vm, wchar_t *report_html, size_t report_chars
     if (!reply) return E_OUTOFMEMORY;
     asb_log(L"Lab: \"%s\" is building the report (diffing the registry and file journal)...", inst->name);
     if (!vm_agent_send(inst, "lab_stop", reply, ASB_DOMAIN_REPLY_MAX, 10ul * 60ul * 1000ul)) {
-        swprintf_s(message, message_chars, L"The lab VM could not build the report: %S",
-                   strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
+        _snwprintf_s(message, message_chars, _TRUNCATE, L"The lab VM could not build the report: %.200S",
+                     strncmp(reply, "error:", 6) == 0 ? reply + 6 : reply[0] ? reply : "no reply");
         free(reply);
         return E_FAIL;
     }
@@ -5746,6 +5779,12 @@ ASB_API HRESULT asb_lab_stop(AsbVm vm, wchar_t *report_html, size_t report_chars
         b64 = reply + 3;
         if (!*b64) break;
         if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, NULL, &raw_len, NULL, NULL)) break;
+        if (raw_len > LAB_REPORT_MAX - total) {
+            swprintf_s(message, message_chars, L"The lab VM's report is larger than %u MB, so it was not saved.",
+                       LAB_REPORT_MAX / (1024u * 1024u));
+            free(reply); free(json);
+            return E_FAIL;
+        }
         if (total + raw_len + 1 > cap) {
             char *nj;
             cap = (total + raw_len + 1) * 2;
