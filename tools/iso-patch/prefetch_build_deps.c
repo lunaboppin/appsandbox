@@ -39,6 +39,7 @@
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
+#include "apt_verify.h"
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s)  (((NTSTATUS)(s)) >= 0)
@@ -199,10 +200,9 @@ static int xz_decompress_file_to_file(const wchar_t *src,
  * WinHTTP wrapper: download URL -> file
  * ==================================================================== */
 
-/* Parses "http://host[:port]/path..." into the three components. Only
- * http:// is supported (we point at archive.ubuntu.com which serves
- * the apt archive over plain HTTP; SHA256 verify is the security
- * check, not TLS). */
+/* Parses "http(s)://host[:port]/path..." into the three components. The
+ * archive is fetched over HTTPS, but what makes it safe is the signed
+ * InRelease (apt_verify.c): every list and package hash chains back to it. */
 static int parse_url(const wchar_t *url,
                      wchar_t *host_out, size_t host_cap,
                      INTERNET_PORT *port_out,
@@ -680,6 +680,70 @@ static int write_closure_json(pkg_table_t *t,
     return 0;
 }
 
+/* Read a whole (small) file. */
+static char *read_small_file(const wchar_t *path, size_t *len_out)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    LARGE_INTEGER sz;
+    char *buf = NULL;
+    DWORD got = 0;
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart < 64 * 1024 * 1024 &&
+        (buf = (char *)malloc((size_t)sz.QuadPart + 1)) != NULL &&
+        ReadFile(h, buf, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart) {
+        buf[got] = 0;
+        *len_out = got;
+    } else {
+        free(buf);
+        buf = NULL;
+    }
+    CloseHandle(h);
+    return buf;
+}
+
+/* One suite's Packages.xz, checked against its signed InRelease.
+ * 0 = verified, 1 = the suite isn't there (no InRelease), -1 = anything that
+ * doesn't verify, which is never ignored. */
+static int fetch_verified_packages(const wchar_t *mirror, const wchar_t *suite,
+                                   const wchar_t *staging, const wchar_t *xz_out)
+{
+    wchar_t url[1024], inrel[MAX_PATH];
+    char *data, want[65], actual[65];
+    const char *text;
+    size_t len = 0, text_len = 0;
+    unsigned long long size = 0;
+    int rc = -1;
+
+    swprintf_s(inrel, MAX_PATH, L"%s\\InRelease-%s", staging, suite);
+    swprintf_s(url, 1024, L"%s/dists/%s/InRelease", mirror, suite);
+    log_msg(L"prefetch: GET %s", url);
+    if (http_download(url, inrel) != 0) return 1;
+    data = read_small_file(inrel, &len);
+    DeleteFileW(inrel);
+    if (!data) { log_err(L"prefetch: could not read InRelease for %s", suite); return -1; }
+    if (apt_inrelease_verify(data, len, &text, &text_len) != 0) {
+        log_err(L"prefetch: InRelease for %s is not signed by the Ubuntu archive key", suite);
+        goto done;
+    }
+    if (apt_release_sha256(text, text_len, "main/binary-" IP_DEB_ARCH_A "/Packages.xz", want, &size) != 0) {
+        log_err(L"prefetch: InRelease for %s lists no main Packages.xz", suite);
+        goto done;
+    }
+    swprintf_s(url, 1024, L"%s/dists/%s/main/binary-" IP_DEB_ARCH L"/Packages.xz", mirror, suite);
+    log_msg(L"prefetch: GET %s", url);
+    if (http_download(url, xz_out) != 0) { log_err(L"prefetch: download Packages.xz for %s failed", suite); goto done; }
+    if (sha256_file(xz_out, actual) != 0 || _stricmp(actual, want) != 0) {
+        log_err(L"prefetch: Packages.xz for %s doesn't match its signed hash", suite);
+        DeleteFileW(xz_out);
+        goto done;
+    }
+    rc = 0;
+done:
+    free(data);
+    return rc;
+}
+
 /* ====================================================================
  * Main entry point
  * ==================================================================== */
@@ -690,7 +754,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
                            const wchar_t *mirror_arg)
 {
     const wchar_t *mirror = mirror_arg ? mirror_arg
-                                       : L"http://archive.ubuntu.com/ubuntu";
+                                       : L"https://archive.ubuntu.com/ubuntu";
 
     log_msg(L"prefetch: codename=%s kver=%s mirror=%s out=%s",
             codename, kernel_ver, mirror, out_dir);
@@ -705,12 +769,8 @@ int do_prefetch_build_deps(const wchar_t *codename,
     swprintf_s(pkgs_xz, MAX_PATH, L"%s\\Packages.xz", staging);
     swprintf_s(pkgs,    MAX_PATH, L"%s\\Packages",    staging);
 
-    wchar_t url[1024];
-    swprintf_s(url, 1024, L"%s/dists/%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
-               mirror, codename);
-    log_msg(L"prefetch: GET %s", url);
-    if (http_download(url, pkgs_xz) != 0) {
-        log_err(L"prefetch: download Packages.xz failed");
+    if (fetch_verified_packages(mirror, codename, staging, pkgs_xz) != 0) {
+        log_err(L"prefetch: no verified Packages.xz for %s", codename);
         return -1;
     }
 
@@ -729,13 +789,14 @@ int do_prefetch_build_deps(const wchar_t *codename,
         static const wchar_t *pockets[] = { L"security", L"updates" };
         for (int i = 0; i < 2; i++) {
             wchar_t pocket_xz[MAX_PATH], pocket[MAX_PATH];
+            wchar_t suite[96];
+            int found;
             swprintf_s(pocket_xz, MAX_PATH, L"%s\\Packages-%s.xz", staging, pockets[i]);
             swprintf_s(pocket,    MAX_PATH, L"%s\\Packages-%s",    staging, pockets[i]);
-            swprintf_s(url, 1024, L"%s/dists/%s-%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
-                       mirror, codename, pockets[i]);
-            log_msg(L"prefetch: GET %s", url);
-            if (http_download(url, pocket_xz) != 0 ||
-                xz_decompress_file_to_file(pocket_xz, pocket) != 0) {
+            swprintf_s(suite, _countof(suite), L"%s-%s", codename, pockets[i]);
+            found = fetch_verified_packages(mirror, suite, staging, pocket_xz);
+            if (found < 0) return -1;   /* there, but not verified: never fall back */
+            if (found != 0 || xz_decompress_file_to_file(pocket_xz, pocket) != 0) {
                 log_msg(L"prefetch: WARN no %s pocket; using the release pocket without it",
                         pockets[i]);
             } else {
@@ -838,9 +899,20 @@ int do_prefetch_build_deps(const wchar_t *codename,
             return -1;
         }
         memcpy(fn_utf8, r->filename, r->filename_len);  fn_utf8[r->filename_len] = 0;
-        if (r->sha256_hex && r->sha256_len < sizeof(sha_utf8)) {
+        /* The name becomes a path here: only pool/... with plain segments, no '\\',
+           ':' or "..", so it can't leave the staging folder. */
+        if (!apt_filename_ok(fn_utf8, r->filename_len)) {
+            log_err(L"prefetch: refusing Filename for %.*hs", (int)r->name_len, r->name);
+            return -1;
+        }
+        /* Packages is verified, so its hash is what makes each .deb trusted: one
+           without a hash isn't taken. */
+        if (r->sha256_hex && r->sha256_len == 64) {
             memcpy(sha_utf8, r->sha256_hex, r->sha256_len); sha_utf8[r->sha256_len] = 0;
-        } else { sha_utf8[0] = 0; }
+        } else {
+            log_err(L"prefetch: %.*hs has no SHA256", (int)r->name_len, r->name);
+            return -1;
+        }
 
         wchar_t fn_wide[1024];
         MultiByteToWideChar(CP_UTF8, 0, fn_utf8, -1, fn_wide, ARRAYSIZE(fn_wide));
@@ -856,15 +928,17 @@ int do_prefetch_build_deps(const wchar_t *codename,
             log_err(L"prefetch: download %ls failed", basename);
             return -1;
         }
-        if (sha_utf8[0]) {
+        {
             char actual[65];
             if (sha256_file(dst, actual) != 0) {
                 log_err(L"prefetch: SHA256 hash compute failed for %ls", basename);
+                DeleteFileW(dst);
                 return -1;
             }
             if (_stricmp(actual, sha_utf8) != 0) {
                 log_err(L"prefetch: SHA256 mismatch for %ls (got %hs, want %hs)",
                         basename, actual, sha_utf8);
+                DeleteFileW(dst);
                 return -1;
             }
         }

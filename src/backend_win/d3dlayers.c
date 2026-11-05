@@ -9,7 +9,9 @@
  *                  -> GetExtendedUpdateInfo2 -> time-limited CDN url.
  *      The package for the build architecture is located by identifier in the
  *      response, so version changes / extra updates do not break resolution.
- *   3. Download the .appx (a zip) from the Microsoft CDN.
+ *   3. Download the .appx (a zip) from the Microsoft CDN, and check it against
+ *      the file digest the FE3 response (over HTTPS) gave for it. The CDN url
+ *      is often plain HTTP; the digest is what makes the download trusted.
  *   4. Extract with the in-box tar.exe (libarchive handles zip natively).
  *   5. Copy the mapping-layer files into <exe_dir>\d3dlayers\ (cached).
  *
@@ -23,12 +25,16 @@
 
 #include <winhttp.h>
 #include <rpc.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 
 #define DL_PRODUCT_ID       L"9NQPSL29BFFF"
 #define DL_FE3_HOST         L"fe3.delivery.mp.microsoft.com"
@@ -48,6 +54,9 @@
 #define DL_APPX_NAME    L"D3DMappingLayers_" DL_ARCH L".appx"
 #define DL_ISI_ARCH      "_" DL_ARCH_A "_"
 #define DL_MAX_ROUNDS       5   /* FE3 faults intermittently; retry the chain */
+/* Written once a download matched its digest. A cache without it predates the
+   check, so it's downloaded again. */
+#define DL_VERIFIED_STAMP   L"verified"
 
 /* Files to extract: dest leaf name <- source path inside the .appx. */
 static const wchar_t *const DL_DST[] = {
@@ -332,7 +341,8 @@ done:
  * (decoded) SyncUpdates response and resolve its UpdateIdentity by joining the
  * file's enclosing <Update> <ID> to the matching NewUpdates <UpdateIdentity>. */
 static BOOL parse_leaf(const char *buf, char *uid, size_t uid_cch,
-                           char *rev, size_t rev_cch, char *digest, size_t dig_cch)
+                           char *rev, size_t rev_cch, char *digest, size_t dig_cch,
+                           char *algo, size_t algo_cch)
 {
     const char *p = buf;
     while ((p = strstr(p, "<File ")) != NULL) {
@@ -355,7 +365,9 @@ static BOOL parse_leaf(const char *buf, char *uid, size_t uid_cch,
             p = gt + 1; continue;
         }
         /* matched the package file for this architecture */
-        attr_in(tag, "Digest", digest, dig_cch);
+        if (!attr_in(tag, "Digest", digest, dig_cch) ||
+            !attr_in(tag, "DigestAlgorithm", algo, algo_cch))
+            return FALSE;   /* without a digest the download couldn't be checked */
 
         /* nearest <ID>N</ID> before this <File> = the ExtendedUpdateInfo id */
         idp = rfind(buf, p, "<ID>");
@@ -382,40 +394,64 @@ static BOOL parse_leaf(const char *buf, char *uid, size_t uid_cch,
 }
 
 /* From a (decoded) GetExtendedUpdateInfo2 response, pick the CDN url for the
- * file whose <FileDigest> matches `digest`; fall back to the first delivery
- * CDN url. */
+ * file whose <FileDigest> matches `digest`. No other url is taken: the digest
+ * is what the download is checked against. */
 static BOOL parse_file_url(const char *buf, const char *digest,
                            wchar_t *out, size_t out_cch)
 {
-    char urla[4096];
-    const char *p;
+    char urla[4096], tag[300];
+    const char *d, *u;
 
-    if (digest && digest[0]) {
-        const char *d = strstr(buf, digest);
-        if (d) {
-            const char *u = strstr(d, "<Url>");
-            if (u && between(u, "<Url>", "</Url>", urla, sizeof(urla))) {
-                MultiByteToWideChar(CP_UTF8, 0, urla, -1, out, (int)out_cch);
-                return TRUE;
-            }
-        }
-    }
-    /* fallback: first delivery.mp CDN url */
-    p = buf;
-    while ((p = strstr(p, "<Url>")) != NULL) {
-        if (between(p, "<Url>", "</Url>", urla, sizeof(urla))) {
-            if (strstr(urla, "delivery.mp.microsoft.com")) {
-                MultiByteToWideChar(CP_UTF8, 0, urla, -1, out, (int)out_cch);
-                return TRUE;
-            }
-        }
-        p += 5;
-    }
-    return FALSE;
+    if (!digest || !digest[0]) return FALSE;
+    sprintf_s(tag, sizeof(tag), "<FileDigest>%s</FileDigest>", digest);
+    d = strstr(buf, tag);
+    if (!d) return FALSE;
+    u = strstr(d, "<Url>");
+    if (!u || !between(u, "<Url>", "</Url>", urla, sizeof(urla))) return FALSE;
+    if (_strnicmp(urla, "http://", 7) != 0 && _strnicmp(urla, "https://", 8) != 0) return FALSE;
+    MultiByteToWideChar(CP_UTF8, 0, urla, -1, out, (int)out_cch);
+    return TRUE;
 }
 
-/* Resolve the (build-architecture) package CDN url from Microsoft. Returns 0 on success. */
-static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
+/* Is the file's hash (base64, as FE3 gives it) the expected digest? SHA-1 and
+   SHA-256 are what FE3 uses. */
+static BOOL file_digest_matches(const wchar_t *path, const char *algo, const char *want_b64)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE h = NULL;
+    HANDLE f = INVALID_HANDLE_VALUE;
+    BYTE digest[32], buf[65536];
+    ULONG digest_len;
+    LPCWSTR id;
+    char b64[64];
+    DWORD b64_len = sizeof(b64), rd;
+    BOOL ok = FALSE;
+
+    if (_stricmp(algo, "SHA1") == 0) { id = BCRYPT_SHA1_ALGORITHM; digest_len = 20; }
+    else if (_stricmp(algo, "SHA256") == 0) { id = BCRYPT_SHA256_ALGORITHM; digest_len = 32; }
+    else return FALSE;
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    if (BCryptOpenAlgorithmProvider(&alg, id, NULL, 0) >= 0 &&
+        BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) >= 0) {
+        BOOL read_ok = TRUE;
+        while ((read_ok = ReadFile(f, buf, sizeof(buf), &rd, NULL)) && rd > 0)
+            if (BCryptHashData(h, buf, rd, 0) < 0) { read_ok = FALSE; break; }
+        if (read_ok && BCryptFinishHash(h, digest, digest_len, 0) >= 0 &&
+            CryptBinaryToStringA(digest, digest_len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                                 b64, &b64_len))
+            ok = strcmp(b64, want_b64) == 0;
+    }
+    if (h) BCryptDestroyHash(h);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(f);
+    return ok;
+}
+
+/* Resolve the (build-architecture) package CDN url from Microsoft, with the
+   digest to check it against. Returns 0 on success. */
+static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch,
+                       char *digest_out, size_t digest_cch, char *algo_out, size_t algo_cch)
 {
     int round, rc = -1;
     for (round = 0; round < DL_MAX_ROUNDS && rc != 0; round++) {
@@ -423,7 +459,7 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         char *t1, *cookie_req = NULL, *cookie_resp = NULL;
         char cookie[8192];
         char *sync_req = NULL, *sync_resp = NULL;
-        char uid[128] = {0}, rev[32] = {0}, digest[256] = {0};
+        char uid[128] = {0}, rev[32] = {0}, digest[256] = {0}, algo[32] = {0};
         char *ext_req = NULL, *ext_resp = NULL;
 
         new_guid(msgid, sizeof(msgid));
@@ -449,7 +485,7 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         if (sync_req) { sync_resp = fe3_post(DL_FE3_PATH, sync_req); free(sync_req); }
         if (sync_resp) html_unescape(sync_resp);
         if (!sync_resp || !parse_leaf(sync_resp, uid, sizeof(uid), rev, sizeof(rev),
-                                      digest, sizeof(digest))) {
+                                      digest, sizeof(digest), algo, sizeof(algo))) {
             free(sync_resp); Sleep(1500); continue;
         }
         free(sync_resp);
@@ -463,9 +499,11 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         if (t1) { ext_req = str_replace_all(t1, "%REVISION%", rev); free(t1); }
         if (ext_req) { ext_resp = fe3_post(DL_FE3_PATH_SECURED, ext_req); free(ext_req); }
         if (ext_resp) html_unescape(ext_resp);
-        if (ext_resp && parse_file_url(ext_resp, digest, url_out, url_cch))
+        if (ext_resp && parse_file_url(ext_resp, digest, url_out, url_cch)) {
+            strcpy_s(digest_out, digest_cch, digest);
+            strcpy_s(algo_out, algo_cch, algo);
             rc = 0;
-        else
+        } else
             Sleep(1500);
         free(ext_resp);
     }
@@ -520,18 +558,23 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
     wchar_t exe_dir[MAX_PATH], cache[MAX_PATH], tmp[MAX_PATH], appx[MAX_PATH];
     wchar_t sysdir[MAX_PATH], cmd[2048];
     char *catalog = NULL, wucatid_a[64] = {0};
-    char wucatid[64] = {0};
+    char wucatid[64] = {0}, digest[256] = {0}, algo[32] = {0};
     wchar_t url[6144];
     int i, present = 0;
 
     get_exe_dir(exe_dir, MAX_PATH);
     swprintf_s(cache, MAX_PATH, L"%s\\%s", exe_dir, DL_CACHE_SUBDIR);
 
-    /* Already cached? */
+    /* Already cached, from a checked download? */
     for (i = 0; i < DL_NFILES; i++) {
         wchar_t f[MAX_PATH];
         swprintf_s(f, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
         if (file_exists(f)) present++;
+    }
+    {
+        wchar_t stamp[MAX_PATH];
+        swprintf_s(stamp, MAX_PATH, L"%s\\%s", cache, DL_VERIFIED_STAMP);
+        if (!file_exists(stamp)) present = 0;
     }
     if (present == DL_NFILES) {
         wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
@@ -561,7 +604,7 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
     }
 
     /* 2. FE3 chain -> CDN url. */
-    if (resolve_url(wucatid, url, ARRAYSIZE(url)) != 0) {
+    if (resolve_url(wucatid, url, ARRAYSIZE(url), digest, sizeof(digest), algo, sizeof(algo)) != 0) {
         ui_log(L"d3dlayers: FE3 did not return a download url (after %d rounds)", DL_MAX_ROUNDS);
         return FALSE;
     }
@@ -569,8 +612,22 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
     /* 3. Download the .appx. */
     swprintf_s(appx, MAX_PATH, L"%s\\%s", cache, DL_APPX_NAME);
     ui_log(L"d3dlayers: downloading D3DMappingLayers package...");
-    if (http_download(url, appx) != 0) {
-        ui_log(L"d3dlayers: package download failed");
+    {
+        /* HTTPS when the CDN offers it; either way the digest decides. */
+        wchar_t secure_url[6144];
+        BOOL got = FALSE;
+        if (_wcsnicmp(url, L"http://", 7) == 0) {
+            swprintf_s(secure_url, ARRAYSIZE(secure_url), L"https://%s", url + 7);
+            got = http_download(secure_url, appx) == 0;
+        }
+        if (!got && http_download(url, appx) != 0) {
+            ui_log(L"d3dlayers: package download failed");
+            return FALSE;
+        }
+    }
+    if (!file_digest_matches(appx, algo, digest)) {
+        ui_log(L"d3dlayers: the downloaded package doesn't match Microsoft's digest; not using it");
+        DeleteFileW(appx);
         return FALSE;
     }
 
@@ -615,6 +672,13 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
         return FALSE;
     }
 
+    {
+        wchar_t stamp[MAX_PATH];
+        HANDLE h;
+        swprintf_s(stamp, MAX_PATH, L"%s\\%s", cache, DL_VERIFIED_STAMP);
+        h = CreateFileW(stamp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
     wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
     ui_log(L"d3dlayers: staged %d mapping-layer files to %s", DL_NFILES, cache);
     return TRUE;

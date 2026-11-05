@@ -27,7 +27,7 @@
  *   kernel_ver   - running kernel version (e.g. "7.0.0-14-generic")
  *                  used to also fetch linux-headers-<ver> defensively
  *   out_dir      - cache destination
- *   mirror       - upstream mirror (default "http://archive.ubuntu.com/ubuntu"
+ *   mirror       - upstream mirror (default "https://archive.ubuntu.com/ubuntu"
  *                  if NULL)
  *
  * Returns 0 on success; non-zero on any failure. Logs to stdout

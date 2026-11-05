@@ -164,6 +164,7 @@
     <ClCompile Include="linux_firstboot.c" />
     <ClCompile Include="download_verify.c" />
     <ClCompile Include="prefetch_build_deps.c" />
+    <ClCompile Include="apt_verify.c" />
     <ClCompile Include="prefetch_wsl_deps.c" />
     <ClCompile Include="prefetch_repo.c" />
     <ClCompile Include="engine\log.c" />
@@ -191,6 +192,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="apt_verify.h" />
     <ClInclude Include="iso_patch_log.h" />
     <ClInclude Include="target_arch.h" />
     <ClInclude Include="ubuntu_vhdx.h" />

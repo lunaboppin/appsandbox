@@ -39,6 +39,16 @@
 #include <io.h>
 #include <bcrypt.h>
 #include <virtdisk.h>
+
+/* This build's version as a wide string (ASB_VERSION_FULL comes from
+   Directory.Build.props, unquoted). */
+#define ASB_CORE_WSTR2(x) L ## #x
+#define ASB_CORE_WSTR(x)  ASB_CORE_WSTR2(x)
+#ifdef ASB_VERSION_FULL
+#define ASB_CORE_VERSION_W ASB_CORE_WSTR(ASB_VERSION_FULL)
+#else
+#define ASB_CORE_VERSION_W L"0.0.0.0"
+#endif
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "bcrypt.lib")
 
@@ -3719,14 +3729,15 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
            wsl-mesa.tar.zst directly into <staging>/extras/. Uses the copy
            shipped with this build, so the guest runs the same revision as the
-           host; GitHub's main is only the fallback for a build without one. */
+           host. A build without one falls back to this version's release tag on
+           GitHub, never a moving branch. */
         asb_log(L"Prefetch 1/3: staging guest source...");
         GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
         slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" "
+            L"--prefetch-repo --tag \"v%s\" "
             L"--local-root \"%s\\resources\\linux\\guest-src\" --out-dir \"%s\"",
-            exe_dir, extras);
+            ASB_CORE_VERSION_W, exe_dir, extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
 
