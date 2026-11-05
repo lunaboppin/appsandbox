@@ -146,8 +146,8 @@ def main():
           "default_mac_field" in hcs and
           r'L"\"Default\":{\"EndpointId\":\"%s\"%s}' in hcs,
           "HCS binds the guest NAT adapter to the HCN endpoint MAC")
-    check("shared_appliance_get_smb_credentials" in host_agent,
-          "client mappings do not use appliance DPAPI credentials")
+    check("shared_appliance_get_vm_smb_credentials" in host_agent,
+          "client mappings do not use their per-VM appliance DPAPI credentials")
     check("strrchr(arg, ':')" in agent,
           "shared NIC parser can still split inside the deterministic MAC address")
     nic = agent[agent.index("static int configure_shared_nic"):

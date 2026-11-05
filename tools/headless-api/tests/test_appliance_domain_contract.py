@@ -91,8 +91,9 @@ def main() -> None:
     assert 'id="manage-domain-member"' in html
     assert "sendCmd('setVmDomainMember'" in js
 
-    # SMB on a DC uses the domain account.
-    assert 'swprintf_s(out, chars, L"%S\\\\%s", ASB_DOMAIN_NETBIOS, APPLIANCE_SERVICE_USER);' in app
+    # SMB on a DC uses the domain account (the service account and per-VM ones).
+    assert 'swprintf_s(out, chars, L"%S\\\\%s", ASB_DOMAIN_NETBIOS, account);' in app
+    assert "smb_account_user(server_ip, APPLIANCE_SERVICE_USER, out, chars);" in app
     assert "if(-not $u.Contains('\\\\')){$u=$h+'\\\\'+$u}" in agent
 
     # UI: Domain button beside Shared Resources, worker-thread bridge.

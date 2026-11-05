@@ -35,6 +35,10 @@
 #define APPLIANCE_VM_NAME L"AppSandbox.SharedAppliance"
 #define APPLIANCE_UNIQUE_ID ((UINT64)0xFFFFFFFFFFFFFF00ull)
 #define APPLIANCE_SERVICE_USER L"AppSandboxShare"
+/* Per-VM accounts: this prefix and 12 lowercase hex digits. Short enough for
+   a sAMAccountName (20) and valid as a Linux user name. */
+#define APPLIANCE_VM_USER_PREFIX L"asbvm-"
+#define APPLIANCE_VM_USER_HEX 12
 #define APPLIANCE_IDLE_MS (5ull * 60ull * 1000ull)
 #define APPLIANCE_SETUP_TIMEOUT_MS (30ul * 60ul * 1000ul)
 /* How long a client VM start waits for a stopped appliance to boot and finish
@@ -123,17 +127,33 @@ static void b64_utf8(const wchar_t *text, char *out, size_t out_chars);
 /* domain_ensure (home share, roaming-files policy, homes) ran this session. */
 static volatile LONG g_domain_ensured;
 
-/* The SMB service account as clients and the host name it. A domain
+/* An appliance SMB account as clients and the host name it. A domain
    controller has no local accounts, so there it is the domain's account. */
-static void smb_service_user(const char *server_ip, wchar_t *out, size_t chars)
+static void smb_account_user(const char *server_ip, const wchar_t *account,
+                             wchar_t *out, size_t chars)
 {
     if (g_appliance.status.domain_enabled)
-        swprintf_s(out, chars, L"%S\\%s", ASB_DOMAIN_NETBIOS, APPLIANCE_SERVICE_USER);
+        swprintf_s(out, chars, L"%S\\%s", ASB_DOMAIN_NETBIOS, account);
     else if (server_ip)
-        swprintf_s(out, chars, L"%S\\%s", server_ip, APPLIANCE_SERVICE_USER);
+        swprintf_s(out, chars, L"%S\\%s", server_ip, account);
     else
-        wcscpy_s(out, chars, APPLIANCE_SERVICE_USER);
+        wcscpy_s(out, chars, account);
 }
+
+/* The shared SMB service account. Only the host's own mappings use it once
+   the appliance handles per-VM accounts. */
+static void smb_service_user(const char *server_ip, wchar_t *out, size_t chars)
+{
+    smb_account_user(server_ip, APPLIANCE_SERVICE_USER, out, chars);
+}
+
+/* Whether the running appliance's agent handles per-VM accounts, and which
+   VM accounts it has been given since it booted. Reset by every startup
+   pass. Guarded by g_appliance.cs. */
+enum { VM_ACCOUNTS_UNKNOWN = 0, VM_ACCOUNTS_SUPPORTED, VM_ACCOUNTS_LEGACY };
+static LONG g_vm_accounts_mode;
+static wchar_t g_vm_accounts_ready[ASB_MAX_VMS][ASB_VM_SMB_ACCOUNT_CHARS];
+static int g_vm_accounts_ready_count;
 
 static HRESULT host_mapping_command(const AsbSharedResourceInfo *resource, BOOL mount);
 static HRESULT reconcile_internal(void);
@@ -530,6 +550,188 @@ static HRESULT generate_password(wchar_t *out, size_t chars)
     out[wanted] = L'\0';
     SecureZeroMemory(random, sizeof(random));
     return S_OK;
+}
+
+/* ---- Per-VM SMB accounts ---- */
+
+BOOL shared_appliance_vm_account_valid(const wchar_t *name)
+{
+    size_t prefix = wcslen(APPLIANCE_VM_USER_PREFIX), i;
+    if (!name || wcslen(name) != prefix + APPLIANCE_VM_USER_HEX ||
+        wcsncmp(name, APPLIANCE_VM_USER_PREFIX, prefix) != 0) return FALSE;
+    for (i = prefix; name[i]; ++i)
+        if (!((name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f')))
+            return FALSE;
+    return TRUE;
+}
+
+HRESULT shared_appliance_new_vm_account(wchar_t *out, size_t chars)
+{
+    BYTE random[APPLIANCE_VM_USER_HEX / 2];
+    size_t prefix = wcslen(APPLIANCE_VM_USER_PREFIX);
+    int i;
+    if (!out || chars <= prefix + APPLIANCE_VM_USER_HEX) return E_INVALIDARG;
+    if (BCryptGenRandom(NULL, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
+        return E_FAIL;
+    wcscpy_s(out, chars, APPLIANCE_VM_USER_PREFIX);
+    for (i = 0; i < (int)sizeof(random); ++i)
+        swprintf_s(out + prefix + i * 2, chars - prefix - i * 2, L"%02x", random[i]);
+    return S_OK;
+}
+
+static void vm_account_dir(wchar_t *out, size_t chars)
+{
+    wchar_t root[MAX_PATH];
+    program_data_root(root, _countof(root));
+    swprintf_s(out, chars, L"%s\\smb-accounts", root);
+}
+
+static void vm_account_path(const wchar_t *name, wchar_t *out, size_t chars)
+{
+    wchar_t dir[MAX_PATH];
+    vm_account_dir(dir, _countof(dir));
+    swprintf_s(out, chars, L"%s\\%s.cred", dir, name);
+}
+
+static HRESULT vm_account_load_password(const wchar_t *name, wchar_t *out, size_t chars)
+{
+    wchar_t path[MAX_PATH];
+    BYTE blob[4096];
+    DWORD read = 0;
+    HANDLE file;
+    HRESULT hr;
+    if (!shared_appliance_vm_account_valid(name)) return E_INVALIDARG;
+    vm_account_path(name, path, _countof(path));
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    if (!ReadFile(file, blob, sizeof(blob), &read, NULL) || read == 0 || read == sizeof(blob))
+        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    else
+        hr = unprotect_text(blob, read, out, chars);
+    CloseHandle(file);
+    SecureZeroMemory(blob, sizeof(blob));
+    return hr;
+}
+
+static HRESULT vm_account_save_password(const wchar_t *name, const wchar_t *password)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH], temp[MAX_PATH], root[MAX_PATH];
+    DATA_BLOB blob;
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    HANDLE file;
+    DWORD written;
+    HRESULT hr;
+    ZeroMemory(&blob, sizeof(blob));
+    hr = protect_text(password, &blob);
+    if (FAILED(hr)) return hr;
+    hr = credential_security_attributes(&sa, &descriptor);
+    if (FAILED(hr)) goto cleanup;
+    program_data_root(root, _countof(root));
+    ensure_directory(root);
+    vm_account_dir(dir, _countof(dir));
+    if (!CreateDirectoryW(dir, &sa) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        hr = HRESULT_FROM_WIN32(GetLastError()); goto cleanup;
+    }
+    vm_account_path(name, path, _countof(path));
+    swprintf_s(temp, _countof(temp), L"%s.tmp", path);
+    file = CreateFileW(temp, GENERIC_WRITE, 0, &sa, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
+    if (file == INVALID_HANDLE_VALUE) { hr = HRESULT_FROM_WIN32(GetLastError()); goto cleanup; }
+    if (!WriteFile(file, blob.pbData, blob.cbData, &written, NULL) || written != blob.cbData ||
+        !FlushFileBuffers(file)) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        CloseHandle(file); DeleteFileW(temp); goto cleanup;
+    }
+    CloseHandle(file);
+    if (!MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        hr = HRESULT_FROM_WIN32(GetLastError()); DeleteFileW(temp); goto cleanup;
+    }
+    hr = S_OK;
+cleanup:
+    if (descriptor) LocalFree(descriptor);
+    if (blob.pbData) { SecureZeroMemory(blob.pbData, blob.cbData); LocalFree(blob.pbData); }
+    return hr;
+}
+
+/* The VM account's password, made (and kept) the first time it is needed. */
+static HRESULT vm_account_password(const wchar_t *name, wchar_t *out, size_t chars)
+{
+    HRESULT hr = vm_account_load_password(name, out, chars);
+    if (SUCCEEDED(hr)) return hr;
+    hr = generate_password(out, chars);
+    if (SUCCEEDED(hr)) hr = vm_account_save_password(name, out);
+    if (FAILED(hr)) SecureZeroMemory(out, chars * sizeof(wchar_t));
+    return hr;
+}
+
+static BOOL vm_account_ready_locked(const wchar_t *name)
+{
+    int i;
+    for (i = 0; i < g_vm_accounts_ready_count; ++i)
+        if (wcscmp(g_vm_accounts_ready[i], name) == 0) return TRUE;
+    return FALSE;
+}
+
+static void vm_account_set_ready(const wchar_t *name, BOOL ready)
+{
+    int i;
+    EnterCriticalSection(&g_appliance.cs);
+    for (i = 0; i < g_vm_accounts_ready_count; ++i)
+        if (wcscmp(g_vm_accounts_ready[i], name) == 0) break;
+    if (ready && i == g_vm_accounts_ready_count && i < ASB_MAX_VMS) {
+        wcscpy_s(g_vm_accounts_ready[i], ASB_VM_SMB_ACCOUNT_CHARS, name);
+        g_vm_accounts_ready_count++;
+    } else if (!ready && i < g_vm_accounts_ready_count) {
+        for (; i + 1 < g_vm_accounts_ready_count; ++i)
+            wcscpy_s(g_vm_accounts_ready[i], ASB_VM_SMB_ACCOUNT_CHARS,
+                     g_vm_accounts_ready[i + 1]);
+        g_vm_accounts_ready_count--;
+    }
+    LeaveCriticalSection(&g_appliance.cs);
+}
+
+/* A fresh boot has been given none of the accounts and may run another agent. */
+static void vm_accounts_reset(void)
+{
+    EnterCriticalSection(&g_appliance.cs);
+    g_vm_accounts_mode = VM_ACCOUNTS_UNKNOWN;
+    g_vm_accounts_ready_count = 0;
+    LeaveCriticalSection(&g_appliance.cs);
+}
+
+void shared_appliance_forget_vm_account(const wchar_t *name)
+{
+    wchar_t path[MAX_PATH];
+    if (!shared_appliance_vm_account_valid(name)) return;
+    vm_account_path(name, path, _countof(path));
+    DeleteFileW(path);
+    if (g_appliance.initialized) vm_account_set_ready(name, FALSE);
+}
+
+/* Passwords of VMs that no longer exist: deleted while App Sandbox was not
+   running, or a Game Streaming duplicate, which is never saved. */
+static void vm_accounts_sweep_host(const AsbVmShareAccess *vms, int count)
+{
+    WIN32_FIND_DATAW data;
+    wchar_t dir[MAX_PATH], pattern[MAX_PATH], name[64], *dot;
+    HANDLE find;
+    int i;
+    vm_account_dir(dir, _countof(dir));
+    swprintf_s(pattern, _countof(pattern), L"%s\\*.cred", dir);
+    find = FindFirstFileW(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wcsncpy_s(name, _countof(name), data.cFileName, _TRUNCATE);
+        dot = wcsrchr(name, L'.');
+        if (dot) *dot = L'\0';
+        for (i = 0; i < count; ++i)
+            if (wcscmp(vms[i].smb_account, name) == 0) break;
+        if (i == count) shared_appliance_forget_vm_account(name);
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
 }
 
 static void load_config(void)
@@ -1515,6 +1717,7 @@ wait_existing:
                 }
                 /* Not the public entry point: status.ready is still FALSE
                    here, and this is the pass that publishes the whole set. */
+                vm_accounts_reset();
                 hr = reconcile_internal();
                 if (FAILED(hr)) goto fail;
                 EnterCriticalSection(&g_appliance.cs);
@@ -1826,12 +2029,84 @@ HRESULT shared_appliance_reconcile(void)
     return reconcile_internal();
 }
 
+/* Gives the appliance an account for each VM it has not had one for since it
+   booted, after removing the accounts of VMs that are gone. granted[i] says
+   whether vms[i] can be named in a share's access list. Returns the mode the
+   appliance's agent supports; an agent from before per-VM accounts answers
+   the removal with error:unknown, and every VM keeps the shared account. */
+static LONG provision_vm_accounts(const AsbVmShareAccess *vms, int count, BOOL *granted)
+{
+    char keep[ASB_MAX_VMS * ASB_VM_SMB_ACCOUNT_CHARS + 1], command[1024], response[256];
+    char account[ASB_VM_SMB_ACCOUNT_CHARS], password[256];
+    wchar_t password_w[128];
+    BOOL ready;
+    size_t used = 0;
+    int i;
+    keep[0] = '\0';
+    for (i = 0; i < count; ++i) {
+        granted[i] = FALSE;
+        if (!shared_appliance_vm_account_valid(vms[i].smb_account)) continue;
+        used += sprintf_s(keep + used, sizeof(keep) - used, "%s%S", used ? "," : "",
+                          vms[i].smb_account);
+    }
+    sprintf_s(command, sizeof(command), "appliance_vm_prune:%s", keep);
+    response[0] = '\0';
+    /* A domain controller retries while AD starts, as appliance_account does. */
+    if (!appliance_send(command, response, sizeof(response), 200000)) {
+        if (strcmp(response, "error:unknown") == 0) {
+            EnterCriticalSection(&g_appliance.cs);
+            if (g_vm_accounts_mode != VM_ACCOUNTS_LEGACY)
+                ui_log(L"Shared appliance: its agent predates per-VM share accounts; "
+                       L"VMs map shares with the shared service account until it is refreshed.");
+            g_vm_accounts_mode = VM_ACCOUNTS_LEGACY;
+            LeaveCriticalSection(&g_appliance.cs);
+            return VM_ACCOUNTS_LEGACY;
+        }
+        /* Not fatal: a stale account still has no share that names it. */
+        ui_log(L"Shared appliance: removing the accounts of deleted VMs failed (%S).",
+               response[0] ? response : "no reply");
+    }
+    EnterCriticalSection(&g_appliance.cs);
+    g_vm_accounts_mode = VM_ACCOUNTS_SUPPORTED;
+    LeaveCriticalSection(&g_appliance.cs);
+    for (i = 0; i < count; ++i) {
+        if (!shared_appliance_vm_account_valid(vms[i].smb_account)) continue;
+        EnterCriticalSection(&g_appliance.cs);
+        ready = vm_account_ready_locked(vms[i].smb_account);
+        LeaveCriticalSection(&g_appliance.cs);
+        if (ready) { granted[i] = TRUE; continue; }
+        if (FAILED(vm_account_password(vms[i].smb_account, password_w, _countof(password_w)))) {
+            ui_log(L"Shared appliance: no password could be kept for VM account %s.",
+                   vms[i].smb_account);
+            continue;
+        }
+        WideCharToMultiByte(CP_UTF8, 0, vms[i].smb_account, -1, account, sizeof(account), NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
+        sprintf_s(command, sizeof(command), "appliance_account:%s:%s", account, password);
+        response[0] = '\0';
+        if (appliance_send(command, response, sizeof(response), 200000)) {
+            vm_account_set_ready(vms[i].smb_account, TRUE);
+            granted[i] = TRUE;
+        } else {
+            ui_log(L"Shared appliance: creating VM account %s failed (%S).",
+                   vms[i].smb_account, response[0] ? response : "no reply");
+        }
+        SecureZeroMemory(command, sizeof(command));
+        SecureZeroMemory(password, sizeof(password));
+        SecureZeroMemory(password_w, sizeof(password_w));
+    }
+    return VM_ACCOUNTS_SUPPORTED;
+}
+
 static HRESULT reconcile_internal(void)
 {
     wchar_t admin_password[256], smb_password[256], smb_user[128];
-    char user[128], password[256], command[1024], response[256];
-    int i, count;
+    char user[128], password[256], command[2048], response[256];
+    int i, j, count, vm_count = 0;
     HcsSharedResource resources[ASB_MAX_SHARED_RESOURCES];
+    AsbVmShareAccess *vms;
+    BOOL granted[ASB_MAX_VMS];
+    LONG mode = VM_ACCOUNTS_LEGACY;
     HRESULT hr;
     response[0] = '\0';   /* a send that never reaches the guest leaves it untouched */
     if (!g_appliance.runtime.agent_online) return HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
@@ -1854,14 +2129,37 @@ static HRESULT reconcile_internal(void)
         return HRESULT_FROM_WIN32(ERROR_LOGON_FAILURE);
     }
     SecureZeroMemory(password, sizeof(password));
+    SecureZeroMemory(admin_password, sizeof(admin_password));
+    SecureZeroMemory(smb_password, sizeof(smb_password));
+
+    /* Each VM's own account, and the shares it may use. */
+    vms = (AsbVmShareAccess *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                        sizeof(AsbVmShareAccess) * ASB_MAX_VMS);
+    if (!vms) return E_OUTOFMEMORY;
+    vm_count = asb_vm_share_access(vms, ASB_MAX_VMS);
+    mode = provision_vm_accounts(vms, vm_count, granted);
+    vm_accounts_sweep_host(vms, vm_count);
+
     count = shared_resources_build_attachments(L"Windows", L"", resources, _countof(resources));
     for (i = 0; i < count; ++i) {
-        char share[128];
+        char share[128], groups_b64[600] = "", users[ASB_MAX_VMS * ASB_VM_SMB_ACCOUNT_CHARS + 1] = "";
+        BOOL group_only = resources[i].groups[0] && g_appliance.status.domain_enabled;
+        size_t used = 0;
         WideCharToMultiByte(CP_UTF8, 0, resources[i].share_name, -1, share, sizeof(share), NULL, NULL);
-        if (resources[i].groups[0] && g_appliance.status.domain_enabled) {
-            /* Only these domain groups (plus the host's service account). */
-            char groups_b64[600];
-            b64_utf8(resources[i].groups, groups_b64, sizeof(groups_b64));
+        /* Only these domain groups (plus the host's service account). */
+        if (group_only) b64_utf8(resources[i].groups, groups_b64, sizeof(groups_b64));
+        if (mode == VM_ACCOUNTS_SUPPORTED) {
+            /* The VMs that have this resource. A group-restricted share is
+               mapped per user with the user's own login, never by a VM. */
+            for (j = 0; j < vm_count && !group_only; ++j) {
+                if (!granted[j] ||
+                    shared_resources_is_excluded(vms[j].exclusions, resources[i].id)) continue;
+                used += sprintf_s(users + used, sizeof(users) - used, "%s%S",
+                                  used ? "," : "", vms[j].smb_account);
+            }
+            sprintf_s(command, sizeof(command), "appliance_reconcile:%s:%s:%s:%s",
+                      share, resources[i].read_only ? "ro" : "rw", groups_b64, users);
+        } else if (group_only) {
             sprintf_s(command, sizeof(command), "appliance_reconcile:%s:%s:%s",
                       share, resources[i].read_only ? "ro" : "rw", groups_b64);
         } else {
@@ -1871,11 +2169,11 @@ static HRESULT reconcile_internal(void)
         if (!appliance_send(command, response, sizeof(response), 30000)) {
             ui_log(L"Shared appliance: publishing share %S failed (%S).",
                    share, response[0] ? response : "no reply");
-            SecureZeroMemory(admin_password, sizeof(admin_password));
-            SecureZeroMemory(smb_password, sizeof(smb_password));
+            HeapFree(GetProcessHeap(), 0, vms);
             return E_FAIL;
         }
     }
+    HeapFree(GetProcessHeap(), 0, vms);
     /* build_attachments only returns the enabled definitions, so a resource
        that was disabled would otherwise stay served under its old name. Its
        directory and data are left alone -- only the share goes away. */
@@ -1889,8 +2187,6 @@ static HRESULT reconcile_internal(void)
         sprintf_s(command, sizeof(command), "appliance_remove:%s", share);
         appliance_send(command, response, sizeof(response), 30000);
     }
-    SecureZeroMemory(admin_password, sizeof(admin_password));
-    SecureZeroMemory(smb_password, sizeof(smb_password));
     return S_OK;
 }
 
@@ -2618,6 +2914,29 @@ BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,
     return TRUE;
 }
 
+BOOL shared_appliance_get_vm_smb_credentials(const VmInstance *vm,
+                                             wchar_t *user, size_t user_chars,
+                                             wchar_t *password, size_t password_chars)
+{
+    LONG mode;
+    BOOL ready;
+    if (!vm || !user || !password || !g_appliance.initialized) return FALSE;
+    EnterCriticalSection(&g_appliance.cs);
+    mode = g_vm_accounts_mode;
+    ready = shared_appliance_vm_account_valid(vm->smb_account) &&
+            vm_account_ready_locked(vm->smb_account);
+    LeaveCriticalSection(&g_appliance.cs);
+    /* An appliance agent from before per-VM accounts can only admit the
+       shared service account, which is what every VM was given before. */
+    if (mode == VM_ACCOUNTS_LEGACY)
+        return shared_appliance_get_smb_credentials(user, user_chars, password, password_chars);
+    if (mode != VM_ACCOUNTS_SUPPORTED || !ready) return FALSE;
+    if (FAILED(vm_account_load_password(vm->smb_account, password, password_chars)))
+        return FALSE;
+    smb_account_user(NULL, vm->smb_account, user, user_chars);
+    return TRUE;
+}
+
 const char *shared_appliance_server_ip(void)
 {
     static char ip[32];
@@ -2673,6 +2992,7 @@ static BOOL domain_protected_user(const wchar_t *name)
     return _wcsicmp(name, g_appliance.status.admin_user) == 0 ||
            _wcsicmp(name, L"Administrator") == 0 ||
            _wcsicmp(name, APPLIANCE_SERVICE_USER) == 0 ||
+           _wcsnicmp(name, APPLIANCE_VM_USER_PREFIX, wcslen(APPLIANCE_VM_USER_PREFIX)) == 0 ||
            _wcsicmp(name, L"krbtgt") == 0;
 }
 

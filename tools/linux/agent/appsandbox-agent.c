@@ -1582,16 +1582,66 @@ static int appliance_rebuild_share_include(void)
         "echo 'include = /etc/samba/appsandbox-shares.conf' >> /etc/samba/smb.conf; }");
 }
 
+/* A comma-separated list of per-VM account names (asbvm-<12 hex>); may be empty. */
+static int appliance_vm_list_ok(const char *list)
+{
+    const char *p = list;
+    int n;
+    if (!p) return 0;
+    if (!*p) return 1;
+    for (;;) {
+        if (strncmp(p, "asbvm-", 6) != 0) return 0;
+        p += 6;
+        for (n = 0; n < 12; n++, p++)
+            if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return 0;
+        if (*p == '\0') return 1;
+        if (*p++ != ',') return 0;
+    }
+}
+
+/* appliance_vm_prune:<accounts to keep>. Deletes every other per-VM account:
+   those of VMs deleted since. */
+static int appliance_prune_vm_accounts(const char *keep)
+{
+    char command[2048];
+    if (!appliance_vm_list_ok(keep)) return EINVAL;
+    snprintf(command, sizeof(command),
+        "keep=',%s,'; for u in $(getent passwd | cut -d: -f1 | grep '^asbvm-'); do "
+        "case \"$keep\" in *\",$u,\"*) ;; *) smbpasswd -x \"$u\" >/dev/null 2>&1; "
+        "userdel \"$u\" || exit 1;; esac; done; exit 0", keep);
+    return run_sync(command) == 0 ? 0 : EIO;
+}
+
+/* appliance_reconcile:<share>:<ro|rw>[:<groups b64>[:<VM accounts>]]. The
+   groups are for a domain controller and mean nothing here. The VM accounts
+   are the only client VMs the share admits; without that field (a host from
+   before per-VM accounts) only the shared service account is. */
 static int appliance_reconcile_share(const char *arguments)
 {
-    char copy[256], *mode, directory[256], path[320], command[768];
+    char copy[2048], *mode, *groups, *users = NULL, directory[256], path[320], command[768];
+    char valid[1024];
     FILE *file;
+    if (strlen(arguments) >= sizeof(copy)) return EINVAL;
     snprintf(copy, sizeof(copy), "%s", arguments);
     mode = strchr(copy, ':');
     if (!mode) return EINVAL;
     *mode++ = '\0';
+    groups = strchr(mode, ':');
+    if (groups) {
+        *groups++ = '\0';
+        users = strchr(groups, ':');
+        if (users) *users++ = '\0';
+    }
     if (!appliance_token_valid(copy) ||
-        (strcmp(mode, "ro") != 0 && strcmp(mode, "rw") != 0)) return EINVAL;
+        (strcmp(mode, "ro") != 0 && strcmp(mode, "rw") != 0) ||
+        (users && !appliance_vm_list_ok(users))) return EINVAL;
+    snprintf(valid, sizeof(valid), "AppSandboxShare");
+    if (users && *users) {
+        size_t used = strlen(valid);
+        char *p;
+        snprintf(valid + used, sizeof(valid) - used, " %s", users);
+        for (p = valid + used; *p; ++p) if (*p == ',') *p = ' ';
+    }
     snprintf(directory, sizeof(directory), "%s", copy);
     { char *dollar = strchr(directory, '$'); if (dollar) *dollar = '\0'; }
     snprintf(command, sizeof(command),
@@ -1602,8 +1652,8 @@ static int appliance_reconcile_share(const char *arguments)
     file = fopen(path, "w");
     if (!file) return errno;
     fprintf(file,
-        "[%s]\npath = /srv/appsandbox/%s\nbrowseable = no\nvalid users = AppSandboxShare\nread only = %s\nforce user = AppSandboxShare\n",
-        copy, directory, strcmp(mode, "ro") == 0 ? "yes" : "no");
+        "[%s]\npath = /srv/appsandbox/%s\nbrowseable = no\nvalid users = %s\nread only = %s\nforce user = AppSandboxShare\n",
+        copy, directory, valid, strcmp(mode, "ro") == 0 ? "yes" : "no");
     fclose(file);
     if (appliance_rebuild_share_include() != 0)
         return EIO;
@@ -1842,6 +1892,9 @@ static void handle_client(int fd)
         }
         else if (strncmp(cmd, "appliance_reconcile:", 20) == 0) {
             send_reply(fd, tag, appliance_reconcile_share(cmd + 20) == 0 ? "ok" : "error:share");
+        }
+        else if (strncmp(cmd, "appliance_vm_prune:", 19) == 0) {
+            send_reply(fd, tag, appliance_prune_vm_accounts(cmd + 19) == 0 ? "ok" : "error:prune");
         }
         else if (strncmp(cmd, "appliance_purge:", 16) == 0) {
             send_reply(fd, tag, appliance_purge_share(cmd + 16) == 0 ? "ok" : "error:purge");

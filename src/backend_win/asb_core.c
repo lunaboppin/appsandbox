@@ -837,6 +837,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"GuestGrowTargetGB=%lu\n", g_vms[i].guest_grow_target_gb);
         if (g_vms[i].shared_resource_exclusions[0])
             fwprintf(f, L"SharedResourceExclusions=%s\n", g_vms[i].shared_resource_exclusions);
+        if (g_vms[i].smb_account[0])
+            fwprintf(f, L"SmbAccount=%s\n", g_vms[i].smb_account);
         if (g_vms[i].preinstall_apps[0])
             fwprintf(f, L"PreinstallApps=%s\n", g_vms[i].preinstall_apps);
         if (g_vms[i].shared_resource_pending)
@@ -1014,6 +1016,10 @@ static void load_vm_list(void)
             vm->guest_grow_target_gb = (DWORD)_wtoi(line + 18);
         else if (wcsncmp(line, L"SharedResourceExclusions=", 25) == 0)
             wcsncpy_s(vm->shared_resource_exclusions, 1024, line + 25, _TRUNCATE);
+        else if (wcsncmp(line, L"SmbAccount=", 11) == 0) {
+            if (shared_appliance_vm_account_valid(line + 11))
+                wcscpy_s(vm->smb_account, _countof(vm->smb_account), line + 11);
+        }
         else if (wcsncmp(line, L"PreinstallApps=", 15) == 0)
             wcsncpy_s(vm->preinstall_apps, _countof(vm->preinstall_apps), line + 15, _TRUNCATE);
         else if (wcsncmp(line, L"SharedResourcesPending=", 23) == 0)
@@ -4349,6 +4355,17 @@ ASB_API HRESULT asb_init(void)
     hcs_set_state_callback(asb_hcs_state_changed);
 
     load_vm_list();
+    {
+        /* VMs from before per-VM share accounts get theirs now. */
+        int ai;
+        BOOL added = FALSE;
+        for (ai = 0; ai < g_vm_count; ai++)
+            if (!g_vms[ai].smb_account[0] &&
+                SUCCEEDED(shared_appliance_new_vm_account(g_vms[ai].smb_account,
+                                                          _countof(g_vms[ai].smb_account))))
+                added = TRUE;
+        if (added) save_vm_list();
+    }
     if (!g_last_storage_parent[0]) {
         wchar_t pd[MAX_PATH];
         if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH))
@@ -4611,6 +4628,8 @@ static HRESULT asb_vm_create_impl(const AsbVmConfig *config,
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
     inst->unique_id = g_next_vm_id++;
+    /* Its own appliance SMB account; the appliance gets it at the next publish. */
+    shared_appliance_new_vm_account(inst->smb_account, _countof(inst->smb_account));
     if (config->shared_resource_exclusions)
         wcsncpy_s(inst->shared_resource_exclusions,
                   _countof(inst->shared_resource_exclusions),
@@ -5404,12 +5423,14 @@ static HRESULT vm_remove(AsbVm vm, BOOL keep_files)
 {
     int idx, i;
     wchar_t dir[MAX_PATH];
+    wchar_t account[ASB_VM_SMB_ACCOUNT_CHARS];
     wchar_t *last_slash;
     VmInstance *inst;
 
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     inst = &g_vms[idx];
+    wcscpy_s(account, _countof(account), inst->smb_account);
     if (InterlockedCompareExchange(&g_management_active, 0, 0) != 0 ||
         InterlockedCompareExchange(&inst->management_busy, 0, 0) != 0) {
         asb_log(L"Cannot delete a VM while a storage or disk operation is active.");
@@ -5461,6 +5482,10 @@ static HRESULT vm_remove(AsbVm vm, BOOL keep_files)
     LeaveCriticalSection(&g_cs);
 
     save_vm_list();
+    /* Its appliance account goes with it: the password now, the account at
+       the next publish (or the appliance's next start). */
+    shared_appliance_forget_vm_account(account);
+    asb_request_shared_resource_sync();
     return S_OK;
 }
 
@@ -6786,6 +6811,21 @@ static DWORD WINAPI share_sync_thread(LPVOID parameter)
         InterlockedExchange(&g_share_sync_state, 1);
     }
     return 0;
+}
+
+int asb_vm_share_access(AsbVmShareAccess *out, int capacity)
+{
+    int i, n = 0;
+    if (!out || capacity <= 0) return 0;
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_vm_count && n < capacity; i++) {
+        wcscpy_s(out[n].smb_account, _countof(out[n].smb_account), g_vms[i].smb_account);
+        wcscpy_s(out[n].exclusions, _countof(out[n].exclusions),
+                 g_vms[i].shared_resource_exclusions);
+        n++;
+    }
+    LeaveCriticalSection(&g_cs);
+    return n;
 }
 
 /* Runs off the caller's thread: publishing and mapping talk to two guests over
