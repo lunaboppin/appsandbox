@@ -2364,7 +2364,7 @@ static const char DOMAIN_LIST_PS[] =
         " for($i=0;$i -lt 18;$i++){ try{ $null=Get-ADDomain; break }catch{ if($i -eq 0){ Start-Service ADWS -ErrorAction SilentlyContinue }; if($i -eq 17){ throw 'Active Directory is still starting on the appliance; try again in a minute.' }; Start-Sleep -Seconds 5 } }\r\n"
         " if(-not (Get-ADGroup -Filter \"Name -eq 'AppSandbox VM Admins'\" -ErrorAction SilentlyContinue)){ New-ADGroup -Name 'AppSandbox VM Admins' -SamAccountName 'AppSandbox VM Admins' -GroupScope Global -GroupCategory Security -Description 'Administrators on every managed AppSandbox VM' }\r\n"
         " $hide=@('krbtgt','Guest','DefaultAccount','AppSandboxShare')\r\n"
-        " $users=@(Get-ADUser -Filter * -Properties MemberOf | Where-Object { $hide -notcontains $_.SamAccountName } | Sort-Object SamAccountName | ForEach-Object { [ordered]@{ name=$_.SamAccountName; enabled=[bool]$_.Enabled; groups=@($_.MemberOf | ForEach-Object { (($_ -split ',')[0]).Substring(3) }) } })\r\n"
+        " $users=@(Get-ADUser -Filter * -Properties MemberOf | Where-Object { $hide -notcontains $_.SamAccountName -and $_.SamAccountName -notlike 'asbvm-*' } | Sort-Object SamAccountName | ForEach-Object { [ordered]@{ name=$_.SamAccountName; enabled=[bool]$_.Enabled; groups=@($_.MemberOf | ForEach-Object { (($_ -split ',')[0]).Substring(3) }) } })\r\n"
         " $groups=@(Get-ADGroup -Filter * | Where-Object { AsbManageable $_ } | Sort-Object Name | ForEach-Object { [ordered]@{ name=$_.Name; system=[bool](AsbSystemGroup $_) } })\r\n"
         " Write-Output ('json:' + (ConvertTo-Json -InputObject ([ordered]@{ users=$users; groups=$groups }) -Depth 4 -Compress))\r\n"
         " exit 0\r\n"
@@ -2529,7 +2529,7 @@ static const char DOMAIN_ENSURE_PS[] =
         " # 0.1.7.17 set ZoneMapKey, which did nothing but stop users' own zone entries working.\r\n"
         " Remove-GPRegistryValue -Name $name -Key ($ie+'\\ZoneMapKey') -ValueName ('*.'+$d.DNSRoot) -ErrorAction SilentlyContinue | Out-Null\r\n"
         " $hide=@('krbtgt','Guest','DefaultAccount','AppSandboxShare')\r\n"
-        " foreach($u in @(Get-ADUser -Filter * | Where-Object { $hide -notcontains $_.SamAccountName })){ AsbHome $u.SamAccountName }\r\n"
+        " foreach($u in @(Get-ADUser -Filter * | Where-Object { $hide -notcontains $_.SamAccountName -and $_.SamAccountName -notlike 'asbvm-*' })){ AsbHome $u.SamAccountName }\r\n"
         " Write-Output 'result:ok'; exit 0\r\n"
         "}catch{ Write-Output ('result:' + $_.Exception.Message); exit 1 }\r\n";
 
@@ -4719,23 +4719,73 @@ static DWORD appliance_set_account(const char *arguments)
     return rc;
 }
 
+/* A comma-separated list of per-VM account names (asbvm-<12 hex>); may be empty. */
+static BOOL appliance_vm_list_ok(const char *list)
+{
+    const char *p = list;
+    int n;
+    if (!p) return FALSE;
+    if (!*p) return TRUE;
+    for (;;) {
+        if (strncmp(p, "asbvm-", 6) != 0) return FALSE;
+        p += 6;
+        for (n = 0; n < 12; n++, p++)
+            if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return FALSE;
+        if (*p == '\0') return TRUE;
+        if (*p++ != ',') return FALSE;
+    }
+}
+
+/* appliance_vm_prune:<accounts to keep>. Deletes every other per-VM account:
+   those of VMs deleted since. On a domain controller these are domain
+   accounts, and AD is still starting for a minute or two after boot. */
+static DWORD appliance_prune_vm_accounts(const char *keep)
+{
+    DWORD rc;
+    if (!appliance_vm_list_ok(keep)) return ERROR_INVALID_PARAMETER;
+    SetEnvironmentVariableA("ASB_KEEP_USERS", *keep ? keep : NULL);
+    rc = run_powershell_wait(
+        L"$keep=@(); if($env:ASB_KEEP_USERS){$keep=@($env:ASB_KEEP_USERS -split ',')}; "
+        L"$ok=$false; $err=$null; for($k=0;$k -lt 30 -and -not $ok;$k++){ try{"
+        L"$root=[ADSI]('WinNT://'+$env:COMPUTERNAME); "
+        L"$gone=@($root.Children | Where-Object { $_.SchemaClassName -eq 'User' } | ForEach-Object { [string]$_.Name } | "
+        L"Where-Object { $_ -like 'asbvm-*' -and $keep -notcontains $_ }); "
+        L"foreach($n in $gone){ $root.Delete('User',$n) }; $ok=$true"
+        L"}catch{$err=$_; Start-Sleep -Seconds 5} }; "
+        L"if(-not $ok){$e=([int]$err.Exception.HResult -band 0xffff); if($e -eq 0){$e=1}; exit $e}; "
+        L"exit 0", 180000);
+    SetEnvironmentVariableA("ASB_KEEP_USERS", NULL);
+    return rc;
+}
+
+/* appliance_reconcile:<share>:<ro|rw>[:<groups b64>[:<VM accounts>]].
+   The VM accounts are the only client VMs the share admits; without that
+   field (a host from before per-VM accounts) the share admits the shared
+   service account alone, as it always did. */
 static DWORD appliance_reconcile_share(const char *arguments)
 {
-    char copy[1024], *separator, *groups;
+    char copy[2048], *separator, *groups, *users = NULL;
     wchar_t share[128], directory[128], script[4096];
     BOOL read_only;
+    if (strlen(arguments) >= sizeof(copy)) return ERROR_INVALID_PARAMETER;
     strcpy_s(copy, sizeof(copy), arguments);
     separator = strchr(copy, ':');
     if (!separator) return ERROR_INVALID_PARAMETER;
     *separator++ = '\0';
     /* Optional: base64 list of the domain groups allowed (domain controller only). */
     groups = strchr(separator, ':');
-    if (groups) *groups++ = '\0';
+    if (groups) {
+        *groups++ = '\0';
+        users = strchr(groups, ':');
+        if (users) *users++ = '\0';
+    }
     if (!appliance_token_valid(copy) ||
         (strcmp(separator, "ro") != 0 && strcmp(separator, "rw") != 0) ||
-        (groups && !domain_field_ok(groups, "+/=", 800)))
+        (groups && !domain_field_ok(groups, "+/=", 800)) ||
+        (users && !appliance_vm_list_ok(users)))
         return ERROR_INVALID_PARAMETER;
     SetEnvironmentVariableA("ASB_SHARE_GROUPS", groups && *groups ? groups : NULL);
+    SetEnvironmentVariableA("ASB_SHARE_USERS", users && *users ? users : NULL);
     read_only = strcmp(separator, "ro") == 0;
     MultiByteToWideChar(CP_UTF8, 0, copy, -1, share, _countof(share));
     wcscpy_s(directory, _countof(directory), share);
@@ -4747,6 +4797,12 @@ static DWORD appliance_reconcile_share(const char *arguments)
         L"$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
         L"'AppSandboxShare',$rights,'ContainerInherit,ObjectInherit','None','Allow'); "
         L"$acl.SetAccessRule($rule); $who=@('AppSandboxShare'); "
+        /* Per-VM accounts: exactly the VMs that have this resource. Rules
+           for VM accounts no longer listed come off the folder too. */
+        L"$keep=@(); if($env:ASB_SHARE_USERS){$keep=@($env:ASB_SHARE_USERS -split ',')}; "
+        L"foreach($r in @($acl.Access)){ $n=([string]$r.IdentityReference).Split('\\')[-1]; "
+        L"if(-not $r.IsInherited -and $n -like 'asbvm-*' -and $keep -notcontains $n){ $null=$acl.RemoveAccessRuleSpecific($r) } }; "
+        L"foreach($u in $keep){ $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($u,$rights,'ContainerInherit,ObjectInherit','None','Allow'))); $who+=$u }; "
         /* Group-restricted: the share admits only these groups (and the
            host's service account), so members map it with their own login. */
         L"if($env:ASB_SHARE_GROUPS){ foreach($g in (([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:ASB_SHARE_GROUPS))) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })){ "
@@ -4763,6 +4819,7 @@ static DWORD appliance_reconcile_share(const char *arguments)
         char out[1024];
         DWORD rc = (DWORD)run_powershell_capture(script, 30000, out, sizeof(out));
         SetEnvironmentVariableA("ASB_SHARE_GROUPS", NULL);
+        SetEnvironmentVariableA("ASB_SHARE_USERS", NULL);
         if (out[0]) {
             char *line = out, *nl;
             while (line && *line) {
@@ -4956,6 +5013,11 @@ static void handle_client(AsbConn *client)
         }
         else if (strncmp(cmd, "appliance_reconcile:", 20) == 0) {
             DWORD ec = appliance_reconcile_share(cmd + 20);
+            if (ec == 0) REPLY("ok");
+            else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
+        }
+        else if (strncmp(cmd, "appliance_vm_prune:", 19) == 0) {
+            DWORD ec = appliance_prune_vm_accounts(cmd + 19);
             if (ec == 0) REPLY("ok");
             else { char reply[64]; sprintf_s(reply, sizeof(reply), "error:%lu", ec); REPLY(reply); }
         }

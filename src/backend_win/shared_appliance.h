@@ -106,6 +106,26 @@ BOOL shared_appliance_get_smb_credentials(wchar_t *user, size_t user_chars,
                                           wchar_t *password, size_t password_chars);
 const char *shared_appliance_server_ip(void);
 
+/* Per-VM appliance SMB accounts. Each client VM maps the appliance's shares
+   as an account of its own, which the appliance admits only to the shares
+   that VM has, so a VM cannot reach a share it opted out of. The name is
+   random (asbvm-<12 hex>), kept in vms.cfg; the password stays on the host,
+   DPAPI-protected. The host's own mappings keep the shared service account. */
+#define ASB_VM_SMB_ACCOUNT_CHARS 24
+typedef struct {
+    wchar_t smb_account[ASB_VM_SMB_ACCOUNT_CHARS];
+    wchar_t exclusions[1024];
+} AsbVmShareAccess;
+HRESULT shared_appliance_new_vm_account(wchar_t *out, size_t chars);
+BOOL shared_appliance_vm_account_valid(const wchar_t *name);
+/* The VM is gone: drop its password. The next publish removes the account. */
+void shared_appliance_forget_vm_account(const wchar_t *name);
+/* The credentials a client VM maps shares with. Fails until the appliance
+   has provisioned the VM's account (a publish pass is requested then). */
+BOOL shared_appliance_get_vm_smb_credentials(const VmInstance *vm,
+                                             wchar_t *user, size_t user_chars,
+                                             wchar_t *password, size_t password_chars);
+
 /* ---- AppSandbox domain (Windows Server Core appliance only) ----
    Optional: the appliance becomes the domain controller of ASB_DOMAIN_FQDN,
    without password complexity rules. Managed VMs join it; its users and

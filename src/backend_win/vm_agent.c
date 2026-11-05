@@ -805,20 +805,26 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 }
             }
 
-            cred_hr = shared_appliance_get_smb_credentials(
+            /* The VM's own appliance account, which the appliance admits only
+               to the shares this VM has. A VM the appliance has not been given
+               an account for yet (a new VM, or App Sandbox restarted under a
+               running appliance) gets one from the publish pass requested
+               here, which then maps its drives. */
+            cred_hr = shared_appliance_get_vm_smb_credentials(vm,
                 user_w, _countof(user_w), password_w, _countof(password_w))
                 ? S_OK : HRESULT_FROM_WIN32(ERROR_LOGON_FAILURE);
             if (FAILED(cred_hr)) {
-                swprintf_s(vm->shared_resource_error,
-                           _countof(vm->shared_resource_error),
-                           L"SMB credential unavailable: 0x%08X", cred_hr);
-                ui_log(L"Shared-resource credentials unavailable for \"%s\" (0x%08X).",
-                       vm->name, cred_hr);
+                wcscpy_s(vm->shared_resource_error, _countof(vm->shared_resource_error),
+                         L"Waiting for the shared appliance to add this VM's share account.");
+                ui_log(L"\"%s\": its share account is not on the shared appliance yet; "
+                       L"its drives map once it is.", vm->name);
+                vm->shared_resource_pending = TRUE;
+                asb_request_shared_resource_sync();
                 notify_agent_status(vm);
-                goto shared_mapping_done;
+            } else {
+                WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
             }
-            WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);
-            WideCharToMultiByte(CP_UTF8, 0, password_w, -1, password, sizeof(password), NULL, NULL);
             user_drives[0] = '\0';
             for (ri = 0; ri < vm->shared_resource_count; ri++) {
                 char map_cmd[1024], share[64];
@@ -841,6 +847,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                     }
                     continue;
                 }
+                if (FAILED(cred_hr)) continue;   /* stays pending; the publish pass maps it */
                 WideCharToMultiByte(CP_UTF8, 0, r->share_name, -1,
                                     share, sizeof(share), NULL, NULL);
                 sprintf_s(map_cmd, sizeof(map_cmd), "shared_smb_map:%c:%s:%s:%s:%s",
@@ -1217,11 +1224,13 @@ BOOL vm_agent_map_shared_resource(VmInstance *instance, HcsSharedResource *resou
         wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"pending");
         return FALSE;
     }
-    if (!shared_appliance_get_smb_credentials(user_w, _countof(user_w),
-                                              password_w, _countof(password_w))) {
+    /* Not requesting a publish pass on failure: this runs inside one, and
+       the pass that provisions the account comes before its mappings. */
+    if (!shared_appliance_get_vm_smb_credentials(instance, user_w, _countof(user_w),
+                                                 password_w, _countof(password_w))) {
         wcscpy_s(resource->mapping_result, _countof(resource->mapping_result), L"failed");
         wcscpy_s(resource->failure, _countof(resource->failure),
-                 L"SMB credential unavailable");
+                 L"This VM's share account is not on the shared appliance yet");
         return FALSE;
     }
     WideCharToMultiByte(CP_UTF8, 0, user_w, -1, user, sizeof(user), NULL, NULL);

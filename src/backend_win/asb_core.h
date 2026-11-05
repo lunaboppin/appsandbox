@@ -366,6 +366,9 @@ ASB_API HRESULT asb_shared_resource_purge(const wchar_t *id);
 
 /* Internal: retry appliance-backed mappings after a guest agent reaches steady state. */
 void asb_request_shared_resource_sync(void);
+/* Internal: every VM's appliance SMB account and resource exclusions, copied
+   under the VM list lock. Returns how many were written. */
+int asb_vm_share_access(AsbVmShareAccess *out, int capacity);
 ASB_API HRESULT asb_shared_appliance_open_terminal(void);
 /* Copy the stopped appliance's own agent/setup logs into the host log. */
 ASB_API void asb_shared_appliance_collect_guest_log(void);

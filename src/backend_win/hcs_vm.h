@@ -180,6 +180,7 @@ typedef struct {
     volatile LONG session_signin_failed; /* it didn't, or it can't happen */
     volatile LONG web_session_active;    /* browser sessions using the guest channels; the display window lets go while > 0 */
     wchar_t     shared_resource_exclusions[1024]; /* comma-separated stable resource GUIDs */
+    wchar_t     smb_account[24];   /* this VM's own appliance SMB account (asbvm-<hex>); stable, never the VM name */
     wchar_t     preinstall_apps[1024]; /* winget IDs not yet handed to the guest agent */
     HcsSharedResource shared_resources[ASB_MAX_SHARED_RESOURCES];
     int         shared_resource_count;
