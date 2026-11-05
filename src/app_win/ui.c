@@ -28,6 +28,7 @@
 #include <commctrl.h>
 #include <stdio.h>
 #include <wctype.h>
+#include <aclapi.h>
 #include <stdlib.h>
 #include <shlobj.h>
 
@@ -1261,7 +1262,7 @@ static void finish_lab_work(LabWork *w)
     jb_string(&jb, L"report", w->report);
     jb_object_end(&jb);
     webview2_post(out);
-    if (SUCCEEDED(w->result) && w->report[0])
+    if (SUCCEEDED(w->result) && w->report[0] && asb_lab_report_path_ok(w->report))
         ShellExecuteW(g_hwnd_main, L"open", w->report, NULL, NULL, SW_SHOWNORMAL);
     send_vm_list();
 }
@@ -1834,9 +1835,9 @@ static void on_webview2_message(const wchar_t *json)
                         L"-o StrictHostKeyChecking=no -o \"UserKnownHostsFile=%sappsandbox_known_hosts\" ",
                         base, tmp);
                 }
-                if (inst->admin_user[0])
+                if (inst->admin_user[0] && asb_user_name_ok(inst->admin_user))
                     _snwprintf_s(cmd, 1024, _TRUNCATE,
-                        L"cmd.exe /k ssh %s-p %lu %s@localhost",
+                        L"cmd.exe /k ssh %s-p %lu \"%s@localhost\"",
                         keyopt, inst->ssh_port, inst->admin_user);
                 else
                     _snwprintf_s(cmd, 1024, _TRUNCATE,
@@ -2192,7 +2193,8 @@ static void on_webview2_message(const wchar_t *json)
             VmInstance *v = asb_vm_instance(asb_vm_get(vi));
             wchar_t dir[MAX_PATH];
             asb_lab_reports_dir(asb_vm_get(vi), dir, MAX_PATH);
-            if (wcscmp(action, L"labOpenReport") == 0 && v && v->lab_report[0])
+            if (wcscmp(action, L"labOpenReport") == 0 && v && v->lab_report[0] &&
+                asb_lab_report_path_ok(v->lab_report))
                 ShellExecuteW(g_hwnd_main, L"open", v->lab_report, NULL, NULL, SW_SHOWNORMAL);
             else
                 ShellExecuteW(g_hwnd_main, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
@@ -2398,6 +2400,60 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 
 /* ---- Window procedure ---- */
 
+/* Run in Sandbox requests come from an unelevated launcher, and the elevated app
+   later reads the file. Only a local file the signed-in user could read anyway:
+   no share (a UNC path, or a mapped drive, would send this PC's credentials to
+   whoever runs it), and nothing only an administrator can read. */
+static BOOL copydata_path_ok(const wchar_t *path)
+{
+    wchar_t root[4] = { path[0], L':', L'\\', L'\0' };
+    HANDLE self = NULL, file;
+    TOKEN_LINKED_TOKEN linked = { 0 };
+    DWORD got = 0, final_len;
+    wchar_t final_path[MAX_PATH + 8];
+    BOOL ok = TRUE;
+
+    if (!(iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\')) return FALSE;
+    if (GetDriveTypeW(root) == DRIVE_REMOTE) return FALSE;
+    file = CreateFileW(path, READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    /* A link on a local drive can still lead to a share. */
+    final_len = GetFinalPathNameByHandleW(file, final_path, _countof(final_path), VOLUME_NAME_DOS);
+    if (final_len == 0 || final_len >= _countof(final_path) ||
+        _wcsnicmp(final_path, L"\\\\?\\UNC\\", 8) == 0)
+        ok = FALSE;
+    /* Check against the user's unelevated token (absent when UAC doesn't split it). */
+    if (ok && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &self) &&
+        GetTokenInformation(self, TokenLinkedToken, &linked, sizeof(linked), &got) &&
+        linked.LinkedToken) {
+        PSECURITY_DESCRIPTOR sd = NULL;
+        if (GetSecurityInfo(file, SE_FILE_OBJECT,
+                            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                            DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                            NULL, NULL, NULL, NULL, &sd) == ERROR_SUCCESS) {
+            GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+                                        FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
+            BYTE privileges[sizeof(PRIVILEGE_SET) + 4 * sizeof(LUID_AND_ATTRIBUTES)];
+            DWORD privileges_len = sizeof(privileges), granted = 0;
+            BOOL status = FALSE;
+            DWORD want = FILE_GENERIC_READ;
+            MapGenericMask(&want, &mapping);
+            if (!AccessCheck(sd, linked.LinkedToken, want, &mapping,
+                             (PPRIVILEGE_SET)privileges, &privileges_len, &granted, &status) ||
+                !status)
+                ok = FALSE;
+            LocalFree(sd);
+        } else {
+            ok = FALSE;
+        }
+    }
+    if (linked.LinkedToken) CloseHandle(linked.LinkedToken);
+    if (self) CloseHandle(self);
+    CloseHandle(file);
+    return ok;
+}
+
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     /* Explorer restarted, and took the tray icon with it. */
@@ -2466,8 +2522,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         path = (const wchar_t *)cds->lpData;
         chars = cds->cbData / sizeof(wchar_t);
         if (path[chars - 1] != L'\0' || wcslen(path) != chars - 1) return 0;
-        if (!((iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') ||
-              (path[0] == L'\\' && path[1] == L'\\')))
+        if (!copydata_path_ok(path))
             return 0;
         if (g_sandbox_ui_ready) {
             post_sandbox_request(path);

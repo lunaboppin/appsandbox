@@ -405,6 +405,41 @@ static int write_tpm_bypass_commands(FILE *f, int order)
 /* Generate autounattend.xml with credentials and VM name substituted.
    If is_template, adds SecureStartup-FilterDriver to disable BitLocker
    (required for sysprep). */
+/* Escape text for an unattend XML element. Names are checked when a VM is made;
+   this keeps the XML well formed whatever reaches it. */
+static void xml_escape_w(const wchar_t *in, wchar_t *out, size_t cap)
+{
+    size_t w = 0;
+    if (!cap) return;
+    for (; in && *in; ++in) {
+        const wchar_t *rep = NULL;
+        wchar_t one[2] = { *in, L'\0' };
+        size_t len;
+        switch (*in) {
+        case L'&': rep = L"&amp;"; break;
+        case L'<': rep = L"&lt;"; break;
+        case L'>': rep = L"&gt;"; break;
+        case L'"': rep = L"&quot;"; break;
+        case L'\'': rep = L"&apos;"; break;
+        default: rep = (*in < 0x20) ? L"" : one; break;
+        }
+        len = wcslen(rep);
+        if (w + len >= cap) break;
+        memcpy(out + w, rep, len * sizeof(wchar_t));
+        w += len;
+    }
+    out[w] = L'\0';
+}
+
+static void sanitize_computer_name_w(wchar_t *name, size_t cap);
+
+static BOOL xml_escape_user_u(const wchar_t *user, char *out, int cap)
+{
+    wchar_t escaped[128 * 6];
+    xml_escape_w(user, escaped, _countof(escaped));
+    return WideCharToMultiByte(CP_UTF8, 0, escaped, -1, out, cap, NULL, NULL) != 0;
+}
+
 static BOOL generate_autounattend(const wchar_t *output_path,
                                    const wchar_t *vm_name,
                                    const wchar_t *admin_user,
@@ -417,7 +452,11 @@ static BOOL generate_autounattend(const wchar_t *output_path,
     FILE *f;
     wchar_t comp_name[16];
     wchar_t product_key_xml[256];
+    wchar_t user_xml[128 * 6];
     wcsncpy_s(comp_name, 16, vm_name, 15);
+    sanitize_computer_name_w(comp_name, 16);
+    xml_escape_w(admin_user, user_xml, _countof(user_xml));
+    admin_user = user_xml;
     if (!image_name || !image_name[0]) image_name = L"Windows 11 Pro";
     if (product_key && product_key[0])
         swprintf_s(product_key_xml, _countof(product_key_xml),
@@ -1035,7 +1074,11 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
 {
     FILE *f;
     wchar_t comp_name[16], time_zone[160];
+    wchar_t user_xml[128 * 6];
     wcsncpy_s(comp_name, 16, vm_name, 15);
+    sanitize_computer_name_w(comp_name, 16);
+    xml_escape_w(admin_user, user_xml, _countof(user_xml));
+    admin_user = user_xml;
     host_time_zone_xml(time_zone, _countof(time_zone));
 
     if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
@@ -2045,7 +2088,7 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
        value didn't fit its buffer (WideCharToMultiByte leaves it unterminated), so bail
        rather than emit garbage. Realistic name/user/pass/lang values fit comfortably. */
     if (!WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, vm_u, sizeof vm_u, NULL, NULL) ||
-        !WideCharToMultiByte(CP_UTF8, 0, admin_user, -1, user_u, sizeof user_u, NULL, NULL) ||
+        !xml_escape_user_u(admin_user, user_u, sizeof user_u) ||
         !WideCharToMultiByte(CP_UTF8, 0, admin_pass, -1, pass_u, sizeof pass_u, NULL, NULL) ||
         !WideCharToMultiByte(CP_UTF8, 0, lang ? lang : L"en-US", -1, lang_u, sizeof lang_u, NULL, NULL)) {
         SecureZeroMemory(pass_u, sizeof pass_u);

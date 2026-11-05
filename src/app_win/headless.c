@@ -27,6 +27,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <wctype.h>
+#include <io.h>
+#include <fcntl.h>
+#include <sddl.h>
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
@@ -195,6 +198,7 @@ static void open_log(void)
     if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
         wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
     swprintf_s(dir, MAX_PATH, L"%s\\AppSandbox", base);
+    asb_secure_data_dir();
     CreateDirectoryW(dir, NULL);
     programdata_path(path, MAX_PATH, L"headless.log");
     InitializeCriticalSection(&g_log_cs);
@@ -1642,17 +1646,56 @@ static void gen_token(void)
     g_token[40] = 0;
 }
 
+/* host.json holds the bearer token, so it is created readable only by SYSTEM,
+   Administrators and the user who started the daemon -- never other users. */
+static PSECURITY_DESCRIPTOR discovery_sd(void)
+{
+    HANDLE token;
+    BYTE buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    DWORD got = 0;
+    wchar_t *sid = NULL, sddl[256];
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return NULL;
+    if (GetTokenInformation(token, TokenUser, buf, sizeof(buf), &got))
+        ConvertSidToStringSidW(((TOKEN_USER *)buf)->User.Sid, &sid);
+    CloseHandle(token);
+    if (!sid) return NULL;
+    swprintf_s(sddl, _countof(sddl), L"O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;%s)", sid);
+    LocalFree(sid);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL))
+        return NULL;
+    return sd;
+}
+
 static void write_discovery(int port)
 {
     wchar_t path[MAX_PATH]; FILE *f = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+    HANDLE h;
+    int fd;
     programdata_path(path, MAX_PATH, L"host.json");
-    if (_wfopen_s(&f, path, L"w") == 0 && f) {
-        fprintf(f,
-            "{\"endpoint\":\"http://127.0.0.1:%d\",\"port\":%d,\"token\":\"%s\","
-            "\"pid\":%lu,\"version\":\"%s\",\"apiVersion\":\"%s\"}\n",
-            port, port, g_token, GetCurrentProcessId(), ASB_PRODUCT_VER, ASB_API_VERSION);
-        fclose(f);
+    sa.lpSecurityDescriptor = discovery_sd();
+    if (!sa.lpSecurityDescriptor) {
+        hlog(L"discovery file not written: could not build its ACL (%lu)", GetLastError());
+        return;
     }
+    /* A new file, so it gets this ACL rather than keeping an old file's. */
+    DeleteFileW(path);
+    h = CreateFileW(path, GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    LocalFree(sa.lpSecurityDescriptor);
+    if (h == INVALID_HANDLE_VALUE) {
+        hlog(L"discovery file not written: %s (%lu)", path, GetLastError());
+        return;
+    }
+    fd = _open_osfhandle((intptr_t)h, _O_WRONLY);
+    if (fd < 0) { CloseHandle(h); return; }
+    f = _fdopen(fd, "w");
+    if (!f) { _close(fd); return; }
+    fprintf(f,
+        "{\"endpoint\":\"http://127.0.0.1:%d\",\"port\":%d,\"token\":\"%s\","
+        "\"pid\":%lu,\"version\":\"%s\",\"apiVersion\":\"%s\"}\n",
+        port, port, g_token, GetCurrentProcessId(), ASB_PRODUCT_VER, ASB_API_VERSION);
+    fclose(f);
     hlog(L"discovery file written: %s", path);
 }
 

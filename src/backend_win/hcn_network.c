@@ -64,7 +64,7 @@ static PFN_HcnQueryEndpointProperties pfnQueryEp;
 
 BOOL hcn_init(void)
 {
-    g_hcn_dll = LoadLibraryW(L"computenetwork.dll");
+    g_hcn_dll = LoadLibraryExW(L"computenetwork.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_hcn_dll)
         return FALSE;
 

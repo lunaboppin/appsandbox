@@ -1285,7 +1285,8 @@ function validateUsername(name) {
     }
     /* Windows account ruleset. */
     if (name.length > 20) return 'Username cannot exceed 20 characters.';
-    if (/["\\/\[\]:;|=,+*?<>]/.test(name)) return 'Username contains invalid characters.';
+    if (!/^[\p{L}\p{N} ._-]+$/u.test(name)) return 'Username can only contain letters, digits, spaces, dots, dashes and underscores.';
+    if (/^[ .]|[ .]$/.test(name)) return 'Username cannot start or end with a space or period.';
     if (/^[.\s]+$/.test(name)) return 'Username cannot be only dots or spaces.';
     if (name.endsWith('.')) return 'Username cannot end with a period.';
     var reserved = ['CON','PRN','AUX','NUL',

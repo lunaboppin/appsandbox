@@ -31,6 +31,7 @@ remote control for the same core the GUI drives.
 - **Discovery file.** On startup the daemon writes `host.json`
   (`%ProgramData%\AppSandbox\`) with the endpoint, port, and a random per-run
   bearer token. `asb.connect()` reads it, so you never hard-code a port or token.
+  Only SYSTEM, Administrators and the user who started the daemon can read it.
 - **Single instance.** A global mutex guarantees
   one AppSandbox at a time — GUI or daemon (a second `--headless` exits with
   status 2). One owner, one source of truth.
@@ -48,11 +49,12 @@ The API is **admin-gated, and that gate is functional, not a security boundary.*
 Creating, starting, and snapshotting VMs go through the Host Compute Service
 (HCS), which requires elevation; binding the `http.sys` URL likewise needs
 elevation. So the daemon must run elevated, and only an administrator can launch
-it. The bearer token exists to stop *other processes* from stumbling onto the
-port, not to defend against an authenticated administrator on the same machine —
-that is explicitly **out of scope**. The threat model is single-user. Do not add
-auth layers, DACL tightening, or token ceremony that the local single-user model
-doesn't justify.
+it. The token is what separates the daemon's user from everyone else on the PC:
+a client with it can make VMs from host files, so `host.json` is readable only by
+SYSTEM, Administrators and the user who started the daemon, and
+`%ProgramData%\AppSandbox` belongs to Administrators (other users can read it but
+not change it). Defending against an administrator on the same machine is **out
+of scope**.
 
 ---
 
