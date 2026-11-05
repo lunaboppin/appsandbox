@@ -2,7 +2,9 @@
  *
  * Pipeline:
  *   1. WinHTTP-download
- *      https://codeload.github.com/lunaboppin/appsandbox/tar.gz/refs/heads/<branch>
+ *      https://codeload.github.com/lunaboppin/appsandbox/tar.gz/refs/tags/<tag>
+ *      -- this release's own tag, never a branch, so the guest gets the source
+ *      this build was released from (and only when the build ships no copy).
  *      → <tmp>/repo.tar.gz
  *   2. Shell out to tar.exe (libarchive handles .tar.gz natively):
  *      `tar -xzf repo.tar.gz -C <tmp>` → <tmp>/appsandbox-<branch>/...
@@ -189,9 +191,9 @@ static int u_cp_tree(const wchar_t *src_dir, const wchar_t *dst_dir)
  * Main flow
  * ==================================================================== */
 
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *local_root, const wchar_t *out_dir)
+int do_prefetch_repo(const wchar_t *tag, const wchar_t *local_root, const wchar_t *out_dir)
 {
-    log_msg(L"prefetch-repo: branch=%s local=%s out=%s", branch,
+    log_msg(L"prefetch-repo: tag=%s local=%s out=%s", tag,
             local_root ? local_root : L"(none)", out_dir);
 
     wchar_t extracted_root[MAX_PATH] = L"";
@@ -218,8 +220,13 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *local_root, const wch
     swprintf_s(tgz, MAX_PATH, L"%s\\repo.tar.gz", tmp);
     {
         wchar_t path[1024];
+        /* A release tag: "v" and the version's digits and dots. */
+        if (tag[0] != L'v' || !tag[1] || wcsspn(tag + 1, L"0123456789.") != wcslen(tag + 1)) {
+            log_err(L"prefetch-repo: not a release tag: %s", tag);
+            return -1;
+        }
         swprintf_s(path, 1024,
-            L"/lunaboppin/appsandbox/tar.gz/refs/heads/%s", branch);
+            L"/lunaboppin/appsandbox/tar.gz/refs/tags/%s", tag);
         log_msg(L"prefetch-repo: GET https://codeload.github.com%s", path);
         if (http_download_secure(L"codeload.github.com", 443, path, tgz) != 0) {
             log_err(L"prefetch-repo: download failed");
