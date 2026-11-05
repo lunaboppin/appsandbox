@@ -34,6 +34,11 @@
 #define GS_WATCH_MS          10000
 #define GS_KEEP_STOPPED_MIN  30       /* a duplicate shut down from inside waits this long to be started again */
 #define GS_CATALOG_MAX       (4u * 1024u * 1024u)
+/* What one image build may copy out of the guest: the guest decides what it sends. */
+#define GS_ART_MAX           (8ull * 1024ull * 1024ull)
+#define GS_CATALOG_TOTAL_MAX (256ull * 1024ull * 1024ull)
+#define GS_CATALOG_FILES_MAX 1000
+#define GS_IDENTITY_FILE_MAX (1024ull * 1024ull)
 #define GS_IDENTITY_MAX      (1024u * 1024u)
 #define GS_IDENTITY_PIECE    1000     /* bytes per command; base64 stays well under the agent's limit */
 #define GS_PORT_FIRST        40000    /* users' own Moonlight ports, below Windows' dynamic range; one per GS_PORT_STEP */
@@ -369,13 +374,20 @@ static BOOL take_kept_password(const char *token, wchar_t *password, size_t char
 
 /* ---- The catalog ---- */
 
-BOOL game_stream_catalog_file(const char *leaf, wchar_t *path, size_t path_chars)
+/* A file name in the catalog folder: letters, digits, '_' and '.', no "..", so it can't
+   leave the folder. The guest supplies these names. */
+static BOOL catalog_leaf_ok(const char *leaf)
 {
     const char *p;
-    wchar_t dir[MAX_PATH] = L"";
     for (p = leaf; *p; p++)
         if (!isalnum((unsigned char)*p) && *p != '_' && *p != '.') return FALSE;
-    if (!leaf[0] || strstr(leaf, "..") || strlen(leaf) > 64) return FALSE;
+    return leaf[0] && leaf[0] != '.' && !strstr(leaf, "..") && strlen(leaf) <= 64;
+}
+
+BOOL game_stream_catalog_file(const char *leaf, wchar_t *path, size_t path_chars)
+{
+    wchar_t dir[MAX_PATH] = L"";
+    if (!catalog_leaf_ok(leaf)) return FALSE;
     AcquireSRWLockShared(&g_lock);
     if (g_image[0]) image_dir_of(g_image, dir, MAX_PATH);
     ReleaseSRWLockShared(&g_lock);
@@ -416,8 +428,10 @@ static BOOL item_allowed(const char *item)
     return found;
 }
 
-/* Copy one file out of the guest's catalog folder. */
-static HRESULT fetch_catalog_file(VmInstance *vm, const char *leaf, const wchar_t *dir)
+/* Copy one file out of the guest's catalog folder, at most max bytes. *budget is what
+   the whole catalog may still use, and goes down by what this file took. */
+static HRESULT fetch_catalog_file(VmInstance *vm, const char *leaf, const wchar_t *dir,
+                                  ULONGLONG max, ULONGLONG *budget)
 {
     char *reply = (char *)malloc(ASB_DOMAIN_REPLY_MAX);
     BYTE *chunk = (BYTE *)malloc(ASB_DOMAIN_REPLY_MAX);
@@ -426,8 +440,10 @@ static HRESULT fetch_catalog_file(VmInstance *vm, const char *leaf, const wchar_
     ULONGLONG offset = 0, total = 1;
     HRESULT hr = E_OUTOFMEMORY;
 
+    path[0] = 0;
+    if (!catalog_leaf_ok(leaf)) { hr = E_INVALIDARG; goto done; }
     if (!reply || !chunk) goto done;
-    swprintf_s(path, MAX_PATH, L"%s\\%S", dir, leaf);
+    if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%S", dir, leaf) < 0) { hr = E_INVALIDARG; goto done; }
     f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) { hr = HRESULT_FROM_WIN32(GetLastError()); goto done; }
     while (offset < total) {
@@ -435,16 +451,22 @@ static HRESULT fetch_catalog_file(VmInstance *vm, const char *leaf, const wchar_
         DWORD bytes = ASB_DOMAIN_REPLY_MAX, wrote = 0;
         sprintf_s(cmd, sizeof(cmd), "session_catalog_read:%s:%llu", leaf, offset);
         if (!vm_agent_send(vm, cmd, reply, ASB_DOMAIN_REPLY_MAX, 30000)) { hr = E_FAIL; goto done; }
+        if (strncmp(reply, "ok:", 3) != 0) { hr = E_FAIL; goto done; }
         total = _strtoui64(reply + 3, &colon, 10);
         if (*colon != ':' || (!colon[1] && offset < total)) { hr = E_FAIL; goto done; }
+        if (total > max || total > *budget) { hr = E_BOUNDS; goto done; }
         if (!colon[1]) break;
         if (!CryptStringToBinaryA(colon + 1, 0, CRYPT_STRING_BASE64, chunk, &bytes, NULL, NULL) ||
-            !bytes || !WriteFile(f, chunk, bytes, &wrote, NULL)) { hr = E_FAIL; goto done; }
+            !bytes || bytes > total - offset || !WriteFile(f, chunk, bytes, &wrote, NULL)) { hr = E_FAIL; goto done; }
         offset += bytes;
     }
+    *budget -= offset;
     hr = S_OK;
 done:
-    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (f != INVALID_HANDLE_VALUE) {
+        CloseHandle(f);
+        if (FAILED(hr)) DeleteFileW(path);
+    }
     free(reply);
     free(chunk);
     return hr;
@@ -458,11 +480,13 @@ static HRESULT collect_catalog(VmInstance *vm, const wchar_t *image_dir)
     HANDLE f;
     DWORD size, got = 0;
     HRESULT hr;
+    ULONGLONG budget = GS_CATALOG_TOTAL_MAX;
+    int files = 0;
 
     swprintf_s(dir, MAX_PATH, L"%s\\catalog", image_dir);
     CreateDirectoryW(dir, NULL);
     if (!vm_agent_send(vm, "session_catalog_scan", reply, sizeof(reply), 6 * 60 * 1000)) return E_FAIL;
-    hr = fetch_catalog_file(vm, "catalog.json", dir);
+    hr = fetch_catalog_file(vm, "catalog.json", dir, GS_CATALOG_MAX - 1, &budget);
     if (FAILED(hr)) return hr;
 
     swprintf_s(path, MAX_PATH, L"%s\\catalog.json", dir);
@@ -480,8 +504,13 @@ static HRESULT collect_catalog(VmInstance *vm, const wchar_t *image_dir)
             if (!end || end == p || end - p >= (int)sizeof(leaf)) continue;
             memcpy(leaf, p, end - p);
             leaf[end - p] = 0;
+            if (++files > GS_CATALOG_FILES_MAX) break;
+            if (!catalog_leaf_ok(leaf) || strcmp(leaf, "catalog.json") == 0) {
+                ui_log(L"Game Streaming: skipped a picture with an unsafe name in the game list.");
+                continue;
+            }
             /* A game without its picture still shows, by name. */
-            fetch_catalog_file(vm, leaf, dir);
+            fetch_catalog_file(vm, leaf, dir, GS_ART_MAX, &budget);
         }
     }
     free(text);
@@ -623,7 +652,7 @@ static HRESULT build_steps(const wchar_t *source_vhdx, const wchar_t *image_dir,
         reply[0] = 0;
         if (vm_agent_send(vm, "session_image_status", reply, sizeof(reply), 10000) &&
             strncmp(reply, "ok:failed|", 10) == 0) {
-            swprintf_s(error, error_chars, L"%S", reply + 10);
+            _snwprintf_s(error, error_chars, _TRUNCATE, L"%S", reply + 10);
             return E_FAIL;
         }
         if (GetTickCount64() > deadline) {
@@ -872,9 +901,9 @@ static BOOL identity_fetch(VmInstance *vm, const char *leaf, const wchar_t *path
         sprintf_s(cmd, sizeof(cmd), "domain_identity_get:%s:%llu", leaf, offset);
         if (!vm_agent_send(vm, cmd, reply, ASB_DOMAIN_REPLY_MAX, 30000)) goto done;
         total = _strtoui64(reply + 3, &colon, 10);
-        if (*colon != ':' || !colon[1]) goto done;
+        if (*colon != ':' || !colon[1] || total > GS_IDENTITY_FILE_MAX) goto done;
         if (!CryptStringToBinaryA(colon + 1, 0, CRYPT_STRING_BASE64, chunk, &bytes, NULL, NULL) ||
-            !bytes || !WriteFile(f, chunk, bytes, &wrote, NULL)) goto done;
+            !bytes || bytes > total - offset || !WriteFile(f, chunk, bytes, &wrote, NULL)) goto done;
         offset += bytes;
     }
     ok = total > 0;

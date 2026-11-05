@@ -2,6 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- Nothing in a report may load or send anything: its data came from malware. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' file:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Malware Lab Report</title>
 <!-- Filled in by AppSandbox: the run's data replaces the marker below.
