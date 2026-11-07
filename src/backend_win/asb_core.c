@@ -556,6 +556,54 @@ static BOOL apply_security(const wchar_t *path, const wchar_t *sddl)
     return ok;
 }
 
+/* Append "(A;OICI;FA;;;<sid>)" for the user a token belongs to. */
+static void append_token_user_ace(HANDLE token, wchar_t *sddl, size_t chars)
+{
+    BYTE buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    DWORD got = 0;
+    wchar_t *sid = NULL;
+    if (!GetTokenInformation(token, TokenUser, buf, sizeof(buf), &got) ||
+        !ConvertSidToStringSidW(((TOKEN_USER *)buf)->User.Sid, &sid))
+        return;
+    if (!wcsstr(sddl, sid)) {
+        wcscat_s(sddl, chars, L"(A;OICI;FA;;;");
+        wcscat_s(sddl, chars, sid);
+        wcscat_s(sddl, chars, L")");
+    }
+    LocalFree(sid);
+}
+
+/* The WebView2 browser behind the UI doesn't run elevated: it runs as the
+   signed-in user, so its profile folder needs that user's write access (and
+   this app's user, if an administrator elevated it with other credentials).
+   Other users still only read. */
+static void secure_webview_dir(const wchar_t *root)
+{
+    wchar_t path[MAX_PATH], sddl[512] = L"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+    HANDLE token;
+    DWORD shell_pid = 0;
+    HWND shell = GetShellWindow();
+
+    swprintf_s(path, MAX_PATH, L"%s\\WebView2Data", root);
+    CreateDirectoryW(path, NULL);
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        append_token_user_ace(token, sddl, _countof(sddl));
+        CloseHandle(token);
+    }
+    if (shell && GetWindowThreadProcessId(shell, &shell_pid) && shell_pid) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shell_pid);
+        if (process) {
+            if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
+                append_token_user_ace(token, sddl, _countof(sddl));
+                CloseHandle(token);
+            }
+            CloseHandle(process);
+        }
+    }
+    wcscat_s(sddl, _countof(sddl), L"(A;OICI;0x1200a9;;;BU)");
+    apply_security(path, sddl);
+}
+
 ASB_API BOOL asb_secure_data_dir(void)
 {
     static LONG done = 0;
@@ -578,6 +626,7 @@ ASB_API BOOL asb_secure_data_dir(void)
         return FALSE;
     }
     ok = apply_security(root, DATA_DIR_SDDL);
+    secure_webview_dir(root);
 
     swprintf_s(path, MAX_PATH, L"%s\\ssh", root);
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
