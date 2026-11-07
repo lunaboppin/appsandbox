@@ -1530,10 +1530,14 @@ static void game_streaming_command(const wchar_t *action, const wchar_t *json)
         } else if (wcscmp(action, L"gameStreamingVmOptions") == 0) {
             wchar_t user[80] = L"", vpn[40] = L"";
             BOOL pin = FALSE, has_pin, has_vpn;
+            int idle = GS_IDLE_LEAVE;
             json_get_string(json, L"user", user, _countof(user));
             has_pin = json_get_bool(json, L"pinned", &pin);
             has_vpn = json_get_string(json, L"vpn", vpn, _countof(vpn));
-            hr = game_stream_set_vm_options(user, has_pin ? (pin ? 1 : 0) : -1, has_vpn ? vpn : NULL,
+            /* idleMinutes: minutes, 0 never, -1 the Game Streaming setting */
+            if (!json_get_int(json, L"idleMinutes", &idle)) idle = GS_IDLE_LEAVE;
+            else if (idle < GS_IDLE_DEFAULT) idle = 1 << 30;   /* refused as out of range */
+            hr = game_stream_set_vm_options(user, has_pin ? (pin ? 1 : 0) : -1, has_vpn ? vpn : NULL, idle,
                                             message, _countof(message));
         }
         if (FAILED(hr) && !message[0]) format_hresult_message(hr, message, _countof(message));

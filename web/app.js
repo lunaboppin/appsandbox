@@ -1048,7 +1048,7 @@ function renderGameStreaming() {
         });
         if (s.vm) select.value = s.vm;
         document.getElementById('gs-max').value = s.maxSessions || 2;
-        document.getElementById('gs-idle').value = s.idleMinutes === undefined ? 30 : s.idleMinutes;
+        fillGsIdleSelect(document.getElementById('gs-idle'), s.idleMinutes === undefined ? 30 : s.idleMinutes, false);
         document.getElementById('gs-keep').value = s.keepDays === undefined ? 14 : s.keepDays;
         document.getElementById('gs-group').value = s.group || '';
         document.getElementById('gs-lan').checked = !!s.lan;
@@ -1112,7 +1112,28 @@ function renderGameStreaming() {
     renderGsUserVms(s);
 }
 
-/* Each user's VM: keep it for good, and its own network. */
+/* Idle timeouts: minutes, 0 = never; -1 = the Game Streaming setting (per VM only). */
+var GS_IDLE_CHOICES = [15, 30, 60, 120, 240, 480, 1440, 10080];
+function gsIdleLabel(m) {
+    if (m === 0) return 'Never';
+    if (m % 1440 === 0) return (m / 1440) + (m === 1440 ? ' day' : (m === 10080 ? ' days (a week)' : ' days'));
+    if (m % 60 === 0) return (m / 60) + (m === 60 ? ' hour' : ' hours');
+    return m + ' minutes';
+}
+function fillGsIdleSelect(select, value, perVm) {
+    select.innerHTML = '';
+    var values = (perVm ? [-1] : []).concat(GS_IDLE_CHOICES, [0]);
+    if (values.indexOf(value) < 0) values.splice(values.length - 1, 0, value);
+    values.forEach(function(m) {
+        var o = document.createElement('option');
+        o.value = String(m);
+        o.textContent = m === -1 ? 'Usual idle time' : gsIdleLabel(m);
+        select.appendChild(o);
+    });
+    select.value = String(value);
+}
+
+/* Each user's VM: keep it for good, its own network and its own idle timeout. */
 function renderGsUserVms(s) {
     var list = document.getElementById('gs-user-vms');
     var vms = s.userVms || [];
@@ -1153,9 +1174,18 @@ function renderGsUserVms(s) {
             sendCmd('gameStreamingVmOptions', { user: v.user, vpn: net.value });
         };
 
+        var idle = document.createElement('select');
+        idle.setAttribute('aria-label', 'Idle timeout for ' + v.user + '\'s VM');
+        idle.title = 'End the session when nobody has connected for this long';
+        fillGsIdleSelect(idle, v.idleMinutes === undefined ? -1 : v.idleMinutes, true);
+        idle.onchange = function() {
+            sendCmd('gameStreamingVmOptions', { user: v.user, idleMinutes: parseInt(idle.value, 10) });
+        };
+
         row.appendChild(text);
         row.appendChild(keep);
         row.appendChild(net);
+        row.appendChild(idle);
         list.appendChild(row);
     });
 }

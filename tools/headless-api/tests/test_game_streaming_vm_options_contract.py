@@ -65,6 +65,25 @@ def main():
     assert "sendCmd('gameStreamingVmOptions', { user: v.user, pinned: check.checked });" in app
     assert "sendCmd('gameStreamingVmOptions', { user: v.user, vpn: net.value });" in app
 
+    # Idle timeout: Never (0) everywhere, up to a week, and per user's VM; re-read as
+    # the session runs so a change applies at once.
+    assert "#define GS_IDLE_MAX_MIN      (7 * 24 * 60)" in gs
+    assert "idle_minutes > GS_IDLE_MAX_MIN" in gs
+    assert 'identity_path(user, L"vm-idle", path, MAX_PATH)' in gs
+    idle_fn = gs[gs.index("static int user_idle_minutes"):gs.index("static void kept_unpin")]
+    assert '_wcsicmp(line, L"never") == 0) return 0;' in idle_fn
+    watch = thread[thread.index("\nwatch:"):thread.index("\nstopped:")]
+    assert watch.index("idle_minutes = user_idle_minutes(s->user, idle_minutes);") < watch.index("idle_minutes > 0 && now - idle_since")
+    assert "idle_minutes = g_idle_minutes;" in watch
+    assert "#define GS_IDLE_LEAVE   (-2)" in header and "#define GS_IDLE_DEFAULT (-1)" in header
+    assert "if (idle != GS_IDLE_LEAVE)" in opts
+    assert '\\"idleMinutes\\":%d}' in gs
+    for src in (ui, headless):
+        assert 'L"idleMinutes", &idle' in src and "has_vpn ? vpn : NULL, idle," in src
+    assert '<select id="gs-idle"></select>' in html
+    assert "if (m === 0) return 'Never';" in app
+    assert "sendCmd('gameStreamingVmOptions', { user: v.user, idleMinutes: parseInt(idle.value, 10) });" in app
+
     print("game streaming VM options contract: OK")
 
 

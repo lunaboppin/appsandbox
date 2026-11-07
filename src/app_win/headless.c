@@ -906,8 +906,9 @@ static int handle_request(PHTTP_REQUEST req)
          POST /v1/game-streaming        {vm, maxSessions, idleMinutes, group, lan, vpn, drivesOff}
          POST /v1/game-streaming/image  build or refresh the image
          POST /v1/game-streaming/off    end every session and delete the image
-         POST /v1/game-streaming/vm     {user, pinned?, vpn?}  one user's VM: keep it for good,
-                                        or give it its own network ("" default, "nat", VPN id) */
+         POST /v1/game-streaming/vm     {user, pinned?, vpn?, idleMinutes?}  one user's VM: keep it
+                                        for good, give it its own network ("" default, "nat", VPN id),
+                                        or its own idle timeout (minutes, 0 never, -1 default) */
     if (wcscmp(path, L"/v1/game-streaming") == 0 || wcsncmp(path, L"/v1/game-streaming/", 19) == 0) {
         wchar_t message[512] = L"";
         HRESULT hr = S_OK;
@@ -932,11 +933,15 @@ static int handle_request(PHTTP_REQUEST req)
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/vm") == 0) {
             wchar_t body[1024] = L"", user[80] = L"", vpn[40] = L"";
             BOOL pin = FALSE, has_pin, has_vpn;
+            int idle = GS_IDLE_LEAVE;
             body_to_wide(req, body, _countof(body));
             json_get_string(body, L"user", user, _countof(user));
             has_pin = json_get_bool(body, L"pinned", &pin);
             has_vpn = json_get_string(body, L"vpn", vpn, _countof(vpn));
-            hr = game_stream_set_vm_options(user, has_pin ? (pin ? 1 : 0) : -1, has_vpn ? vpn : NULL,
+            /* idleMinutes: minutes, 0 never, -1 the Game Streaming setting */
+            if (!json_get_int(body, L"idleMinutes", &idle)) idle = GS_IDLE_LEAVE;
+            else if (idle < GS_IDLE_DEFAULT) idle = 1 << 30;   /* refused as out of range */
+            hr = game_stream_set_vm_options(user, has_pin ? (pin ? 1 : 0) : -1, has_vpn ? vpn : NULL, idle,
                                             message, _countof(message));
         } else if (verb != HttpVerbGET || wcscmp(path, L"/v1/game-streaming") != 0) {
             send_err(req->RequestId, 404, "Not Found", "not_found", "no such route");
