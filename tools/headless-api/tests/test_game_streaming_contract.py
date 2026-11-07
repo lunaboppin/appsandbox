@@ -243,12 +243,13 @@ def main() -> None:
     # Each user's VM is kept between sessions: shut down, taken out of the list with its
     # folder left, and booted again next time without setup, identity restore or a join.
     assert "static int       g_keep_days = 14;" in gs and 'L"GameStreamKeepDays="' in gs
-    assert "keep = id && keep_days > 0 && (reuse || ready_once) && !InterlockedCompareExchange(&s->discard, 0, 0);" in thread
+    assert "keep = id && !InterlockedCompareExchange(&s->discard, 0, 0) &&" in thread
+    assert "(pinned || (keep_days > 0 && (reuse || ready_once)))" in thread
     end = thread[thread.index("\ncleanup:"):]
     assert end.index("asb_vm_shutdown(handle);") < end.index("asb_session_clone_release(id)")
     assert "kept_forget(s->user);" in end and "shared_appliance_domain_computer_remove(s->vm_name)" in end
     assert "config.session_reuse = reuse;" in thread and "identity = reuse ? NULL : identity_commands(s->user);" in thread
-    assert 'if (reuse) kept_remove(s->user, s->vm_name, L"it couldn\'t start");' in thread
+    assert 'if (reuse && !pinned) kept_remove(s->user, s->vm_name, L"it couldn\'t start");' in thread
     unusable = gs[gs.index("static const wchar_t *kept_unusable"):gs.index("static BOOL session_active(const wchar_t *user);")]
     assert "the games image was refreshed" in unusable and "unused for too long" in unusable
     assert "kept_sweep(NULL, NULL);   /* VMs from the old image start over */" in gs
