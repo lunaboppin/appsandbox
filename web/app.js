@@ -1109,6 +1109,55 @@ function renderGameStreaming() {
         row.appendChild(end);
         list.appendChild(row);
     });
+    renderGsUserVms(s);
+}
+
+/* Each user's VM: keep it for good, and its own network. */
+function renderGsUserVms(s) {
+    var list = document.getElementById('gs-user-vms');
+    var vms = s.userVms || [];
+    /* Don't rebuild a select the admin has open. */
+    if (list.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
+    list.innerHTML = '';
+    document.getElementById('gs-user-vms-section').style.display = vms.length ? '' : 'none';
+    vms.forEach(function(v) {
+        var row = document.createElement('div');
+        row.className = 'settings-resource-row';
+        var text = document.createElement('span');
+        var used = v.active ? 'in use now' : (v.lastUsed ? 'last used ' + new Date(v.lastUsed * 1000).toLocaleDateString() : '');
+        text.textContent = v.user + ': ' + v.vm + (used ? ' (' + used + ')' : '');
+
+        var keep = document.createElement('label');
+        keep.className = 'manage-check';
+        var check = document.createElement('input');
+        check.type = 'checkbox';
+        check.checked = !!v.pinned;
+        check.onchange = function() {
+            sendCmd('gameStreamingVmOptions', { user: v.user, pinned: check.checked });
+        };
+        keep.appendChild(check);
+        keep.appendChild(document.createTextNode(' Keep forever'));
+
+        var net = document.createElement('select');
+        net.setAttribute('aria-label', 'Network for ' + v.user + '\'s VM');
+        [['', 'Game Streaming network'], ['nat', 'NAT (no VPN)']].concat((vpnConfigs || []).map(function(c) {
+            return [c.id, 'VPN: ' + c.name];
+        })).forEach(function(o) {
+            var opt = document.createElement('option');
+            opt.value = o[0]; opt.textContent = o[1];
+            net.appendChild(opt);
+        });
+        net.value = v.vpn || '';
+        if (net.value !== (v.vpn || '')) net.value = '';
+        net.onchange = function() {
+            sendCmd('gameStreamingVmOptions', { user: v.user, vpn: net.value });
+        };
+
+        row.appendChild(text);
+        row.appendChild(keep);
+        row.appendChild(net);
+        list.appendChild(row);
+    });
 }
 
 /* Sessions get their own network and drives, whatever the nominated VM uses. */

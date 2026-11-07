@@ -214,6 +214,8 @@ static void image_dir_of(const wchar_t *base, wchar_t *dir, size_t chars)
 }
 
 /* Delete images nothing depends on any more. */
+static BOOL kept_uses_image(const wchar_t *dir);
+
 static void prune_images(void)
 {
     wchar_t pattern[MAX_PATH], dir[MAX_PATH], current[MAX_PATH] = L"", root[MAX_PATH];
@@ -236,6 +238,7 @@ static void prune_images(void)
         for (i = 0; i < GS_MAX_SESSIONS; i++)
             if (g_sessions[i].used && _wcsicmp(g_sessions[i].image, dir) == 0) used = TRUE;
         ReleaseSRWLockShared(&g_lock);
+        if (!used) used = kept_uses_image(dir);
         if (!used && !InterlockedCompareExchange(&g_build.busy, 0, 0))
             asb_session_clone_remove_leftover(NULL, dir);
     } while (FindNextFileW(h, &d));
@@ -1028,7 +1031,10 @@ static void user_stream_name(const wchar_t *user, char *out, size_t chars)
 /* ---- A user's kept VM ----
    Each user's duplicate is kept between sessions, stopped, so the next one only boots it.
    identities\<user>\vm: "<VM name>|<image folder>|<last used, seconds since 1970>". It is
-   deleted when the image changes, after g_keep_days unused, or when it fails to set up. */
+   deleted when the image changes, after g_keep_days unused, or when it fails to set up --
+   unless an administrator marked it to keep: identities\<user>\vm-pin names that VM, and
+   then nothing automatic deletes it (it keeps its own image, even after a refresh). Only
+   an administrator ending the session, deleting the user or turning the feature off does. */
 
 static BOOL kept_read(const wchar_t *user, wchar_t *name, size_t name_chars,
                       wchar_t *image, size_t image_chars, ULONGLONG *last)
@@ -1069,6 +1075,52 @@ static void kept_forget(const wchar_t *user)
     if (identity_path(user, L"vm", path, MAX_PATH)) DeleteFileW(path);
 }
 
+/* TRUE when an administrator marked this user's VM name to keep. */
+static BOOL kept_pinned(const wchar_t *user, const wchar_t *name)
+{
+    wchar_t path[MAX_PATH], line[64] = L"";
+    FILE *f = NULL;
+    if (!name || !name[0] || !identity_path(user, L"vm-pin", path, MAX_PATH) ||
+        _wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f)
+        return FALSE;
+    if (!fgetws(line, _countof(line), f)) line[0] = 0;
+    fclose(f);
+    line[wcscspn(line, L"\r\n")] = 0;
+    return _wcsicmp(line, name) == 0;
+}
+
+/* The network an administrator chose for this user's VM: "" = the Game Streaming
+   setting, "nat" = no VPN, otherwise a VPN config's id. */
+static void user_vpn_read(const wchar_t *user, wchar_t *out, size_t chars)
+{
+    wchar_t path[MAX_PATH], line[64] = L"";
+    FILE *f = NULL;
+    out[0] = 0;
+    if (!identity_path(user, L"vm-vpn", path, MAX_PATH) || _wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f)
+        return;
+    if (!fgetws(line, _countof(line), f)) line[0] = 0;
+    fclose(f);
+    line[wcscspn(line, L"\r\n")] = 0;
+    if (wcslen(line) < chars) wcscpy_s(out, chars, line);
+}
+
+static void kept_unpin(const wchar_t *user)
+{
+    wchar_t path[MAX_PATH];
+    if (identity_path(user, L"vm-pin", path, MAX_PATH)) DeleteFileW(path);
+}
+
+static BOOL kept_pin(const wchar_t *user, const wchar_t *name)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f = NULL;
+    if (!identity_dirs(user) || !identity_path(user, L"vm-pin", path, MAX_PATH)) return FALSE;
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return FALSE;
+    fwprintf(f, L"%s\n", name);
+    fclose(f);
+    return TRUE;
+}
+
 /* Its folder, its computer account and the record. */
 static void kept_remove(const wchar_t *user, const wchar_t *name, const wchar_t *why)
 {
@@ -1079,11 +1131,12 @@ static void kept_remove(const wchar_t *user, const wchar_t *name, const wchar_t 
     asb_session_clone_remove_leftover(name, dir);
     shared_appliance_domain_computer_remove(name);
     kept_forget(user);
+    kept_unpin(user);
     ui_log(L"Game Streaming: deleted %s's VM \"%s\" (%s).", user, name, why);
 }
 
 /* NULL when the kept VM can start the user's next session, otherwise why not. */
-static const wchar_t *kept_unusable(const wchar_t *name, const wchar_t *image, ULONGLONG last)
+static const wchar_t *kept_unusable(const wchar_t *name, const wchar_t *image, ULONGLONG last, BOOL pinned)
 {
     wchar_t current[MAX_PATH] = L"", disk[MAX_PATH];
     int days;
@@ -1092,6 +1145,14 @@ static const wchar_t *kept_unusable(const wchar_t *name, const wchar_t *image, U
     days = g_keep_days;
     swprintf_s(disk, MAX_PATH, L"%s\\sessions\\%s\\disk.vhdx", g_root, name);
     ReleaseSRWLockShared(&g_lock);
+    if (pinned) {
+        /* Kept whatever the settings and image say; its own image stays with it. */
+        wchar_t parent[MAX_PATH];
+        if (GetFileAttributesW(disk) == INVALID_FILE_ATTRIBUTES) return L"its disk is missing";
+        swprintf_s(parent, MAX_PATH, L"%s\\base.vhdx", image);
+        if (GetFileAttributesW(parent) == INVALID_FILE_ATTRIBUTES) return L"its image is missing";
+        return NULL;
+    }
     if (days <= 0) return L"VMs aren't kept between sessions";
     if (!current[0] || _wcsicmp(image, current) != 0) return L"the games image was refreshed";
     if ((ULONGLONG)_time64(NULL) > last + (ULONGLONG)days * 86400ull) return L"unused for too long";
@@ -1118,11 +1179,33 @@ static void kept_sweep(void (*keep)(const wchar_t *name, void *ctx), void *ctx)
         if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || d.cFileName[0] == L'.') continue;
         if (!kept_read(d.cFileName, name, _countof(name), image, _countof(image), &last)) continue;
         if (session_active(d.cFileName) || asb_vm_find(name)) { if (keep) keep(name, ctx); continue; }
-        why = kept_unusable(name, image, last);
+        why = kept_unusable(name, image, last, kept_pinned(d.cFileName, name));
         if (why) kept_remove(d.cFileName, name, why);
         else if (keep) keep(name, ctx);
     } while (FindNextFileW(h, &d) && !g_shutting_down);
     FindClose(h);
+}
+
+/* TRUE when a kept VM is a copy of the image in dir. */
+static BOOL kept_uses_image(const wchar_t *dir)
+{
+    wchar_t pattern[MAX_PATH], name[32], image[MAX_PATH];
+    WIN32_FIND_DATAW d;
+    HANDLE h;
+    ULONGLONG last;
+    BOOL used = FALSE;
+    if (!identity_path(NULL, NULL, pattern, MAX_PATH)) return FALSE;
+    wcscat_s(pattern, MAX_PATH, L"\\*");
+    h = FindFirstFileW(pattern, &d);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || d.cFileName[0] == L'.') continue;
+        if (kept_read(d.cFileName, name, _countof(name), image, _countof(image), &last) &&
+            _wcsicmp(image, dir) == 0)
+            used = TRUE;
+    } while (!used && FindNextFileW(h, &d));
+    FindClose(h);
+    return used;
 }
 
 static DWORD WINAPI kept_sweep_thread(LPVOID param)
@@ -1157,6 +1240,7 @@ void game_stream_forget_user(const wchar_t *user)
     game_stream_session_end(user);
     if (kept_read(user, name, _countof(name), image, _countof(image), &last))
         kept_remove(user, name, L"the user's Game Streaming data was deleted");
+    kept_unpin(user);
     if (identity_path(user, NULL, path, MAX_PATH) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
         asb_session_clone_remove_leftover(NULL, path);
         ui_log(L"Game Streaming: deleted %s's Moonlight identity.", user);
@@ -1200,7 +1284,7 @@ static DWORD WINAPI session_thread(LPVOID param)
     GsStart *start = (GsStart *)param;
     int slot = start->slot, signed_out = 0;
     BOOL seen_user = TRUE;            /* signed in when the session became ready */
-    BOOL reuse = FALSE, ready_once = FALSE, keep;
+    BOOL reuse = FALSE, ready_once = FALSE, keep, pinned = FALSE;
     int keep_days;
     wchar_t image_dir[MAX_PATH], kept_name[32], kept_image[MAX_PATH];
     ULONGLONG kept_last;
@@ -1227,6 +1311,13 @@ static DWORD WINAPI session_thread(LPVOID param)
     wcscpy_s(vpn, _countof(vpn), g_vpn);
     wcscpy_s(drives_off, _countof(drives_off), g_drives_off);
     ReleaseSRWLockShared(&g_lock);
+    /* An administrator's choice for this user's VM wins over the Game Streaming setting. */
+    {
+        wchar_t own[40];
+        user_vpn_read(s->user, own, _countof(own));
+        if (_wcsicmp(own, L"nat") == 0) vpn[0] = 0;
+        else if (own[0]) wcscpy_s(vpn, _countof(vpn), own);
+    }
     /* A VPN deleted since it was chosen: the session goes out through NAT instead. */
     if (vpn[0] && !vpn_configs_find(vpn, NULL)) {
         ui_log(L"Game Streaming: the chosen VPN no longer exists, so \"%s\" uses NAT.", s->vm_name);
@@ -1244,12 +1335,21 @@ static DWORD WINAPI session_thread(LPVOID param)
     image_dir_of(base, image_dir, MAX_PATH);
     /* Their VM from last time, if it can still be used; otherwise a new one. */
     if (kept_read(s->user, kept_name, _countof(kept_name), kept_image, _countof(kept_image), &kept_last)) {
-        const wchar_t *why = kept_unusable(kept_name, kept_image, kept_last);
+        BOOL kept_marked = kept_pinned(s->user, kept_name);
+        const wchar_t *why = kept_unusable(kept_name, kept_image, kept_last, kept_marked);
         if (!why && !asb_vm_find(kept_name)) {
             reuse = TRUE;
+            pinned = kept_marked;
+            /* A VM marked to keep may be a copy of an older image: it stays on that one. */
+            wcscpy_s(image_dir, MAX_PATH, kept_image);
             AcquireSRWLockExclusive(&g_lock);
             wcscpy_s(s->vm_name, _countof(s->vm_name), kept_name);
+            wcscpy_s(s->image, MAX_PATH, kept_image);
             ReleaseSRWLockExclusive(&g_lock);
+        } else if (kept_marked && !why) {
+            /* Never replaced by a new one: wait until it's free. */
+            session_failed(slot, "Your VM is still in use. Try again in a minute.");
+            goto cleanup;
         } else {
             kept_remove(s->user, kept_name, why ? why : L"it's in use");
         }
@@ -1294,11 +1394,11 @@ static DWORD WINAPI session_thread(LPVOID param)
     if (FAILED(hr)) {
         sprintf_s(reply, sizeof(reply), "The VM couldn't be created (0x%08X).", hr);
         session_failed(slot, reply);
-        if (reuse) kept_remove(s->user, s->vm_name, L"it couldn't start");
+        if (reuse && !pinned) kept_remove(s->user, s->vm_name, L"it couldn't start");
         reuse = FALSE;
         goto cleanup;
     }
-    if (keep_days > 0) kept_write(s->user, s->vm_name, image_dir);
+    if (keep_days > 0 || pinned) kept_write(s->user, s->vm_name, image_dir);
     vm = asb_vm_instance(asb_vm_find(s->vm_name));
     if (!vm) { session_failed(slot, "The VM couldn't be created."); goto cleanup; }
     id = vm->unique_id;
@@ -1403,7 +1503,7 @@ stopped:
     /* Shut down from inside: kept a while in case they want it back. */
     ui_log(L"Game Streaming: \"%s\" was shut down. It's kept for %d min in case %s starts it again.",
            s->vm_name, GS_KEEP_STOPPED_MIN, s->user);
-    sprintf_s(reply, sizeof(reply), keep_days > 0
+    sprintf_s(reply, sizeof(reply), keep_days > 0 || kept_pinned(s->user, s->vm_name)
               ? "Your VM was shut down. Start it again within %d minutes, or the session ends and it's kept for next time."
               : "Your VM was shut down. Start it again within %d minutes, or it's removed.",
               GS_KEEP_STOPPED_MIN);
@@ -1453,8 +1553,11 @@ cleanup:
     SecureZeroMemory(start->password, sizeof(start->password));
     SecureZeroMemory(logon, sizeof(logon));
     free(start);
-    /* Kept for next time once it has worked: a new VM that never got ready is deleted. */
-    keep = id && keep_days > 0 && (reuse || ready_once) && !InterlockedCompareExchange(&s->discard, 0, 0);
+    /* Kept for next time once it has worked: a new VM that never got ready is deleted.
+       One an administrator marked to keep is always kept (unless they delete the user). */
+    pinned = id && kept_pinned(s->user, s->vm_name);
+    keep = id && !InterlockedCompareExchange(&s->discard, 0, 0) &&
+           (pinned || (keep_days > 0 && (reuse || ready_once)));
     session_state(slot, "ending", keep ? "Shutting down your VM. It's kept for your next session." : "");
     if (id) {
         vm = asb_find_vm_by_id(id);
@@ -1471,14 +1574,24 @@ cleanup:
         if (keep && SUCCEEDED(asb_session_clone_release(id))) {
             kept_write(s->user, s->vm_name, image_dir);
             ui_log(L"Game Streaming: kept \"%s\" for %s's next session.", s->vm_name, s->user);
+        } else if (pinned && keep) {
+            /* Marked to keep: left as it is rather than deleted. */
+            kept_write(s->user, s->vm_name, image_dir);
+            ui_log(L"Game Streaming: \"%s\" couldn't be released, but it's marked to keep, so it isn't deleted.", s->vm_name);
         } else {
             keep = FALSE;
             asb_session_clone_delete(id);
         }
     }
     if (!keep) {
-        kept_forget(s->user);
-        if (SUCCEEDED(shared_appliance_domain_computer_remove(s->vm_name)))
+        /* A VM marked to keep that this session never got to use stays recorded. */
+        wchar_t held[32];
+        ULONGLONG held_last;
+        if (!kept_read(s->user, held, _countof(held), kept_image, _countof(kept_image), &held_last) ||
+            !kept_pinned(s->user, held))
+            kept_forget(s->user);
+        if (!kept_pinned(s->user, s->vm_name) &&
+            SUCCEEDED(shared_appliance_domain_computer_remove(s->vm_name)))
             ui_log(L"Game Streaming: removed \"%s\" and its computer account.", s->vm_name);
     }
     AcquireSRWLockExclusive(&g_lock);
@@ -1869,6 +1982,113 @@ HRESULT game_stream_turn_off(void)
     return S_OK;
 }
 
+/* User names here come from the dashboard sign-in and name a folder: check them. */
+static BOOL admin_user_ok(const wchar_t *user)
+{
+    size_t n = user ? wcslen(user) : 0;
+    wchar_t path[MAX_PATH];
+    if (n == 0 || n > 64 || user[0] == L'.' || wcspbrk(user, L"\\/:*?\"<>|") || wcsstr(user, L".."))
+        return FALSE;
+    return identity_path(user, NULL, path, MAX_PATH) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn,
+                                   wchar_t *err, size_t err_chars)
+{
+    wchar_t name[32] = L"", image[MAX_PATH], path[MAX_PATH];
+    ULONGLONG last;
+    int slot;
+    if (err && err_chars) err[0] = 0;
+    if (!admin_user_ok(user)) {
+        if (err) wcscpy_s(err, err_chars, L"That user has no Game Streaming VM.");
+        return E_INVALIDARG;
+    }
+    if (pin >= 0) {
+        /* The VM to mark: the kept one, or the one their session is using now. */
+        if (!kept_read(user, name, _countof(name), image, _countof(image), &last)) {
+            AcquireSRWLockShared(&g_lock);
+            slot = find_session(user);
+            if (slot >= 0) wcscpy_s(name, _countof(name), g_sessions[slot].vm_name);
+            ReleaseSRWLockShared(&g_lock);
+        }
+        if (pin && !name[0]) {
+            if (err) wcscpy_s(err, err_chars, L"That user has no VM to keep.");
+            return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        }
+        if (pin) {
+            if (!kept_pin(user, name)) return E_FAIL;
+            ui_log(L"Game Streaming: %s's VM \"%s\" is kept until an administrator deletes it.", user, name);
+        } else {
+            kept_unpin(user);
+            ui_log(L"Game Streaming: %s's VM follows the usual keep rules again.", user);
+            kept_sweep_later();
+        }
+    }
+    if (vpn) {
+        if (vpn[0] && _wcsicmp(vpn, L"nat") != 0 && !vpn_configs_find(vpn, NULL)) {
+            if (err) wcscpy_s(err, err_chars, L"That VPN config doesn't exist.");
+            return E_INVALIDARG;
+        }
+        if (!identity_path(user, L"vm-vpn", path, MAX_PATH)) return E_FAIL;
+        if (!vpn[0]) {
+            DeleteFileW(path);
+        } else {
+            FILE *f = NULL;
+            if (!identity_dirs(user) || _wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return E_FAIL;
+            fwprintf(f, L"%s\n", vpn);
+            fclose(f);
+        }
+        ui_log(L"Game Streaming: %s's VM uses %s from its next start.", user,
+               !vpn[0] ? L"the Game Streaming network" : _wcsicmp(vpn, L"nat") == 0 ? L"no VPN" : vpn);
+    }
+    return S_OK;
+}
+
+/* Every user with a VM: kept, or in a session now. */
+static int append_user_vms(char *out, int cap, int pos, const GsSession *sessions)
+{
+    wchar_t pattern[MAX_PATH], name[32], image[MAX_PATH], vpn[40];
+    WIN32_FIND_DATAW d;
+    HANDLE h;
+    ULONGLONG last;
+    int listed = 0, i;
+    pos += sprintf_s(out + pos, cap - pos, ",\"userVms\":[");
+    if (identity_path(NULL, NULL, pattern, MAX_PATH)) {
+        wcscat_s(pattern, MAX_PATH, L"\\*");
+        h = FindFirstFileW(pattern, &d);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                BOOL kept, active = FALSE;
+                if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || d.cFileName[0] == L'.') continue;
+                kept = kept_read(d.cFileName, name, _countof(name), image, _countof(image), &last);
+                if (!kept) {
+                    last = 0;
+                    name[0] = 0;
+                }
+                for (i = 0; i < GS_MAX_SESSIONS; i++)
+                    if (sessions[i].used && _wcsicmp(sessions[i].user, d.cFileName) == 0) {
+                        active = TRUE;
+                        wcscpy_s(name, _countof(name), sessions[i].vm_name);
+                    }
+                if (!name[0] || cap - pos < 512) continue;
+                user_vpn_read(d.cFileName, vpn, _countof(vpn));
+                pos += sprintf_s(out + pos, cap - pos, "%s{", listed++ ? "," : "");
+                pos = json_append_wide(out, cap, pos, "user", d.cFileName);
+                pos += sprintf_s(out + pos, cap - pos, ",");
+                pos = json_append_wide(out, cap, pos, "vm", name);
+                pos += sprintf_s(out + pos, cap - pos, ",");
+                pos = json_append_wide(out, cap, pos, "vpn", vpn);
+                pos += sprintf_s(out + pos, cap - pos, ",\"pinned\":%s,\"active\":%s,\"lastUsed\":%llu}",
+                                 kept_pinned(d.cFileName, name) ? "true" : "false",
+                                 active ? "true" : "false", (unsigned long long)last);
+            } while (FindNextFileW(h, &d));
+            FindClose(h);
+        }
+    }
+    pos += sprintf_s(out + pos, cap - pos, "]");
+    return pos;
+}
+
 int game_stream_status_json(char *out, int cap)
 {
     int pos = 0, i, games = 0, listed = 0;
@@ -1931,7 +2151,9 @@ int game_stream_status_json(char *out, int cap)
         pos = json_append_utf8(out, cap, pos, "detail", copy[i].detail);
         pos += sprintf_s(out + pos, cap - pos, "}");
     }
-    pos += sprintf_s(out + pos, cap - pos, "]}");
+    pos += sprintf_s(out + pos, cap - pos, "]");
+    pos = append_user_vms(out, cap, pos, copy);
+    pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
 

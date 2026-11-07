@@ -55,6 +55,12 @@ ASB_API HRESULT game_stream_build_image(wchar_t *err, size_t err_chars);
 ASB_API HRESULT game_stream_end_session_of_vm(const wchar_t *vm_name);
 ASB_API HRESULT game_stream_turn_off(void);
 
+/* One user's VM: pin 1 keeps it until an administrator deletes it, 0 lets the usual keep
+   rules apply again, -1 leaves it. vpn: NULL leaves it, "" uses the Game Streaming network,
+   "nat" no VPN, otherwise a VPN config's id; it applies from the VM's next start. */
+ASB_API HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn,
+                                           wchar_t *err, size_t err_chars);
+
 /* A domain user is gone: end their session and delete their Moonlight identity. */
 void game_stream_forget_user(const wchar_t *user);
 
