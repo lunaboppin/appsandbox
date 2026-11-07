@@ -164,6 +164,8 @@ try {
     }
 
     # ----------------------------------------------------------- uninstall ---
+    # The app makes its data folder when it opens (above), so compare with what's here now.
+    $dataBeforeUninstall = Test-Path $dataDir
     $code = Run-Setup (Join-Path $dir 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
     Check 'uninstaller exits 0' ($code -eq 0) "exit $code"
     # The uninstaller hands off to a temporary copy of itself, so wait for it to finish.
@@ -183,7 +185,7 @@ try {
         Check 'short menu certificate no longer trusted' (-not (Test-Path "Cert:\LocalMachine\TrustedPeople\$($signer.Thumbprint)"))
     }
     Check 'shortcuts removed' (-not (Test-Path (Join-Path $programs 'App Sandbox.lnk')) -and -not (Test-Path (Join-Path $desktop 'App Sandbox.lnk')))
-    Check 'a silent uninstall leaves VM data alone' ((Test-Path $dataDir) -eq $dataBefore)
+    Check 'a silent uninstall leaves VM data alone' ((Test-Path $dataDir) -eq $dataBeforeUninstall)
 } finally {
     if ($held) { $held.Dispose() }
     if (Test-Path (Join-Path $dir 'unins000.exe')) {
