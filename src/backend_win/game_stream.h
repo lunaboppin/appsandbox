@@ -57,8 +57,12 @@ ASB_API HRESULT game_stream_turn_off(void);
 
 /* One user's VM: pin 1 keeps it until an administrator deletes it, 0 lets the usual keep
    rules apply again, -1 leaves it. vpn: NULL leaves it, "" uses the Game Streaming network,
-   "nat" no VPN, otherwise a VPN config's id; it applies from the VM's next start. */
-ASB_API HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn,
+   "nat" no VPN, otherwise a VPN config's id; it applies from the VM's next start.
+   idle: minutes with nobody connected before the session ends, 0 never,
+   GS_IDLE_DEFAULT the Game Streaming setting, GS_IDLE_LEAVE leaves it; applies at once. */
+#define GS_IDLE_LEAVE   (-2)
+#define GS_IDLE_DEFAULT (-1)
+ASB_API HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn, int idle,
                                            wchar_t *err, size_t err_chars);
 
 /* A domain user is gone: end their session and delete their Moonlight identity. */

@@ -454,8 +454,8 @@
                     <select id="gs-vm"></select>
                     <label for="gs-max">Most sessions at once:</label>
                     <input id="gs-max" type="number" min="1" max="8" value="2">
-                    <label for="gs-idle">End after idle (minutes, 0 = never):</label>
-                    <input id="gs-idle" type="number" min="0" max="1440" value="30">
+                    <label for="gs-idle">End a session when nobody has connected for:</label>
+                    <select id="gs-idle"></select>
                     <label for="gs-keep">Keep each user's VM (days unused, 0 = delete after each session):</label>
                     <input id="gs-keep" type="number" min="0" max="365" value="14">
                     <label for="gs-group">Only this domain group:</label>
@@ -494,7 +494,7 @@
             <fieldset id="gs-user-vms-section">
                 <legend>User VMs</legend>
                 <div id="gs-user-vms" class="settings-resource-list"></div>
-                <small>Keep forever: the VM is never deleted automatically (not when it's unused, when the image is refreshed or when it fails to start). It stays on the image it was made from. A network change applies from the VM's next start.</small>
+                <small>Keep forever: the VM is never deleted automatically (not when it's unused, when the image is refreshed or when it fails to start). It stays on the image it was made from. A network change applies from the VM's next start; an idle time applies at once.</small>
             </fieldset>
             <small>Each device pairs with Moonlight once per user. Launchers like Steam and Epic may ask users to sign in each session, and only Desktop, Documents, Downloads and Pictures are kept between sessions.</small>
         </div>

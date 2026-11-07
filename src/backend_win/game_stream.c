@@ -32,6 +32,7 @@
 #define GS_SIGNIN_MS         (6ull * 60ull * 1000ull)
 #define GS_SIGNED_OUT_POLLS  3        /* of GS_WATCH_MS each, before a session counts as over */
 #define GS_WATCH_MS          10000
+#define GS_IDLE_MAX_MIN      (7 * 24 * 60)   /* a week; 0 means never */
 #define GS_KEEP_STOPPED_MIN  30       /* a duplicate shut down from inside waits this long to be started again */
 #define GS_CATALOG_MAX       (4u * 1024u * 1024u)
 /* What one image build may copy out of the guest: the guest decides what it sends. */
@@ -1104,6 +1105,25 @@ static void user_vpn_read(const wchar_t *user, wchar_t *out, size_t chars)
     if (wcslen(line) < chars) wcscpy_s(out, chars, line);
 }
 
+/* How long this user's session may go with nobody connected before it ends, in
+   minutes (0 = never): identities\<user>\vm-idle when an administrator set one
+   ("never" or minutes), otherwise the Game Streaming setting. Read as the session
+   runs, so a change applies at once. */
+static int user_idle_minutes(const wchar_t *user, int fallback)
+{
+    wchar_t path[MAX_PATH], line[32] = L"";
+    FILE *f = NULL;
+    int minutes;
+    if (!identity_path(user, L"vm-idle", path, MAX_PATH) || _wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f)
+        return fallback;
+    if (!fgetws(line, _countof(line), f)) line[0] = 0;
+    fclose(f);
+    line[wcscspn(line, L"\r\n")] = 0;
+    if (_wcsicmp(line, L"never") == 0) return 0;
+    minutes = _wtoi(line);
+    return minutes > 0 && minutes <= GS_IDLE_MAX_MIN ? minutes : fallback;
+}
+
 static void kept_unpin(const wchar_t *user)
 {
     wchar_t path[MAX_PATH];
@@ -1483,6 +1503,10 @@ watch:
         if (!vm) break;
         if (!vm->running) goto stopped;
         now = GetTickCount64();
+        AcquireSRWLockShared(&g_lock);
+        idle_minutes = g_idle_minutes;
+        ReleaseSRWLockShared(&g_lock);
+        idle_minutes = user_idle_minutes(s->user, idle_minutes);
         if (vm_web_connected(id) || now - vm_stream_last_activity(id) < 30000)
             idle_since = now;
         else if (idle_minutes > 0 && now - idle_since > (ULONGLONG)idle_minutes * 60000ull) {
@@ -1874,7 +1898,7 @@ HRESULT game_stream_configure(const wchar_t *vm_name, int max_sessions, int idle
         if (err) wcsncpy_s(err, err_chars, why, _TRUNCATE);
         return E_INVALIDARG;
     }
-    if (max_sessions < 1 || max_sessions > GS_MAX_SESSIONS || idle_minutes < 0 || idle_minutes > 24 * 60 ||
+    if (max_sessions < 1 || max_sessions > GS_MAX_SESSIONS || idle_minutes < 0 || idle_minutes > GS_IDLE_MAX_MIN ||
         (group && wcslen(group) > 64)) {
         if (err) swprintf_s(err, err_chars, L"Sessions must be 1 to %d, and the idle time 0 to 1440 minutes.", GS_MAX_SESSIONS);
         return E_INVALIDARG;
@@ -1992,7 +2016,7 @@ static BOOL admin_user_ok(const wchar_t *user)
     return identity_path(user, NULL, path, MAX_PATH) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn,
+HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn, int idle,
                                    wchar_t *err, size_t err_chars)
 {
     wchar_t name[32] = L"", image[MAX_PATH], path[MAX_PATH];
@@ -2041,6 +2065,25 @@ HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *
         ui_log(L"Game Streaming: %s's VM uses %s from its next start.", user,
                !vpn[0] ? L"the Game Streaming network" : _wcsicmp(vpn, L"nat") == 0 ? L"no VPN" : vpn);
     }
+    if (idle != GS_IDLE_LEAVE) {
+        if (idle < GS_IDLE_DEFAULT || idle > GS_IDLE_MAX_MIN) {
+            if (err) swprintf_s(err, err_chars, L"Choose up to %d minutes, never, or the Game Streaming setting.", GS_IDLE_MAX_MIN);
+            return E_INVALIDARG;
+        }
+        if (!identity_path(user, L"vm-idle", path, MAX_PATH)) return E_FAIL;
+        if (idle == GS_IDLE_DEFAULT) {
+            DeleteFileW(path);
+            ui_log(L"Game Streaming: %s's VM ends after the usual idle time.", user);
+        } else {
+            FILE *f = NULL;
+            if (!identity_dirs(user) || _wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return E_FAIL;
+            if (idle == 0) fwprintf(f, L"never\n");
+            else fwprintf(f, L"%d\n", idle);
+            fclose(f);
+            if (idle == 0) ui_log(L"Game Streaming: %s's VM is never ended for being idle.", user);
+            else ui_log(L"Game Streaming: %s's VM ends after %d min with nobody connected.", user, idle);
+        }
+    }
     return S_OK;
 }
 
@@ -2078,9 +2121,10 @@ static int append_user_vms(char *out, int cap, int pos, const GsSession *session
                 pos = json_append_wide(out, cap, pos, "vm", name);
                 pos += sprintf_s(out + pos, cap - pos, ",");
                 pos = json_append_wide(out, cap, pos, "vpn", vpn);
-                pos += sprintf_s(out + pos, cap - pos, ",\"pinned\":%s,\"active\":%s,\"lastUsed\":%llu}",
+                pos += sprintf_s(out + pos, cap - pos, ",\"pinned\":%s,\"active\":%s,\"lastUsed\":%llu,\"idleMinutes\":%d}",
                                  kept_pinned(d.cFileName, name) ? "true" : "false",
-                                 active ? "true" : "false", (unsigned long long)last);
+                                 active ? "true" : "false", (unsigned long long)last,
+                                 user_idle_minutes(d.cFileName, -1));
             } while (FindNextFileW(h, &d));
             FindClose(h);
         }
