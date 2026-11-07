@@ -39,6 +39,14 @@ def main():
     assert "PROTECTED_DACL_SECURITY_INFORMATION" in apply
     assert "asb_secure_data_dir();" in headless[headless.index("static void open_log"):]
 
+    # The UI's WebView2 browser runs as the signed-in user, unelevated: its profile
+    # keeps that user's write access, set before the browser starts.
+    wv = core[core.index("static void secure_webview_dir"):core.index("ASB_API BOOL asb_secure_data_dir(void)")]
+    assert "WebView2Data" in wv and "GetShellWindow()" in wv and "append_token_user_ace" in wv
+    assert "secure_webview_dir(root);" in secure
+    bridge = read("src/app_win/webview2_bridge.c")
+    assert bridge.index("asb_secure_data_dir();") < bridge.index("pfnCreateEnv(NULL, udf")
+
     # Settings: the temp file gets the admin-only ACL before it replaces vms.cfg.
     save = core[core.index('L"%s.tmp", path'):]
     assert save.index("apply_security(temp_path, PRIVATE_FILE_SDDL);") < save.index("MoveFileExW(temp_path, path,")

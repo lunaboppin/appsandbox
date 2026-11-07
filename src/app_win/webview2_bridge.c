@@ -7,6 +7,7 @@
 
 #include "webview2_bridge.h"
 #include "ui.h"
+#include "asb_core.h"
 #include <shlwapi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,6 +355,8 @@ BOOL webview2_init(HWND parent, HINSTANCE hInstance)
     if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
         wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
     swprintf_s(udf, MAX_PATH, L"%s\\AppSandbox\\WebView2Data", base);
+    /* Before the browser starts: it needs write access to this folder. */
+    asb_secure_data_dir();
 
     /* Create environment */
     eh = (EnvHandler *)calloc(1, sizeof(EnvHandler));
