@@ -84,6 +84,21 @@ def main():
     assert "if (m === 0) return 'Never';" in app
     assert "sendCmd('gameStreamingVmOptions', { user: v.user, idleMinutes: parseInt(idle.value, 10) });" in app
 
+    # Delete a user's VM: even one marked to keep. A session using it ends without
+    # keeping it; a kept one goes on a worker (the domain controller can be slow).
+    assert "ASB_API HRESULT game_stream_delete_user_vm(" in header
+    dele = gs[gs.index("HRESULT game_stream_delete_user_vm"):gs.index("HRESULT game_stream_set_vm_options")]
+    assert "admin_user_ok(user)" in dele
+    assert dele.index("kept_unpin(user);") < dele.index("InterlockedExchange(&g_sessions[slot].discard, 1);")
+    assert "InterlockedExchange(&g_sessions[slot].stop, 1);" in dele
+    assert 'L"vm-vpn"' in dele and 'L"vm-idle"' in dele
+    assert "CreateThread(NULL, 0, delete_vm_thread, work, 0, NULL)" in dele
+    worker = gs[gs.index("static DWORD WINAPI delete_vm_thread"):gs.index("HRESULT game_stream_delete_user_vm")]
+    assert 'kept_remove(d->user, name, L"an administrator deleted it");' in worker
+    assert 'L"gameStreamingDeleteVm"' in ui and 'L"/v1/game-streaming/vm/delete"' in headless
+    assert "sendCmd('gameStreamingDeleteVm', { user: v.user });" in app
+    assert "confirmClass: 'danger'" in app[app.index("function renderGsUserVms"):]
+
     print("game streaming VM options contract: OK")
 
 

@@ -2016,6 +2016,71 @@ static BOOL admin_user_ok(const wchar_t *user)
     return identity_path(user, NULL, path, MAX_PATH) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
+/* Deleting can wait on the domain controller: a worker does it. */
+typedef struct { wchar_t user[80]; } GsDeleteVm;
+
+static DWORD WINAPI delete_vm_thread(LPVOID param)
+{
+    GsDeleteVm *d = (GsDeleteVm *)param;
+    wchar_t name[32], image[MAX_PATH];
+    ULONGLONG last;
+    if (kept_read(d->user, name, _countof(name), image, _countof(image), &last))
+        kept_remove(d->user, name, L"an administrator deleted it");
+    prune_images();
+    free(d);
+    InterlockedDecrement(&g_threads);
+    return 0;
+}
+
+HRESULT game_stream_delete_user_vm(const wchar_t *user, wchar_t *err, size_t err_chars)
+{
+    wchar_t name[32] = L"", image[MAX_PATH], path[MAX_PATH];
+    ULONGLONG last;
+    BOOL kept, active = FALSE;
+    int slot;
+    GsDeleteVm *work;
+    HANDLE t;
+    if (err && err_chars) err[0] = 0;
+    if (!admin_user_ok(user)) {
+        if (err) wcscpy_s(err, err_chars, L"That user has no Game Streaming VM.");
+        return E_INVALIDARG;
+    }
+    /* Their own settings for it go too: a new VM starts from the usual ones. */
+    kept_unpin(user);
+    if (identity_path(user, L"vm-vpn", path, MAX_PATH)) DeleteFileW(path);
+    if (identity_path(user, L"vm-idle", path, MAX_PATH)) DeleteFileW(path);
+    kept = kept_read(user, name, _countof(name), image, _countof(image), &last);
+    /* A session using it ends without keeping it. */
+    AcquireSRWLockShared(&g_lock);
+    slot = find_session(user);
+    if (slot >= 0) {
+        active = TRUE;
+        InterlockedExchange(&g_sessions[slot].discard, 1);
+        InterlockedExchange(&g_sessions[slot].stop, 1);
+    }
+    ReleaseSRWLockShared(&g_lock);
+    if (active) {
+        ui_log(L"Game Streaming: ending %s's session and deleting their VM.", user);
+        return S_OK;
+    }
+    if (!kept) {
+        if (err) wcscpy_s(err, err_chars, L"That user has no Game Streaming VM.");
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    work = (GsDeleteVm *)calloc(1, sizeof(*work));
+    if (!work) return E_OUTOFMEMORY;
+    wcscpy_s(work->user, _countof(work->user), user);
+    InterlockedIncrement(&g_threads);
+    t = CreateThread(NULL, 0, delete_vm_thread, work, 0, NULL);
+    if (!t) {
+        InterlockedDecrement(&g_threads);
+        free(work);
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    CloseHandle(t);
+    return S_OK;
+}
+
 HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn, int idle,
                                    wchar_t *err, size_t err_chars)
 {
