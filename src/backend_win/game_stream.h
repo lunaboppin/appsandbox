@@ -60,6 +60,10 @@ ASB_API HRESULT game_stream_turn_off(void);
    "nat" no VPN, otherwise a VPN config's id; it applies from the VM's next start.
    idle: minutes with nobody connected before the session ends, 0 never,
    GS_IDLE_DEFAULT the Game Streaming setting, GS_IDLE_LEAVE leaves it; applies at once. */
+/* Delete one user's VM now, kept or in a session (which ends), even one marked to keep,
+   with its computer account and their settings for it. */
+ASB_API HRESULT game_stream_delete_user_vm(const wchar_t *user, wchar_t *err, size_t err_chars);
+
 #define GS_IDLE_LEAVE   (-2)
 #define GS_IDLE_DEFAULT (-1)
 ASB_API HRESULT game_stream_set_vm_options(const wchar_t *user, int pin, const wchar_t *vpn, int idle,

@@ -908,7 +908,8 @@ static int handle_request(PHTTP_REQUEST req)
          POST /v1/game-streaming/off    end every session and delete the image
          POST /v1/game-streaming/vm     {user, pinned?, vpn?, idleMinutes?}  one user's VM: keep it
                                         for good, give it its own network ("" default, "nat", VPN id),
-                                        or its own idle timeout (minutes, 0 never, -1 default) */
+                                        or its own idle timeout (minutes, 0 never, -1 default)
+         POST /v1/game-streaming/vm/delete {user}  delete that user's VM now (ending its session) */
     if (wcscmp(path, L"/v1/game-streaming") == 0 || wcsncmp(path, L"/v1/game-streaming/", 19) == 0) {
         wchar_t message[512] = L"";
         HRESULT hr = S_OK;
@@ -930,6 +931,11 @@ static int handle_request(PHTTP_REQUEST req)
             hr = game_stream_build_image(message, _countof(message));
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/off") == 0) {
             hr = game_stream_turn_off();
+        } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/vm/delete") == 0) {
+            wchar_t body[1024] = L"", user[80] = L"";
+            body_to_wide(req, body, _countof(body));
+            json_get_string(body, L"user", user, _countof(user));
+            hr = game_stream_delete_user_vm(user, message, _countof(message));
         } else if (verb == HttpVerbPOST && wcscmp(path, L"/v1/game-streaming/vm") == 0) {
             wchar_t body[1024] = L"", user[80] = L"", vpn[40] = L"";
             BOOL pin = FALSE, has_pin, has_vpn;

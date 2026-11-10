@@ -1527,6 +1527,10 @@ static void game_streaming_command(const wchar_t *action, const wchar_t *json)
             hr = game_stream_end_session_of_vm(vm);
         } else if (wcscmp(action, L"gameStreamingOff") == 0) {
             hr = game_stream_turn_off();
+        } else if (wcscmp(action, L"gameStreamingDeleteVm") == 0) {
+            wchar_t user[80] = L"";
+            json_get_string(json, L"user", user, _countof(user));
+            hr = game_stream_delete_user_vm(user, message, _countof(message));
         } else if (wcscmp(action, L"gameStreamingVmOptions") == 0) {
             wchar_t user[80] = L"", vpn[40] = L"";
             BOOL pin = FALSE, has_pin, has_vpn;

@@ -1182,10 +1182,27 @@ function renderGsUserVms(s) {
             sendCmd('gameStreamingVmOptions', { user: v.user, idleMinutes: parseInt(idle.value, 10) });
         };
 
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'danger';
+        del.textContent = 'Delete';
+        del.onclick = function() {
+            showModal('Delete game VM',
+                'Delete ' + v.user + '\'s VM ' + v.vm + '?' +
+                (v.active ? ' Their session ends now.' : '') +
+                ' Anything not saved to their H: drive is lost, and their next session starts with a new VM.' +
+                (v.pinned ? ' It is marked Keep forever; it is deleted anyway.' : '') +
+                '\n\nThis cannot be undone.',
+                'Delete', { confirmClass: 'danger' }).then(function(ok) {
+                if (ok) sendCmd('gameStreamingDeleteVm', { user: v.user });
+            });
+        };
+
         row.appendChild(text);
         row.appendChild(keep);
         row.appendChild(net);
         row.appendChild(idle);
+        row.appendChild(del);
         list.appendChild(row);
     });
 }
